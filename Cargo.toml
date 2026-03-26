@@ -43,3 +43,7 @@ bytes = "1"
 [dev-dependencies]
 tempfile = "3"
 zip = "2.2"
+
+[[bin]]
+name = "tdf-iroh-s3-test"
+path = "src/bin/test_cli.rs"
