@@ -5,26 +5,38 @@ use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::store::mem::MemStore;
 use iroh_blobs::BlobsProtocol;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use tracing::info;
+
+use crate::config::Config;
+use crate::store::s3::S3Client;
 
 pub struct TdfIrohNode {
     router: Router,
     store: MemStore,
     endpoint: Endpoint,
+    pub s3_client: Arc<S3Client>,
+    pub config: Arc<Config>,
 }
 
 impl TdfIrohNode {
-    pub async fn spawn(bind_port: u16) -> Result<Self> {
+    pub async fn spawn(config: Config) -> Result<Self> {
+        let s3_client = Arc::new(
+            S3Client::new(&config.s3.bucket, &config.s3.region, &config.s3.prefix)
+                .await
+                .context("Failed to create S3 client")?,
+        );
+
         let store = MemStore::new();
 
         let endpoint = Endpoint::builder(presets::N0)
-            .bind_addr((Ipv4Addr::UNSPECIFIED, bind_port))
+            .bind_addr((Ipv4Addr::UNSPECIFIED, config.iroh.bind_port))
             .context("Invalid bind address")?
             .bind()
             .await
             .context("Failed to bind Iroh endpoint")?;
 
-        info!("Iroh endpoint bound on port {}", bind_port);
+        info!("Iroh endpoint bound on port {}", config.iroh.bind_port);
         endpoint.online().await;
         info!("Iroh endpoint online");
 
@@ -41,6 +53,8 @@ impl TdfIrohNode {
             router,
             store,
             endpoint,
+            s3_client,
+            config: Arc::new(config),
         })
     }
 

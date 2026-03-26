@@ -24,9 +24,12 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let config = Config::from_file(&cli.config)?;
-    info!("Loaded config from {:?}", cli.config);
+    info!("Config loaded from {:?}", cli.config);
+    info!("S3: {}:{}", config.s3.bucket, config.s3.region);
+    info!("Required attributes: {:?}", config.validation.required_attributes);
+    info!("Assertion check: {}", config.validation.assertion.enabled);
 
-    let node = TdfIrohNode::spawn(config.iroh.bind_port).await?;
+    let node = TdfIrohNode::spawn(config).await?;
     let addr = node.addr();
     info!("Node running at {}", addr.id);
 
