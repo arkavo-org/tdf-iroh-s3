@@ -22,6 +22,21 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
     },
+
+    /// Create a TDF and push it to a remote node
+    Push {
+        /// Remote node Endpoint ID
+        #[arg(short, long)]
+        node: String,
+
+        /// Attribute FQN to include in the TDF policy
+        #[arg(short, long)]
+        attribute: String,
+
+        /// Payload data (string)
+        #[arg(short, long, default_value = "test payload")]
+        data: String,
+    },
 }
 
 #[tokio::main]
@@ -39,6 +54,14 @@ async fn main() -> Result<()> {
                 data.as_bytes(),
                 &output,
             )?;
+        }
+        Commands::Push {
+            node,
+            attribute,
+            data,
+        } => {
+            let node_id = tdf_iroh_s3::test_cli::iroh_client::parse_endpoint_id(&node)?;
+            tdf_iroh_s3::test_cli::push::push_tdf(node_id, &attribute, data.as_bytes()).await?;
         }
     }
 
