@@ -1,0 +1,45 @@
+[package]
+name = "tdf-iroh-s3"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+
+[dependencies]
+# Iroh networking and blobs
+iroh = "0.97"
+iroh-blobs = "0.99"
+
+# OpenTDF validation
+opentdf = { git = "https://github.com/arkavo-org/opentdf-rs", default-features = false }
+
+# AWS S3
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Hashing
+blake3 = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization / config
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Misc
+bytes = "1"
+
+[dev-dependencies]
+tempfile = "3"
+zip = "2.2"
