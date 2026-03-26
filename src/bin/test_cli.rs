@@ -23,6 +23,17 @@ enum Commands {
         output: PathBuf,
     },
 
+    /// Push raw bytes (no TDF wrapping) to a remote node
+    PushRaw {
+        /// Remote node Endpoint ID
+        #[arg(short, long)]
+        node: String,
+
+        /// File containing raw bytes to push
+        #[arg(short, long)]
+        data: PathBuf,
+    },
+
     /// Create a TDF and push it to a remote node
     Push {
         /// Remote node Endpoint ID
@@ -54,6 +65,10 @@ async fn main() -> Result<()> {
                 data.as_bytes(),
                 &output,
             )?;
+        }
+        Commands::PushRaw { node, data } => {
+            let node_id = tdf_iroh_s3::test_cli::iroh_client::parse_endpoint_id(&node)?;
+            tdf_iroh_s3::test_cli::push_raw::push_raw_file(node_id, &data).await?;
         }
         Commands::Push {
             node,
