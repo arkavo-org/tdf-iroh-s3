@@ -1,6 +1,6 @@
 [package]
 name = "tdf-iroh-s3"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.91"
 
@@ -8,6 +8,7 @@ rust-version = "1.91"
 # Iroh networking and blobs
 iroh = "0.97"
 iroh-blobs = "0.99"
+irpc = "0.13"
 
 # OpenTDF validation
 opentdf = { git = "https://github.com/arkavo-org/opentdf-rs", default-features = false }

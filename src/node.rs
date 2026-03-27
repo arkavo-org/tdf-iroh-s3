@@ -2,13 +2,15 @@ use anyhow::{Context, Result};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr};
-use iroh_blobs::provider::events::{EventMask, EventSender, ProviderMessage, RequestMode};
+use iroh_blobs::provider::events::{
+    EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
+};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::BlobsProtocol;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::ingest::ingest_from_store;
@@ -60,9 +62,13 @@ impl TdfIrohNode {
 
         let cancel = CancellationToken::new();
 
-        // Create event sender with push notifications enabled
+        // NotifyLog on `get` enables event delivery for ALL request types (get, push, etc.)
+        // and provides a RequestUpdate stream to track transfer completion.
+        // Note: EventSender::request() checks only mask.get, not mask.push.
+        // Notify on `get` enables event delivery for ALL request types (get, push, etc.)
+        // Note: EventSender::request() checks only mask.get, not mask.push.
         let mask = EventMask {
-            push: RequestMode::Notify,
+            get: RequestMode::Notify,
             ..EventMask::DEFAULT
         };
         let (event_sender, event_rx) = EventSender::channel(64, mask);
@@ -131,17 +137,45 @@ async fn run_ingest_loop(
                 break;
             }
             msg = rx.recv() => {
+                if let Some(ref m) = msg {
+                    info!("Received provider message: {:?}", m);
+                }
                 match msg {
                     Some(ProviderMessage::PushRequestReceivedNotify(msg)) => {
                         let hash = msg.inner.request.hash;
+                        info!(%hash, "Push request received (notify)");
                         let store = store.clone();
                         let s3_client = Arc::clone(&s3_client);
                         let config = Arc::clone(&config);
                         tokio::spawn(async move {
-                            ingest_pushed_blob(hash, &store, &s3_client, &config).await;
+                            wait_and_ingest(hash, msg.rx, &store, &s3_client, &config).await;
                         });
                     }
-                    Some(_) => {} // Ignore other message types
+                    Some(ProviderMessage::PushRequestReceived(msg)) => {
+                        let hash = msg.inner.request.hash;
+                        info!(%hash, "Push request received (intercept)");
+                        msg.tx.send(Ok(())).await.ok();
+                        let store = store.clone();
+                        let s3_client = Arc::clone(&s3_client);
+                        let config = Arc::clone(&config);
+                        tokio::spawn(async move {
+                            wait_and_ingest(hash, msg.rx, &store, &s3_client, &config).await;
+                        });
+                    }
+                    Some(ProviderMessage::GetRequestReceivedNotify(_)) => {
+                        debug!("Get request received (notify)");
+                    }
+                    Some(ProviderMessage::GetRequestReceived(msg)) => {
+                        debug!("Get request received (intercept)");
+                        msg.tx.send(Ok(())).await.ok();
+                    }
+                    Some(ProviderMessage::ClientConnected(msg)) => {
+                        debug!("Client connected, accepting");
+                        msg.tx.send(Ok(())).await.ok();
+                    }
+                    Some(other) => {
+                        debug!("Other event received: {:?}", std::mem::discriminant(&other));
+                    }
                     None => {
                         info!("Event channel closed, ingest loop exiting");
                         break;
@@ -152,37 +186,58 @@ async fn run_ingest_loop(
     }
 }
 
-async fn ingest_pushed_blob(
+async fn wait_and_ingest(
     hash: iroh_blobs::Hash,
+    mut rx: irpc::channel::mpsc::Receiver<RequestUpdate>,
     store: &FsStore,
     s3_client: &S3Client,
     config: &Config,
 ) {
-    info!(hash = %hash, "Push received, starting ingest");
+    // Wait for the push transfer to complete
+    let mut completed = false;
+    while let Ok(Some(update)) = rx.recv().await {
+        match update {
+            RequestUpdate::Started(s) => {
+                info!(%hash, size = s.size, "Push transfer started");
+            }
+            RequestUpdate::Progress(_) => {}
+            RequestUpdate::Completed(_) => {
+                info!(%hash, "Push transfer completed");
+                completed = true;
+                break;
+            }
+            RequestUpdate::Aborted(_) => {
+                warn!(%hash, "Push transfer aborted");
+                return;
+            }
+        }
+    }
+    if !completed {
+        // Notify mode doesn't provide RequestUpdate events — the stream closes
+        // immediately. The blob should already be in the store by this point.
+        info!(%hash, "Push notification received, checking store");
+    }
 
-    const MAX_ATTEMPTS: u32 = 300;
-    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-
-    for attempt in 0..MAX_ATTEMPTS {
+    // Blob is written — ingest with small retry for FsStore async DB propagation
+    for attempt in 0..10 {
         match ingest_from_store(hash, store, &config.validation, s3_client).await {
             Ok(Some(result)) => {
                 info!(
                     hash = %result.hash_hex,
                     size = result.size,
-                    attempts = attempt + 1,
                     "Blob ingested successfully"
                 );
                 return;
             }
             Ok(None) => {
-                tokio::time::sleep(POLL_INTERVAL).await;
+                debug!(%hash, attempt, "Blob not yet readable, retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
             Err(e) => {
-                error!(hash = %hash, error = %e, "Ingest failed");
+                error!(%hash, error = %e, "Ingest failed");
                 return;
             }
         }
     }
-
-    warn!(hash = %hash, "Ingest timed out waiting for blob to complete");
+    error!(%hash, "Blob not readable after transfer completed");
 }

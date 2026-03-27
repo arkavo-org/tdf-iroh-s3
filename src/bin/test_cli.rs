@@ -29,6 +29,10 @@ enum Commands {
         #[arg(short, long)]
         node: String,
 
+        /// Direct address (ip:port) of the remote node
+        #[arg(long)]
+        addr: Option<String>,
+
         /// File containing raw bytes to push
         #[arg(short, long)]
         data: PathBuf,
@@ -39,6 +43,10 @@ enum Commands {
         /// Remote node Endpoint ID
         #[arg(short, long)]
         node: String,
+
+        /// Direct address (ip:port) of the remote node
+        #[arg(long)]
+        addr: Option<String>,
 
         /// Attribute FQN to include in the TDF policy
         #[arg(short, long)]
@@ -55,6 +63,10 @@ enum Commands {
         #[arg(short, long)]
         node: String,
 
+        /// Direct address (ip:port) of the remote node
+        #[arg(long)]
+        addr: Option<String>,
+
         /// BLAKE3 hash (hex) of the blob to fetch
         #[arg(long)]
         hash: String,
@@ -63,6 +75,18 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+}
+
+fn parse_addr(node: &str, addr: &Option<String>) -> Result<iroh::EndpointAddr> {
+    let node_id = tdf_iroh_s3::test_cli::iroh_client::parse_endpoint_id(node)?;
+    let socket_addr = addr
+        .as_deref()
+        .map(|a| a.parse::<std::net::SocketAddr>())
+        .transpose()?;
+    Ok(tdf_iroh_s3::test_cli::iroh_client::build_endpoint_addr(
+        node_id,
+        socket_addr,
+    ))
 }
 
 #[tokio::main]
@@ -81,30 +105,29 @@ async fn main() -> Result<()> {
                 &output,
             )?;
         }
-        Commands::PushRaw { node, data } => {
-            let node_id = tdf_iroh_s3::test_cli::iroh_client::parse_endpoint_id(&node)?;
-            tdf_iroh_s3::test_cli::push_raw::push_raw_file(node_id, &data).await?;
+        Commands::PushRaw { node, addr, data } => {
+            let endpoint_addr = parse_addr(&node, &addr)?;
+            tdf_iroh_s3::test_cli::push_raw::push_raw_file(endpoint_addr.id, &data).await?;
         }
         Commands::Push {
             node,
+            addr,
             attribute,
             data,
         } => {
-            let node_id = tdf_iroh_s3::test_cli::iroh_client::parse_endpoint_id(&node)?;
-            tdf_iroh_s3::test_cli::push::push_tdf(node_id, &attribute, data.as_bytes()).await?;
+            let endpoint_addr = parse_addr(&node, &addr)?;
+            tdf_iroh_s3::test_cli::push::push_tdf(endpoint_addr, &attribute, data.as_bytes())
+                .await?;
         }
         Commands::Fetch {
             node,
+            addr,
             hash,
             output,
         } => {
-            let node_id = tdf_iroh_s3::test_cli::iroh_client::parse_endpoint_id(&node)?;
-            tdf_iroh_s3::test_cli::fetch::fetch_blob(
-                node_id,
-                &hash,
-                output.as_deref(),
-            )
-            .await?;
+            let endpoint_addr = parse_addr(&node, &addr)?;
+            tdf_iroh_s3::test_cli::fetch::fetch_blob(endpoint_addr, &hash, output.as_deref())
+                .await?;
         }
     }
 

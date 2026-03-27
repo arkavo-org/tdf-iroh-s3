@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use iroh::EndpointId;
+use iroh::EndpointAddr;
 use iroh_blobs::Hash;
 use std::path::Path;
 use std::str::FromStr;
@@ -8,7 +8,7 @@ use super::iroh_client::IrohTestClient;
 
 /// Fetch a blob from a remote node by its BLAKE3 hash.
 pub async fn fetch_blob(
-    node_id: EndpointId,
+    addr: EndpointAddr,
     hash_hex: &str,
     output_path: Option<&Path>,
 ) -> Result<()> {
@@ -18,11 +18,11 @@ pub async fn fetch_blob(
         .await
         .context("Failed to create Iroh client")?;
 
-    println!("Connecting to node {}...", node_id);
+    println!("Connecting to node {}...", addr.id);
     println!("Fetching blob {}...", hash_hex);
 
     let data = client
-        .fetch_from_node(node_id, hash)
+        .fetch_from_node(addr, hash)
         .await
         .context("Failed to fetch blob")?;
 

@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
-use iroh::EndpointId;
+use iroh::EndpointAddr;
 
 use super::create_tdf::create_tdf_bytes;
 use super::iroh_client::IrohTestClient;
 
 /// Create a TDF with the given attribute and push it to a remote node.
 pub async fn push_tdf(
-    node_id: EndpointId,
+    addr: EndpointAddr,
     attribute_fqn: &str,
     data: &[u8],
 ) -> Result<()> {
@@ -21,9 +21,9 @@ pub async fn push_tdf(
         .await
         .context("Failed to create Iroh client")?;
 
-    println!("Connecting to node {}...", node_id);
+    println!("Connecting to node {}...", addr.id);
     let hash = client
-        .push_to_node(node_id, &tdf_bytes)
+        .push_to_node(addr, &tdf_bytes)
         .await
         .context("Failed to push TDF to node")?;
 
