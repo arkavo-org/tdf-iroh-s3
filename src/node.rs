@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr};
-use iroh_blobs::store::mem::MemStore;
+use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::BlobsProtocol;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use crate::store::s3::S3Client;
 
 pub struct TdfIrohNode {
     router: Router,
-    store: MemStore,
+    store: FsStore,
     endpoint: Endpoint,
     pub s3_client: Arc<S3Client>,
     pub config: Arc<Config>,
@@ -27,7 +27,9 @@ impl TdfIrohNode {
                 .context("Failed to create S3 client")?,
         );
 
-        let store = MemStore::new();
+        let store = FsStore::load(&config.iroh.data_dir)
+            .await
+            .context("Failed to load FsStore")?;
 
         let endpoint = Endpoint::builder(presets::N0)
             .bind_addr((Ipv4Addr::UNSPECIFIED, config.iroh.bind_port))
@@ -62,7 +64,7 @@ impl TdfIrohNode {
         self.endpoint.addr()
     }
 
-    pub fn store(&self) -> &MemStore {
+    pub fn store(&self) -> &FsStore {
         &self.store
     }
 
@@ -71,6 +73,9 @@ impl TdfIrohNode {
             .shutdown()
             .await
             .context("Failed to shutdown router")?;
+        let _ = self.store
+            .shutdown()
+            .await;
         Ok(())
     }
 }
