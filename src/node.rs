@@ -122,9 +122,16 @@ async fn run_ingest_loop(
             }
             msg = rx.recv() => {
                 match msg {
-                    Some(message) => {
-                        handle_provider_message(message, &store, &s3_client, &config).await;
+                    Some(ProviderMessage::PushRequestReceivedNotify(msg)) => {
+                        let hash = msg.inner.request.hash;
+                        let store = store.clone();
+                        let s3_client = Arc::clone(&s3_client);
+                        let config = Arc::clone(&config);
+                        tokio::spawn(async move {
+                            ingest_pushed_blob(hash, &store, &s3_client, &config).await;
+                        });
                     }
+                    Some(_) => {} // Ignore other message types
                     None => {
                         info!("Event channel closed, ingest loop exiting");
                         break;
@@ -135,47 +142,37 @@ async fn run_ingest_loop(
     }
 }
 
-async fn handle_provider_message(
-    msg: ProviderMessage,
+async fn ingest_pushed_blob(
+    hash: iroh_blobs::Hash,
     store: &FsStore,
     s3_client: &S3Client,
     config: &Config,
 ) {
-    match msg {
-        ProviderMessage::PushRequestReceivedNotify(msg) => {
-            let hash = msg.inner.request.hash;
-            info!(hash = %hash, "Push request received, starting ingest");
+    info!(hash = %hash, "Push received, starting ingest");
 
-            // Poll until the blob is complete or timeout (max 300 attempts, 100ms apart = 30s)
-            const MAX_ATTEMPTS: u32 = 300;
-            const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+    const MAX_ATTEMPTS: u32 = 300;
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
-            for attempt in 0..MAX_ATTEMPTS {
-                match ingest_from_store(hash, store, &config.validation, s3_client).await {
-                    Ok(Some(result)) => {
-                        info!(
-                            hash = %result.hash_hex,
-                            size = result.size,
-                            attempts = attempt + 1,
-                            "Blob ingested successfully"
-                        );
-                        return;
-                    }
-                    Ok(None) => {
-                        // Blob not yet complete, wait and retry
-                        tokio::time::sleep(POLL_INTERVAL).await;
-                    }
-                    Err(e) => {
-                        error!(hash = %hash, error = %e, "Ingest failed");
-                        return;
-                    }
-                }
+    for attempt in 0..MAX_ATTEMPTS {
+        match ingest_from_store(hash, store, &config.validation, s3_client).await {
+            Ok(Some(result)) => {
+                info!(
+                    hash = %result.hash_hex,
+                    size = result.size,
+                    attempts = attempt + 1,
+                    "Blob ingested successfully"
+                );
+                return;
             }
-
-            warn!(hash = %hash, "Ingest timed out waiting for blob to complete");
-        }
-        _ => {
-            // Ignore other message types
+            Ok(None) => {
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            Err(e) => {
+                error!(hash = %hash, error = %e, "Ingest failed");
+                return;
+            }
         }
     }
+
+    warn!(hash = %hash, "Ingest timed out waiting for blob to complete");
 }

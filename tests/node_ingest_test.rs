@@ -51,16 +51,45 @@ async fn test_push_blob_stored_in_node() {
     let client = IrohTestClient::new().await.unwrap();
     let hash = client.push_to_node(node_id, &tdf_bytes).await.unwrap();
 
-    // Small delay to let the push fully propagate through the node
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
     // Verify the blob is accessible by fetching it back from the node
+    // (fetch_from_node blocks until the blob is available over the protocol)
     let fetched = client.fetch_from_node(node_id, hash).await.unwrap();
     assert_eq!(
         fetched.as_ref(),
         tdf_bytes.as_slice(),
         "Fetched blob should match the original TDF bytes"
     );
+
+    client.shutdown().await.unwrap();
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_push_invalid_blob_does_not_crash_node() {
+    // SAFETY: current_thread runtime ensures no other threads read env vars concurrently.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+    }
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let config = test_config(tmp_dir.path().to_str().unwrap());
+
+    let node = TdfIrohNode::spawn(config).await.unwrap();
+    let node_id = node.addr().id;
+
+    // Push garbage (non-TDF) bytes to the node
+    let garbage = vec![0xDEu8; 256];
+    let client = IrohTestClient::new().await.unwrap();
+    let hash = client.push_to_node(node_id, &garbage).await.unwrap();
+
+    // Give the ingest loop time to attempt (and reject) the blob
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // The node should still be alive — verify by fetching the blob back
+    // (it's stored in FsStore even though ingest to S3 was rejected)
+    let fetched = client.fetch_from_node(node_id, hash).await.unwrap();
+    assert_eq!(fetched.as_ref(), garbage.as_slice());
 
     client.shutdown().await.unwrap();
     node.shutdown().await.unwrap();
