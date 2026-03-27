@@ -62,7 +62,10 @@ pub async fn ingest_from_store(
     // bypassing the database metadata which updates asynchronously).
     let data = match store.get_bytes(hash).await {
         Ok(bytes) => bytes,
-        Err(_) => return Ok(None), // Blob not yet available
+        Err(e) => {
+            tracing::trace!(hash = %hash, error = %e, "Blob not yet available in store");
+            return Ok(None);
+        }
     };
 
     // Delegate to the existing ingest pipeline

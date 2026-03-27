@@ -28,12 +28,11 @@ fn test_config(data_dir: &str) -> Config {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn test_push_blob_stored_in_node() {
     // Set dummy AWS credentials so S3Client::new doesn't hang
     // trying to reach the IMDS endpoint.
-    // SAFETY: This test is single-threaded at this point (before spawning the node),
-    // so no other threads are reading environment variables concurrently.
+    // SAFETY: current_thread runtime ensures no other threads read env vars concurrently.
     unsafe {
         std::env::set_var("AWS_ACCESS_KEY_ID", "test");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
