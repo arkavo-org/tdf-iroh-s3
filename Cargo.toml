@@ -18,6 +18,7 @@ aws-sdk-s3 = "1"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 
 # Hashing
 blake3 = "1"
