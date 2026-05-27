@@ -176,8 +176,13 @@ impl Verifier {
         // pep_check will internally retry against any key — but only the
         // currently-cached set. If verification fails and we have a URL,
         // force a refresh and try once more in case the keyset rotated.
-        let first_attempt = pep_check::verify_cose_sign1(&sign1, &raw_keyset);
-        if first_attempt.is_err() {
+        //
+        // Capture only the boolean: the `Box<dyn StdError>` error type is
+        // !Send, so binding the full `Result` across the `.await` below
+        // would taint this future and prevent `impl Future + Send` callers
+        // (like ProtocolHandler::accept) from compiling.
+        let first_failed = pep_check::verify_cose_sign1(&sign1, &raw_keyset).is_err();
+        if first_failed {
             if self.keys.force_refresh().await {
                 let refreshed = self
                     .keys

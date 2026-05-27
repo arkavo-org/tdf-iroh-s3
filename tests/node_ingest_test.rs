@@ -63,13 +63,9 @@ async fn test_push_blob_stored_in_node() {
     let node = TdfIrohNode::spawn(config).await.unwrap();
     let node_id = node.addr().id;
 
-    // Phase C smoke check: catalog replica is alive and addressable.
-    let ns_id = node.catalog.namespace_id();
-    assert_ne!(
-        ns_id.as_bytes(),
-        &[0u8; 32],
-        "catalog namespace id must be initialised on spawn"
-    );
+    // Smoke check: EventStore opened cleanly (tail is 0 on a fresh DB).
+    let tail = node.catalog.current_tail();
+    assert_eq!(tail, 0, "fresh EventStore should have tail 0");
 
     // Create a valid TDF blob
     let tdf_bytes = create_test_tdf();
