@@ -64,17 +64,20 @@ cose_keys_url = "https://issuer.example/.well-known/cose-keys"
 issuer = "https://issuer.example"
 "#;
     let config: Config = toml::from_str(toml_str).unwrap();
-    assert_eq!(config.catalog.data_dir, "/var/lib/tdf-iroh-s3/docs");
+    assert_eq!(config.catalog.data_dir, "/var/lib/tdf-iroh-s3/catalog");
 }
 
 #[test]
 fn test_config_auth_required() {
+    // auth is now optional at parse time; validate() enforces required URLs fail-closed.
     let toml_str = r#"
 [s3]
 bucket = "test-bucket"
 region = "us-east-1"
 "#;
-    let err = toml::from_str::<Config>(toml_str).unwrap_err();
+    let cfg = toml::from_str::<Config>(toml_str).expect("parses without auth section");
+    // validate() should reject empty URLs
+    let err = cfg.validate().unwrap_err();
     assert!(err.to_string().contains("auth"), "expected auth-missing error, got: {err}");
 }
 
@@ -151,4 +154,44 @@ trusted_public_keys = ["/tmp/key1.pem", "/tmp/key2.pem"]
     assert_eq!(config.validation.required_attributes.len(), 1);
     assert!(config.validation.assertion.enabled);
     assert_eq!(config.validation.assertion.trusted_public_keys.len(), 2);
+}
+
+#[test]
+fn missing_auth_section_uses_default_with_empty_urls() {
+    let toml = r#"
+        [s3]
+        bucket = "b"
+        region = "us-east-1"
+    "#;
+    let cfg: tdf_iroh_s3::config::Config = toml::from_str(toml).expect("parses");
+    assert_eq!(cfg.auth.cose_keys_url, "");
+    assert_eq!(cfg.auth.issuer, "");
+    assert_eq!(cfg.pdp.attribute_defs_url, "");
+}
+
+#[test]
+fn refresh_interval_zero_is_rejected() {
+    let toml = r#"
+        [s3]
+        bucket = "b"
+        region = "us-east-1"
+        [auth]
+        cose_keys_url = "https://x"
+        issuer = "https://x"
+        refresh_interval_secs = 0
+    "#;
+    let err = toml::from_str::<tdf_iroh_s3::config::Config>(toml).unwrap_err();
+    assert!(err.to_string().contains("refresh_interval_secs"));
+}
+
+#[test]
+fn auth_and_pdp_url_required_at_validate() {
+    let cfg: tdf_iroh_s3::config::Config = toml::from_str(r#"
+        [s3]
+        bucket = "b"
+        region = "us-east-1"
+    "#).unwrap();
+    let err = cfg.validate().unwrap_err();
+    let s = err.to_string();
+    assert!(s.contains("auth.cose_keys_url") || s.contains("auth.issuer"), "got: {s}");
 }
