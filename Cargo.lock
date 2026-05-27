@@ -3689,8 +3689,8 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "opentdf"
-version = "0.11.1"
-source = "git+https://github.com/arkavo-org/opentdf-rs#adfdcf427f67dc0b77ea20ef4b6d139a384bd3dc"
+version = "0.12.0"
+source = "git+https://github.com/arkavo-org/opentdf-rs?tag=0.12.0#85b8b052b78b97421ecd75024686caf00f5d6f66"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -3706,8 +3706,8 @@ dependencies = [
 
 [[package]]
 name = "opentdf-crypto"
-version = "0.11.1"
-source = "git+https://github.com/arkavo-org/opentdf-rs#adfdcf427f67dc0b77ea20ef4b6d139a384bd3dc"
+version = "0.12.0"
+source = "git+https://github.com/arkavo-org/opentdf-rs?tag=0.12.0#85b8b052b78b97421ecd75024686caf00f5d6f66"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3727,8 +3727,8 @@ dependencies = [
 
 [[package]]
 name = "opentdf-protocol"
-version = "0.11.1"
-source = "git+https://github.com/arkavo-org/opentdf-rs#adfdcf427f67dc0b77ea20ef4b6d139a384bd3dc"
+version = "0.12.0"
+source = "git+https://github.com/arkavo-org/opentdf-rs?tag=0.12.0#85b8b052b78b97421ecd75024686caf00f5d6f66"
 dependencies = [
  "base64",
  "chrono",
@@ -5225,6 +5225,7 @@ dependencies = [
  "opentdf",
  "p256 0.13.2",
  "rand 0.9.2",
+ "redb",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
