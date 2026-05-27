@@ -9,7 +9,6 @@ rust-version = "1.91"
 iroh = "0.97"
 iroh-base = "0.97"
 iroh-blobs = "0.99"
-iroh-docs = "0.97"
 irpc = "0.13"
 
 # OpenTDF validation
@@ -58,7 +57,6 @@ bytes = "1"
 hex = "0.4"
 rand = "0.9"
 futures-lite = "2.6.1"
-iroh-gossip = "0.97"
 
 # Embedded database
 redb = "2"
