@@ -62,21 +62,25 @@ impl AccessPdpCache {
     /// Records the timestamp ONLY on successful fetch so a transient
     /// upstream error does not consume the budget. Single-flight via the mutex.
     pub async fn force_refresh(&self) -> bool {
-        let guard = self.last_force_refresh.lock().await;
+        let mut guard = self.last_force_refresh.lock().await;
         let now = Instant::now();
         if let Some(prev) = *guard {
             if now.duration_since(prev) < FORCE_REFRESH_MIN_GAP {
                 return false;
             }
         }
-        drop(guard);
+        // Hold the guard across the fetch: serializes concurrent callers
+        // (true single-flight) and prevents duplicate in-flight requests.
         match fetch_and_build(&self.http, &self.url).await {
             Ok(new_pdp) => {
                 self.pdp.store(Arc::new(new_pdp));
-                *self.last_force_refresh.lock().await = Some(now);
+                *guard = Some(now);
                 true
             }
             Err(e) => {
+                // On failure we deliberately do NOT stamp the timestamp,
+                // so the next caller can retry immediately rather than
+                // burning the 1s budget on a transient error.
                 warn!(error = %e, "force PDP refresh failed");
                 false
             }
