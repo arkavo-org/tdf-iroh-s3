@@ -72,15 +72,11 @@ pub async fn ingest_from_store_with_manifest(
         }
     };
 
-    // Run the full validation pipeline (structure + attributes + assertion).
-    crate::validation::validate_blob(&data, validation_config)
+    // Run the full validation pipeline and capture the parsed manifest in
+    // one pass — used downstream to denormalize attribute-value FQNs onto
+    // the catalog event.
+    let manifest = crate::validation::validate_blob_and_parse(&data, validation_config)
         .context("Blob rejected by validation")?;
-
-    // Re-parse the manifest for FQN extraction. validate_tdf_structure already
-    // parses it; we call it again here to keep ingest decoupled from validation
-    // internals. The cost is a second ZIP parse on a blob that already passed.
-    let manifest = crate::validation::structure::validate_tdf_structure(&data)
-        .context("re-parse manifest for catalog event")?;
 
     let bhash = blake3::hash(&data);
     let hash_hex = bhash.to_hex().to_string();

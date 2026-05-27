@@ -215,13 +215,17 @@ impl Verifier {
             });
         }
 
+        // Clock skew is applied symmetrically to both bounds: a token may
+        // arrive `clock_skew_secs` early (iat in the future relative to us)
+        // or `clock_skew_secs` late (now past exp from our view). Matches
+        // RFC 7519 §4.1.4/§4.1.5 guidance and standard JWT/CWT libraries.
         let iat = claims.iat.ok_or(VerifyError::MissingClaim("iat"))?;
         if iat - self.clock_skew_secs > now {
             return Err(VerifyError::NotYetValid { iat, now });
         }
 
         let exp = claims.exp.ok_or(VerifyError::MissingClaim("exp"))?;
-        if now >= exp {
+        if now >= exp + self.clock_skew_secs {
             return Err(VerifyError::Expired { exp, now });
         }
 

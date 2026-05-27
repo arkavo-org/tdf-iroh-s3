@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -87,8 +86,11 @@ const TOKEN_WARNING_LEAD: i64 = 60;
 pub struct SubscriptionLimits {
     pub max_per_peer: u32,
     pub max_total: u32,
+    /// Per-peer counts. The total cap is enforced as `sum(values) < max_total`
+    /// computed under this lock — no separate atomic field is kept, which
+    /// eliminates the cross-state drift hazard. With `max_total` in the
+    /// low hundreds the sum is O(n) but trivially cheap.
     per_peer: Mutex<HashMap<String, u32>>,
-    total: AtomicU32,
 }
 
 impl SubscriptionLimits {
@@ -97,13 +99,13 @@ impl SubscriptionLimits {
             max_per_peer,
             max_total,
             per_peer: Mutex::new(HashMap::new()),
-            total: AtomicU32::new(0),
         })
     }
 
     fn try_acquire(&self, peer: &str) -> bool {
         let mut map = self.per_peer.lock();
-        if self.total.load(Ordering::SeqCst) >= self.max_total {
+        let current_total: u32 = map.values().sum();
+        if current_total >= self.max_total {
             return false;
         }
         let count = map.entry(peer.to_string()).or_insert(0);
@@ -111,7 +113,6 @@ impl SubscriptionLimits {
             return false;
         }
         *count += 1;
-        self.total.fetch_add(1, Ordering::SeqCst);
         true
     }
 
@@ -123,7 +124,6 @@ impl SubscriptionLimits {
                 map.remove(peer);
             }
         }
-        self.total.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
