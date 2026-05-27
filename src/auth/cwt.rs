@@ -36,9 +36,16 @@ const CWT_TAG_PREFIX: [u8; 2] = [0xd8, 0x3d];
 /// Maximum allowed `exp - iat` window per the v1 contract.
 const MAX_TOKEN_LIFETIME_SECS: i64 = 3600;
 
-/// Contract-defined `authorization_details[].type` we honor on the read
-/// path. Anything else MUST be skipped silently (forward compat for new
-/// grant types added by the issuer).
+/// Grant `type` discriminator per the Arkavo CWT v1 contract §3.
+///
+/// Note: vendored `pep_check.rs` defines `GRANT_TYPE_ATTRIBUTE = "opentdf_attribute"`
+/// from an earlier draft. The contract is the source of truth here; we
+/// deliberately do NOT call `pep_check::parse_authorization_details` (which
+/// would filter on the legacy constant) and instead re-parse in
+/// `parse_authorization_details` below using this contract-correct value.
+///
+/// Anything else MUST be skipped silently (forward compat for new grant types
+/// added by the issuer).
 const GRANT_TYPE_TDF_ATTRIBUTE: &str = "tdf_attribute";
 
 // IANA CWT claim keys (RFC 8392 + RFC 8747).
@@ -108,6 +115,8 @@ pub enum VerifyError {
     NodeIdMismatch { token: String, connection: String },
     #[error("cwt: cnf.iroh_node_id missing or malformed")]
     MissingNodeIdBinding,
+    #[error("cwt: connection node id is not 32-byte hex (programmer bug at the ALPN handler)")]
+    MalformedConnectionBinding,
     #[error("cwt: authorization_details missing or empty")]
     MissingAuthDetails,
     #[error("cwt: unknown action name in authorization_details")]
@@ -321,20 +330,13 @@ fn decode_claims_map(payload: &[u8]) -> Result<ClaimsView, VerifyError> {
                     _ => {}
                 }
             }
-            CborValue::Text(s) => {
-                // Text-keyed claims. The contract pins `scope` (registry-
-                // integer 9) but some issuers also publish a parallel text
-                // key — accept either, integer wins if both present.
-                match s.as_str() {
-                    "scope" => {
-                        if out.scope.is_none()
-                            && let CborValue::Text(v) = val
-                        {
-                            out.scope = Some(v);
-                        }
-                    }
-                    _ => {}
-                }
+            CborValue::Text(_) => {
+                // The contract pins `scope` exclusively to IANA integer key 9
+                // (CLAIM_SCOPE). Text-keyed claims are not part of the v1
+                // contract; accepting a "scope" text key would let a
+                // non-compliant issuer bypass the integer-keyed check.
+                // All contract-relevant claims use integer keys — ignore
+                // any text-keyed entries here.
             }
             _ => {}
         }
@@ -345,10 +347,21 @@ fn decode_claims_map(payload: &[u8]) -> Result<ClaimsView, VerifyError> {
 fn cbor_to_i64(v: &CborValue) -> Option<i64> {
     match v {
         CborValue::Integer(i) => (*i).try_into().ok(),
-        // Tolerate timestamps that arrive as float seconds (RFC 8392
-        // permits both whole and fractional). Floor to integer seconds —
-        // the contract's window checks operate at second granularity.
-        CborValue::Float(f) => Some(*f as i64),
+        // RFC 8392 permits fractional-second timestamps. Defensive bounds:
+        // reject NaN/Inf and anything outside i64 range so an attacker
+        // can't backdate/forward-date a token by encoding the time field
+        // as a special float.
+        CborValue::Float(f) => {
+            if !f.is_finite() {
+                return None;
+            }
+            let lo = i64::MIN as f64;
+            let hi = i64::MAX as f64;
+            if *f < lo || *f > hi {
+                return None;
+            }
+            Some(*f as i64)
+        }
         _ => None,
     }
 }
@@ -380,10 +393,11 @@ fn check_node_id_binding(
         return Err(VerifyError::MissingNodeIdBinding);
     }
 
-    let connection_bytes = hex::decode(bound_node_id).map_err(|_| VerifyError::NodeIdMismatch {
-        token: hex::encode(token_bytes),
-        connection: bound_node_id.to_string(),
-    })?;
+    let connection_bytes = hex::decode(bound_node_id)
+        .map_err(|_| VerifyError::MalformedConnectionBinding)?;
+    if connection_bytes.len() != 32 {
+        return Err(VerifyError::MalformedConnectionBinding);
+    }
 
     if connection_bytes.as_slice() != token_bytes.as_slice() {
         return Err(VerifyError::NodeIdMismatch {
