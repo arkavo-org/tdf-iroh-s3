@@ -181,7 +181,26 @@ fn refresh_interval_zero_is_rejected() {
         refresh_interval_secs = 0
     "#;
     let err = toml::from_str::<tdf_iroh_s3::config::Config>(toml).unwrap_err();
-    assert!(err.to_string().contains("refresh_interval_secs"));
+    let s = err.to_string();
+    assert!(s.contains("auth.refresh_interval_secs"), "expected auth-named error, got: {s}");
+}
+
+#[test]
+fn pdp_refresh_interval_zero_is_rejected() {
+    let toml = r#"
+        [s3]
+        bucket = "b"
+        region = "us-east-1"
+        [auth]
+        cose_keys_url = "https://x"
+        issuer = "https://x"
+        [pdp]
+        attribute_defs_url = "https://x"
+        refresh_interval_secs = 0
+    "#;
+    let err = toml::from_str::<tdf_iroh_s3::config::Config>(toml).unwrap_err();
+    let s = err.to_string();
+    assert!(s.contains("pdp.refresh_interval_secs"), "expected pdp-named error, got: {s}");
 }
 
 #[test]
@@ -193,5 +212,7 @@ fn auth_and_pdp_url_required_at_validate() {
     "#).unwrap();
     let err = cfg.validate().unwrap_err();
     let s = err.to_string();
-    assert!(s.contains("auth.cose_keys_url") || s.contains("auth.issuer"), "got: {s}");
+    assert!(s.contains("auth.cose_keys_url"), "got: {s}");
+    assert!(s.contains("auth.issuer"),         "got: {s}");
+    assert!(s.contains("pdp.attribute_defs_url"), "got: {s}");
 }
