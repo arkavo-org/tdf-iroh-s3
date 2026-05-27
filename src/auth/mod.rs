@@ -17,8 +17,17 @@ pub mod pep_check;
 pub mod test_signer;
 
 pub use cose_keys::CoseKeyCache;
-pub use cwt::{VerifiedClaims, Verifier, VerifyError};
+pub use cwt::{Grant, VerifiedClaims, VerifyError, Verifier};
 
-/// Scope value the catalog write path requires to be present in the CWT's
-/// `scope` claim (space-separated, OAuth-style).
+/// Required `scope` value at the catalog read ALPN per Arkavo CWT v1
+/// (Appendix A.2 of the reader-side spec).
+pub const SCOPE_CATALOG_READ: &str = "catalog.read";
+
+/// Only `authorization_details[].actions` name accepted in v1
+/// (Appendix A.3). Unknown action names reject the **whole token**.
+pub const ACTION_READ: &str = "read";
+
+/// Legacy publisher-side scope retained until Task 12 rewrites
+/// `test_signer`. Do not consume from new code — read paths require
+/// [`SCOPE_CATALOG_READ`] and the publisher path is being reworked.
 pub const SCOPE_CATALOG_WRITE: &str = "catalog.write";

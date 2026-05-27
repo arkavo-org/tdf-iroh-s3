@@ -50,11 +50,14 @@ impl TestSigner {
     }
 
     /// Build an in-memory `CoseKeyCache` populated with this signer's public
-    /// key. Skips the HTTP path entirely.
+    /// key. Skips the HTTP path entirely. The raw CBOR keyset is seeded
+    /// alongside the parsed map so [`crate::auth::Verifier`] (which calls
+    /// `pep_check::verify_cose_sign1` with the raw bytes) can verify
+    /// signatures without an HTTP fetch.
     pub fn cose_key_cache(&self) -> Arc<CoseKeyCache> {
         let mut map = HashMap::new();
         map.insert(self.kid.clone(), self.verifying_key);
-        CoseKeyCache::new_static(map)
+        CoseKeyCache::new_static(map, bytes::Bytes::from(self.cose_key_set()))
     }
 
     /// Mint a CWT for the given claims.

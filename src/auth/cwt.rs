@@ -1,55 +1,94 @@
-//! COSE_Sign1 / CWT verification.
+//! COSE_Sign1 / CWT verification for the **read** path.
 //!
-//! The verifier is constructed with an issuer name, a JWKS cache, and a
-//! permitted clock skew (seconds). [`Verifier::verify`] parses a
-//! COSE_Sign1, looks the key up by `kid`, verifies the ES256 signature,
-//! and walks the CWT claims set to enforce issuer, `exp`, `iat`, and the
-//! `scope` / `sub` / `campaign_id` shape we require for catalog writes.
+//! The verifier enforces the Arkavo CWT v1 contract (Appendix A of the
+//! reader-side spec). Signature verification is delegated to
+//! [`super::pep_check::verify_cose_sign1`] so the bytes-on-the-wire shape
+//! stays aligned with the upstream reference implementation. Everything
+//! after the signature check — claim shape, channel binding, action
+//! allowlist — lives in this module.
+//!
+//! v1 contract summary:
+//! - alg ES256 only (pep_check enforces by being P-256-only)
+//! - `iss` exact match; `sub` non-empty; `iat`/`exp` window <= 3600s
+//! - `scope` (text claim 9) must contain `catalog.read`
+//! - `cnf.iroh_node_id` (claim 8 → `"iroh_node_id"`) is REQUIRED on
+//!   iroh-authenticated channels and must equal the QUIC peer NodeId
+//!   (compared after hex-decoding the connection side)
+//! - `authorization_details` (text claim) must be a non-empty array.
+//!   Grant `type` allowlist: `"tdf_attribute"` (others skipped silently).
+//!   Grant `actions` allowlist: `"read"` (others reject the **whole**
+//!   token).
 
 use bytes::Bytes;
-use coset::iana::EnumI64;
-use coset::{AsCborValue, CborSerializable, CoseSign1, iana, cwt::ClaimsSet, cwt::Timestamp};
-use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier as _};
+use ciborium::Value as CborValue;
+use coset::{CborSerializable, CoseSign1};
 use std::sync::Arc;
 use thiserror::Error;
 
-use super::SCOPE_CATALOG_WRITE;
 use super::cose_keys::CoseKeyCache;
+use super::pep_check;
+use super::{ACTION_READ, SCOPE_CATALOG_READ};
 
-/// Claim key for the OAuth-style `scope` string in a CWT.
-/// IANA registration: 9 (RFC 8693).
-const CLAIM_SCOPE: i64 = 9;
-/// Confirmation claim (`cnf`). IANA registration: 8 (RFC 8747).
+/// CBOR tag prefix for a `tag(61)` ("CWT") wrapping a COSE_Sign1.
+/// Stripped before handing the inner bytes to coset.
+const CWT_TAG_PREFIX: [u8; 2] = [0xd8, 0x3d];
+
+/// Maximum allowed `exp - iat` window per the v1 contract.
+const MAX_TOKEN_LIFETIME_SECS: i64 = 3600;
+
+/// Contract-defined `authorization_details[].type` we honor on the read
+/// path. Anything else MUST be skipped silently (forward compat for new
+/// grant types added by the issuer).
+const GRANT_TYPE_TDF_ATTRIBUTE: &str = "tdf_attribute";
+
+// IANA CWT claim keys (RFC 8392 + RFC 8747).
+const CLAIM_ISS: i64 = 1;
+const CLAIM_SUB: i64 = 2;
+const CLAIM_EXP: i64 = 4;
+const CLAIM_IAT: i64 = 6;
+const CLAIM_CTI: i64 = 7;
 const CLAIM_CNF: i64 = 8;
-/// Custom text claim — campaign identifier the token is bound to.
-const CLAIM_CAMPAIGN_ID: &str = "campaign_id";
-/// Custom text claim inside `cnf` — iroh NodeId (hex) the token is bound to.
+const CLAIM_SCOPE: i64 = 9;
+
+const CLAIM_AUTHORIZATION_DETAILS: &str = "authorization_details";
 const CNF_IROH_NODE_ID: &str = "iroh_node_id";
+
+/// Channel binding: NodeId is the 32-byte ed25519 public key per iroh.
+const IROH_NODE_ID_LEN: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct VerifiedClaims {
-    pub creator_id: String,
-    pub campaign_id: String,
+    pub subject: String,
     pub raw_cwt: Bytes,
     pub cti: String,
     pub exp: i64,
+    pub iat: i64,
     pub issuer: String,
+    /// Surviving grants after filtering by `type == "tdf_attribute"` and
+    /// validating the action allowlist. Non-empty by construction.
+    pub grants: Vec<Grant>,
+}
+
+/// Decoded v1 `authorization_details[]` entry, in the shape the read path
+/// actually consumes. The fields map to the contract example in spec
+/// Appendix A.3:
+/// - `fqn`: the canonical OpenTDF attribute-value URL
+/// - `actions`: filtered to the v1 allowlist (`["read"]`)
+/// - `locations` / `obligations`: surfaced verbatim for future use
+#[derive(Debug, Clone)]
+pub struct Grant {
+    pub fqn: String,
+    pub actions: Vec<String>,
+    pub locations: Vec<String>,
+    pub obligations: Vec<String>,
 }
 
 #[derive(Debug, Error)]
 pub enum VerifyError {
-    #[error("cwt: failed to parse COSE_Sign1: {0}")]
+    #[error("cwt: parse: {0}")]
     Parse(String),
-    #[error("cwt: unsupported alg (only ES256 / -7 accepted)")]
-    UnsupportedAlg,
-    #[error("cwt: missing kid in protected header")]
-    MissingKid,
-    #[error("cwt: unknown kid '{0}'")]
-    UnknownKid(String), // hex-encoded for diagnostics
     #[error("cwt: signature verification failed")]
     BadSignature,
-    #[error("cwt: failed to decode payload: {0}")]
-    BadPayload(String),
     #[error("cwt: wrong issuer (expected '{expected}', got '{got:?}')")]
     WrongIssuer {
         expected: String,
@@ -59,12 +98,22 @@ pub enum VerifyError {
     Expired { exp: i64, now: i64 },
     #[error("cwt: issued in the future (iat={iat}, now={now})")]
     NotYetValid { iat: i64, now: i64 },
+    #[error("cwt: iat-exp window too wide (exp-iat={diff}, max={max})")]
+    WindowTooWide { diff: i64, max: i64 },
     #[error("cwt: missing or empty claim '{0}'")]
     MissingClaim(&'static str),
     #[error("cwt: scope missing required '{0}'")]
     MissingScope(&'static str),
     #[error("cwt: cnf.iroh_node_id mismatch (token='{token}', connection='{connection}')")]
     NodeIdMismatch { token: String, connection: String },
+    #[error("cwt: cnf.iroh_node_id missing or malformed")]
+    MissingNodeIdBinding,
+    #[error("cwt: authorization_details missing or empty")]
+    MissingAuthDetails,
+    #[error("cwt: unknown action name in authorization_details")]
+    UnknownAction,
+    #[error("cwt: COSE_KeySet not yet loaded")]
+    KeySetUnavailable,
 }
 
 pub struct Verifier {
@@ -82,45 +131,67 @@ impl Verifier {
         }
     }
 
+    /// Verify a CWT and channel-bind it to `bound_node_id` (the hex-encoded
+    /// QUIC peer NodeId from the ALPN handler).
+    ///
+    /// Returns `VerifiedClaims` only when the v1 contract is satisfied end
+    /// to end — callers may forward the surviving grants to the PDP
+    /// without re-checking shape.
     pub async fn verify(
         &self,
         cwt: &[u8],
-        bound_node_id: Option<&str>,
+        bound_node_id: &str,
     ) -> Result<VerifiedClaims, VerifyError> {
-        // Accept both a bare COSE_Sign1 and a tag(18) wrapper.
-        let sign1 = parse_sign1(cwt)?;
-
-        let kid = sign1.protected.header.key_id.clone();
-        if kid.is_empty() {
-            return Err(VerifyError::MissingKid);
-        }
-
-        match sign1.protected.header.alg {
-            Some(coset::Algorithm::Assigned(iana::Algorithm::ES256)) => {}
-            _ => return Err(VerifyError::UnsupportedAlg),
-        }
-
-        let key = match self.keys.get(&kid) {
-            Some(k) => k,
-            None => {
-                self.keys.force_refresh().await;
-                self.keys
-                    .get(&kid)
-                    .ok_or_else(|| VerifyError::UnknownKid(hex::encode(&kid)))?
-            }
+        // 1. Strip optional CWT tag prefix; pep_check / coset want a bare
+        //    COSE_Sign1 array.
+        let inner = if cwt.starts_with(&CWT_TAG_PREFIX) {
+            &cwt[2..]
+        } else {
+            cwt
         };
 
-        verify_signature(&sign1, &key)?;
+        // 2. Parse the COSE_Sign1 envelope.
+        let sign1 =
+            CoseSign1::from_slice(inner).map_err(|e| VerifyError::Parse(e.to_string()))?;
+
+        // 3. Signature verification via the vendored pep_check primitive.
+        //    The cache hands us the raw bytes that produced the parsed key
+        //    map; pep_check iterates the array itself and tries every key.
+        //    This keeps our verifier byte-compatible with the upstream
+        //    reference implementation.
+        let raw_keyset = self
+            .keys
+            .raw_bytes()
+            .ok_or(VerifyError::KeySetUnavailable)?;
+
+        // pep_check will internally retry against any key — but only the
+        // currently-cached set. If verification fails and we have a URL,
+        // force a refresh and try once more in case the keyset rotated.
+        let first_attempt = pep_check::verify_cose_sign1(&sign1, &raw_keyset);
+        if first_attempt.is_err() {
+            if self.keys.force_refresh().await {
+                let refreshed = self
+                    .keys
+                    .raw_bytes()
+                    .ok_or(VerifyError::KeySetUnavailable)?;
+                pep_check::verify_cose_sign1(&sign1, &refreshed)
+                    .map_err(|_| VerifyError::BadSignature)?;
+            } else {
+                return Err(VerifyError::BadSignature);
+            }
+        }
 
         let payload = sign1
             .payload
             .as_ref()
-            .ok_or_else(|| VerifyError::BadPayload("missing payload".into()))?;
-        let claims =
-            decode_claims(payload).map_err(|e| VerifyError::BadPayload(e.to_string()))?;
+            .ok_or_else(|| VerifyError::Parse("missing payload".into()))?;
 
+        // 4. Walk the CWT claims map directly. We avoid coset's ClaimsSet
+        //    because it doesn't surface arbitrary text claims in a stable
+        //    shape and the contract pins specific text-keyed claims
+        //    (`scope`, `authorization_details`).
+        let claims = decode_claims_map(payload)?;
         let now = now_unix();
-        let skew = self.clock_skew_secs;
 
         let got_issuer = claims.issuer.clone();
         if got_issuer.as_deref() != Some(self.issuer.as_str()) {
@@ -130,133 +201,330 @@ impl Verifier {
             });
         }
 
-        let exp = ts_to_secs(claims.expiration_time.as_ref()).ok_or(VerifyError::MissingClaim("exp"))?;
-        if exp + skew < now {
-            return Err(VerifyError::Expired { exp, now });
-        }
-        if let Some(iat) = ts_to_secs(claims.issued_at.as_ref())
-            && iat - skew > now
-        {
+        let iat = claims.iat.ok_or(VerifyError::MissingClaim("iat"))?;
+        if iat - self.clock_skew_secs > now {
             return Err(VerifyError::NotYetValid { iat, now });
         }
 
-        let sub = claims
+        let exp = claims.exp.ok_or(VerifyError::MissingClaim("exp"))?;
+        if now >= exp {
+            return Err(VerifyError::Expired { exp, now });
+        }
+
+        let diff = exp - iat;
+        if diff > MAX_TOKEN_LIFETIME_SECS {
+            return Err(VerifyError::WindowTooWide {
+                diff,
+                max: MAX_TOKEN_LIFETIME_SECS,
+            });
+        }
+
+        let subject = claims
             .subject
             .clone()
             .filter(|s| !s.is_empty())
             .ok_or(VerifyError::MissingClaim("sub"))?;
 
-        let mut campaign_id: Option<String> = None;
-        let mut scope: Option<String> = None;
-        let mut cnf_node_id: Option<String> = None;
-        for (label, value) in &claims.rest {
-            match label {
-                coset::cwt::ClaimName::Assigned(a) if a.to_i64() == CLAIM_SCOPE => {
-                    scope = match value {
-                        ciborium::Value::Text(s) => Some(s.clone()),
-                        _ => None,
-                    };
-                }
-                coset::cwt::ClaimName::Assigned(a) if a.to_i64() == CLAIM_CNF => {
-                    cnf_node_id = extract_cnf_node_id(value);
-                }
-                coset::cwt::ClaimName::Text(s) if s == CLAIM_CAMPAIGN_ID => {
-                    campaign_id = match value {
-                        ciborium::Value::Text(s) => Some(s.clone()),
-                        _ => None,
-                    };
-                }
-                _ => {}
-            }
+        // scope (text key per IANA registry) — space-separated, must list
+        // catalog.read. Reject if claim is absent OR present but missing
+        // the required scope; both shapes mean "no read intent".
+        let scope = claims
+            .scope
+            .as_deref()
+            .ok_or(VerifyError::MissingScope(SCOPE_CATALOG_READ))?;
+        if !scope.split(' ').any(|s| s == SCOPE_CATALOG_READ) {
+            return Err(VerifyError::MissingScope(SCOPE_CATALOG_READ));
         }
 
-        let campaign_id =
-            campaign_id.ok_or(VerifyError::MissingClaim(CLAIM_CAMPAIGN_ID))?;
-        if campaign_id.is_empty() {
-            return Err(VerifyError::MissingClaim(CLAIM_CAMPAIGN_ID));
-        }
-        let scope = scope.ok_or(VerifyError::MissingScope(SCOPE_CATALOG_WRITE))?;
-        if !scope.split(' ').any(|s| s == SCOPE_CATALOG_WRITE) {
-            return Err(VerifyError::MissingScope(SCOPE_CATALOG_WRITE));
-        }
+        // cnf.iroh_node_id binding. The contract treats *every* read-side
+        // call as iroh-authenticated (the ALPN handler always provides a
+        // node id), so the binding is unconditionally required.
+        check_node_id_binding(claims.cnf.as_ref(), bound_node_id)?;
 
-        if let (Some(token_node_id), Some(connection_node_id)) = (cnf_node_id, bound_node_id) {
-            if token_node_id != connection_node_id {
-                return Err(VerifyError::NodeIdMismatch {
-                    token: token_node_id,
-                    connection: connection_node_id.to_string(),
-                });
-            }
+        // 5. authorization_details — must be present and yield at least
+        //    one usable grant after filtering. We re-parse from the
+        //    payload bytes because pep_check::Grant doesn't carry the
+        //    contract's `fqn` field (it only surfaces RFC 9396
+        //    `locations`).
+        let raw_grants = parse_authorization_details(payload)?;
+        let grants = filter_and_validate_grants(raw_grants)?;
+        if grants.is_empty() {
+            return Err(VerifyError::MissingAuthDetails);
         }
-
-        let cti = claims
-            .cwt_id
-            .clone()
-            .map(|b| hex::encode(b))
-            .unwrap_or_default();
 
         Ok(VerifiedClaims {
-            creator_id: sub,
-            campaign_id,
+            subject,
             raw_cwt: Bytes::copy_from_slice(cwt),
-            cti,
+            cti: claims.cti.map(hex::encode).unwrap_or_default(),
             exp,
+            iat,
             issuer: self.issuer.clone(),
+            grants,
         })
     }
 }
 
-fn parse_sign1(bytes: &[u8]) -> Result<CoseSign1, VerifyError> {
-    if let Ok(s) = CoseSign1::from_slice(bytes) {
-        return Ok(s);
-    }
-    // Try the CWT tag (61) wrapping a tagged COSE_Sign1.
-    if let Ok(ciborium::Value::Tag(_, inner)) = ciborium::de::from_reader::<ciborium::Value, _>(bytes)
-        && let Ok(s) = CoseSign1::from_cbor_value(*inner)
-    {
-        return Ok(s);
-    }
-    Err(VerifyError::Parse("not a COSE_Sign1".into()))
+// --- claim decoding ---------------------------------------------------------
+
+/// Parsed shape of the CWT claims we care about. Anything not listed here
+/// is intentionally discarded.
+#[derive(Default)]
+struct ClaimsView {
+    issuer: Option<String>,
+    subject: Option<String>,
+    iat: Option<i64>,
+    exp: Option<i64>,
+    cti: Option<Vec<u8>>,
+    scope: Option<String>,
+    cnf: Option<CborValue>,
 }
 
-fn verify_signature(sign1: &CoseSign1, key: &VerifyingKey) -> Result<(), VerifyError> {
-    sign1
-        .verify_signature(&[], |sig, tbs| -> Result<(), VerifyError> {
-            let signature = Signature::from_slice(sig).map_err(|_| VerifyError::BadSignature)?;
-            key.verify(tbs, &signature)
-                .map_err(|_| VerifyError::BadSignature)
-        })
-}
-
-fn decode_claims(payload: &[u8]) -> Result<ClaimsSet, coset::CoseError> {
-    let value: ciborium::Value =
-        ciborium::de::from_reader(payload).map_err(|e| coset::CoseError::DecodeFailed(
-            coset::cbor::de::Error::Semantic(None, e.to_string()),
-        ))?;
-    ClaimsSet::from_cbor_value(value)
-}
-
-fn ts_to_secs(t: Option<&Timestamp>) -> Option<i64> {
-    match t? {
-        Timestamp::WholeSeconds(s) => Some(*s),
-        Timestamp::FractionalSeconds(f) => Some(*f as i64),
-    }
-}
-
-fn extract_cnf_node_id(v: &ciborium::Value) -> Option<String> {
-    let map = match v {
-        ciborium::Value::Map(m) => m,
-        _ => return None,
+fn decode_claims_map(payload: &[u8]) -> Result<ClaimsView, VerifyError> {
+    let value: CborValue = ciborium::de::from_reader(payload)
+        .map_err(|e| VerifyError::Parse(format!("CWT claims CBOR: {e}")))?;
+    let map = match value {
+        CborValue::Map(m) => m,
+        _ => return Err(VerifyError::Parse("CWT claims is not a CBOR map".into())),
     };
-    for (k, val) in map {
-        if let ciborium::Value::Text(s) = k
-            && s == CNF_IROH_NODE_ID
-            && let ciborium::Value::Text(node_id) = val
-        {
-            return Some(node_id.clone());
+
+    let mut out = ClaimsView::default();
+    for (key, val) in map {
+        match key {
+            CborValue::Integer(i) => {
+                let n: i64 = i
+                    .try_into()
+                    .map_err(|_| VerifyError::Parse("claim key overflow".into()))?;
+                match n {
+                    CLAIM_ISS => {
+                        if let CborValue::Text(s) = val {
+                            out.issuer = Some(s);
+                        }
+                    }
+                    CLAIM_SUB => {
+                        if let CborValue::Text(s) = val {
+                            out.subject = Some(s);
+                        }
+                    }
+                    CLAIM_IAT => out.iat = cbor_to_i64(&val),
+                    CLAIM_EXP => out.exp = cbor_to_i64(&val),
+                    CLAIM_CTI => {
+                        if let CborValue::Bytes(b) = val {
+                            out.cti = Some(b);
+                        }
+                    }
+                    CLAIM_CNF => out.cnf = Some(val),
+                    CLAIM_SCOPE => {
+                        if let CborValue::Text(s) = val {
+                            out.scope = Some(s);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            CborValue::Text(s) => {
+                // Text-keyed claims. The contract pins `scope` (registry-
+                // integer 9) but some issuers also publish a parallel text
+                // key — accept either, integer wins if both present.
+                match s.as_str() {
+                    "scope" => {
+                        if out.scope.is_none()
+                            && let CborValue::Text(v) = val
+                        {
+                            out.scope = Some(v);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
         }
     }
-    None
+    Ok(out)
+}
+
+fn cbor_to_i64(v: &CborValue) -> Option<i64> {
+    match v {
+        CborValue::Integer(i) => (*i).try_into().ok(),
+        // Tolerate timestamps that arrive as float seconds (RFC 8392
+        // permits both whole and fractional). Floor to integer seconds —
+        // the contract's window checks operate at second granularity.
+        CborValue::Float(f) => Some(*f as i64),
+        _ => None,
+    }
+}
+
+// --- channel binding --------------------------------------------------------
+
+fn check_node_id_binding(
+    cnf: Option<&CborValue>,
+    bound_node_id: &str,
+) -> Result<(), VerifyError> {
+    let cnf = cnf.ok_or(VerifyError::MissingNodeIdBinding)?;
+    let map = match cnf {
+        CborValue::Map(m) => m,
+        _ => return Err(VerifyError::MissingNodeIdBinding),
+    };
+
+    let mut token_bytes: Option<&Vec<u8>> = None;
+    for (k, v) in map {
+        if let CborValue::Text(s) = k
+            && s == CNF_IROH_NODE_ID
+            && let CborValue::Bytes(b) = v
+        {
+            token_bytes = Some(b);
+            break;
+        }
+    }
+    let token_bytes = token_bytes.ok_or(VerifyError::MissingNodeIdBinding)?;
+    if token_bytes.len() != IROH_NODE_ID_LEN {
+        return Err(VerifyError::MissingNodeIdBinding);
+    }
+
+    let connection_bytes = hex::decode(bound_node_id).map_err(|_| VerifyError::NodeIdMismatch {
+        token: hex::encode(token_bytes),
+        connection: bound_node_id.to_string(),
+    })?;
+
+    if connection_bytes.as_slice() != token_bytes.as_slice() {
+        return Err(VerifyError::NodeIdMismatch {
+            token: hex::encode(token_bytes),
+            connection: bound_node_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
+// --- authorization_details --------------------------------------------------
+
+/// In-flight grant shape pulled from CWT CBOR. Carries the contract-level
+/// `fqn` field that pep_check's `Grant` does not surface.
+#[derive(Debug, Default)]
+struct RawGrant {
+    grant_type: String,
+    fqn: Option<String>,
+    actions: Vec<String>,
+    locations: Vec<String>,
+    obligations: Vec<String>,
+}
+
+/// Decode the `authorization_details` array out of the CWT payload.
+///
+/// We do this here (instead of calling `pep_check::parse_authorization_details`)
+/// because the v1 contract uses a top-level `fqn` field that pep_check
+/// drops on the floor — its `Grant` only retains the RFC 9396 standard
+/// fields. Touching `pep_check` is forbidden by Task 10, so we re-implement
+/// the walk and keep `fqn`.
+fn parse_authorization_details(payload: &[u8]) -> Result<Vec<RawGrant>, VerifyError> {
+    let value: CborValue = ciborium::de::from_reader(payload)
+        .map_err(|e| VerifyError::Parse(format!("authorization_details: {e}")))?;
+    let map = match value {
+        CborValue::Map(m) => m,
+        _ => return Ok(Vec::new()),
+    };
+
+    for (k, v) in map {
+        if let CborValue::Text(name) = k
+            && name == CLAIM_AUTHORIZATION_DETAILS
+        {
+            return parse_grants_array(v);
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn parse_grants_array(v: CborValue) -> Result<Vec<RawGrant>, VerifyError> {
+    let arr = match v {
+        CborValue::Array(a) => a,
+        _ => {
+            return Err(VerifyError::Parse(
+                "authorization_details is not a CBOR array".into(),
+            ));
+        }
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        if let Some(g) = parse_one_grant(entry) {
+            out.push(g);
+        }
+    }
+    Ok(out)
+}
+
+fn parse_one_grant(v: CborValue) -> Option<RawGrant> {
+    let map = match v {
+        CborValue::Map(m) => m,
+        _ => return None,
+    };
+    let mut g = RawGrant::default();
+    for (k, val) in map {
+        let key = match k {
+            CborValue::Text(s) => s,
+            _ => continue,
+        };
+        match key.as_str() {
+            "type" => {
+                if let CborValue::Text(s) = val {
+                    g.grant_type = s;
+                }
+            }
+            "fqn" => {
+                if let CborValue::Text(s) = val {
+                    g.fqn = Some(s);
+                }
+            }
+            "actions" => g.actions = cbor_string_array(&val),
+            "locations" => g.locations = cbor_string_array(&val),
+            "obligations" => g.obligations = cbor_string_array(&val),
+            _ => {}
+        }
+    }
+    Some(g)
+}
+
+fn cbor_string_array(v: &CborValue) -> Vec<String> {
+    match v {
+        CborValue::Array(a) => a
+            .iter()
+            .filter_map(|e| match e {
+                CborValue::Text(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Apply the v1 type / action allowlist.
+///
+/// - Drop grants whose `type` is not `"tdf_attribute"` — silently, per
+///   contract A.7 (additive new types should not break v1 clients).
+/// - Drop grants without a parseable `fqn` — per contract A.6 ("fqn not
+///   parseable as a URL: skip that entry"). We only check non-empty here;
+///   strict URL validation lives in the PDP layer.
+/// - Reject the **whole token** if any surviving grant lists an action
+///   not in the v1 allowlist (`["read"]`).
+fn filter_and_validate_grants(raw: Vec<RawGrant>) -> Result<Vec<Grant>, VerifyError> {
+    let mut out = Vec::with_capacity(raw.len());
+    for g in raw {
+        if g.grant_type != GRANT_TYPE_TDF_ATTRIBUTE {
+            continue;
+        }
+        for action in &g.actions {
+            if action != ACTION_READ {
+                return Err(VerifyError::UnknownAction);
+            }
+        }
+        let Some(fqn) = g.fqn.filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        out.push(Grant {
+            fqn,
+            actions: g.actions,
+            locations: g.locations,
+            obligations: g.obligations,
+        });
+    }
+    Ok(out)
 }
 
 fn now_unix() -> i64 {

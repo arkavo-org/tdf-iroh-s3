@@ -38,7 +38,10 @@ pub async fn publish_content(
         bail!("content metadata title must not be empty");
     }
 
-    let creator_id = auth.creator_id.as_str();
+    // v1 read-side CWT exposes the issuer-supplied identity as `subject`.
+    // The catalog's persisted shape still calls this `creator_id`; the
+    // publisher-side rewrite (Task 12+) will reconcile naming end to end.
+    let creator_id = auth.subject.as_str();
     let content_id = blake3::hash(&payload).to_hex().to_string();
     let payload_size = payload.len() as u64;
     let published_at = now_rfc3339()?;

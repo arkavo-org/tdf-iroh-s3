@@ -12,6 +12,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use coset::iana::EnumI64;
 use coset::{CborSerializable, CoseKey, CoseKeySet, iana};
 use p256::ecdsa::VerifyingKey;
@@ -33,6 +34,11 @@ pub struct CoseKeyCache {
     url: Option<String>,
     http: reqwest::Client,
     keys: ArcSwap<HashMap<Kid, VerifyingKey>>,
+    /// Raw CBOR of the most recently fetched COSE_KeySet — empty `Bytes`
+    /// means "no fetch has succeeded yet". Stored alongside the parsed map
+    /// so the CWT verifier can hand the original bytes to `pep_check`,
+    /// which iterates the array itself rather than relying on our parser.
+    raw_bytes: ArcSwap<Bytes>,
     last_force_refresh: Mutex<Option<Instant>>,
 }
 
@@ -52,11 +58,15 @@ impl CoseKeyCache {
             url: Some(url.clone()),
             http: http.clone(),
             keys: ArcSwap::from_pointee(HashMap::new()),
+            raw_bytes: ArcSwap::from_pointee(Bytes::new()),
             last_force_refresh: Mutex::new(None),
         });
 
         match fetch_and_parse(&http, &url).await {
-            Ok(initial) => cache.keys.store(Arc::new(initial)),
+            Ok((initial_map, raw)) => {
+                cache.keys.store(Arc::new(initial_map));
+                cache.raw_bytes.store(Arc::new(raw));
+            }
             Err(e) => warn!(
                 url = %url,
                 error = %e,
@@ -84,20 +94,38 @@ impl CoseKeyCache {
         Ok(cache)
     }
 
-    /// Construct a cache prepopulated with a fixed set of keys. No HTTP.
-    /// Used by tests and the dev test-signer; `force_refresh` is a no-op.
+    /// Construct a cache prepopulated with a fixed set of keys and the raw
+    /// CBOR `COSE_KeySet` bytes that produced them. No HTTP. Used by tests
+    /// and the dev test-signer; `force_refresh` is a no-op.
+    ///
+    /// The raw bytes are what `Verifier::verify` hands to
+    /// `pep_check::verify_cose_sign1`, so they must round-trip to the same
+    /// keys in the parsed map.
     #[cfg(any(test, feature = "test-fixtures"))]
-    pub fn new_static(keys: HashMap<Kid, VerifyingKey>) -> Arc<Self> {
+    pub fn new_static(keys: HashMap<Kid, VerifyingKey>, raw_keyset: Bytes) -> Arc<Self> {
         Arc::new(Self {
             url: None,
             http: reqwest::Client::new(),
             keys: ArcSwap::from_pointee(keys),
+            raw_bytes: ArcSwap::from_pointee(raw_keyset),
             last_force_refresh: Mutex::new(None),
         })
     }
 
     pub fn get(&self, kid: &[u8]) -> Option<VerifyingKey> {
         self.keys.load().get(kid).copied()
+    }
+
+    /// Raw CBOR of the most recently fetched (or seeded) COSE_KeySet.
+    /// Returns `None` until a fetch has succeeded — verifiers should
+    /// surface this as "key set unavailable" rather than guess.
+    pub fn raw_bytes(&self) -> Option<Bytes> {
+        let guard = self.raw_bytes.load_full();
+        if guard.is_empty() {
+            None
+        } else {
+            Some((*guard).clone())
+        }
     }
 
     /// Trigger an out-of-band refresh, rate-limited to one per
@@ -117,8 +145,9 @@ impl CoseKeyCache {
         drop(guard);
 
         match fetch_and_parse(&self.http, url).await {
-            Ok(map) => {
+            Ok((map, raw)) => {
                 self.keys.store(Arc::new(map));
+                self.raw_bytes.store(Arc::new(raw));
                 true
             }
             Err(e) => {
@@ -132,8 +161,9 @@ impl CoseKeyCache {
         let Some(url) = self.url.as_deref() else {
             return Ok(());
         };
-        let map = fetch_and_parse(&self.http, url).await?;
+        let (map, raw) = fetch_and_parse(&self.http, url).await?;
         self.keys.store(Arc::new(map));
+        self.raw_bytes.store(Arc::new(raw));
         Ok(())
     }
 }
@@ -141,7 +171,7 @@ impl CoseKeyCache {
 async fn fetch_and_parse(
     http: &reqwest::Client,
     url: &str,
-) -> Result<HashMap<Kid, VerifyingKey>> {
+) -> Result<(HashMap<Kid, VerifyingKey>, Bytes)> {
     let bytes = http
         .get(url)
         .send()
@@ -153,7 +183,8 @@ async fn fetch_and_parse(
         .await
         .with_context(|| format!("COSE_KeySet body read from {url}"))?;
 
-    parse_cose_key_set(&bytes)
+    let map = parse_cose_key_set(&bytes)?;
+    Ok((map, bytes))
 }
 
 pub(crate) fn parse_cose_key_set(bytes: &[u8]) -> Result<HashMap<Kid, VerifyingKey>> {
