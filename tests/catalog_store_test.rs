@@ -1,3 +1,4 @@
+use futures_lite::StreamExt;
 use tdf_iroh_s3::catalog::store::EventStore;
 use tdf_iroh_s3::catalog::types::NewContentEvent;
 
@@ -41,4 +42,26 @@ async fn current_tail_survives_reopen() {
 
     let e3 = reopened.append(sample("z")).await.unwrap();
     assert_eq!(e3.seq, 3);
+}
+
+#[tokio::test]
+async fn list_from_returns_events_in_seq_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = EventStore::open(&dir.path().join("events.redb")).await.unwrap();
+    for id in ["a", "b", "c", "d"] {
+        store.append(sample(id)).await.unwrap();
+    }
+
+    let mut stream = store.list_from(0).await.unwrap();
+    let mut seen = Vec::new();
+    while let Some(evt) = stream.next().await {
+        seen.push(evt.unwrap());
+    }
+    assert_eq!(seen.iter().map(|e| e.content_id.as_str()).collect::<Vec<_>>(),
+               vec!["a", "b", "c", "d"]);
+
+    let mut stream = store.list_from(2).await.unwrap();
+    let mut after = Vec::new();
+    while let Some(evt) = stream.next().await { after.push(evt.unwrap()); }
+    assert_eq!(after.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4]);
 }

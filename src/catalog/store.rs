@@ -50,18 +50,54 @@ impl EventStore {
         let db = Arc::clone(&self.db);
         let r = match db.begin_read() {
             Ok(r) => r,
-            Err(_) => return 0,
+            Err(e) => {
+                tracing::warn!(error = %e, "EventStore::current_tail: begin_read failed; returning 0");
+                return 0;
+            }
         };
         let table = match r.open_table(META_TABLE) {
             Ok(t) => t,
-            Err(_) => return 0,
+            Err(e) => {
+                tracing::warn!(error = %e, "EventStore::current_tail: open meta table failed; returning 0");
+                return 0;
+            }
         };
-        table
-            .get(META_LAST_SEQ)
-            .ok()
-            .flatten()
-            .map(|v| v.value())
-            .unwrap_or(0)
+        match table.get(META_LAST_SEQ) {
+            Ok(opt) => opt.map(|v| v.value()).unwrap_or(0),
+            Err(e) => {
+                tracing::warn!(error = %e, "EventStore::current_tail: get last_seq failed; returning 0");
+                0
+            }
+        }
+    }
+
+    /// Stream all events with `seq > after_seq` in ascending order.
+    pub async fn list_from(
+        &self,
+        after_seq: u64,
+    ) -> Result<impl futures_lite::Stream<Item = Result<ContentEvent>> + Send + 'static> {
+        let db = Arc::clone(&self.db);
+        let events: Vec<Result<ContentEvent>> = tokio::task::spawn_blocking(move || {
+            let r = db.begin_read()?;
+            let table = r.open_table(EVENTS_TABLE)?;
+            let range = table.range((after_seq.saturating_add(1))..)?;
+            let mut out = Vec::new();
+            for entry in range {
+                let (_seq, bytes) = match entry {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        out.push(Err(anyhow::anyhow!("read events table: {e}")));
+                        break;
+                    }
+                };
+                let decoded: Result<ContentEvent> = ciborium::de::from_reader(bytes.value())
+                    .context("decode ContentEvent CBOR");
+                out.push(decoded);
+            }
+            Ok::<Vec<Result<ContentEvent>>, anyhow::Error>(out)
+        })
+        .await??;
+        Ok(futures_lite::stream::iter(events))
     }
 
     pub async fn append(&self, new: NewContentEvent) -> Result<ContentEvent> {
