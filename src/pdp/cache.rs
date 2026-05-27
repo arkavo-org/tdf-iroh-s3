@@ -64,10 +64,10 @@ impl AccessPdpCache {
     pub async fn force_refresh(&self) -> bool {
         let mut guard = self.last_force_refresh.lock().await;
         let now = Instant::now();
-        if let Some(prev) = *guard {
-            if now.duration_since(prev) < FORCE_REFRESH_MIN_GAP {
-                return false;
-            }
+        if let Some(prev) = *guard
+            && now.duration_since(prev) < FORCE_REFRESH_MIN_GAP
+        {
+            return false;
         }
         // Hold the guard across the fetch: serializes concurrent callers
         // (true single-flight) and prevents duplicate in-flight requests.
