@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use tracing::info;
@@ -12,6 +12,7 @@ use tdf_iroh_s3::authz::{ConnectAuthzClient, DecisionProvider, DenyAll};
 use tdf_iroh_s3::catalog_api::{self, CatalogApiState, CatalogCache};
 use tdf_iroh_s3::config::Config;
 use tdf_iroh_s3::node::TdfIrohNode;
+use tdf_iroh_s3::ssm;
 use tdf_iroh_s3::tags_api::{self, ApiState};
 
 #[derive(Parser)]
@@ -140,17 +141,41 @@ async fn main() -> Result<()> {
                 ));
             } else {
                 let credential = if !cat.authz.token_url.is_empty() {
-                    // The secret may come from config or — preferably, so a
-                    // long-lived credential never sits in the TOML — from the
-                    // CATALOG_AUTHZ_CLIENT_SECRET environment variable.
-                    let client_secret = if cat.authz.client_secret.is_empty() {
-                        std::env::var("CATALOG_AUTHZ_CLIENT_SECRET").unwrap_or_default()
-                    } else {
+                    // Secret resolution, in order of precedence. A long-lived
+                    // credential should never sit in the TOML, so config is the
+                    // least-preferred source (tests / local override):
+                    //   1. config client_secret
+                    //   2. CATALOG_AUTHZ_CLIENT_SECRET env var
+                    //   3. client_secret_param in SSM (the production path —
+                    //      mirrors the node-secret-key load in secret_key.rs;
+                    //      fetched decrypted via the instance role)
+                    let client_secret = if !cat.authz.client_secret.is_empty() {
                         cat.authz.client_secret.clone()
+                    } else {
+                        let from_env =
+                            std::env::var("CATALOG_AUTHZ_CLIENT_SECRET").unwrap_or_default();
+                        if !from_env.is_empty() {
+                            from_env
+                        } else if !cat.authz.client_secret_param.is_empty() {
+                            ssm::load_secret(
+                                &cat.authz.client_secret_param,
+                                &node.config.s3.region,
+                            )
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "[catalog.authz] loading client secret from SSM parameter {}",
+                                    cat.authz.client_secret_param
+                                )
+                            })?
+                        } else {
+                            String::new()
+                        }
                     };
                     anyhow::ensure!(
                         !cat.authz.client_id.is_empty() && !client_secret.is_empty(),
-                        "[catalog.authz] token_url requires client_id and a client secret                          (config client_secret or CATALOG_AUTHZ_CLIENT_SECRET env)"
+                        "[catalog.authz] token_url requires client_id and a client secret \
+                         (config client_secret, CATALOG_AUTHZ_CLIENT_SECRET env, or client_secret_param in SSM)"
                     );
                     tdf_iroh_s3::authz::ServiceCredential::ClientCredentials {
                         token_url: cat.authz.token_url.clone(),

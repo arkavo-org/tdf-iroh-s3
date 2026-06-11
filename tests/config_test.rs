@@ -69,3 +69,39 @@ trusted_public_keys = ["/tmp/key1.pem", "/tmp/key2.pem"]
     assert!(config.validation.assertion.enabled);
     assert_eq!(config.validation.assertion.trusted_public_keys.len(), 2);
 }
+
+#[test]
+fn test_authz_client_secret_param_defaults() {
+    // Unset ⇒ the node-secret-key-style SSM default, so the production path
+    // works without an explicit config line.
+    let toml_str = r#"
+[s3]
+bucket = "b"
+region = "us-east-1"
+
+[catalog.authz]
+endpoint = "https://platform.arkavo.net"
+token_url = "https://identity.arkavo.net/oauth/token"
+client_id = "catalog-node"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(
+        config.catalog.authz.client_secret_param,
+        "/tdf-iroh-s3/catalog-authz-client-secret"
+    );
+    assert!(config.catalog.authz.client_secret.is_empty());
+}
+
+#[test]
+fn test_authz_client_secret_param_override() {
+    let toml_str = r#"
+[s3]
+bucket = "b"
+region = "us-east-1"
+
+[catalog.authz]
+client_secret_param = "/custom/path"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.catalog.authz.client_secret_param, "/custom/path");
+}

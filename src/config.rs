@@ -108,6 +108,14 @@ pub struct AuthzConfig {
     pub client_id: String,
     #[serde(default)]
     pub client_secret: String,
+    /// SSM Parameter Store name holding the `client_credentials` secret as a
+    /// `SecureString`. Used only when `client_secret` (TOML) and the
+    /// `CATALOG_AUTHZ_CLIENT_SECRET` env var are both empty, mirroring the
+    /// node-secret-key load path (`secret_key.rs`) so the long-lived
+    /// credential never sits in the config file or IMDS-readable user-data.
+    /// Loaded (decrypted) at startup via the instance role.
+    #[serde(default = "default_authz_client_secret_param")]
+    pub client_secret_param: String,
     /// Static bearer token override (tests / externally rotated
     /// credentials). Ignored when client_credentials is configured.
     #[serde(default)]
@@ -134,6 +142,7 @@ impl Default for AuthzConfig {
             token_url: String::new(),
             client_id: String::new(),
             client_secret: String::new(),
+            client_secret_param: default_authz_client_secret_param(),
             bearer_token: String::new(),
             environment_region: String::new(),
             entity_mode: String::new(),
@@ -143,6 +152,10 @@ impl Default for AuthzConfig {
 
 fn default_authz_action() -> String {
     "read".to_string()
+}
+
+fn default_authz_client_secret_param() -> String {
+    "/tdf-iroh-s3/catalog-authz-client-secret".to_string()
 }
 
 #[derive(Debug, Deserialize)]
