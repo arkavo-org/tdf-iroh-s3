@@ -305,15 +305,24 @@ async fn build_chain<S: CatalogStore, D: DecisionProvider>(
         err(StatusCode::UNAUTHORIZED, "invalid token")
     })?;
 
-    // Subject claims for the decision: extracted from the *verified* CWT —
-    // the identifiers the platform's Patreon ERS resolves directly.
+    // Subject claims for the decision: extracted from the *verified* CWT.
+    // Forward the whole arkavo_patreon claim so the platform's
+    // claims-passthrough derives campaign-qualified entitlements from the
+    // memberships array — this node verified the CWT signature, so the
+    // claim is authoritative. iss is included so the platform can pin the
+    // materializer's issuer. patreon_user_id/email remain as the ERS's
+    // fallback lookup keys.
     let mut subject_claims = serde_json::Map::new();
     subject_claims.insert("sub".into(), pe.sub.clone().into());
+    subject_claims.insert("iss".into(), pe.iss.clone().into());
     if let Some(uid) = &pe.patreon_user_id {
         subject_claims.insert("patreon_user_id".into(), uid.clone().into());
     }
     if let Some(email) = &pe.email {
         subject_claims.insert("email".into(), email.clone().into());
+    }
+    if let Some(patreon) = &pe.arkavo_patreon {
+        subject_claims.insert("arkavo_patreon".into(), patreon.clone());
     }
     let mut chain = vec![ChainEntity {
         is_subject: true,
@@ -398,11 +407,15 @@ mod tests {
     struct StubProvider {
         permit: Vec<String>,
         seen_chain_len: std::sync::Mutex<Option<usize>>,
+        seen_subject_claims: std::sync::Mutex<Option<serde_json::Value>>,
     }
 
     impl DecisionProvider for StubProvider {
         async fn decide(&self, req: DecisionRequest) -> anyhow::Result<crate::authz::Decisions> {
             *self.seen_chain_len.lock().unwrap() = Some(req.chain.len());
+            if let Some(pe) = req.chain.iter().find(|e| e.is_subject) {
+                *self.seen_subject_claims.lock().unwrap() = Some(pe.claims.clone());
+            }
             Ok(req
                 .resources
                 .into_iter()
@@ -448,6 +461,7 @@ mod tests {
             provider: StubProvider {
                 permit,
                 seen_chain_len: std::sync::Mutex::new(None),
+                seen_subject_claims: std::sync::Mutex::new(None),
             },
             verifier: Arc::new(CwtVerifier::with_static_keys(vec![(b"kid-1".to_vec(), vk)])),
             action: "read".into(),
@@ -503,6 +517,68 @@ mod tests {
                 .iter()
                 .all(|i| i["entitled"] == false)
         );
+    }
+
+    #[tokio::test]
+    async fn forwards_full_arkavo_patreon_claim_to_decision() {
+        use crate::auth::test_support::mint_with_extras;
+        let r = rig(vec![], None);
+        // Mint a PE token carrying a multi-campaign arkavo_patreon claim.
+        let patreon = ciborium::value::Value::Map(vec![
+            (
+                ciborium::value::Value::Text("role".into()),
+                ciborium::value::Value::Text("consumer".into()),
+            ),
+            (
+                ciborium::value::Value::Text("patreon_user_id".into()),
+                ciborium::value::Value::Text("p-1".into()),
+            ),
+            (
+                ciborium::value::Value::Text("memberships".into()),
+                ciborium::value::Value::Array(vec![ciborium::value::Value::Map(vec![
+                    (
+                        ciborium::value::Value::Text("campaign_id".into()),
+                        ciborium::value::Value::Text("11111111".into()),
+                    ),
+                    (
+                        ciborium::value::Value::Text("patron_status".into()),
+                        ciborium::value::Value::Text("active_patron".into()),
+                    ),
+                    (
+                        ciborium::value::Value::Text("tier_slugs".into()),
+                        ciborium::value::Value::Array(vec![ciborium::value::Value::Text(
+                            "gold-tier".into(),
+                        )]),
+                    ),
+                ])]),
+            ),
+        ]);
+        let token = mint_with_extras(
+            &r.sk,
+            b"kid-1",
+            "https://i.test",
+            "arkavo:u1",
+            now(),
+            now() + 3600,
+            &[("arkavo_patreon", patreon)],
+        );
+        let auth = format!("Bearer {token}");
+        let (status, _) = get_json(&r.router, "/catalog/camp1", &[("authorization", &auth)]).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The decision provider saw the full membership in the subject claims.
+        let claims = r
+            .state
+            .provider
+            .seen_subject_claims
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("subject claims captured");
+        assert_eq!(claims["iss"], "https://i.test");
+        let ap = &claims["arkavo_patreon"];
+        assert_eq!(ap["memberships"][0]["campaign_id"], "11111111");
+        assert_eq!(ap["memberships"][0]["tier_slugs"][0], "gold-tier");
     }
 
     #[tokio::test]

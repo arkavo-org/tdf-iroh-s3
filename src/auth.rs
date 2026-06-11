@@ -66,6 +66,12 @@ pub struct VerifiedClaims {
     pub patreon_user_id: Option<String>,
     /// `email` claim, when present (the ERS's fallback lookup key).
     pub email: Option<String>,
+    /// The full verified `arkavo_patreon` claim as JSON (role,
+    /// patreon_user_id, campaign_id, memberships[…]), so the catalog node
+    /// can forward it verbatim to the platform's claims-passthrough — which
+    /// derives campaign-qualified entitlements from the memberships array.
+    /// None when the token carries no Patreon claim.
+    pub arkavo_patreon: Option<serde_json::Value>,
 }
 
 struct KeyCache {
@@ -323,6 +329,7 @@ fn parse_claims(payload: &[u8]) -> Result<VerifiedClaims, AuthError> {
     let mut iat = None;
     let mut patreon_user_id = None;
     let mut email = None;
+    let mut arkavo_patreon = None;
     for (k, v) in entries {
         match k {
             Value::Integer(key) => match (i128::from(key), v) {
@@ -334,14 +341,15 @@ fn parse_claims(payload: &[u8]) -> Result<VerifiedClaims, AuthError> {
             },
             Value::Text(key) => match (key.as_str(), v) {
                 ("email", Value::Text(s)) => email = Some(s),
-                ("arkavo_patreon", Value::Map(patreon)) => {
-                    for (pk, pv) in patreon {
-                        if let (Value::Text(pk), Value::Text(pv)) = (pk, pv)
-                            && pk == "patreon_user_id"
-                        {
-                            patreon_user_id = Some(pv);
-                        }
-                    }
+                ("arkavo_patreon", patreon @ Value::Map(_)) => {
+                    // Keep the whole claim as JSON for forwarding, and pull
+                    // patreon_user_id out of it for the token-mode fallback.
+                    let json = cbor_to_json(&patreon);
+                    patreon_user_id = json
+                        .get("patreon_user_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    arkavo_patreon = Some(json);
                 }
                 _ => {}
             },
@@ -356,7 +364,35 @@ fn parse_claims(payload: &[u8]) -> Result<VerifiedClaims, AuthError> {
         iat: iat.ok_or(AuthError::MissingClaim("iat"))?,
         patreon_user_id,
         email,
+        arkavo_patreon,
     })
+}
+
+/// Convert a CBOR value (as it appears in a CWT claim) to JSON for
+/// forwarding. The arkavo_patreon claim is text/integer/bool/array/map
+/// only; bytes (not expected here) become null.
+fn cbor_to_json(v: &Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    match v {
+        Value::Text(s) => J::String(s.clone()),
+        Value::Integer(n) => {
+            let i: i128 = (*n).into();
+            i64::try_from(i).map(J::from).unwrap_or(J::Null)
+        }
+        Value::Bool(b) => J::Bool(*b),
+        Value::Null => J::Null,
+        Value::Array(a) => J::Array(a.iter().map(cbor_to_json).collect()),
+        Value::Map(m) => {
+            let mut obj = serde_json::Map::new();
+            for (k, val) in m {
+                if let Value::Text(key) = k {
+                    obj.insert(key.clone(), cbor_to_json(val));
+                }
+            }
+            J::Object(obj)
+        }
+        _ => J::Null,
+    }
 }
 
 #[cfg(test)]
@@ -525,6 +561,48 @@ mod tests {
         let claims = verifier(b"kid-1", vk).verify(&token, NOW).await.unwrap();
         assert_eq!(claims.patreon_user_id.as_deref(), Some("p-9000"));
         assert_eq!(claims.email.as_deref(), Some("a@b.test"));
+        // The full claim is surfaced as JSON for forwarding.
+        let ap = claims.arkavo_patreon.as_ref().expect("arkavo_patreon json");
+        assert_eq!(ap["role"], "consumer");
+        assert_eq!(ap["patreon_user_id"], "p-9000");
+
+        // Memberships array (incl. tier_slugs) round-trips through CBOR->JSON.
+        let memberships = Value::Array(vec![Value::Map(vec![
+            (
+                Value::Text("campaign_id".into()),
+                Value::Text("11111111".into()),
+            ),
+            (
+                Value::Text("patron_status".into()),
+                Value::Text("active_patron".into()),
+            ),
+            (
+                Value::Text("tier_slugs".into()),
+                Value::Array(vec![Value::Text("gold-tier".into())]),
+            ),
+        ])]);
+        let full = Value::Map(vec![
+            (Value::Text("role".into()), Value::Text("consumer".into())),
+            (
+                Value::Text("patreon_user_id".into()),
+                Value::Text("p-1".into()),
+            ),
+            (Value::Text("memberships".into()), memberships),
+        ]);
+        let token = test_support::mint_with_extras(
+            &sk,
+            b"kid-1",
+            "i",
+            "s",
+            NOW,
+            NOW + 3600,
+            &[("arkavo_patreon", full)],
+        );
+        let claims = verifier(b"kid-1", vk).verify(&token, NOW).await.unwrap();
+        let ap = claims.arkavo_patreon.unwrap();
+        assert_eq!(ap["memberships"][0]["campaign_id"], "11111111");
+        assert_eq!(ap["memberships"][0]["patron_status"], "active_patron");
+        assert_eq!(ap["memberships"][0]["tier_slugs"][0], "gold-tier");
 
         // Tokens without the claim parse with None — not an error.
         let plain = mint(&sk, b"kid-1", "i", "s", NOW, NOW + 3600);
