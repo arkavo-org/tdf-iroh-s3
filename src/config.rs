@@ -8,6 +8,8 @@ pub struct Config {
     pub s3: S3Config,
     #[serde(default)]
     pub validation: ValidationConfig,
+    #[serde(default)]
+    pub http: HttpConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +66,40 @@ pub struct AssertionConfig {
     pub enabled: bool,
     #[serde(default)]
     pub trusted_public_keys: Vec<String>,
+}
+
+/// HTTP tag API (catalog discovery). Disabled unless `[http]` is configured
+/// with `enabled = true` and a `cose_keys_url` to verify tag-write CWTs
+/// against (identity.arkavo.net's `/.well-known/cose-keys`).
+#[derive(Debug, Deserialize)]
+pub struct HttpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_http_bind_port")]
+    pub bind_port: u16,
+    #[serde(default)]
+    pub cose_keys_url: String,
+    #[serde(default = "default_tag_prefix")]
+    pub tag_prefix: String,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_port: default_http_bind_port(),
+            cose_keys_url: String::new(),
+            tag_prefix: default_tag_prefix(),
+        }
+    }
+}
+
+fn default_http_bind_port() -> u16 {
+    8090
+}
+
+fn default_tag_prefix() -> String {
+    "catalog/".to_string()
 }
 
 impl Config {

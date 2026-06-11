@@ -39,7 +39,37 @@ required_attributes = [
 [validation.assertion]
 enabled = false
 trusted_public_keys = []
+
+# Optional: HTTP tag API for catalog discovery. Tags are stable names
+# pointing at the latest blob hash (e.g. a creator's content catalog).
+# GET /tags/<name> is public; PUT /tags/<name> requires an Arkavo CWT
+# whose subject owns the tag (name must equal "<tag_prefix><sub>").
+[http]
+enabled = true
+bind_port = 8090
+cose_keys_url = "https://identity.arkavo.net/.well-known/cose-keys"
+tag_prefix = "catalog/"
 ```
+
+## Tag API (catalog discovery)
+
+Content blobs are immutable, so consumers need a stable pointer to a
+creator's *latest* catalog. With `[http]` enabled:
+
+```bash
+# Resolve a creator's catalog pointer (public)
+curl https://iroh.arkavo.net/tags/catalog/arkavo:<user-id>
+# -> {"name":"catalog/arkavo:<user-id>","hash":"<blake3-hex>"}
+
+# Move your own pointer (requires Arkavo CWT; hash must be an ingested blob)
+curl -X PUT https://iroh.arkavo.net/tags/catalog/arkavo:<user-id> \
+  -H "Authorization: Bearer <cwt>" \
+  -H "Content-Type: application/json" \
+  -d '{"hash":"<blake3-hex>"}'
+```
+
+The blob itself is then fetched over the Iroh blobs protocol by hash.
+TLS terminates in front of the listener (ALB / reverse proxy).
 
 ## Run
 

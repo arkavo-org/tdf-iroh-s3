@@ -1,7 +1,9 @@
+pub mod auth;
 pub mod config;
 pub mod ingest;
 pub mod node;
 pub mod secret_key;
 pub mod store;
+pub mod tags_api;
 pub mod test_cli;
 pub mod validation;
