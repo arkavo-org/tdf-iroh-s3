@@ -33,8 +33,17 @@ pub struct CatalogConfig {
     /// with campaign X are indexed under group X.
     #[serde(default = "default_group_attribute_fqn")]
     pub group_attribute_fqn: String,
-    /// Path to the attribute definitions artifact (JSON). Required when
-    /// `enabled`; the grouping attribute must be defined in it.
+    /// URL of the platform's public attributes endpoint (e.g.
+    /// "https://platform.arkavo.net/attributes") — the single source of
+    /// truth, served from the same policy snapshot the PDP evaluates.
+    /// When set, the node validates `group_attribute_fqn` against it at
+    /// startup and does NOT serve attribute routes itself.
+    #[serde(default)]
+    pub attributes_url: String,
+    /// Local attribute definitions artifact (JSON). Offline/test
+    /// alternative to `attributes_url`: the node serves the definitions
+    /// itself on /attributes and /attr/... routes. Exactly one of
+    /// `attributes_url` / `attributes_file` is required when `enabled`.
     #[serde(default)]
     pub attributes_file: String,
     /// How long `/catalog/{group}` responses may serve a cached index
@@ -61,6 +70,7 @@ impl Default for CatalogConfig {
         Self {
             enabled: false,
             group_attribute_fqn: default_group_attribute_fqn(),
+            attributes_url: String::new(),
             attributes_file: String::new(),
             cache_ttl_secs: default_catalog_cache_ttl_secs(),
             authz: AuthzConfig::default(),

@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use opentdf::TdfManifest;
 use opentdf::fqn::AttributeFqn;
 
@@ -19,10 +19,7 @@ pub fn validate_attributes(manifest: &TdfManifest, required_attributes: &[String
     // Check each required attribute is present in the policy JSON
     for required in required_attributes {
         if !attribute_in_policy(&policy_json, required)? {
-            bail!(
-                "Required attribute '{}' not found in TDF policy",
-                required
-            );
+            bail!("Required attribute '{}' not found in TDF policy", required);
         }
     }
 
@@ -36,8 +33,8 @@ pub fn validate_attributes(manifest: &TdfManifest, required_attributes: &[String
 /// For example, "https://example.com/attr/storage/value/permanent" is stored as:
 ///   {"attribute": {"namespace": "example.com", "name": "storage"}, "operator": "equals", "value": "permanent"}
 fn attribute_in_policy(policy_json: &str, fqn: &str) -> Result<bool> {
-    let parsed = AttributeFqn::parse(fqn)
-        .with_context(|| format!("Invalid attribute FQN: '{fqn}'"))?;
+    let parsed =
+        AttributeFqn::parse(fqn).with_context(|| format!("Invalid attribute FQN: '{fqn}'"))?;
 
     let namespace = parsed.get_namespace();
     let name = parsed.get_name();
