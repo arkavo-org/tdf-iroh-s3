@@ -83,6 +83,11 @@ environment_region = "us-east-1"
 # (the ERS token parser rejects CWTs). Environment entities are filtered
 # by the platform's decision flow today; they are forwarded for
 # forward-compatibility.
+#
+# UPGRADE NOTE: "claims" is the default. Deployments fronted by a
+# JWT-issuing IdP (not Arkavo CWTs) must set entity_mode = "token"
+# explicitly — claims mode extracts arkavo_patreon/email claims that a
+# generic JWT IdP may not mint.
 entity_mode = "claims"
 ```
 
