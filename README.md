@@ -39,7 +39,110 @@ required_attributes = [
 [validation.assertion]
 enabled = false
 trusted_public_keys = []
+
+# Optional: HTTP tag API for catalog discovery. Tags are stable names
+# pointing at the latest blob hash (e.g. a creator's content catalog).
+# GET /tags/<name> is public; PUT /tags/<name> requires an Arkavo CWT
+# whose subject owns the tag (name must equal "<tag_prefix><sub>").
+[http]
+enabled = true
+bind_port = 8090
+cose_keys_url = "https://identity.arkavo.net/.well-known/cose-keys"
+expected_issuer = "https://identity.arkavo.net"
+tag_prefix = "catalog/"
+
+# Optional: ingest-time catalog index (see issue #5). Each ingested blob
+# gets a catalog-index/<group>/<hash> entry per value of the grouping
+# attribute in its TDF policy; the extracted manifest.json is stored at
+# manifests/<hash> so indexing/UIs never re-download content blobs.
+[catalog]
+enabled = true
+# Grouping attribute (must be defined in attributes_file). Items labeled
+# with campaign X are indexed and served under /catalog/X.
+group_attribute_fqn = "https://patreon.arkavo.com/attr/campaign"
+# OpenTDF-shaped attribute definitions, served publicly on /attributes and
+# FQN-resolving /attr/{name}[/value/{value}] routes. Attributes are never
+# hardcoded — this artifact is the source of truth.
+attributes_file = "/etc/tdf-iroh-s3/attributes.json"
+cache_ttl_secs = 30
+
+# OpenTDF authorization service for per-item catalog decisions. Empty
+# endpoint = fail closed (catalog lists, nothing entitled).
+[catalog.authz]
+endpoint = "https://platform.arkavo.net"
+action = "read"
+# environment_region is asserted by this node as an environment NPE in the
+# decision entity chain; clients can never supply environment claims.
+environment_region = "us-east-1"
+# Entity presentation, contract-verified against the platform source:
+# "claims" (default) sends an entityChain of claims-bearing entities built
+# from claims this node extracts from verified CWTs (arkavo_patreon.
+# patreon_user_id, email) — the platform PDP resolves every chain entity
+# through the ERS, and the Patreon ERS resolves exactly those claims.
+# "token" sends entityIdentifier.token, which only works for JWT IdPs
+# (the ERS token parser rejects CWTs). Environment entities are filtered
+# by the platform's decision flow today; they are forwarded for
+# forward-compatibility.
+#
+# UPGRADE NOTE: "claims" is the default. Deployments fronted by a
+# JWT-issuing IdP (not Arkavo CWTs) must set entity_mode = "token"
+# explicitly — claims mode extracts arkavo_patreon/email claims that a
+# generic JWT IdP may not mint.
+entity_mode = "claims"
 ```
+
+The IAM role needs the same S3 write permissions on `manifests/` and
+`catalog-index/` as on `blobs/` — derived-artifact writes are best-effort
+(a failure is logged and never masks a successful blob ingest; re-pushing
+the content repairs the index).
+
+## Entitled catalog
+
+`GET /catalog/{group}` lists the group's ingested items, each annotated
+with whether the requesting entity chain is entitled to it:
+
+```bash
+# Anonymous: full listing, nothing entitled (public storefront)
+curl https://iroh.arkavo.net/catalog/12345678
+
+# With a person entity (Arkavo CWT) — decisions come from the OpenTDF
+# authorization service over the full chain PE -> NPE -> NPE:
+curl https://iroh.arkavo.net/catalog/12345678 \
+  -H "Authorization: Bearer <pe-cwt>" \
+  -H "X-Entity-Token: <attested-device-cwt>"
+```
+
+Response: `{"group": "...", "decision": "evaluated|anonymous|unavailable",
+"items": [{"hash", "size", "attribute_fqns", "ingested_at", "entitled"}]}`.
+NPE tokens must carry the same subject as the PE; the node appends its own
+observed environment entity. All failure modes degrade to
+`entitled: false`, never to access.
+
+Attribute definitions resolve as URLs: `GET /attributes` (the full set),
+`GET /attr/tier`, `GET /attr/tier/value/supporter` — so an FQN like
+`https://patreon.arkavo.com/attr/tier/value/supporter` dereferences when
+the namespace host points at this node. See
+`attributes/patreon.arkavo.com.json` for the example artifact.
+
+## Tag API (catalog discovery)
+
+Content blobs are immutable, so consumers need a stable pointer to a
+creator's *latest* catalog. With `[http]` enabled:
+
+```bash
+# Resolve a creator's catalog pointer (public)
+curl https://iroh.arkavo.net/tags/catalog/arkavo:<user-id>
+# -> {"name":"catalog/arkavo:<user-id>","hash":"<blake3-hex>"}
+
+# Move your own pointer (requires Arkavo CWT; hash must be an ingested blob)
+curl -X PUT https://iroh.arkavo.net/tags/catalog/arkavo:<user-id> \
+  -H "Authorization: Bearer <cwt>" \
+  -H "Content-Type: application/json" \
+  -d '{"hash":"<blake3-hex>"}'
+```
+
+The blob itself is then fetched over the Iroh blobs protocol by hash.
+TLS terminates in front of the listener (ALB / reverse proxy).
 
 ## Run
 

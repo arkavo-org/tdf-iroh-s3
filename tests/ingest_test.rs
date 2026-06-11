@@ -5,9 +5,7 @@ use tdf_iroh_s3::validation::validate_blob;
 fn test_ingest_validates_before_accepting() {
     let valid_tdf = create_tdf_with_attribute("https://example.com/attr/storage/value/permanent");
     let config = ValidationConfig {
-        required_attributes: vec![
-            "https://example.com/attr/storage/value/permanent".to_string(),
-        ],
+        required_attributes: vec!["https://example.com/attr/storage/value/permanent".to_string()],
         assertion: Default::default(),
     };
 
@@ -55,4 +53,76 @@ fn create_tdf_with_attribute(attr_fqn: &str) -> Vec<u8> {
         .policy(policy)
         .to_bytes()
         .unwrap()
+}
+
+#[test]
+fn derive_artifacts_produces_manifest_and_group_entries() {
+    use tdf_iroh_s3::catalog::{CatalogEntry, derive_artifacts};
+    use tdf_iroh_s3::config::CatalogConfig;
+    use tdf_iroh_s3::validation::validate_blob;
+
+    // End-to-end from real TDF bytes: validate → derive. The grouping
+    // attribute value becomes the catalog group; the entry carries every
+    // policy FQN; the manifest sidecar is standalone-parseable JSON.
+    let tdf = create_tdf_with_attribute("https://patreon.arkavo.com/attr/campaign/value/12345678");
+    let manifest = validate_blob(&tdf, &ValidationConfig::default()).unwrap();
+
+    let config = CatalogConfig {
+        enabled: true,
+        ..CatalogConfig::default()
+    };
+    let derived = derive_artifacts(&manifest, &"ab".repeat(32), tdf.len() as u64, 42, &config)
+        .expect("derivation succeeds");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&derived.manifest_json).expect("extracted manifest is valid JSON");
+    assert!(parsed.get("encryptionInformation").is_some());
+
+    assert_eq!(derived.entries.len(), 1, "one group entry expected");
+    let (group, entry_json) = &derived.entries[0];
+    assert_eq!(group, "12345678");
+    let entry: CatalogEntry = serde_json::from_slice(entry_json).unwrap();
+    assert_eq!(entry.hash, "ab".repeat(32));
+    assert_eq!(entry.ingested_at, 42);
+    assert!(
+        entry
+            .attribute_fqns
+            .contains(&"https://patreon.arkavo.com/attr/campaign/value/12345678".to_string()),
+        "entry FQNs: {:?}",
+        entry.attribute_fqns
+    );
+}
+
+#[test]
+fn derive_artifacts_with_catalog_disabled_still_extracts_manifest() {
+    use tdf_iroh_s3::catalog::derive_artifacts;
+    use tdf_iroh_s3::config::CatalogConfig;
+    use tdf_iroh_s3::validation::validate_blob;
+
+    let tdf = create_tdf_with_attribute("https://patreon.arkavo.com/attr/campaign/value/1");
+    let manifest = validate_blob(&tdf, &ValidationConfig::default()).unwrap();
+    let derived =
+        derive_artifacts(&manifest, &"cd".repeat(32), 1, 0, &CatalogConfig::default()).unwrap();
+    assert!(!derived.manifest_json.is_empty());
+    assert!(
+        derived.entries.is_empty(),
+        "disabled catalog indexes nothing"
+    );
+}
+
+#[test]
+fn derive_artifacts_ungrouped_policy_yields_no_entries() {
+    use tdf_iroh_s3::catalog::derive_artifacts;
+    use tdf_iroh_s3::config::CatalogConfig;
+    use tdf_iroh_s3::validation::validate_blob;
+
+    // No grouping attribute → in no catalog (curation = labeling).
+    let tdf = create_tdf_with_attribute("https://example.com/attr/storage/value/permanent");
+    let manifest = validate_blob(&tdf, &ValidationConfig::default()).unwrap();
+    let config = CatalogConfig {
+        enabled: true,
+        ..CatalogConfig::default()
+    };
+    let derived = derive_artifacts(&manifest, &"ee".repeat(32), 1, 0, &config).unwrap();
+    assert!(derived.entries.is_empty());
 }

@@ -49,6 +49,14 @@ impl S3Client {
         format!("{}tags/{}", self.prefix, tag_name)
     }
 
+    pub fn manifest_key(&self, hash_hex: &str) -> String {
+        format!("{}manifests/{}", self.prefix, hash_hex)
+    }
+
+    pub fn catalog_entry_key(&self, group: &str, hash_hex: &str) -> String {
+        format!("{}catalog-index/{}/{}", self.prefix, group, hash_hex)
+    }
+
     pub async fn put_blob(&self, hash_hex: &str, data: Bytes) -> Result<()> {
         self.client
             .put_object()
@@ -71,6 +79,101 @@ impl S3Client {
             .await
             .context("Failed to PUT outboard to S3")?;
         Ok(())
+    }
+
+    /// Store the extracted manifest.json alongside the blob. Readers of
+    /// policy/metadata (catalog indexing, UIs, repair) hit this small object
+    /// instead of downloading and unzipping the full TDF.
+    pub async fn put_manifest(&self, hash_hex: &str, manifest_json: Bytes) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.manifest_key(hash_hex))
+            .content_type("application/json")
+            .body(manifest_json.into())
+            .send()
+            .await
+            .context("Failed to PUT manifest to S3")?;
+        Ok(())
+    }
+
+    /// Store a catalog index entry under `catalog-index/<group>/<hash>`.
+    pub async fn put_catalog_entry(
+        &self,
+        group: &str,
+        hash_hex: &str,
+        entry_json: Bytes,
+    ) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_entry_key(group, hash_hex))
+            .content_type("application/json")
+            .body(entry_json.into())
+            .send()
+            .await
+            .context("Failed to PUT catalog entry to S3")?;
+        Ok(())
+    }
+
+    /// List the blob hashes indexed under one catalog group (keys below
+    /// `catalog-index/<group>/`), paginating as needed.
+    pub async fn list_catalog_hashes(&self, group: &str) -> Result<Vec<String>> {
+        let prefix = format!("{}catalog-index/{}/", self.prefix, group);
+        let mut hashes = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&prefix);
+            if let Some(token) = &continuation {
+                req = req.continuation_token(token);
+            }
+            let resp = req
+                .send()
+                .await
+                .context("Failed to LIST catalog entries in S3")?;
+            for obj in resp.contents() {
+                if let Some(key) = obj.key()
+                    && let Some(hash) = key.strip_prefix(&prefix)
+                {
+                    hashes.push(hash.to_string());
+                }
+            }
+            match resp.next_continuation_token() {
+                Some(token) => continuation = Some(token.to_string()),
+                None => break,
+            }
+        }
+        Ok(hashes)
+    }
+
+    pub async fn get_catalog_entry(&self, group: &str, hash_hex: &str) -> Result<Option<Bytes>> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_entry_key(group, hash_hex))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let data = resp.body.collect().await?;
+                Ok(Some(data.into_bytes()))
+            }
+            Err(e) => {
+                if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Failed to GET catalog entry from S3: {}",
+                        e
+                    ))
+                }
+            }
+        }
     }
 
     pub async fn get_blob(&self, hash_hex: &str) -> Result<Bytes> {
@@ -118,9 +221,7 @@ impl S3Client {
         {
             Ok(_) => Ok(true),
             Err(e) => {
-                if e.as_service_error()
-                    .is_some_and(|se| se.is_not_found())
-                {
+                if e.as_service_error().is_some_and(|se| se.is_not_found()) {
                     Ok(false)
                 } else {
                     Err(anyhow::anyhow!("Failed to HEAD blob in S3: {}", e))
@@ -174,9 +275,7 @@ impl S3Client {
                 Ok(Some(hash_hex))
             }
             Err(e) => {
-                if e.as_service_error()
-                    .is_some_and(|se| se.is_no_such_key())
-                {
+                if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
                     Ok(None)
                 } else {
                     Err(anyhow::anyhow!("Failed to GET tag from S3: {}", e))

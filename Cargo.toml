@@ -46,9 +46,23 @@ hex = "0.4"
 rand = "0.9"
 iroh-base = "0.97"
 
+# HTTP tag API (catalog discovery)
+axum = "0.8"
+futures = "0.3"
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# CWT verification (COSE_Sign1, ES256) against identity.arkavo.net
+coset = "0.3"
+ciborium = "0.2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+base64 = "0.22"
+
 [dev-dependencies]
 tempfile = "3"
 zip = "2.2"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [[bin]]
 name = "tdf-iroh-s3-test"
