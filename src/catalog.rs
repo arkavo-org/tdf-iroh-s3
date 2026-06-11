@@ -94,20 +94,79 @@ fn collect_fqns(policy: &AttributePolicy, out: &mut Vec<String>) {
     }
 }
 
+/// Everything ingest derives from a validated manifest: the extracted
+/// manifest JSON plus one serialized index entry per catalog group. Pure —
+/// no I/O — so the full pipeline is testable from TDF bytes alone.
+pub struct DerivedArtifacts {
+    pub manifest_json: String,
+    /// (group, serialized CatalogEntry) pairs.
+    pub entries: Vec<(String, Vec<u8>)>,
+}
+
+pub fn derive_artifacts(
+    manifest: &opentdf::TdfManifest,
+    hash_hex: &str,
+    size: u64,
+    ingested_at: i64,
+    catalog_config: &crate::config::CatalogConfig,
+) -> Result<DerivedArtifacts> {
+    let manifest_json = manifest
+        .to_json()
+        .context("Failed to serialize manifest for extraction")?;
+
+    let mut entries = Vec::new();
+    if catalog_config.enabled {
+        let policy_json = manifest
+            .get_policy_raw()
+            .context("Failed to decode policy from manifest")?;
+        let fqns = extract_attribute_fqns(&policy_json)
+            .context("Failed to extract attribute FQNs from policy")?;
+        let groups = group_keys(&fqns, &catalog_config.group_attribute_prefix());
+        if !groups.is_empty() {
+            let entry = CatalogEntry {
+                hash: hash_hex.to_string(),
+                size,
+                attribute_fqns: fqns,
+                ingested_at,
+            };
+            let entry_json =
+                serde_json::to_vec(&entry).context("Failed to serialize catalog entry")?;
+            entries = groups
+                .into_iter()
+                .map(|group| (group, entry_json.clone()))
+                .collect();
+        }
+    }
+    Ok(DerivedArtifacts {
+        manifest_json,
+        entries,
+    })
+}
+
 /// Derive the catalog group keys for a blob: the values of every FQN that
 /// starts with the configured grouping-attribute prefix (e.g.
 /// `https://patreon.arkavo.com/attr/campaign/value/` → campaign ids).
-/// Values that would be unsafe as S3 key segments are skipped.
+/// Values that would be unsafe as S3 key segments are skipped — loudly, so
+/// a valid policy value silently producing no catalog entry is observable
+/// (e.g. DateTime values render with '+'/':' beyond the safe alphabet).
 pub fn group_keys(fqns: &[String], group_attribute_prefix: &str) -> Vec<String> {
     if group_attribute_prefix.is_empty() {
         return Vec::new();
     }
-    let mut groups: Vec<String> = fqns
-        .iter()
-        .filter_map(|fqn| fqn.strip_prefix(group_attribute_prefix))
-        .filter(|v| is_safe_key_segment(v))
-        .map(str::to_string)
-        .collect();
+    let mut groups = Vec::new();
+    for fqn in fqns {
+        let Some(value) = fqn.strip_prefix(group_attribute_prefix) else {
+            continue;
+        };
+        if is_safe_key_segment(value) {
+            groups.push(value.to_string());
+        } else {
+            tracing::warn!(
+                %fqn,
+                "Grouping-attribute value is not a safe key segment; item will not be cataloged under it"
+            );
+        }
+    }
     groups.sort();
     groups.dedup();
     groups

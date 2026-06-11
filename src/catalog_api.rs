@@ -74,13 +74,21 @@ impl CatalogStore for crate::store::s3::S3Client {
 
 type CachedGroup = (Instant, Arc<Vec<CatalogEntry>>);
 
+/// Bound on distinct cached groups — `/catalog/{group}` is a public GET,
+/// so without this an attacker enumerating group names grows the map
+/// without limit.
+const MAX_CACHED_GROUPS: usize = 1024;
+
 /// Read-through cache over the index so catalog browsing doesn't relist S3
 /// on every request. Entries expire after `ttl`; freshness within the TTL
-/// is acceptable for a discovery surface.
+/// is acceptable for a discovery surface. Misses are single-flighted per
+/// group (concurrent requests share one S3 listing), the map is bounded,
+/// and an S3 failure serves the stale listing rather than a 502.
 pub struct CatalogCache<S: CatalogStore> {
     store: Arc<S>,
     ttl: Duration,
     groups: RwLock<HashMap<String, CachedGroup>>,
+    refresh_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl<S: CatalogStore> CatalogCache<S> {
@@ -89,21 +97,71 @@ impl<S: CatalogStore> CatalogCache<S> {
             store,
             ttl,
             groups: RwLock::new(HashMap::new()),
+            refresh_locks: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
     pub async fn entries(&self, group: &str) -> anyhow::Result<Arc<Vec<CatalogEntry>>> {
-        if let Some((at, entries)) = self.groups.read().await.get(group)
-            && at.elapsed() < self.ttl
-        {
-            return Ok(Arc::clone(entries));
+        if let Some(fresh) = self.fresh_hit(group).await {
+            return Ok(fresh);
         }
-        let fresh = Arc::new(self.store.list_group(group).await?);
-        self.groups
-            .write()
-            .await
-            .insert(group.to_string(), (Instant::now(), Arc::clone(&fresh)));
-        Ok(fresh)
+
+        // Single-flight per group: concurrent misses queue here and the
+        // late arrivals find the refreshed entry on the re-check.
+        let group_lock = {
+            let mut locks = self.refresh_locks.lock().await;
+            if locks.len() > MAX_CACHED_GROUPS {
+                locks.retain(|_, l| Arc::strong_count(l) > 1);
+            }
+            Arc::clone(locks.entry(group.to_string()).or_default())
+        };
+        let _guard = group_lock.lock().await;
+
+        if let Some(fresh) = self.fresh_hit(group).await {
+            return Ok(fresh);
+        }
+
+        match self.store.list_group(group).await {
+            Ok(listing) => {
+                let fresh = Arc::new(listing);
+                let mut groups = self.groups.write().await;
+                groups.insert(group.to_string(), (Instant::now(), Arc::clone(&fresh)));
+                Self::evict(&mut groups, self.ttl);
+                Ok(fresh)
+            }
+            Err(e) => {
+                // Stale-on-error: a slightly outdated listing beats a 502
+                // on a discovery surface that already tolerates TTL lag.
+                if let Some((_, stale)) = self.groups.read().await.get(group) {
+                    warn!(%group, error = %e, "Index refresh failed; serving stale listing");
+                    return Ok(Arc::clone(stale));
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn fresh_hit(&self, group: &str) -> Option<Arc<Vec<CatalogEntry>>> {
+        let groups = self.groups.read().await;
+        let (at, entries) = groups.get(group)?;
+        (at.elapsed() < self.ttl).then(|| Arc::clone(entries))
+    }
+
+    fn evict(groups: &mut HashMap<String, CachedGroup>, ttl: Duration) {
+        if groups.len() <= MAX_CACHED_GROUPS {
+            return;
+        }
+        groups.retain(|_, (at, _)| at.elapsed() < ttl);
+        while groups.len() > MAX_CACHED_GROUPS {
+            let Some(oldest) = groups
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            groups.remove(&oldest);
+        }
     }
 }
 
@@ -304,10 +362,23 @@ mod tests {
 
     struct MemCatalog {
         groups: HashMap<String, Vec<CatalogEntry>>,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl MemCatalog {
+        fn new(groups: HashMap<String, Vec<CatalogEntry>>) -> Self {
+            Self {
+                groups,
+                fail: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
     }
 
     impl CatalogStore for MemCatalog {
         async fn list_group(&self, group: &str) -> anyhow::Result<Vec<CatalogEntry>> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("simulated S3 outage");
+            }
             Ok(self.groups.get(group).cloned().unwrap_or_default())
         }
     }
@@ -358,12 +429,10 @@ mod tests {
 
     fn rig(permit: Vec<String>, environment: Option<serde_json::Value>) -> Rig {
         let (sk, vk) = keypair();
-        let store = Arc::new(MemCatalog {
-            groups: HashMap::from([(
-                "camp1".to_string(),
-                vec![entry(&"aa".repeat(32)), entry(&"bb".repeat(32))],
-            )]),
-        });
+        let store = Arc::new(MemCatalog::new(HashMap::from([(
+            "camp1".to_string(),
+            vec![entry(&"aa".repeat(32)), entry(&"bb".repeat(32))],
+        )])));
         let state = Arc::new(CatalogApiState {
             cache: CatalogCache::new(store, Duration::from_secs(30)),
             provider: StubProvider {
@@ -520,6 +589,27 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cache_serves_stale_listing_when_refresh_fails() {
+        let store = Arc::new(MemCatalog::new(HashMap::from([(
+            "camp1".to_string(),
+            vec![entry(&"cc".repeat(32))],
+        )])));
+        // Zero TTL: every request is a refresh.
+        let cache = CatalogCache::new(Arc::clone(&store), Duration::from_secs(0));
+
+        let first = cache.entries("camp1").await.unwrap();
+        assert_eq!(first.len(), 1);
+
+        // Store starts failing → the stale listing is served, not an error.
+        store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let stale = cache.entries("camp1").await.unwrap();
+        assert_eq!(stale.len(), 1);
+
+        // A group never cached has no stale fallback → error propagates.
+        assert!(cache.entries("never-seen").await.is_err());
     }
 
     #[tokio::test]

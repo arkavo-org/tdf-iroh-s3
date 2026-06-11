@@ -74,7 +74,17 @@ action = "read"
 # environment_region is asserted by this node as an environment NPE in the
 # decision entity chain; clients can never supply environment claims.
 environment_region = "us-east-1"
+# EXPERIMENTAL: forward multi-entity chains as entityIdentifier.entityChain.
+# Leave false until contract-verified against the platform — the ERS does
+# not resolve tokens buried in entityChain claims. When false, only the PE
+# token is forwarded; NPE/environment entities are verified at the edge.
+entity_chain_mode = false
 ```
+
+The IAM role needs the same S3 write permissions on `manifests/` and
+`catalog-index/` as on `blobs/` — derived-artifact writes are best-effort
+(a failure is logged and never masks a successful blob ingest; re-pushing
+the content repairs the index).
 
 ## Entitled catalog
 

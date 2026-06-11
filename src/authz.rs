@@ -65,14 +65,23 @@ impl DecisionProvider for DenyAll {
 pub struct ConnectAuthzClient {
     endpoint: String,
     bearer_token: Option<String>,
+    /// Send multi-entity chains as `entityIdentifier.entityChain`.
+    /// EXPERIMENTAL: an explicit entityChain tells the PDP the entities are
+    /// already resolved — the ERS does not unpack tokens buried in claims —
+    /// so this shape must be contract-verified against the platform before
+    /// production use. When false (default), the PE token is always sent as
+    /// `entityIdentifier.token` (the path the ERS resolves) and NPE/
+    /// environment context is logged but not forwarded.
+    entity_chain_mode: bool,
     http: reqwest::Client,
 }
 
 impl ConnectAuthzClient {
-    pub fn new(endpoint: String, bearer_token: Option<String>) -> Self {
+    pub fn new(endpoint: String, bearer_token: Option<String>, entity_chain_mode: bool) -> Self {
         Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             bearer_token,
+            entity_chain_mode,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
@@ -81,50 +90,62 @@ impl ConnectAuthzClient {
     }
 
     /// Build the proto-JSON GetDecisionMultiResource request.
-    ///
-    /// A single token-backed PE is passed as `entityIdentifier.token` so the
-    /// platform's ERS does chain construction; a multi-entity chain maps to
-    /// `entityIdentifier.entityChain` with claims as Any-wrapped Structs.
-    fn build_request(req: &DecisionRequest) -> Value {
-        let entity_identifier =
-            if req.chain.len() == 1 && req.chain[0].is_subject && req.chain[0].token.is_some() {
-                json!({ "token": { "ephemeralId": "pe", "jwt": req.chain[0].token } })
-            } else {
-                let entities: Vec<Value> = req
-                    .chain
-                    .iter()
-                    .enumerate()
-                    .map(|(i, e)| {
-                        let category = if e.is_subject {
-                            "CATEGORY_SUBJECT"
-                        } else {
-                            "CATEGORY_ENVIRONMENT"
-                        };
-                        let mut claims = e.claims.clone();
-                        if let Some(token) = &e.token {
-                            claims = json!({ "token": token });
-                        }
-                        json!({
-                            "ephemeralId": format!("e{i}"),
-                            "category": category,
-                            "claims": {
-                                "@type": "type.googleapis.com/google.protobuf.Struct",
-                                "value": claims,
-                            },
-                        })
-                    })
-                    .collect();
-                json!({ "entityChain": { "ephemeralId": "chain", "entities": entities } })
-            };
+    fn build_request(&self, req: &DecisionRequest) -> Result<Value> {
+        let pe = req
+            .chain
+            .iter()
+            .find(|e| e.is_subject)
+            .context("decision request has no subject entity")?;
+        let pe_token = pe.token.as_ref().context("subject entity has no token")?;
 
-        json!({
+        let entity_identifier = if self.entity_chain_mode && req.chain.len() > 1 {
+            let entities: Vec<Value> = req
+                .chain
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let category = if e.is_subject {
+                        "CATEGORY_SUBJECT"
+                    } else {
+                        "CATEGORY_ENVIRONMENT"
+                    };
+                    let mut claims = e.claims.clone();
+                    if let Some(token) = &e.token {
+                        claims = json!({ "token": token });
+                    }
+                    json!({
+                        "ephemeralId": format!("e{i}"),
+                        "category": category,
+                        "claims": {
+                            "@type": "type.googleapis.com/google.protobuf.Struct",
+                            "value": claims,
+                        },
+                    })
+                })
+                .collect();
+            json!({ "entityChain": { "ephemeralId": "chain", "entities": entities } })
+        } else {
+            // The contract-verified path: a token identifier triggers the
+            // platform ERS (CreateEntityChainsFromTokens) to resolve the
+            // subject's claims. NPE/environment entities are validated at
+            // the edge but not yet forwarded — see entity_chain_mode.
+            if req.chain.len() > 1 {
+                warn!(
+                    dropped = req.chain.len() - 1,
+                    "NPE/environment entities verified but not forwarded (entity_chain_mode off)"
+                );
+            }
+            json!({ "token": { "ephemeralId": "pe", "jwt": pe_token } })
+        };
+
+        Ok(json!({
             "entityIdentifier": entity_identifier,
             "action": { "name": req.action },
             "resources": req.resources.iter().map(|(id, fqns)| json!({
                 "ephemeralId": id,
                 "attributeValues": { "fqns": fqns },
             })).collect::<Vec<_>>(),
-        })
+        }))
     }
 }
 
@@ -150,7 +171,7 @@ impl DecisionProvider for ConnectAuthzClient {
             "{}/authorization.v2.AuthorizationService/GetDecisionMultiResource",
             self.endpoint
         );
-        let body = Self::build_request(&req);
+        let body = self.build_request(&req)?;
 
         let mut http_req = self
             .http
@@ -207,6 +228,10 @@ mod tests {
         assert_eq!(d.get("r1"), Some(&false));
     }
 
+    fn client(entity_chain_mode: bool) -> ConnectAuthzClient {
+        ConnectAuthzClient::new("https://platform.test".into(), None, entity_chain_mode)
+    }
+
     #[test]
     fn single_pe_token_uses_token_identifier() {
         let req = DecisionRequest {
@@ -217,7 +242,7 @@ mod tests {
                 vec!["https://p.example/attr/tier/value/gold".into()],
             )],
         };
-        let body = ConnectAuthzClient::build_request(&req);
+        let body = client(false).build_request(&req).unwrap();
         assert_eq!(body["entityIdentifier"]["token"]["jwt"], "tok-abc");
         assert_eq!(body["action"]["name"], "read");
         assert_eq!(body["resources"][0]["ephemeralId"], "hash1");
@@ -225,6 +250,42 @@ mod tests {
             body["resources"][0]["attributeValues"]["fqns"][0],
             "https://p.example/attr/tier/value/gold"
         );
+    }
+
+    #[test]
+    fn chain_mode_off_forwards_only_the_pe_token() {
+        // The safe default: NPE/environment context must never push the
+        // request into the unverified entityChain shape, which the ERS
+        // would treat as already-resolved (deny-everything footgun).
+        let req = DecisionRequest {
+            chain: vec![
+                pe("pe-tok"),
+                ChainEntity {
+                    is_subject: false,
+                    token: None,
+                    claims: json!({ "region": "us-east-1" }),
+                },
+            ],
+            action: "read".into(),
+            resources: vec![("r".into(), vec![])],
+        };
+        let body = client(false).build_request(&req).unwrap();
+        assert_eq!(body["entityIdentifier"]["token"]["jwt"], "pe-tok");
+        assert!(body["entityIdentifier"]["entityChain"].is_null());
+    }
+
+    #[test]
+    fn request_without_subject_is_an_error() {
+        let req = DecisionRequest {
+            chain: vec![ChainEntity {
+                is_subject: false,
+                token: None,
+                claims: json!({}),
+            }],
+            action: "read".into(),
+            resources: vec![],
+        };
+        assert!(client(false).build_request(&req).is_err());
     }
 
     #[test]
@@ -246,7 +307,7 @@ mod tests {
             action: "read".into(),
             resources: vec![("r".into(), vec![])],
         };
-        let body = ConnectAuthzClient::build_request(&req);
+        let body = client(true).build_request(&req).unwrap();
         let entities = body["entityIdentifier"]["entityChain"]["entities"]
             .as_array()
             .unwrap();

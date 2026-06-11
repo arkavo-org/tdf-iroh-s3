@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use iroh_blobs::Hash;
 use iroh_blobs::store::fs::FsStore;
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::catalog::{self, CatalogEntry};
+use crate::catalog;
 use crate::config::{CatalogConfig, ValidationConfig};
 use crate::store::s3::S3Client;
 use crate::validation;
@@ -48,45 +48,37 @@ pub async fn ingest_blob(
             .context("Failed to upload blob to S3")?;
     }
 
-    // Step 4: Extract the manifest next to the blob. Policy/metadata readers
-    // (catalog indexing, UIs, repair) hit this small object instead of
-    // downloading and unzipping the full TDF.
-    let manifest_json = manifest
-        .to_json()
-        .context("Failed to serialize manifest for extraction")?;
-    s3_client
-        .put_manifest(&hash_hex, Bytes::from(manifest_json))
-        .await
-        .context("Failed to store extracted manifest")?;
-
-    // Step 5: Catalog index entries, one per grouping-attribute value in the
-    // policy. A blob whose policy carries no grouping attribute is in no
-    // catalog — curation is the creator's labeling (ArkavoKit#1).
-    if catalog_config.enabled {
-        let policy_json = manifest
-            .get_policy_raw()
-            .context("Failed to decode policy from manifest")?;
-        let fqns = catalog::extract_attribute_fqns(&policy_json)
-            .context("Failed to extract attribute FQNs from policy")?;
-        let groups = catalog::group_keys(&fqns, &catalog_config.group_attribute_prefix());
-        if groups.is_empty() {
-            info!(hash = %hash_hex, "No grouping attribute in policy; not cataloged");
-        } else {
-            let entry = CatalogEntry {
-                hash: hash_hex.clone(),
-                size,
-                attribute_fqns: fqns,
-                ingested_at: unix_now(),
-            };
-            let entry_json =
-                serde_json::to_vec(&entry).context("Failed to serialize catalog entry")?;
-            for group in &groups {
-                s3_client
-                    .put_catalog_entry(group, &hash_hex, Bytes::from(entry_json.clone()))
-                    .await
-                    .with_context(|| format!("Failed to store catalog entry for group {group}"))?;
+    // Steps 4–5: derived artifacts (extracted manifest + catalog index
+    // entries). Best-effort: the content blob is already durably stored, so
+    // a manifest/index write failure must not mask a successful ingest —
+    // it is loudly logged, and re-pushing the same content rewrites the
+    // artifacts (self-repair). Note: the index prefixes (`manifests/`,
+    // `catalog-index/`) need the same S3 write permissions as `blobs/`.
+    match catalog::derive_artifacts(&manifest, &hash_hex, size, unix_now(), catalog_config) {
+        Ok(derived) => {
+            if let Err(e) = s3_client
+                .put_manifest(&hash_hex, Bytes::from(derived.manifest_json))
+                .await
+            {
+                warn!(hash = %hash_hex, error = %e,
+                    "Failed to store extracted manifest — blob remains available; re-push to repair");
             }
-            info!(hash = %hash_hex, groups = ?groups, "Catalog index entries written");
+            if catalog_config.enabled && derived.entries.is_empty() {
+                info!(hash = %hash_hex, "No grouping attribute in policy; not cataloged");
+            }
+            for (group, entry_json) in derived.entries {
+                match s3_client
+                    .put_catalog_entry(&group, &hash_hex, Bytes::from(entry_json))
+                    .await
+                {
+                    Ok(()) => info!(hash = %hash_hex, %group, "Catalog index entry written"),
+                    Err(e) => warn!(hash = %hash_hex, %group, error = %e,
+                        "Failed to store catalog entry — blob remains available; re-push to repair"),
+                }
+            }
+        }
+        Err(e) => {
+            warn!(hash = %hash_hex, error = %e, "Failed to derive catalog artifacts");
         }
     }
 

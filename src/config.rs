@@ -93,6 +93,15 @@ pub struct AuthzConfig {
     /// no environment entity is appended to chains.
     #[serde(default)]
     pub environment_region: String,
+    /// EXPERIMENTAL: forward multi-entity chains as
+    /// `entityIdentifier.entityChain`. Leave false until that shape is
+    /// contract-verified against the platform — the ERS does not resolve
+    /// tokens buried in entityChain claims, so enabling this prematurely
+    /// silently denies everything. When false, only the PE token is
+    /// forwarded (the ERS-resolved path); NPE/environment entities are
+    /// verified at the edge and logged.
+    #[serde(default)]
+    pub entity_chain_mode: bool,
 }
 
 impl Default for AuthzConfig {
@@ -102,6 +111,7 @@ impl Default for AuthzConfig {
             action: default_authz_action(),
             bearer_token: String::new(),
             environment_region: String::new(),
+            entity_chain_mode: false,
         }
     }
 }

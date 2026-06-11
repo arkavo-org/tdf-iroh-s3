@@ -123,7 +123,11 @@ async fn main() -> Result<()> {
             } else {
                 let bearer =
                     (!cat.authz.bearer_token.is_empty()).then(|| cat.authz.bearer_token.clone());
-                let provider = ConnectAuthzClient::new(cat.authz.endpoint.clone(), bearer);
+                let provider = ConnectAuthzClient::new(
+                    cat.authz.endpoint.clone(),
+                    bearer,
+                    cat.authz.entity_chain_mode,
+                );
                 router = router.merge(catalog_router(
                     cache,
                     provider,
