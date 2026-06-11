@@ -139,6 +139,48 @@ impl AttributeSet {
     }
 }
 
+/// Fetch the attribute definitions from the platform's public attributes
+/// endpoint (the single source of truth — the same snapshot the PDP
+/// evaluates) and return every attribute FQN. Used at startup to validate
+/// the configured grouping attribute when the node is NOT serving
+/// definitions itself.
+pub async fn fetch_attribute_fqns(url: &str) -> Result<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct Listing {
+        #[serde(default)]
+        attributes: Vec<RemoteAttribute>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RemoteAttribute {
+        #[serde(default)]
+        fqn: String,
+    }
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("reqwest client")?;
+    let resp = http
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("attributes endpoint returned {}", resp.status());
+    }
+    let listing: Listing = resp.json().await.context("attributes JSON parse")?;
+    let fqns: Vec<String> = listing
+        .attributes
+        .into_iter()
+        .map(|a| a.fqn)
+        .filter(|f| !f.is_empty())
+        .collect();
+    if fqns.is_empty() {
+        anyhow::bail!("attributes endpoint returned no definitions with FQNs");
+    }
+    Ok(fqns)
+}
+
 /// Routes serving the definition set. Mounted on the same listener as the
 /// tag/catalog API; point the namespace host (e.g. patreon.arkavo.com) at
 /// this node (or proxy these paths) and every FQN dereferences.
@@ -243,6 +285,55 @@ mod tests {
         )
         .unwrap();
         assert!(bad.normalize_and_validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn fetches_fqns_from_platform_listing() {
+        // Stub serving the platform's proto-JSON shape (no namespace
+        // wrapper; extra fields the node must tolerate).
+        use axum::routing::get;
+        let app = Router::new().route(
+            "/attributes",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "attributes": [
+                        {"id": "x1", "name": "tier",
+                         "rule": "ATTRIBUTE_RULE_TYPE_ENUM_HIERARCHY",
+                         "fqn": "https://patreon.arkavo.com/attr/tier",
+                         "values": [{"value": "free", "fqn": "https://patreon.arkavo.com/attr/tier/value/free"}]},
+                        {"name": "campaign",
+                         "fqn": "https://patreon.arkavo.com/attr/campaign"}
+                    ]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let fqns = fetch_attribute_fqns(&format!("http://{addr}/attributes"))
+            .await
+            .unwrap();
+        assert!(fqns.contains(&"https://patreon.arkavo.com/attr/campaign".to_string()));
+        assert_eq!(fqns.len(), 2);
+
+        // Empty listing is a startup error, not a silent pass.
+        let app = Router::new().route(
+            "/attributes",
+            get(|| async { axum::Json(serde_json::json!({"attributes": []})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        assert!(
+            fetch_attribute_fqns(&format!("http://{addr}/attributes"))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

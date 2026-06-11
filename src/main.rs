@@ -80,22 +80,40 @@ async fn main() -> Result<()> {
         let cat = &node.config.catalog;
         if cat.enabled {
             anyhow::ensure!(
-                !cat.attributes_file.is_empty(),
-                "[catalog] enabled requires attributes_file (OpenTDF-shaped definitions JSON)"
+                cat.attributes_url.is_empty() != cat.attributes_file.is_empty(),
+                "[catalog] enabled requires exactly one of attributes_url (platform single                  source) or attributes_file (local artifact, node serves it)"
             );
-            let set = AttributeSet::load(&cat.attributes_file)?;
-            anyhow::ensure!(
-                set.attribute_by_fqn(&cat.group_attribute_fqn).is_some(),
-                "[catalog] group_attribute_fqn {} is not defined in {}",
-                cat.group_attribute_fqn,
-                cat.attributes_file
-            );
-            info!(
-                "Attribute definitions loaded: namespace {} ({} attributes)",
-                set.namespace.fqn,
-                set.attributes.len()
-            );
-            router = router.merge(attributes::router(Arc::new(set)));
+            if !cat.attributes_url.is_empty() {
+                // Single source of truth: the platform serves definitions
+                // from the snapshot the PDP evaluates; this node only
+                // validates its grouping attribute against it at startup.
+                let fqns = attributes::fetch_attribute_fqns(&cat.attributes_url).await?;
+                anyhow::ensure!(
+                    fqns.iter().any(|f| f == &cat.group_attribute_fqn),
+                    "[catalog] group_attribute_fqn {} is not defined at {}",
+                    cat.group_attribute_fqn,
+                    cat.attributes_url
+                );
+                info!(
+                    "Attribute definitions validated against {} ({} attributes);                      definitions are served by the platform, not this node",
+                    cat.attributes_url,
+                    fqns.len()
+                );
+            } else {
+                let set = AttributeSet::load(&cat.attributes_file)?;
+                anyhow::ensure!(
+                    set.attribute_by_fqn(&cat.group_attribute_fqn).is_some(),
+                    "[catalog] group_attribute_fqn {} is not defined in {}",
+                    cat.group_attribute_fqn,
+                    cat.attributes_file
+                );
+                info!(
+                    "Attribute definitions loaded: namespace {} ({} attributes)",
+                    set.namespace.fqn,
+                    set.attributes.len()
+                );
+                router = router.merge(attributes::router(Arc::new(set)));
+            }
 
             let environment = if cat.authz.environment_region.is_empty() {
                 None

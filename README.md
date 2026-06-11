@@ -57,13 +57,17 @@ tag_prefix = "catalog/"
 # manifests/<hash> so indexing/UIs never re-download content blobs.
 [catalog]
 enabled = true
-# Grouping attribute (must be defined in attributes_file). Items labeled
-# with campaign X are indexed and served under /catalog/X.
+# Grouping attribute (must be defined in the attribute source). Items
+# labeled with campaign X are indexed and served under /catalog/X.
 group_attribute_fqn = "https://patreon.arkavo.com/attr/campaign"
-# OpenTDF-shaped attribute definitions, served publicly on /attributes and
-# FQN-resolving /attr/{name}[/value/{value}] routes. Attributes are never
-# hardcoded — this artifact is the source of truth.
-attributes_file = "/etc/tdf-iroh-s3/attributes.json"
+# Attribute definitions: exactly one of the following.
+# Production — the platform's public attributes endpoint is the single
+# source of truth (served from the snapshot the PDP evaluates); this node
+# validates group_attribute_fqn against it at startup and serves nothing:
+attributes_url = "https://platform.arkavo.net/attributes"
+# Offline/test alternative — local artifact, served by this node on
+# /attributes and FQN-resolving /attr/... routes:
+# attributes_file = "/etc/tdf-iroh-s3/attributes.json"
 cache_ttl_secs = 30
 
 # OpenTDF authorization service for per-item catalog decisions. Empty
