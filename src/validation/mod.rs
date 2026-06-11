@@ -10,10 +10,13 @@ use anyhow::{Context, Result};
 /// 1. Structure: verify it's a valid TDF (ZIP with manifest + payload)
 /// 2. Attributes: check required attributes are present in the policy
 /// 3. Assertion: optionally verify assertion signature against trusted keys
-pub fn validate_blob(data: &[u8], config: &ValidationConfig) -> Result<()> {
+///
+/// Returns the parsed manifest so ingest can derive artifacts (extracted
+/// manifest, catalog index) without re-opening the archive.
+pub fn validate_blob(data: &[u8], config: &ValidationConfig) -> Result<opentdf::TdfManifest> {
     // Step 1: Structure validation
-    let manifest = structure::validate_tdf_structure(data)
-        .context("TDF structure validation failed")?;
+    let manifest =
+        structure::validate_tdf_structure(data).context("TDF structure validation failed")?;
 
     // Step 2: Attribute policy check
     attributes::validate_attributes(&manifest, &config.required_attributes)
@@ -27,5 +30,5 @@ pub fn validate_blob(data: &[u8], config: &ValidationConfig) -> Result<()> {
     )
     .context("TDF assertion validation failed")?;
 
-    Ok(())
+    Ok(manifest)
 }

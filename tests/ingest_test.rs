@@ -5,9 +5,7 @@ use tdf_iroh_s3::validation::validate_blob;
 fn test_ingest_validates_before_accepting() {
     let valid_tdf = create_tdf_with_attribute("https://example.com/attr/storage/value/permanent");
     let config = ValidationConfig {
-        required_attributes: vec![
-            "https://example.com/attr/storage/value/permanent".to_string(),
-        ],
+        required_attributes: vec!["https://example.com/attr/storage/value/permanent".to_string()],
         assertion: Default::default(),
     };
 

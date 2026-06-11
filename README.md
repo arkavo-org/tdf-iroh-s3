@@ -50,6 +50,14 @@ bind_port = 8090
 cose_keys_url = "https://identity.arkavo.net/.well-known/cose-keys"
 expected_issuer = "https://identity.arkavo.net"
 tag_prefix = "catalog/"
+
+# Optional: ingest-time catalog index (see issue #5). Each ingested blob
+# gets a catalog-index/<group>/<hash> entry per value of the grouping
+# attribute in its TDF policy; the extracted manifest.json is stored at
+# manifests/<hash> so indexing/UIs never re-download content blobs.
+[catalog]
+enabled = true
+group_attribute_prefix = "https://patreon.arkavo.com/attr/campaign/value/"
 ```
 
 ## Tag API (catalog discovery)

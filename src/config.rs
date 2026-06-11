@@ -10,6 +10,37 @@ pub struct Config {
     pub validation: ValidationConfig,
     #[serde(default)]
     pub http: HttpConfig,
+    #[serde(default)]
+    pub catalog: CatalogConfig,
+}
+
+/// Ingest-time catalog indexing (see tdf-iroh-s3#5). When enabled, every
+/// ingested blob gets a `catalog-index/<group>/<hash>` entry per value of
+/// the grouping attribute found in its policy. The extracted manifest is
+/// written to `manifests/<hash>` regardless, so future indexing never has
+/// to re-download content blobs.
+#[derive(Debug, Deserialize)]
+pub struct CatalogConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// FQN prefix whose values become catalog groups, e.g. the Patreon
+    /// campaign attribute: items labeled with campaign X are indexed under
+    /// group X.
+    #[serde(default = "default_group_attribute_prefix")]
+    pub group_attribute_prefix: String,
+}
+
+impl Default for CatalogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            group_attribute_prefix: default_group_attribute_prefix(),
+        }
+    }
+}
+
+fn default_group_attribute_prefix() -> String {
+    "https://patreon.arkavo.com/attr/campaign/value/".to_string()
 }
 
 #[derive(Debug, Deserialize)]

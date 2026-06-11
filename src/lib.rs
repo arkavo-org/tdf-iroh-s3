@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod catalog;
 pub mod config;
 pub mod ingest;
 pub mod node;

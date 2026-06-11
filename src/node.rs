@@ -2,11 +2,11 @@ use anyhow::{Context, Result};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr};
+use iroh_blobs::BlobsProtocol;
 use iroh_blobs::provider::events::{
     EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
 };
 use iroh_blobs::store::fs::FsStore;
-use iroh_blobs::BlobsProtocol;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -220,7 +220,7 @@ async fn wait_and_ingest(
 
     // Blob is written — ingest with small retry for FsStore async DB propagation
     for attempt in 0..10 {
-        match ingest_from_store(hash, store, &config.validation, s3_client).await {
+        match ingest_from_store(hash, store, &config.validation, &config.catalog, s3_client).await {
             Ok(Some(result)) => {
                 info!(
                     hash = %result.hash_hex,

@@ -8,7 +8,9 @@
 //! served via the network protocol). We verify accessibility by fetching the
 //! blob back from the node over the iroh-blobs GET protocol.
 
-use tdf_iroh_s3::config::{Config, HttpConfig, IrohConfig, S3Config, ValidationConfig};
+use tdf_iroh_s3::config::{
+    CatalogConfig, Config, HttpConfig, IrohConfig, S3Config, ValidationConfig,
+};
 use tdf_iroh_s3::node::TdfIrohNode;
 use tdf_iroh_s3::test_cli::iroh_client::IrohTestClient;
 
@@ -26,6 +28,7 @@ fn test_config(data_dir: &str) -> Config {
         },
         validation: ValidationConfig::default(),
         http: HttpConfig::default(),
+        catalog: CatalogConfig::default(),
     }
 }
 
