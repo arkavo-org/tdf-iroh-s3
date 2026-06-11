@@ -79,7 +79,11 @@ endpoint = "https://platform.arkavo.net"
 action = "read"
 token_url = "https://identity.arkavo.net/oauth/token"
 client_id = "catalog-node"
-client_secret = "${CATALOG_NODE_CLIENT_SECRET}"
+# The secret is read from the CATALOG_AUTHZ_CLIENT_SECRET environment
+# variable when client_secret is unset here — preferred, so the
+# long-lived credential never sits in the config file. (No shell-style
+# ${VAR} expansion happens inside this file.)
+# client_secret = "..."
 # environment_region is asserted by this node as an environment NPE in the
 # decision entity chain; clients can never supply environment claims.
 environment_region = "us-east-1"
