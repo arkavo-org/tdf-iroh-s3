@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
         if cat.enabled {
             anyhow::ensure!(
                 cat.attributes_url.is_empty() != cat.attributes_file.is_empty(),
-                "[catalog] enabled requires exactly one of attributes_url (platform single                  source) or attributes_file (local artifact, node serves it)"
+                "[catalog] enabled requires exactly one of attributes_url (platform single source) or attributes_file (local artifact, node serves it)"
             );
             if !cat.attributes_url.is_empty() {
                 // Single source of truth: the platform serves definitions
@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
                     cat.attributes_url
                 );
                 info!(
-                    "Attribute definitions validated against {} ({} attributes);                      definitions are served by the platform, not this node",
+                    "Attribute definitions validated against {} ({} attributes); definitions are served by the platform, not this node",
                     cat.attributes_url,
                     fqns.len()
                 );
