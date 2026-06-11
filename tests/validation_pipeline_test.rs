@@ -5,9 +5,7 @@ use tdf_iroh_s3::validation::validate_blob;
 fn test_valid_tdf_passes_full_pipeline() {
     let tdf_bytes = create_tdf_with_attribute("https://example.com/attr/storage/value/permanent");
     let config = ValidationConfig {
-        required_attributes: vec![
-            "https://example.com/attr/storage/value/permanent".to_string(),
-        ],
+        required_attributes: vec!["https://example.com/attr/storage/value/permanent".to_string()],
         assertion: Default::default(),
     };
     let result = validate_blob(&tdf_bytes, &config);
@@ -26,9 +24,7 @@ fn test_garbage_fails_pipeline() {
 fn test_missing_attribute_fails_pipeline() {
     let tdf_bytes = create_tdf_with_attribute("https://example.com/attr/level/value/public");
     let config = ValidationConfig {
-        required_attributes: vec![
-            "https://example.com/attr/storage/value/permanent".to_string(),
-        ],
+        required_attributes: vec!["https://example.com/attr/storage/value/permanent".to_string()],
         assertion: Default::default(),
     };
     let result = validate_blob(&tdf_bytes, &config);

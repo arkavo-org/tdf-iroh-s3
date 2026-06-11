@@ -86,7 +86,20 @@ pub struct AuthzConfig {
     /// Action evaluated per resource.
     #[serde(default = "default_authz_action")]
     pub action: String,
-    /// Optional service bearer token presented to the platform.
+    /// OAuth client_credentials against the IdP token endpoint — the
+    /// production credential. The node mints and refreshes its own
+    /// short-lived service CWT (the platform requires an authenticated
+    /// caller, and access tokens live ~1h, so a static token would
+    /// silently fail-close the catalog after an hour). All three must be
+    /// set together.
+    #[serde(default)]
+    pub token_url: String,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+    /// Static bearer token override (tests / externally rotated
+    /// credentials). Ignored when client_credentials is configured.
     #[serde(default)]
     pub bearer_token: String,
     /// Environment this node asserts as an NPE (e.g. its region). Empty ⇒
@@ -108,6 +121,9 @@ impl Default for AuthzConfig {
         Self {
             endpoint: String::new(),
             action: default_authz_action(),
+            token_url: String::new(),
+            client_id: String::new(),
+            client_secret: String::new(),
             bearer_token: String::new(),
             environment_region: String::new(),
             entity_mode: String::new(),

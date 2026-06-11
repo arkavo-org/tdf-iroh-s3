@@ -1,5 +1,5 @@
-use tdf_iroh_s3::validation::attributes::validate_attributes;
 use opentdf::TdfManifest;
+use tdf_iroh_s3::validation::attributes::validate_attributes;
 
 #[test]
 fn test_no_required_attributes_always_passes() {
@@ -17,7 +17,11 @@ fn test_matching_attribute_passes() {
     let manifest = parse_manifest(&tdf_bytes);
     let required = vec![attr.to_string()];
     let result = validate_attributes(&manifest, &required);
-    assert!(result.is_ok(), "TDF with required attribute should pass: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "TDF with required attribute should pass: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -26,7 +30,10 @@ fn test_missing_attribute_fails() {
     let manifest = parse_manifest(&tdf_bytes);
     let required = vec!["https://example.com/attr/storage/value/permanent".to_string()];
     let result = validate_attributes(&manifest, &required);
-    assert!(result.is_err(), "TDF missing required attribute should fail");
+    assert!(
+        result.is_err(),
+        "TDF missing required attribute should fail"
+    );
 }
 
 fn create_tdf_with_attribute(attr_fqn: &str) -> Vec<u8> {

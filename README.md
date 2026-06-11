@@ -68,9 +68,18 @@ cache_ttl_secs = 30
 
 # OpenTDF authorization service for per-item catalog decisions. Empty
 # endpoint = fail closed (catalog lists, nothing entitled).
+#
+# The platform REQUIRES an authenticated caller. Production: register a
+# confidential OIDC client on the IdP and configure client_credentials —
+# the node mints and refreshes its own short-lived service CWT (access
+# tokens live ~1h; a static token would silently fail-close the catalog
+# an hour after boot).
 [catalog.authz]
 endpoint = "https://platform.arkavo.net"
 action = "read"
+token_url = "https://identity.arkavo.net/oauth/token"
+client_id = "catalog-node"
+client_secret = "${CATALOG_NODE_CLIENT_SECRET}"
 # environment_region is asserted by this node as an environment NPE in the
 # decision entity chain; clients can never supply environment claims.
 environment_region = "us-east-1"
