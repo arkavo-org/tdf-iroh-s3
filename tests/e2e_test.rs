@@ -11,9 +11,7 @@ fn test_e2e_valid_tdf_full_pipeline() {
     let tdf_bytes = create_tdf("https://example.com/attr/storage/value/permanent");
 
     let config = ValidationConfig {
-        required_attributes: vec![
-            "https://example.com/attr/storage/value/permanent".to_string(),
-        ],
+        required_attributes: vec!["https://example.com/attr/storage/value/permanent".to_string()],
         assertion: Default::default(),
     };
 
@@ -43,9 +41,7 @@ fn test_e2e_reject_non_tdf() {
 fn test_e2e_reject_wrong_attribute() {
     let tdf_bytes = create_tdf("https://example.com/attr/level/value/public");
     let config = ValidationConfig {
-        required_attributes: vec![
-            "https://example.com/attr/storage/value/permanent".to_string(),
-        ],
+        required_attributes: vec!["https://example.com/attr/storage/value/permanent".to_string()],
         assertion: Default::default(),
     };
     let result = validate_blob(&tdf_bytes, &config);

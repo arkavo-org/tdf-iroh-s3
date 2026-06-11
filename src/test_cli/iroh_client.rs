@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_base::TransportAddr;
+use iroh_blobs::BlobsProtocol;
 use iroh_blobs::protocol::{GetRequest, PushRequest};
 use iroh_blobs::store::mem::MemStore;
-use iroh_blobs::BlobsProtocol;
 use iroh_blobs::{Hash, HashAndFormat};
 use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -58,11 +58,7 @@ impl IrohTestClient {
 
     /// Push a blob to a remote node. Adds the data to the local store first,
     /// then sends it to the remote node using the iroh-blobs push protocol.
-    pub async fn push_to_node(
-        &self,
-        addr: impl Into<EndpointAddr>,
-        data: &[u8],
-    ) -> Result<Hash> {
+    pub async fn push_to_node(&self, addr: impl Into<EndpointAddr>, data: &[u8]) -> Result<Hash> {
         // Add blob to local store
         let hash = self.add_bytes(data).await?;
 

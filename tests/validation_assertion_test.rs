@@ -1,5 +1,5 @@
-use tdf_iroh_s3::validation::assertion::validate_assertion;
 use opentdf::TdfManifest;
+use tdf_iroh_s3::validation::assertion::validate_assertion;
 
 #[test]
 fn test_assertion_disabled_always_passes() {
@@ -16,7 +16,10 @@ fn test_assertion_enabled_no_assertion_fails() {
     let manifest = parse_manifest(&tdf_bytes);
     let trusted_keys = vec!["/tmp/nonexistent.pem".to_string()];
     let result = validate_assertion(&manifest, true, &trusted_keys);
-    assert!(result.is_err(), "TDF without assertion should fail when check is enabled");
+    assert!(
+        result.is_err(),
+        "TDF without assertion should fail when check is enabled"
+    );
 }
 
 fn create_basic_tdf() -> Vec<u8> {

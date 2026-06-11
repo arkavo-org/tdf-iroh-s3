@@ -121,15 +121,39 @@ async fn main() -> Result<()> {
                     environment,
                 ));
             } else {
-                let bearer =
-                    (!cat.authz.bearer_token.is_empty()).then(|| cat.authz.bearer_token.clone());
+                let credential = if !cat.authz.token_url.is_empty() {
+                    // The secret may come from config or — preferably, so a
+                    // long-lived credential never sits in the TOML — from the
+                    // CATALOG_AUTHZ_CLIENT_SECRET environment variable.
+                    let client_secret = if cat.authz.client_secret.is_empty() {
+                        std::env::var("CATALOG_AUTHZ_CLIENT_SECRET").unwrap_or_default()
+                    } else {
+                        cat.authz.client_secret.clone()
+                    };
+                    anyhow::ensure!(
+                        !cat.authz.client_id.is_empty() && !client_secret.is_empty(),
+                        "[catalog.authz] token_url requires client_id and a client secret                          (config client_secret or CATALOG_AUTHZ_CLIENT_SECRET env)"
+                    );
+                    tdf_iroh_s3::authz::ServiceCredential::ClientCredentials {
+                        token_url: cat.authz.token_url.clone(),
+                        client_id: cat.authz.client_id.clone(),
+                        client_secret,
+                    }
+                } else if !cat.authz.bearer_token.is_empty() {
+                    tdf_iroh_s3::authz::ServiceCredential::Static(cat.authz.bearer_token.clone())
+                } else {
+                    tracing::warn!(
+                        "[catalog.authz] no credential configured — the platform requires an                          authenticated caller, decisions will be rejected"
+                    );
+                    tdf_iroh_s3::authz::ServiceCredential::None
+                };
                 let entity_mode: tdf_iroh_s3::authz::EntityMode = cat
                     .authz
                     .entity_mode
                     .parse()
                     .map_err(|e: String| anyhow::anyhow!(e))?;
                 let provider =
-                    ConnectAuthzClient::new(cat.authz.endpoint.clone(), bearer, entity_mode);
+                    ConnectAuthzClient::new(cat.authz.endpoint.clone(), credential, entity_mode);
                 router = router.merge(catalog_router(
                     cache,
                     provider,

@@ -98,25 +98,113 @@ impl std::str::FromStr for EntityMode {
     }
 }
 
+/// How this node authenticates to the authorization service. The platform
+/// REQUIRES an authenticated caller (the PEP client identity is taken from
+/// the verified token), so production uses `ClientCredentials`: the node
+/// mints its own short-lived service CWT from the IdP's token endpoint and
+/// refreshes before expiry — a static token would silently fail-close the
+/// catalog one access-token lifetime (~1h) after boot.
+pub enum ServiceCredential {
+    /// Fixed bearer string (tests, or externally rotated credentials).
+    Static(String),
+    /// OAuth client_credentials against the IdP token endpoint.
+    ClientCredentials {
+        token_url: String,
+        client_id: String,
+        client_secret: String,
+    },
+    /// No Authorization header (only viable if the platform runs authless —
+    /// never true in production).
+    None,
+}
+
+/// Refresh this long before `expires_in` elapses.
+const TOKEN_REFRESH_MARGIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+struct CachedToken {
+    token: String,
+    expires_at: std::time::Instant,
+}
+
+#[derive(serde::Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    #[serde(default)]
+    expires_in: u64,
+}
+
 /// ConnectRPC-JSON client for authorization.v2.
 pub struct ConnectAuthzClient {
     endpoint: String,
-    bearer_token: Option<String>,
+    credential: ServiceCredential,
     entity_mode: EntityMode,
     http: reqwest::Client,
+    token_cache: tokio::sync::Mutex<Option<CachedToken>>,
 }
 
 impl ConnectAuthzClient {
-    pub fn new(endpoint: String, bearer_token: Option<String>, entity_mode: EntityMode) -> Self {
+    pub fn new(endpoint: String, credential: ServiceCredential, entity_mode: EntityMode) -> Self {
         Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
-            bearer_token,
+            credential,
             entity_mode,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .expect("reqwest client"),
+            token_cache: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// The bearer token for the next decision request, minting/refreshing
+    /// via client_credentials as needed. The mutex doubles as single-flight:
+    /// concurrent refreshes collapse to one IdP round-trip.
+    async fn bearer(&self) -> Result<Option<String>> {
+        let (token_url, client_id, client_secret) = match &self.credential {
+            ServiceCredential::None => return Ok(None),
+            ServiceCredential::Static(token) => return Ok(Some(token.clone())),
+            ServiceCredential::ClientCredentials {
+                token_url,
+                client_id,
+                client_secret,
+            } => (token_url, client_id, client_secret),
+        };
+
+        let mut cache = self.token_cache.lock().await;
+        if let Some(cached) = cache.as_ref()
+            && std::time::Instant::now() < cached.expires_at
+        {
+            return Ok(Some(cached.token.clone()));
+        }
+
+        let resp = self
+            .http
+            .post(token_url)
+            .form(&[
+                ("grant_type", "client_credentials"),
+                ("client_id", client_id.as_str()),
+                ("client_secret", client_secret.as_str()),
+            ])
+            .send()
+            .await
+            .with_context(|| format!("token POST {token_url}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            anyhow::bail!("token endpoint returned {status}");
+        }
+        let parsed: TokenResponse = resp.json().await.context("token JSON parse")?;
+        let ttl = std::time::Duration::from_secs(parsed.expires_in.max(120));
+        let expires_at = std::time::Instant::now() + ttl.saturating_sub(TOKEN_REFRESH_MARGIN);
+        let token = parsed.access_token.clone();
+        *cache = Some(CachedToken {
+            token: parsed.access_token,
+            expires_at,
+        });
+        tracing::info!(
+            ttl_secs = ttl.as_secs(),
+            "Minted service token via client_credentials"
+        );
+        Ok(Some(token))
     }
 
     /// Build the proto-JSON GetDecisionMultiResource request.
@@ -210,7 +298,7 @@ impl DecisionProvider for ConnectAuthzClient {
             .post(&url)
             .header("Content-Type", "application/json")
             .json(&body);
-        if let Some(token) = &self.bearer_token {
+        if let Some(token) = self.bearer().await? {
             http_req = http_req.bearer_auth(token);
         }
 
@@ -261,7 +349,11 @@ mod tests {
     }
 
     fn client(mode: EntityMode) -> ConnectAuthzClient {
-        ConnectAuthzClient::new("https://platform.test".into(), None, mode)
+        ConnectAuthzClient::new(
+            "https://platform.test".into(),
+            ServiceCredential::None,
+            mode,
+        )
     }
 
     #[test]
@@ -370,5 +462,69 @@ mod tests {
         assert_eq!(entities[0]["category"], "CATEGORY_SUBJECT");
         assert_eq!(entities[1]["category"], "CATEGORY_ENVIRONMENT");
         assert_eq!(entities[2]["claims"]["value"]["region"], "us-east-1");
+    }
+
+    /// Token endpoint stub counting mints; returns a 1h token.
+    async fn spawn_token_endpoint(counter: std::sync::Arc<std::sync::atomic::AtomicU32>) -> String {
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/oauth/token",
+            post(move || {
+                let counter = std::sync::Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "access_token": "svc-token-1",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/oauth/token")
+    }
+
+    #[tokio::test]
+    async fn client_credentials_mints_and_caches() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let token_url = spawn_token_endpoint(std::sync::Arc::clone(&counter)).await;
+        let client = ConnectAuthzClient::new(
+            "https://platform.test".into(),
+            ServiceCredential::ClientCredentials {
+                token_url,
+                client_id: "catalog-node".into(),
+                client_secret: "s3cret".into(),
+            },
+            EntityMode::Claims,
+        );
+
+        for _ in 0..3 {
+            let tok = client.bearer().await.unwrap();
+            assert_eq!(tok.as_deref(), Some("svc-token-1"));
+        }
+        // 3600s token with 60s margin: one mint serves all three calls.
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn static_and_none_credentials() {
+        let c = ConnectAuthzClient::new(
+            "https://p.test".into(),
+            ServiceCredential::Static("fixed".into()),
+            EntityMode::Claims,
+        );
+        assert_eq!(c.bearer().await.unwrap().as_deref(), Some("fixed"));
+
+        let c = ConnectAuthzClient::new(
+            "https://p.test".into(),
+            ServiceCredential::None,
+            EntityMode::Claims,
+        );
+        assert!(c.bearer().await.unwrap().is_none());
     }
 }

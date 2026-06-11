@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use opentdf::TdfManifest;
 
 /// Validates the TDF manifest's assertion signature against trusted public keys.
@@ -20,7 +20,12 @@ pub fn validate_assertion(
     }
 
     // Verify that the policy binding is present and non-empty on each key_access
-    for (i, ka) in manifest.encryption_information.key_access.iter().enumerate() {
+    for (i, ka) in manifest
+        .encryption_information
+        .key_access
+        .iter()
+        .enumerate()
+    {
         if ka.policy_binding.hash.is_empty() {
             bail!(
                 "Key access object {} has empty policy binding hash — assertion verification failed",

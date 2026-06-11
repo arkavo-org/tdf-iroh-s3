@@ -14,7 +14,11 @@ fn test_create_tdf_with_attribute() {
         assertion: Default::default(),
     };
     let result = validate_blob(&tdf_bytes, &config);
-    assert!(result.is_ok(), "Created TDF should pass validation: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Created TDF should pass validation: {:?}",
+        result.err()
+    );
 }
 
 #[test]

@@ -12,7 +12,6 @@ use coset::iana;
 use coset::{AsCborValue, CborSerializable, CoseSign1Builder, HeaderBuilder};
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
-use p256::elliptic_curve::sec1::ToEncodedPoint;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
