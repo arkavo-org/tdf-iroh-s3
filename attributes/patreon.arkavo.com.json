@@ -1,0 +1,71 @@
+{
+  "namespace": {
+    "name": "patreon.arkavo.com",
+    "fqn": "https://patreon.arkavo.com"
+  },
+  "attributes": [
+    {
+      "name": "classification",
+      "rule": "ATTRIBUTE_RULE_TYPE_ENUM_HIERARCHY",
+      "fqn": "https://patreon.arkavo.com/attr/classification",
+      "values": [
+        { "value": "public", "fqn": "https://patreon.arkavo.com/attr/classification/value/public" },
+        { "value": "member", "fqn": "https://patreon.arkavo.com/attr/classification/value/member" },
+        { "value": "paid", "fqn": "https://patreon.arkavo.com/attr/classification/value/paid" },
+        { "value": "vip", "fqn": "https://patreon.arkavo.com/attr/classification/value/vip" }
+      ]
+    },
+    {
+      "name": "content-type",
+      "rule": "ATTRIBUTE_RULE_TYPE_ENUM_ANY_OF",
+      "fqn": "https://patreon.arkavo.com/attr/content-type",
+      "values": [
+        { "value": "text", "fqn": "https://patreon.arkavo.com/attr/content-type/value/text" },
+        { "value": "image", "fqn": "https://patreon.arkavo.com/attr/content-type/value/image" },
+        { "value": "video", "fqn": "https://patreon.arkavo.com/attr/content-type/value/video" },
+        { "value": "audio", "fqn": "https://patreon.arkavo.com/attr/content-type/value/audio" }
+      ]
+    },
+    {
+      "name": "entitlement",
+      "rule": "ATTRIBUTE_RULE_TYPE_ENUM_ALL_OF",
+      "fqn": "https://patreon.arkavo.com/attr/entitlement",
+      "values": [
+        { "value": "exclusive-content", "fqn": "https://patreon.arkavo.com/attr/entitlement/value/exclusive-content" },
+        { "value": "early-access", "fqn": "https://patreon.arkavo.com/attr/entitlement/value/early-access" },
+        { "value": "behind-the-scenes", "fqn": "https://patreon.arkavo.com/attr/entitlement/value/behind-the-scenes" },
+        { "value": "live-stream", "fqn": "https://patreon.arkavo.com/attr/entitlement/value/live-stream" },
+        { "value": "discord", "fqn": "https://patreon.arkavo.com/attr/entitlement/value/discord" }
+      ]
+    },
+    {
+      "name": "tier",
+      "rule": "ATTRIBUTE_RULE_TYPE_ENUM_HIERARCHY",
+      "fqn": "https://patreon.arkavo.com/attr/tier",
+      "values": [
+        { "value": "vip", "fqn": "https://patreon.arkavo.com/attr/tier/value/vip" },
+        { "value": "patron", "fqn": "https://patreon.arkavo.com/attr/tier/value/patron" },
+        { "value": "supporter", "fqn": "https://patreon.arkavo.com/attr/tier/value/supporter" },
+        { "value": "free", "fqn": "https://patreon.arkavo.com/attr/tier/value/free" }
+      ]
+    },
+    {
+      "name": "campaign",
+      "rule": "ATTRIBUTE_RULE_TYPE_ENUM_ANY_OF",
+      "fqn": "https://patreon.arkavo.com/attr/campaign",
+      "values": [
+        { "value": "arkavo", "fqn": "https://patreon.arkavo.com/attr/campaign/value/arkavo" }
+      ]
+    },
+    {
+      "name": "status",
+      "rule": "ATTRIBUTE_RULE_TYPE_ENUM_ANY_OF",
+      "fqn": "https://patreon.arkavo.com/attr/status",
+      "values": [
+        { "value": "active", "fqn": "https://patreon.arkavo.com/attr/status/value/active" },
+        { "value": "declined", "fqn": "https://patreon.arkavo.com/attr/status/value/declined" },
+        { "value": "former", "fqn": "https://patreon.arkavo.com/attr/status/value/former" }
+      ]
+    }
+  ]
+}

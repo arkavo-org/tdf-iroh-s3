@@ -5077,6 +5077,7 @@ dependencies = [
  "ciborium",
  "clap",
  "coset",
+ "futures",
  "hex",
  "http-body-util",
  "iroh",

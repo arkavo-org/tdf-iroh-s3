@@ -116,6 +116,66 @@ impl S3Client {
         Ok(())
     }
 
+    /// List the blob hashes indexed under one catalog group (keys below
+    /// `catalog-index/<group>/`), paginating as needed.
+    pub async fn list_catalog_hashes(&self, group: &str) -> Result<Vec<String>> {
+        let prefix = format!("{}catalog-index/{}/", self.prefix, group);
+        let mut hashes = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&prefix);
+            if let Some(token) = &continuation {
+                req = req.continuation_token(token);
+            }
+            let resp = req
+                .send()
+                .await
+                .context("Failed to LIST catalog entries in S3")?;
+            for obj in resp.contents() {
+                if let Some(key) = obj.key()
+                    && let Some(hash) = key.strip_prefix(&prefix)
+                {
+                    hashes.push(hash.to_string());
+                }
+            }
+            match resp.next_continuation_token() {
+                Some(token) => continuation = Some(token.to_string()),
+                None => break,
+            }
+        }
+        Ok(hashes)
+    }
+
+    pub async fn get_catalog_entry(&self, group: &str, hash_hex: &str) -> Result<Option<Bytes>> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_entry_key(group, hash_hex))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let data = resp.body.collect().await?;
+                Ok(Some(data.into_bytes()))
+            }
+            Err(e) => {
+                if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Failed to GET catalog entry from S3: {}",
+                        e
+                    ))
+                }
+            }
+        }
+    }
+
     pub async fn get_blob(&self, hash_hex: &str) -> Result<Bytes> {
         let resp = self
             .client

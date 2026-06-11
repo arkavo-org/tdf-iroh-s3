@@ -55,7 +55,9 @@ impl TagStore for crate::store::s3::S3Client {
 
 pub struct ApiState<S: TagStore> {
     pub store: Arc<S>,
-    pub verifier: CwtVerifier,
+    /// Shared with the catalog API so PE/NPE tokens verify against one
+    /// cached key set.
+    pub verifier: Arc<CwtVerifier>,
     pub tag_prefix: String,
 }
 
@@ -253,7 +255,7 @@ mod tests {
         let store = Arc::new(MemStore::new());
         let state = Arc::new(ApiState {
             store: Arc::clone(&store),
-            verifier: CwtVerifier::with_static_keys(vec![(b"kid-1".to_vec(), vk)]),
+            verifier: Arc::new(CwtVerifier::with_static_keys(vec![(b"kid-1".to_vec(), vk)])),
             tag_prefix: "catalog/".to_string(),
         });
         let token = mint(
@@ -405,7 +407,7 @@ mod tests {
         store.blobs.lock().await.push(blob_hash());
         let state = Arc::new(ApiState {
             store: Arc::clone(&store),
-            verifier: CwtVerifier::with_static_keys(vec![(b"kid-1".to_vec(), vk)]),
+            verifier: Arc::new(CwtVerifier::with_static_keys(vec![(b"kid-1".to_vec(), vk)])),
             tag_prefix: "catalog/".to_string(),
         });
         let router = router(state);

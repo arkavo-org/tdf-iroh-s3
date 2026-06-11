@@ -14,33 +14,100 @@ pub struct Config {
     pub catalog: CatalogConfig,
 }
 
-/// Ingest-time catalog indexing (see tdf-iroh-s3#5). When enabled, every
-/// ingested blob gets a `catalog-index/<group>/<hash>` entry per value of
-/// the grouping attribute found in its policy. The extracted manifest is
-/// written to `manifests/<hash>` regardless, so future indexing never has
-/// to re-download content blobs.
+/// Catalog (see tdf-iroh-s3#5). When enabled, every ingested blob gets a
+/// `catalog-index/<group>/<hash>` entry per value of the grouping attribute
+/// found in its policy, and the HTTP listener serves `GET /catalog/{group}`.
+/// The extracted manifest is written to `manifests/<hash>` regardless, so
+/// future indexing never has to re-download content blobs.
+///
+/// Attributes are never hardcoded: `attributes_file` points at the
+/// OpenTDF-shaped definitions artifact (served publicly on `/attributes`
+/// and FQN-resolving `/attr/...` routes), and `group_attribute_fqn` must
+/// name an attribute defined in it.
 #[derive(Debug, Deserialize)]
 pub struct CatalogConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// FQN prefix whose values become catalog groups, e.g. the Patreon
-    /// campaign attribute: items labeled with campaign X are indexed under
-    /// group X.
-    #[serde(default = "default_group_attribute_prefix")]
-    pub group_attribute_prefix: String,
+    /// FQN of the attribute whose values become catalog groups (without
+    /// `/value/...`), e.g. the Patreon campaign attribute: items labeled
+    /// with campaign X are indexed under group X.
+    #[serde(default = "default_group_attribute_fqn")]
+    pub group_attribute_fqn: String,
+    /// Path to the attribute definitions artifact (JSON). Required when
+    /// `enabled`; the grouping attribute must be defined in it.
+    #[serde(default)]
+    pub attributes_file: String,
+    /// How long `/catalog/{group}` responses may serve a cached index
+    /// listing before re-reading S3.
+    #[serde(default = "default_catalog_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    #[serde(default)]
+    pub authz: AuthzConfig,
+}
+
+impl CatalogConfig {
+    /// The FQN prefix that group values are extracted from at ingest.
+    pub fn group_attribute_prefix(&self) -> String {
+        if self.group_attribute_fqn.is_empty() {
+            String::new()
+        } else {
+            format!("{}/value/", self.group_attribute_fqn.trim_end_matches('/'))
+        }
+    }
 }
 
 impl Default for CatalogConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            group_attribute_prefix: default_group_attribute_prefix(),
+            group_attribute_fqn: default_group_attribute_fqn(),
+            attributes_file: String::new(),
+            cache_ttl_secs: default_catalog_cache_ttl_secs(),
+            authz: AuthzConfig::default(),
         }
     }
 }
 
-fn default_group_attribute_prefix() -> String {
-    "https://patreon.arkavo.com/attr/campaign/value/".to_string()
+fn default_group_attribute_fqn() -> String {
+    "https://patreon.arkavo.com/attr/campaign".to_string()
+}
+
+fn default_catalog_cache_ttl_secs() -> u64 {
+    30
+}
+
+/// OpenTDF authorization service used for per-item catalog decisions.
+/// Empty endpoint ⇒ fail closed (catalog lists, nothing entitled).
+#[derive(Debug, Deserialize)]
+pub struct AuthzConfig {
+    /// Base URL of the platform, e.g. "https://platform.arkavo.net".
+    #[serde(default)]
+    pub endpoint: String,
+    /// Action evaluated per resource.
+    #[serde(default = "default_authz_action")]
+    pub action: String,
+    /// Optional service bearer token presented to the platform.
+    #[serde(default)]
+    pub bearer_token: String,
+    /// Environment this node asserts as an NPE (e.g. its region). Empty ⇒
+    /// no environment entity is appended to chains.
+    #[serde(default)]
+    pub environment_region: String,
+}
+
+impl Default for AuthzConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            action: default_authz_action(),
+            bearer_token: String::new(),
+            environment_region: String::new(),
+        }
+    }
+}
+
+fn default_authz_action() -> String {
+    "read".to_string()
 }
 
 #[derive(Debug, Deserialize)]

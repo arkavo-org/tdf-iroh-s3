@@ -68,7 +68,7 @@ pub async fn ingest_blob(
             .context("Failed to decode policy from manifest")?;
         let fqns = catalog::extract_attribute_fqns(&policy_json)
             .context("Failed to extract attribute FQNs from policy")?;
-        let groups = catalog::group_keys(&fqns, &catalog_config.group_attribute_prefix);
+        let groups = catalog::group_keys(&fqns, &catalog_config.group_attribute_prefix());
         if groups.is_empty() {
             info!(hash = %hash_hex, "No grouping attribute in policy; not cataloged");
         } else {

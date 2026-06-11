@@ -57,8 +57,52 @@ tag_prefix = "catalog/"
 # manifests/<hash> so indexing/UIs never re-download content blobs.
 [catalog]
 enabled = true
-group_attribute_prefix = "https://patreon.arkavo.com/attr/campaign/value/"
+# Grouping attribute (must be defined in attributes_file). Items labeled
+# with campaign X are indexed and served under /catalog/X.
+group_attribute_fqn = "https://patreon.arkavo.com/attr/campaign"
+# OpenTDF-shaped attribute definitions, served publicly on /attributes and
+# FQN-resolving /attr/{name}[/value/{value}] routes. Attributes are never
+# hardcoded — this artifact is the source of truth.
+attributes_file = "/etc/tdf-iroh-s3/attributes.json"
+cache_ttl_secs = 30
+
+# OpenTDF authorization service for per-item catalog decisions. Empty
+# endpoint = fail closed (catalog lists, nothing entitled).
+[catalog.authz]
+endpoint = "https://platform.arkavo.net"
+action = "read"
+# environment_region is asserted by this node as an environment NPE in the
+# decision entity chain; clients can never supply environment claims.
+environment_region = "us-east-1"
 ```
+
+## Entitled catalog
+
+`GET /catalog/{group}` lists the group's ingested items, each annotated
+with whether the requesting entity chain is entitled to it:
+
+```bash
+# Anonymous: full listing, nothing entitled (public storefront)
+curl https://iroh.arkavo.net/catalog/12345678
+
+# With a person entity (Arkavo CWT) — decisions come from the OpenTDF
+# authorization service over the full chain PE -> NPE -> NPE:
+curl https://iroh.arkavo.net/catalog/12345678 \
+  -H "Authorization: Bearer <pe-cwt>" \
+  -H "X-Entity-Token: <attested-device-cwt>"
+```
+
+Response: `{"group": "...", "decision": "evaluated|anonymous|unavailable",
+"items": [{"hash", "size", "attribute_fqns", "ingested_at", "entitled"}]}`.
+NPE tokens must carry the same subject as the PE; the node appends its own
+observed environment entity. All failure modes degrade to
+`entitled: false`, never to access.
+
+Attribute definitions resolve as URLs: `GET /attributes` (the full set),
+`GET /attr/tier`, `GET /attr/tier/value/supporter` — so an FQN like
+`https://patreon.arkavo.com/attr/tier/value/supporter` dereferences when
+the namespace host points at this node. See
+`attributes/patreon.arkavo.com.json` for the example artifact.
 
 ## Tag API (catalog discovery)
 
