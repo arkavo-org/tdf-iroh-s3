@@ -369,18 +369,34 @@ fn parse_claims(payload: &[u8]) -> Result<VerifiedClaims, AuthError> {
 }
 
 /// Convert a CBOR value (as it appears in a CWT claim) to JSON for
-/// forwarding. The arkavo_patreon claim is text/integer/bool/array/map
-/// only; bytes (not expected here) become null.
+/// forwarding. Conversions are lossless: integers outside i64 fall back to
+/// u64 then to a decimal string (rather than silently becoming null), and an
+/// unexpected CBOR type (bytes, float, tag) is preserved as a string with a
+/// warning so a future schema change surfaces instead of dropping data.
 fn cbor_to_json(v: &Value) -> serde_json::Value {
     use serde_json::Value as J;
     match v {
         Value::Text(s) => J::String(s.clone()),
         Value::Integer(n) => {
             let i: i128 = (*n).into();
-            i64::try_from(i).map(J::from).unwrap_or(J::Null)
+            if let Ok(small) = i64::try_from(i) {
+                J::from(small)
+            } else if let Ok(big) = u64::try_from(i) {
+                J::from(big)
+            } else {
+                // Beyond u64 (rare): keep the exact value as a string.
+                J::String(i.to_string())
+            }
         }
         Value::Bool(b) => J::Bool(*b),
         Value::Null => J::Null,
+        Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(J::Number)
+            .unwrap_or(J::Null),
+        Value::Bytes(b) => {
+            use base64::Engine;
+            J::String(base64::engine::general_purpose::STANDARD.encode(b))
+        }
         Value::Array(a) => J::Array(a.iter().map(cbor_to_json).collect()),
         Value::Map(m) => {
             let mut obj = serde_json::Map::new();
@@ -391,7 +407,10 @@ fn cbor_to_json(v: &Value) -> serde_json::Value {
             }
             J::Object(obj)
         }
-        _ => J::Null,
+        other => {
+            warn!("cbor_to_json: unexpected CBOR type in claim, stringifying: {other:?}");
+            J::String(format!("{other:?}"))
+        }
     }
 }
 
@@ -609,6 +628,22 @@ mod tests {
         let claims = verifier(b"kid-1", vk).verify(&plain, NOW).await.unwrap();
         assert!(claims.patreon_user_id.is_none());
         assert!(claims.email.is_none());
+    }
+
+    #[test]
+    fn cbor_to_json_is_lossless_for_large_ints() {
+        use ciborium::value::Value as C;
+        // u64 beyond i64::MAX must not become null.
+        let big = C::Integer((u64::MAX).into());
+        assert_eq!(cbor_to_json(&big), serde_json::json!(u64::MAX));
+        // small int, bool, nested map.
+        let m = C::Map(vec![
+            (C::Text("n".into()), C::Integer(42.into())),
+            (C::Text("b".into()), C::Bool(true)),
+        ]);
+        let j = cbor_to_json(&m);
+        assert_eq!(j["n"], 42);
+        assert_eq!(j["b"], true);
     }
 
     #[tokio::test]
