@@ -3,15 +3,25 @@
 //! policy locally, so there is exactly one PDP (the platform).
 //!
 //! Requests are made over ConnectRPC's JSON mapping (a plain HTTP POST of
-//! the proto-JSON request — no codegen needed). The entity input is the
-//! full chain, PE → NPE → NPE:
+//! the proto-JSON request — no codegen needed).
 //!
-//! - PE: the consumer's CWT, passed as a token for the platform's ERS to
-//!   resolve (`CreateEntityChainsFromTokens` → Patreon ERS).
-//! - NPE: attested app/device CWTs presented by the client
-//!   (`X-Entity-Token`), category ENVIRONMENT.
-//! - NPE: the environment this node observes (e.g. its region), asserted
-//!   server-side — never client-supplied.
+//! ## Contract (verified against the platform source)
+//!
+//! `JustInTimePDP.resolveEntitiesFromEntityChain` round-trips every chain
+//! entity through ERS `ResolveEntities`, and the Patreon ERS resolves
+//! `Entity_Claims` entities via `resolveFromClaims` (lookup order:
+//! `patreon_access_token` → `patreon_user_id` → `email` →
+//! `preferred_username`). So the default request shape is an entityChain
+//! whose SUBJECT entity carries claims this node extracted from the
+//! *verified* PE CWT (`arkavo_patreon.patreon_user_id`, `email`).
+//!
+//! Two contract facts that shape this client:
+//! - `entityIdentifier.token` is parsed by the ERS with a JWT parser —
+//!   Arkavo CWTs (CBOR) fail that parse, so token mode only works for
+//!   JWT-issuing IdPs (kept available via config for that case).
+//! - CATEGORY_ENVIRONMENT entities are *skipped* by the decision flow
+//!   (`skipEnvironmentEntities=true`); NPE device/environment entities are
+//!   forwarded for forward-compatibility but do not affect decisions yet.
 //!
 //! Unconfigured ⇒ `DenyAll`: the catalog still lists, nothing is entitled.
 
@@ -26,10 +36,12 @@ use tracing::warn;
 pub struct ChainEntity {
     /// True for the person entity; false for NPEs (category ENVIRONMENT).
     pub is_subject: bool,
-    /// Bearer token (base64url CWT) for token-backed entities.
+    /// Bearer token (base64url) — used only in token mode, and only for
+    /// the subject.
     pub token: Option<String>,
-    /// Claims for entities this node asserts directly (observed
-    /// environment); ignored when `token` is set.
+    /// Claims the node asserts for this entity. For the PE these are
+    /// extracted from the verified CWT (patreon_user_id, email, sub); for
+    /// NPEs they describe the attested device or observed environment.
     pub claims: Value,
 }
 
@@ -61,27 +73,45 @@ impl DecisionProvider for DenyAll {
     }
 }
 
+/// How the entity identifier is presented to the authorization service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EntityMode {
+    /// entityChain of claims-bearing entities, built from claims this node
+    /// extracted from *verified* CWTs. The contract-verified default for
+    /// Arkavo CWTs.
+    #[default]
+    Claims,
+    /// entityIdentifier.token — the platform ERS parses the token itself.
+    /// Only works for JWT-issuing IdPs (the ERS's parser rejects CWTs).
+    Token,
+}
+
+impl std::str::FromStr for EntityMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "claims" | "" => Ok(EntityMode::Claims),
+            "token" => Ok(EntityMode::Token),
+            other => Err(format!("invalid entity_mode {other:?} (claims|token)")),
+        }
+    }
+}
+
 /// ConnectRPC-JSON client for authorization.v2.
 pub struct ConnectAuthzClient {
     endpoint: String,
     bearer_token: Option<String>,
-    /// Send multi-entity chains as `entityIdentifier.entityChain`.
-    /// EXPERIMENTAL: an explicit entityChain tells the PDP the entities are
-    /// already resolved — the ERS does not unpack tokens buried in claims —
-    /// so this shape must be contract-verified against the platform before
-    /// production use. When false (default), the PE token is always sent as
-    /// `entityIdentifier.token` (the path the ERS resolves) and NPE/
-    /// environment context is logged but not forwarded.
-    entity_chain_mode: bool,
+    entity_mode: EntityMode,
     http: reqwest::Client,
 }
 
 impl ConnectAuthzClient {
-    pub fn new(endpoint: String, bearer_token: Option<String>, entity_chain_mode: bool) -> Self {
+    pub fn new(endpoint: String, bearer_token: Option<String>, entity_mode: EntityMode) -> Self {
         Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             bearer_token,
-            entity_chain_mode,
+            entity_mode,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
@@ -96,46 +126,48 @@ impl ConnectAuthzClient {
             .iter()
             .find(|e| e.is_subject)
             .context("decision request has no subject entity")?;
-        let pe_token = pe.token.as_ref().context("subject entity has no token")?;
 
-        let entity_identifier = if self.entity_chain_mode && req.chain.len() > 1 {
-            let entities: Vec<Value> = req
-                .chain
-                .iter()
-                .enumerate()
-                .map(|(i, e)| {
-                    let category = if e.is_subject {
-                        "CATEGORY_SUBJECT"
-                    } else {
-                        "CATEGORY_ENVIRONMENT"
-                    };
-                    let mut claims = e.claims.clone();
-                    if let Some(token) = &e.token {
-                        claims = json!({ "token": token });
-                    }
-                    json!({
-                        "ephemeralId": format!("e{i}"),
-                        "category": category,
-                        "claims": {
-                            "@type": "type.googleapis.com/google.protobuf.Struct",
-                            "value": claims,
-                        },
-                    })
-                })
-                .collect();
-            json!({ "entityChain": { "ephemeralId": "chain", "entities": entities } })
-        } else {
-            // The contract-verified path: a token identifier triggers the
-            // platform ERS (CreateEntityChainsFromTokens) to resolve the
-            // subject's claims. NPE/environment entities are validated at
-            // the edge but not yet forwarded — see entity_chain_mode.
-            if req.chain.len() > 1 {
-                warn!(
-                    dropped = req.chain.len() - 1,
-                    "NPE/environment entities verified but not forwarded (entity_chain_mode off)"
-                );
+        let entity_identifier = match self.entity_mode {
+            EntityMode::Token => {
+                let pe_token = pe
+                    .token
+                    .as_ref()
+                    .context("subject entity has no token (entity_mode = token)")?;
+                if req.chain.len() > 1 {
+                    warn!(
+                        dropped = req.chain.len() - 1,
+                        "NPE/environment entities not representable in token mode"
+                    );
+                }
+                json!({ "token": { "ephemeralId": "pe", "jwt": pe_token } })
             }
-            json!({ "token": { "ephemeralId": "pe", "jwt": pe_token } })
+            EntityMode::Claims => {
+                // Every chain entity travels as Entity_Claims (an Any-wrapped
+                // Struct). The PDP resolves all of them through the ERS;
+                // CATEGORY_ENVIRONMENT entries are filtered by the decision
+                // flow today and carried for forward-compatibility.
+                let entities: Vec<Value> = req
+                    .chain
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let category = if e.is_subject {
+                            "CATEGORY_SUBJECT"
+                        } else {
+                            "CATEGORY_ENVIRONMENT"
+                        };
+                        json!({
+                            "ephemeralId": format!("e{i}"),
+                            "category": category,
+                            "claims": {
+                                "@type": "type.googleapis.com/google.protobuf.Struct",
+                                "value": e.claims,
+                            },
+                        })
+                    })
+                    .collect();
+                json!({ "entityChain": { "ephemeralId": "chain", "entities": entities } })
+            }
         };
 
         Ok(json!({
@@ -213,7 +245,7 @@ mod tests {
         ChainEntity {
             is_subject: true,
             token: Some(token.to_string()),
-            claims: Value::Null,
+            claims: json!({ "patreon_user_id": "p-1", "sub": "arkavo:u1" }),
         }
     }
 
@@ -228,12 +260,15 @@ mod tests {
         assert_eq!(d.get("r1"), Some(&false));
     }
 
-    fn client(entity_chain_mode: bool) -> ConnectAuthzClient {
-        ConnectAuthzClient::new("https://platform.test".into(), None, entity_chain_mode)
+    fn client(mode: EntityMode) -> ConnectAuthzClient {
+        ConnectAuthzClient::new("https://platform.test".into(), None, mode)
     }
 
     #[test]
-    fn single_pe_token_uses_token_identifier() {
+    fn claims_mode_sends_subject_claims_chain() {
+        // The contract-verified default: the PE travels as Entity_Claims
+        // carrying the identifiers the Patreon ERS resolves
+        // (patreon_user_id / email), wrapped as an Any Struct.
         let req = DecisionRequest {
             chain: vec![pe("tok-abc")],
             action: "read".into(),
@@ -242,8 +277,17 @@ mod tests {
                 vec!["https://p.example/attr/tier/value/gold".into()],
             )],
         };
-        let body = client(false).build_request(&req).unwrap();
-        assert_eq!(body["entityIdentifier"]["token"]["jwt"], "tok-abc");
+        let body = client(EntityMode::Claims).build_request(&req).unwrap();
+        let entities = body["entityIdentifier"]["entityChain"]["entities"]
+            .as_array()
+            .unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0]["category"], "CATEGORY_SUBJECT");
+        assert_eq!(
+            entities[0]["claims"]["@type"],
+            "type.googleapis.com/google.protobuf.Struct"
+        );
+        assert_eq!(entities[0]["claims"]["value"]["patreon_user_id"], "p-1");
         assert_eq!(body["action"]["name"], "read");
         assert_eq!(body["resources"][0]["ephemeralId"], "hash1");
         assert_eq!(
@@ -253,10 +297,21 @@ mod tests {
     }
 
     #[test]
-    fn chain_mode_off_forwards_only_the_pe_token() {
-        // The safe default: NPE/environment context must never push the
-        // request into the unverified entityChain shape, which the ERS
-        // would treat as already-resolved (deny-everything footgun).
+    fn token_mode_uses_token_identifier() {
+        let req = DecisionRequest {
+            chain: vec![pe("tok-abc")],
+            action: "read".into(),
+            resources: vec![("hash1".into(), vec![])],
+        };
+        let body = client(EntityMode::Token).build_request(&req).unwrap();
+        assert_eq!(body["entityIdentifier"]["token"]["jwt"], "tok-abc");
+        assert!(body["entityIdentifier"]["entityChain"].is_null());
+    }
+
+    #[test]
+    fn token_mode_drops_npes_rather_than_burying_them() {
+        // Token mode cannot represent NPEs; they must never be smuggled in
+        // a shape the ERS would silently fail to resolve.
         let req = DecisionRequest {
             chain: vec![
                 pe("pe-tok"),
@@ -269,7 +324,7 @@ mod tests {
             action: "read".into(),
             resources: vec![("r".into(), vec![])],
         };
-        let body = client(false).build_request(&req).unwrap();
+        let body = client(EntityMode::Token).build_request(&req).unwrap();
         assert_eq!(body["entityIdentifier"]["token"]["jwt"], "pe-tok");
         assert!(body["entityIdentifier"]["entityChain"].is_null());
     }
@@ -285,7 +340,7 @@ mod tests {
             action: "read".into(),
             resources: vec![],
         };
-        assert!(client(false).build_request(&req).is_err());
+        assert!(client(EntityMode::Claims).build_request(&req).is_err());
     }
 
     #[test]
@@ -296,7 +351,7 @@ mod tests {
                 ChainEntity {
                     is_subject: false,
                     token: Some("npe-tok".into()),
-                    claims: Value::Null,
+                    claims: json!({ "sub": "arkavo:u1", "kind": "ios-app" }),
                 },
                 ChainEntity {
                     is_subject: false,
@@ -307,7 +362,7 @@ mod tests {
             action: "read".into(),
             resources: vec![("r".into(), vec![])],
         };
-        let body = client(true).build_request(&req).unwrap();
+        let body = client(EntityMode::Claims).build_request(&req).unwrap();
         let entities = body["entityIdentifier"]["entityChain"]["entities"]
             .as_array()
             .unwrap();

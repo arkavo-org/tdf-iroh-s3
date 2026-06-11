@@ -123,11 +123,13 @@ async fn main() -> Result<()> {
             } else {
                 let bearer =
                     (!cat.authz.bearer_token.is_empty()).then(|| cat.authz.bearer_token.clone());
-                let provider = ConnectAuthzClient::new(
-                    cat.authz.endpoint.clone(),
-                    bearer,
-                    cat.authz.entity_chain_mode,
-                );
+                let entity_mode: tdf_iroh_s3::authz::EntityMode = cat
+                    .authz
+                    .entity_mode
+                    .parse()
+                    .map_err(|e: String| anyhow::anyhow!(e))?;
+                let provider =
+                    ConnectAuthzClient::new(cat.authz.endpoint.clone(), bearer, entity_mode);
                 router = router.merge(catalog_router(
                     cache,
                     provider,

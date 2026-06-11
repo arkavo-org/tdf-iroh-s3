@@ -74,11 +74,16 @@ action = "read"
 # environment_region is asserted by this node as an environment NPE in the
 # decision entity chain; clients can never supply environment claims.
 environment_region = "us-east-1"
-# EXPERIMENTAL: forward multi-entity chains as entityIdentifier.entityChain.
-# Leave false until contract-verified against the platform — the ERS does
-# not resolve tokens buried in entityChain claims. When false, only the PE
-# token is forwarded; NPE/environment entities are verified at the edge.
-entity_chain_mode = false
+# Entity presentation, contract-verified against the platform source:
+# "claims" (default) sends an entityChain of claims-bearing entities built
+# from claims this node extracts from verified CWTs (arkavo_patreon.
+# patreon_user_id, email) — the platform PDP resolves every chain entity
+# through the ERS, and the Patreon ERS resolves exactly those claims.
+# "token" sends entityIdentifier.token, which only works for JWT IdPs
+# (the ERS token parser rejects CWTs). Environment entities are filtered
+# by the platform's decision flow today; they are forwarded for
+# forward-compatibility.
+entity_mode = "claims"
 ```
 
 The IAM role needs the same S3 write permissions on `manifests/` and

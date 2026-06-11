@@ -53,13 +53,19 @@ pub enum AuthError {
     KeySet(String),
 }
 
-/// The subset of CWT claims the tag API needs.
+/// The subset of CWT claims the tag and catalog APIs need.
 #[derive(Debug, Clone)]
 pub struct VerifiedClaims {
     pub iss: String,
     pub sub: String,
     pub exp: i64,
     pub iat: i64,
+    /// `arkavo_patreon.patreon_user_id`, when the token carries the
+    /// membership claim — the identifier the platform's Patreon ERS
+    /// resolves directly.
+    pub patreon_user_id: Option<String>,
+    /// `email` claim, when present (the ERS's fallback lookup key).
+    pub email: Option<String>,
 }
 
 struct KeyCache {
@@ -315,13 +321,30 @@ fn parse_claims(payload: &[u8]) -> Result<VerifiedClaims, AuthError> {
     let mut sub = None;
     let mut exp = None;
     let mut iat = None;
+    let mut patreon_user_id = None;
+    let mut email = None;
     for (k, v) in entries {
-        let Value::Integer(key) = k else { continue };
-        match (i128::from(key), v) {
-            (1, Value::Text(s)) => iss = Some(s),
-            (2, Value::Text(s)) => sub = Some(s),
-            (4, Value::Integer(n)) => exp = i64::try_from(i128::from(n)).ok(),
-            (6, Value::Integer(n)) => iat = i64::try_from(i128::from(n)).ok(),
+        match k {
+            Value::Integer(key) => match (i128::from(key), v) {
+                (1, Value::Text(s)) => iss = Some(s),
+                (2, Value::Text(s)) => sub = Some(s),
+                (4, Value::Integer(n)) => exp = i64::try_from(i128::from(n)).ok(),
+                (6, Value::Integer(n)) => iat = i64::try_from(i128::from(n)).ok(),
+                _ => {}
+            },
+            Value::Text(key) => match (key.as_str(), v) {
+                ("email", Value::Text(s)) => email = Some(s),
+                ("arkavo_patreon", Value::Map(patreon)) => {
+                    for (pk, pv) in patreon {
+                        if let (Value::Text(pk), Value::Text(pv)) = (pk, pv)
+                            && pk == "patreon_user_id"
+                        {
+                            patreon_user_id = Some(pv);
+                        }
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -331,6 +354,8 @@ fn parse_claims(payload: &[u8]) -> Result<VerifiedClaims, AuthError> {
         sub: sub.ok_or(AuthError::MissingClaim("sub"))?,
         exp: exp.ok_or(AuthError::MissingClaim("exp"))?,
         iat: iat.ok_or(AuthError::MissingClaim("iat"))?,
+        patreon_user_id,
+        email,
     })
 }
 
@@ -343,13 +368,29 @@ pub(crate) mod test_support {
     use p256::ecdsa::{SigningKey, signature::Signer};
 
     pub fn mint(key: &SigningKey, kid: &[u8], iss: &str, sub: &str, iat: i64, exp: i64) -> String {
+        mint_with_extras(key, kid, iss, sub, iat, exp, &[])
+    }
+
+    /// Mint with additional text-keyed claims, e.g. an `arkavo_patreon` map.
+    pub fn mint_with_extras(
+        key: &SigningKey,
+        kid: &[u8],
+        iss: &str,
+        sub: &str,
+        iat: i64,
+        exp: i64,
+        extras: &[(&str, Value)],
+    ) -> String {
         use base64::Engine;
-        let entries: Vec<(Value, Value)> = vec![
+        let mut entries: Vec<(Value, Value)> = vec![
             (Value::Integer(1.into()), Value::Text(iss.into())),
             (Value::Integer(2.into()), Value::Text(sub.into())),
             (Value::Integer(4.into()), Value::Integer(exp.into())),
             (Value::Integer(6.into()), Value::Integer(iat.into())),
         ];
+        for (k, v) in extras {
+            entries.push((Value::Text((*k).into()), v.clone()));
+        }
         let mut payload = Vec::new();
         ciborium::ser::into_writer(&Value::Map(entries), &mut payload).unwrap();
 
@@ -457,6 +498,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(claims.sub, "arkavo:u1");
+    }
+
+    #[tokio::test]
+    async fn parses_patreon_and_email_claims() {
+        let (sk, vk) = keypair();
+        let patreon = Value::Map(vec![
+            (Value::Text("role".into()), Value::Text("consumer".into())),
+            (
+                Value::Text("patreon_user_id".into()),
+                Value::Text("p-9000".into()),
+            ),
+        ]);
+        let token = test_support::mint_with_extras(
+            &sk,
+            b"kid-1",
+            "https://identity.test",
+            "arkavo:u1",
+            NOW,
+            NOW + 3600,
+            &[
+                ("arkavo_patreon", patreon),
+                ("email", Value::Text("a@b.test".into())),
+            ],
+        );
+        let claims = verifier(b"kid-1", vk).verify(&token, NOW).await.unwrap();
+        assert_eq!(claims.patreon_user_id.as_deref(), Some("p-9000"));
+        assert_eq!(claims.email.as_deref(), Some("a@b.test"));
+
+        // Tokens without the claim parse with None — not an error.
+        let plain = mint(&sk, b"kid-1", "i", "s", NOW, NOW + 3600);
+        let claims = verifier(b"kid-1", vk).verify(&plain, NOW).await.unwrap();
+        assert!(claims.patreon_user_id.is_none());
+        assert!(claims.email.is_none());
     }
 
     #[tokio::test]

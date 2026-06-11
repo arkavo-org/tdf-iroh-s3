@@ -93,15 +93,14 @@ pub struct AuthzConfig {
     /// no environment entity is appended to chains.
     #[serde(default)]
     pub environment_region: String,
-    /// EXPERIMENTAL: forward multi-entity chains as
-    /// `entityIdentifier.entityChain`. Leave false until that shape is
-    /// contract-verified against the platform — the ERS does not resolve
-    /// tokens buried in entityChain claims, so enabling this prematurely
-    /// silently denies everything. When false, only the PE token is
-    /// forwarded (the ERS-resolved path); NPE/environment entities are
-    /// verified at the edge and logged.
+    /// How entities are presented to the authorization service:
+    /// "claims" (default) sends an entityChain of claims-bearing entities
+    /// built from claims this node extracted from verified CWTs — the
+    /// shape the platform's ERS resolves for Arkavo tokens. "token" sends
+    /// `entityIdentifier.token` for JWT-issuing IdPs (the platform's ERS
+    /// token parser rejects CWTs).
     #[serde(default)]
-    pub entity_chain_mode: bool,
+    pub entity_mode: String,
 }
 
 impl Default for AuthzConfig {
@@ -111,7 +110,7 @@ impl Default for AuthzConfig {
             action: default_authz_action(),
             bearer_token: String::new(),
             environment_region: String::new(),
-            entity_chain_mode: false,
+            entity_mode: String::new(),
         }
     }
 }

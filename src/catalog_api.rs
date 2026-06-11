@@ -305,10 +305,20 @@ async fn build_chain<S: CatalogStore, D: DecisionProvider>(
         err(StatusCode::UNAUTHORIZED, "invalid token")
     })?;
 
+    // Subject claims for the decision: extracted from the *verified* CWT —
+    // the identifiers the platform's Patreon ERS resolves directly.
+    let mut subject_claims = serde_json::Map::new();
+    subject_claims.insert("sub".into(), pe.sub.clone().into());
+    if let Some(uid) = &pe.patreon_user_id {
+        subject_claims.insert("patreon_user_id".into(), uid.clone().into());
+    }
+    if let Some(email) = &pe.email {
+        subject_claims.insert("email".into(), email.clone().into());
+    }
     let mut chain = vec![ChainEntity {
         is_subject: true,
         token: Some(pe_token.to_string()),
-        claims: serde_json::Value::Null,
+        claims: serde_json::Value::Object(subject_claims),
     }];
 
     for token in npe_tokens {
@@ -327,7 +337,7 @@ async fn build_chain<S: CatalogStore, D: DecisionProvider>(
         chain.push(ChainEntity {
             is_subject: false,
             token: Some(token.to_string()),
-            claims: serde_json::Value::Null,
+            claims: serde_json::json!({ "sub": claims.sub, "iss": claims.iss }),
         });
     }
 
