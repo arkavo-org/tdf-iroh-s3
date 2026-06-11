@@ -48,6 +48,7 @@ trusted_public_keys = []
 enabled = true
 bind_port = 8090
 cose_keys_url = "https://identity.arkavo.net/.well-known/cose-keys"
+expected_issuer = "https://identity.arkavo.net"
 tag_prefix = "catalog/"
 ```
 

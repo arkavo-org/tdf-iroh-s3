@@ -51,9 +51,17 @@ async fn main() -> Result<()> {
             !http_cfg.cose_keys_url.is_empty(),
             "[http] enabled requires cose_keys_url (e.g. https://identity.arkavo.net/.well-known/cose-keys)"
         );
+        let expected_iss = if http_cfg.expected_issuer.is_empty() {
+            tracing::warn!(
+                "[http] expected_issuer unset — any token signed by the key set is accepted"
+            );
+            None
+        } else {
+            Some(http_cfg.expected_issuer.clone())
+        };
         let state = Arc::new(ApiState {
             store: Arc::clone(&node.s3_client),
-            verifier: CwtVerifier::new(http_cfg.cose_keys_url.clone()),
+            verifier: CwtVerifier::new(http_cfg.cose_keys_url.clone(), expected_iss),
             tag_prefix: http_cfg.tag_prefix.clone(),
         });
         let listener = tokio::net::TcpListener::bind(("0.0.0.0", http_cfg.bind_port)).await?;

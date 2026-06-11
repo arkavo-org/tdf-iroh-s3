@@ -79,6 +79,11 @@ pub struct HttpConfig {
     pub bind_port: u16,
     #[serde(default)]
     pub cose_keys_url: String,
+    /// Required `iss` claim on tag-write CWTs (e.g.
+    /// "https://identity.arkavo.net"). Empty disables the issuer check —
+    /// any token signed by a key in the key set is accepted.
+    #[serde(default)]
+    pub expected_issuer: String,
     #[serde(default = "default_tag_prefix")]
     pub tag_prefix: String,
 }
@@ -89,6 +94,7 @@ impl Default for HttpConfig {
             enabled: false,
             bind_port: default_http_bind_port(),
             cose_keys_url: String::new(),
+            expected_issuer: String::new(),
             tag_prefix: default_tag_prefix(),
         }
     }

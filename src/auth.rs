@@ -27,6 +27,10 @@ const SKEW_SECS: i64 = 60;
 /// tokens cannot turn this node into an IdP load generator.
 const KEY_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Hard bound on the IdP key-set fetch — a hung IdP must not wedge
+/// token verification.
+const KEY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("malformed token")]
@@ -43,6 +47,8 @@ pub enum AuthError {
     NotYetValid,
     #[error("required claim missing: {0}")]
     MissingClaim(&'static str),
+    #[error("issuer mismatch")]
+    Issuer,
     #[error("key set unavailable: {0}")]
     KeySet(String),
 }
@@ -63,16 +69,27 @@ struct KeyCache {
 
 pub struct CwtVerifier {
     cose_keys_url: Option<String>,
+    expected_iss: Option<String>,
     http: reqwest::Client,
     cache: RwLock<KeyCache>,
 }
 
+fn bounded_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(KEY_FETCH_TIMEOUT)
+        .build()
+        .expect("reqwest client")
+}
+
 impl CwtVerifier {
     /// Verifier that fetches (and refreshes) keys from a COSE key set URL.
-    pub fn new(cose_keys_url: String) -> Self {
+    /// When `expected_iss` is set, tokens minted by any other issuer are
+    /// rejected even if their signature verifies.
+    pub fn new(cose_keys_url: String, expected_iss: Option<String>) -> Self {
         Self {
             cose_keys_url: Some(cose_keys_url),
-            http: reqwest::Client::new(),
+            expected_iss,
+            http: bounded_http_client(),
             cache: RwLock::new(KeyCache {
                 keys: HashMap::new(),
                 last_fetch: None,
@@ -85,12 +102,20 @@ impl CwtVerifier {
     pub fn with_static_keys(keys: Vec<(Vec<u8>, VerifyingKey)>) -> Self {
         Self {
             cose_keys_url: None,
-            http: reqwest::Client::new(),
+            expected_iss: None,
+            http: bounded_http_client(),
             cache: RwLock::new(KeyCache {
                 keys: keys.into_iter().collect(),
                 last_fetch: None,
             }),
         }
+    }
+
+    /// Require a specific `iss` claim on every accepted token.
+    #[must_use]
+    pub fn with_expected_issuer(mut self, iss: String) -> Self {
+        self.expected_iss = Some(iss);
+        self
     }
 
     /// Verify a base64url(no pad) CWT and return its claims.
@@ -140,6 +165,14 @@ impl CwtVerifier {
         if claims.iat > now + SKEW_SECS {
             return Err(AuthError::NotYetValid);
         }
+        // Issuer pinning: a key in the trusted set is necessary but not
+        // sufficient — tokens minted by a different issuer (or for an
+        // unrelated purpose by a co-located IdP) are refused.
+        if let Some(expected) = &self.expected_iss
+            && &claims.iss != expected
+        {
+            return Err(AuthError::Issuer);
+        }
         Ok(claims)
     }
 
@@ -153,16 +186,19 @@ impl CwtVerifier {
             return Ok(());
         };
 
-        let mut cache = self.cache.write().await;
-        // Re-check under the write lock: another task may have just
-        // refreshed, and a flood of unknown-kid tokens must not stampede
-        // the IdP.
-        if let Some(last) = cache.last_fetch
-            && last.elapsed() < KEY_REFRESH_MIN_INTERVAL
+        // Claim the refresh slot under the write lock, but do NOT hold the
+        // lock across the network fetch — concurrent verifications must keep
+        // reading the current key set, and a slow/hung IdP must not wedge
+        // the whole API. The rate-limit stamp doubles as the stampede guard.
         {
-            return Ok(());
+            let mut cache = self.cache.write().await;
+            if let Some(last) = cache.last_fetch
+                && last.elapsed() < KEY_REFRESH_MIN_INTERVAL
+            {
+                return Ok(());
+            }
+            cache.last_fetch = Some(Instant::now());
         }
-        cache.last_fetch = Some(Instant::now());
 
         let resp = self
             .http
@@ -184,7 +220,7 @@ impl CwtVerifier {
         let keys = parse_cose_key_set(&body)
             .map_err(|e| AuthError::KeySet(format!("parse key set: {e}")))?;
         info!(count = keys.len(), "Refreshed COSE key set from IdP");
-        cache.keys = keys.into_iter().collect();
+        self.cache.write().await.keys = keys.into_iter().collect();
         Ok(())
     }
 }
@@ -386,6 +422,41 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AuthError::Expired));
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_issuer() {
+        let (sk, vk) = keypair();
+        let token = mint(
+            &sk,
+            b"kid-1",
+            "https://evil.test",
+            "arkavo:u1",
+            NOW,
+            NOW + 3600,
+        );
+        let err = verifier(b"kid-1", vk)
+            .with_expected_issuer("https://identity.test".into())
+            .verify(&token, NOW)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::Issuer));
+
+        // Matching issuer still verifies.
+        let token = mint(
+            &sk,
+            b"kid-1",
+            "https://identity.test",
+            "arkavo:u1",
+            NOW,
+            NOW + 3600,
+        );
+        let claims = verifier(b"kid-1", vk)
+            .with_expected_issuer("https://identity.test".into())
+            .verify(&token, NOW)
+            .await
+            .unwrap();
+        assert_eq!(claims.sub, "arkavo:u1");
     }
 
     #[tokio::test]
