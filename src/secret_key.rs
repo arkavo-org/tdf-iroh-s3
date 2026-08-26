@@ -36,7 +36,7 @@ pub async fn load_or_create(param_name: &str, region: &str) -> Result<SecretKey>
             // Check if it's a parameter-not-found error
             if is_parameter_not_found(&e) {
                 info!("No secret key found in SSM, generating new one");
-                let key = SecretKey::generate(&mut rand::rng());
+                let key = SecretKey::generate();
                 let key_hex = hex::encode(key.to_bytes());
 
                 ssm.put_parameter()

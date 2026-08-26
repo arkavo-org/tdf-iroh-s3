@@ -6,10 +6,10 @@ rust-version = "1.91"
 
 [dependencies]
 # Iroh networking, blobs, and replicated docs
-iroh = "0.97"
-iroh-base = "0.97"
-iroh-blobs = "0.99"
-irpc = "0.13"
+iroh = "1.0.3"
+iroh-base = "1.0.3"
+iroh-blobs = "0.103"
+irpc = "0.17"
 
 # OpenTDF validation
 opentdf = { git = "https://github.com/arkavo-org/opentdf-rs", tag = "0.12.0", default-features = false }
@@ -55,7 +55,6 @@ thiserror = "2"
 # Misc
 bytes = "1"
 hex = "0.4"
-rand = "0.9"
 futures-lite = "2.6.1"
 
 # Embedded database
