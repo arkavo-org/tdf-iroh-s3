@@ -57,7 +57,7 @@ fn create_tdf_with_attribute(attr_fqn: &str) -> Vec<u8> {
 
 #[test]
 fn derive_artifacts_produces_manifest_and_group_entries() {
-    use tdf_iroh_s3::catalog::{CatalogEntry, derive_artifacts};
+    use tdf_core::catalog::{CatalogEntry, derive_artifacts};
     use tdf_iroh_s3::config::CatalogConfig;
     use tdf_iroh_s3::validation::validate_blob;
 
@@ -71,8 +71,15 @@ fn derive_artifacts_produces_manifest_and_group_entries() {
         enabled: true,
         ..CatalogConfig::default()
     };
-    let derived = derive_artifacts(&manifest, &"ab".repeat(32), tdf.len() as u64, 42, &config)
-        .expect("derivation succeeds");
+    let derived = derive_artifacts(
+        &manifest,
+        &"ab".repeat(32),
+        tdf.len() as u64,
+        42,
+        true,
+        &config.group_attribute_prefix(),
+    )
+    .expect("derivation succeeds");
 
     let parsed: serde_json::Value =
         serde_json::from_str(&derived.manifest_json).expect("extracted manifest is valid JSON");
@@ -95,14 +102,12 @@ fn derive_artifacts_produces_manifest_and_group_entries() {
 
 #[test]
 fn derive_artifacts_with_catalog_disabled_still_extracts_manifest() {
-    use tdf_iroh_s3::catalog::derive_artifacts;
-    use tdf_iroh_s3::config::CatalogConfig;
+    use tdf_core::catalog::derive_artifacts;
     use tdf_iroh_s3::validation::validate_blob;
 
     let tdf = create_tdf_with_attribute("https://patreon.arkavo.com/attr/campaign/value/1");
     let manifest = validate_blob(&tdf, &ValidationConfig::default()).unwrap();
-    let derived =
-        derive_artifacts(&manifest, &"cd".repeat(32), 1, 0, &CatalogConfig::default()).unwrap();
+    let derived = derive_artifacts(&manifest, &"cd".repeat(32), 1, 0, false, "").unwrap();
     assert!(!derived.manifest_json.is_empty());
     assert!(
         derived.entries.is_empty(),
@@ -112,7 +117,7 @@ fn derive_artifacts_with_catalog_disabled_still_extracts_manifest() {
 
 #[test]
 fn derive_artifacts_ungrouped_policy_yields_no_entries() {
-    use tdf_iroh_s3::catalog::derive_artifacts;
+    use tdf_core::catalog::derive_artifacts;
     use tdf_iroh_s3::config::CatalogConfig;
     use tdf_iroh_s3::validation::validate_blob;
 
@@ -123,6 +128,14 @@ fn derive_artifacts_ungrouped_policy_yields_no_entries() {
         enabled: true,
         ..CatalogConfig::default()
     };
-    let derived = derive_artifacts(&manifest, &"ee".repeat(32), 1, 0, &config).unwrap();
+    let derived = derive_artifacts(
+        &manifest,
+        &"ee".repeat(32),
+        1,
+        0,
+        true,
+        &config.group_attribute_prefix(),
+    )
+    .unwrap();
     assert!(derived.entries.is_empty());
 }

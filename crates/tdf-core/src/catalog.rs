@@ -108,20 +108,21 @@ pub fn derive_artifacts(
     hash_hex: &str,
     size: u64,
     ingested_at: i64,
-    catalog_config: &crate::config::CatalogConfig,
+    catalog_enabled: bool,
+    group_attribute_prefix: &str,
 ) -> Result<DerivedArtifacts> {
     let manifest_json = manifest
         .to_json()
         .context("Failed to serialize manifest for extraction")?;
 
     let mut entries = Vec::new();
-    if catalog_config.enabled {
+    if catalog_enabled {
         let policy_json = manifest
             .get_policy_raw()
             .context("Failed to decode policy from manifest")?;
         let fqns = extract_attribute_fqns(&policy_json)
             .context("Failed to extract attribute FQNs from policy")?;
-        let groups = group_keys(&fqns, &catalog_config.group_attribute_prefix());
+        let groups = group_keys(&fqns, group_attribute_prefix);
         if !groups.is_empty() {
             let entry = CatalogEntry {
                 hash: hash_hex.to_string(),

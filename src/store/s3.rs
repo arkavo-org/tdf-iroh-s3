@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use bytes::Bytes;
+use tracing::warn;
 
 pub struct S3Client {
     client: Client,
@@ -293,5 +294,39 @@ impl S3Client {
             .await
             .context("Failed to DELETE tag from S3")?;
         Ok(())
+    }
+}
+impl tdf_core::catalog_api::CatalogStore for S3Client {
+    async fn list_group(
+        &self,
+        group: &str,
+    ) -> anyhow::Result<Vec<tdf_core::catalog::CatalogEntry>> {
+        use futures::StreamExt;
+        let hashes = self.list_catalog_hashes(group).await?;
+        let mut entries: Vec<tdf_core::catalog::CatalogEntry> = futures::stream::iter(hashes)
+            .map(|hash| async move {
+                match self.get_catalog_entry(group, &hash).await {
+                    Ok(Some(bytes)) => {
+                        match serde_json::from_slice::<tdf_core::catalog::CatalogEntry>(&bytes) {
+                            Ok(entry) => Some(entry),
+                            Err(e) => {
+                                warn!(%group, %hash, error = %e, "Unparseable catalog entry");
+                                None
+                            }
+                        }
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        warn!(%group, %hash, error = %e, "Catalog entry fetch failed");
+                        None
+                    }
+                }
+            })
+            .buffer_unordered(16)
+            .filter_map(std::future::ready)
+            .collect()
+            .await;
+        entries.sort_by_key(|e| std::cmp::Reverse(e.ingested_at));
+        Ok(entries)
     }
 }

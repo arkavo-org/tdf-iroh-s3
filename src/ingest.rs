@@ -4,10 +4,10 @@ use iroh_blobs::Hash;
 use iroh_blobs::store::fs::FsStore;
 use tracing::{info, warn};
 
-use crate::catalog;
 use crate::config::{CatalogConfig, ValidationConfig};
 use crate::store::s3::S3Client;
 use crate::validation;
+use tdf_core::catalog;
 
 /// Result of a successful ingest operation.
 pub struct IngestResult {
@@ -54,7 +54,14 @@ pub async fn ingest_blob(
     // it is loudly logged, and re-pushing the same content rewrites the
     // artifacts (self-repair). Note: the index prefixes (`manifests/`,
     // `catalog-index/`) need the same S3 write permissions as `blobs/`.
-    match catalog::derive_artifacts(&manifest, &hash_hex, size, unix_now(), catalog_config) {
+    match catalog::derive_artifacts(
+        &manifest,
+        &hash_hex,
+        size,
+        unix_now(),
+        catalog_config.enabled,
+        &catalog_config.group_attribute_prefix(),
+    ) {
         Ok(derived) => {
             if let Err(e) = s3_client
                 .put_manifest(&hash_hex, Bytes::from(derived.manifest_json))

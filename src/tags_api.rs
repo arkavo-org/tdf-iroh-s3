@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::auth::{AuthError, CwtVerifier};
+use tdf_core::auth::{AuthError, CwtVerifier};
 
 /// Storage the tag API needs. `S3Client` is the production implementation;
 /// tests use an in-memory store.
@@ -198,11 +198,11 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::test_support::{keypair, mint};
     use axum::body::Body;
     use axum::http::{Method, Request};
     use http_body_util::BodyExt;
     use std::collections::HashMap;
+    use tdf_core::auth::test_support::{keypair, mint};
     use tokio::sync::Mutex;
     use tower::ServiceExt;
 

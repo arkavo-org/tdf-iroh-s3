@@ -1,10 +1,38 @@
-[package]
-name = "tdf-iroh-s3"
-version = "0.2.0"
+[workspace]
+resolver = "3"
+members = ["crates/tdf-core", "crates/tdf-transparency", "."]
+
+[workspace.package]
 edition = "2024"
 rust-version = "1.91"
 
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+hex = "0.4"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+axum = "0.8"
+coset = "0.3"
+ciborium = "0.2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+sha2 = "0.10"
+blake3 = "1"
+time = { version = "0.3", features = ["formatting"] }
+
+[package]
+name = "tdf-iroh-s3"
+version = "0.2.0"
+edition.workspace = true
+rust-version.workspace = true
+
 [dependencies]
+tdf-core = { path = "crates/tdf-core" }
+
 # Iroh networking and blobs
 iroh = "1.0.3"
 iroh-blobs = "0.103"
@@ -19,7 +47,7 @@ aws-sdk-s3 = "1"
 aws-sdk-ssm = "1"
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio.workspace = true
 tokio-util = "0.7"
 
 # Hashing
@@ -29,35 +57,34 @@ blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 
 # Logging
-tracing = "0.1"
+tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Serialization / config
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
 toml = "0.8"
 
 # Error handling
-anyhow = "1"
-thiserror = "2"
+anyhow.workspace = true
 
 # Misc
 bytes = "1"
-hex = "0.4"
+hex.workspace = true
 iroh-base = "1.0.3"
 
 # HTTP tag API (catalog discovery)
-axum = "0.8"
+axum.workspace = true
 futures = "0.3"
-serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde_json.workspace = true
+reqwest.workspace = true
 
-# CWT verification (COSE_Sign1, ES256) against identity.arkavo.net
-coset = "0.3"
-ciborium = "0.2"
-p256 = { version = "0.13", features = ["ecdsa"] }
-base64 = "0.22"
+coset.workspace = true
+ciborium.workspace = true
+p256.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
+tdf-core = { path = "crates/tdf-core", features = ["test-fixtures"] }
 tempfile = "3"
 zip = "2.2"
 tower = { version = "0.5", features = ["util"] }

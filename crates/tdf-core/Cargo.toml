@@ -1,0 +1,29 @@
+[package]
+name = "tdf-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+hex.workspace = true
+base64.workspace = true
+reqwest.workspace = true
+axum.workspace = true
+coset.workspace = true
+ciborium.workspace = true
+p256.workspace = true
+opentdf = { version = "0.14.2", default-features = false }
+
+[features]
+test-fixtures = []
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
