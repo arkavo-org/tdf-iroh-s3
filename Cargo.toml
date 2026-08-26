@@ -6,12 +6,12 @@ rust-version = "1.91"
 
 [dependencies]
 # Iroh networking and blobs
-iroh = "0.97"
-iroh-blobs = "0.99"
-irpc = "0.13"
+iroh = "1.0.3"
+iroh-blobs = "0.103"
+irpc = "0.17"
 
 # OpenTDF validation
-opentdf = { git = "https://github.com/arkavo-org/opentdf-rs", default-features = false }
+opentdf = { version = "0.14.2", default-features = false }
 
 # AWS S3
 aws-config = { version = "1", features = ["behavior-version-latest"] }
@@ -43,8 +43,7 @@ thiserror = "2"
 # Misc
 bytes = "1"
 hex = "0.4"
-rand = "0.9"
-iroh-base = "0.97"
+iroh-base = "1.0.3"
 
 # HTTP tag API (catalog discovery)
 axum = "0.8"
