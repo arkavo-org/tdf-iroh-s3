@@ -532,10 +532,10 @@ fn parse_cnf_kid(map: &[(Value, Value)]) -> Result<Option<String>, AuthError> {
     let mut kid_bytes: Option<Vec<u8>> = None;
     let mut cose_kid: Option<Vec<u8>> = None;
     for (k, v) in map {
-        let key_id = match k {
-            Value::Integer(i) => format!("i:{}", i128::from(*i)),
-            _ => return Err(AuthError::Malformed),
+        let Value::Integer(i) = k else {
+            continue;
         };
+        let key_id = format!("i:{}", i128::from(*i));
         if !seen.insert(key_id) {
             return Err(AuthError::DuplicateKey);
         }
@@ -1063,6 +1063,33 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AuthError::DuplicateKey));
+    }
+
+    #[tokio::test]
+    async fn pe_cnf_ignores_unknown_keys() {
+        let (sk, vk) = keypair();
+        let cnf = Value::Map(vec![(
+            Value::Text("x".into()),
+            Value::Text("ignored".into()),
+        )]);
+        let token = mint_map(
+            &sk,
+            b"kid-1",
+            vec![
+                (Value::Integer(1.into()), Value::Text("i".into())),
+                (Value::Integer(2.into()), Value::Text("s".into())),
+                (Value::Integer(3.into()), Value::Text("arkavo".into())),
+                (
+                    Value::Integer(4.into()),
+                    Value::Integer((NOW + 3600).into()),
+                ),
+                (Value::Integer(6.into()), Value::Integer(NOW.into())),
+                (Value::Integer(7.into()), Value::Bytes(vec![0u8; 16])),
+                (Value::Integer(8.into()), cnf),
+            ],
+        );
+        let claims = verifier(b"kid-1", vk).verify(&token, NOW).await.unwrap();
+        assert!(claims.kid.is_none());
     }
 
     #[tokio::test]

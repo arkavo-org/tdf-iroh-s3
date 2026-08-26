@@ -358,6 +358,8 @@ pub struct AuthZenClient {
     credential: ServiceCredential,
     http: reqwest::Client,
     token_cache: tokio::sync::Mutex<Option<CachedToken>>,
+    /// Process-lifetime cache of `access_evaluations_endpoint`. A PDP that
+    /// rotates the URL fails closed until restart.
     evaluations_url: tokio::sync::Mutex<Option<String>>,
 }
 
@@ -368,6 +370,7 @@ impl AuthZenClient {
             credential,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest client"),
             token_cache: tokio::sync::Mutex::new(None),
@@ -576,11 +579,15 @@ fn sanitize_patreon(p: &Value) -> Value {
 }
 
 fn required_obligations_nonempty(context: Option<&Value>) -> bool {
-    context
+    match context
         .and_then(|c| c.get("obligations"))
         .and_then(|o| o.get("required"))
-        .and_then(Value::as_array)
-        .is_some_and(|a| !a.is_empty())
+    {
+        None => false,
+        Some(Value::Array(a)) => !a.is_empty(),
+        // Present and not an empty array (string, object, bool, …) → fail closed.
+        Some(_) => true,
+    }
 }
 
 pub(crate) fn evaluation_entitled(decision: bool, context: Option<&Value>) -> bool {
@@ -913,6 +920,15 @@ mod tests {
         assert!(!evaluation_entitled(
             true,
             Some(&json!({ "obligations": { "required": ["https://example/attr/x"] } }))
+        ));
+        // Present but not an empty array → fail closed (confused-PDP / non-array).
+        assert!(!evaluation_entitled(
+            true,
+            Some(&json!({ "obligations": { "required": "https://example/attr/x" } }))
+        ));
+        assert!(!evaluation_entitled(
+            true,
+            Some(&json!({ "obligations": { "required": { "fqn": "x" } } }))
         ));
     }
 

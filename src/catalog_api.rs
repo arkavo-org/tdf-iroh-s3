@@ -306,6 +306,11 @@ async fn build_chain<S: CatalogStore, D: DecisionProvider>(
         ));
     };
 
+    let extra = usize::from(state.environment.is_some());
+    if 1 + npe_tokens.len() + extra > MAX_CHAIN_ENTITIES {
+        return Err(err(StatusCode::BAD_REQUEST, "too many entities"));
+    }
+
     let now = unix_now();
     let pe = state.verifier.verify(pe_token, now).await.map_err(|e| {
         warn!(error = %e, "PE token verification failed");
@@ -387,11 +392,6 @@ async fn build_chain<S: CatalogStore, D: DecisionProvider>(
                 "kid": kid,
             }),
         });
-    }
-
-    let extra = usize::from(state.environment.is_some());
-    if chain.len() + extra > MAX_CHAIN_ENTITIES {
-        return Err(err(StatusCode::BAD_REQUEST, "too many entities"));
     }
 
     // Observed environment: asserted by this node, never client-supplied.
@@ -883,8 +883,9 @@ mod tests {
         for d in &devices {
             headers.push(("x-entity-token", d.as_str()));
         }
-        let (status, _) = get_json(&r.router, "/catalog/camp1", &headers).await;
+        let (status, body) = get_json(&r.router, "/catalog/camp1", &headers).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "too many entities");
         assert_eq!(
             r.state
                 .provider
@@ -892,6 +893,13 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+
+        // Cap is applied before verify: garbage among an over-size set is 400, not 401.
+        let garbage = "not-a-token";
+        headers[1] = ("x-entity-token", garbage);
+        let (status, body) = get_json(&r.router, "/catalog/camp1", &headers).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "too many entities");
     }
 
     #[tokio::test]
