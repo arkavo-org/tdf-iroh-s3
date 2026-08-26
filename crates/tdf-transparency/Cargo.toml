@@ -1,0 +1,24 @@
+[package]
+name = "tdf-transparency"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tdf-core = { path = "../tdf-core" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+hex.workspace = true
+base64.workspace = true
+coset.workspace = true
+ciborium.workspace = true
+p256.workspace = true
+sha2.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

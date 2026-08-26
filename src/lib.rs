@@ -1,8 +1,3 @@
-pub mod attributes;
-pub mod auth;
-pub mod authz;
-pub mod catalog;
-pub mod catalog_api;
 pub mod config;
 pub mod ingest;
 pub mod node;

@@ -5291,6 +5291,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 
 [[package]]
+name = "tdf-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "ciborium",
+ "coset",
+ "hex",
+ "http-body-util",
+ "opentdf",
+ "p256 0.13.2",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "tdf-iroh-s3"
 version = "0.2.0"
 dependencies = [
@@ -5317,8 +5340,8 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "tdf-core",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "toml",
@@ -5326,6 +5349,27 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zip",
+]
+
+[[package]]
+name = "tdf-transparency"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "ciborium",
+ "coset",
+ "hex",
+ "p256 0.13.2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tdf-core",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

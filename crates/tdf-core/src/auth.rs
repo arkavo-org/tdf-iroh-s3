@@ -414,8 +414,8 @@ fn cbor_to_json(v: &Value) -> serde_json::Value {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod test_support {
     //! Mint Arkavo-compatible CWTs for tests, mirroring authnz-rs `cwt::mint`.
 
     use super::*;

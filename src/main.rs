@@ -6,10 +6,10 @@ use tracing_subscriber::EnvFilter;
 
 use std::sync::Arc;
 
-use tdf_iroh_s3::attributes::{self, AttributeSet};
-use tdf_iroh_s3::auth::CwtVerifier;
-use tdf_iroh_s3::authz::{ConnectAuthzClient, DecisionProvider, DenyAll};
-use tdf_iroh_s3::catalog_api::{self, CatalogApiState, CatalogCache};
+use tdf_core::attributes::{self, AttributeSet};
+use tdf_core::auth::CwtVerifier;
+use tdf_core::authz::{ConnectAuthzClient, DecisionProvider, DenyAll};
+use tdf_core::catalog_api::{self, CatalogApiState, CatalogCache};
 use tdf_iroh_s3::config::Config;
 use tdf_iroh_s3::node::TdfIrohNode;
 use tdf_iroh_s3::ssm;
@@ -177,20 +177,20 @@ async fn main() -> Result<()> {
                         "[catalog.authz] token_url requires client_id and a client secret \
                          (config client_secret, CATALOG_AUTHZ_CLIENT_SECRET env, or client_secret_param in SSM)"
                     );
-                    tdf_iroh_s3::authz::ServiceCredential::ClientCredentials {
+                    tdf_core::authz::ServiceCredential::ClientCredentials {
                         token_url: cat.authz.token_url.clone(),
                         client_id: cat.authz.client_id.clone(),
                         client_secret,
                     }
                 } else if !cat.authz.bearer_token.is_empty() {
-                    tdf_iroh_s3::authz::ServiceCredential::Static(cat.authz.bearer_token.clone())
+                    tdf_core::authz::ServiceCredential::Static(cat.authz.bearer_token.clone())
                 } else {
                     tracing::warn!(
                         "[catalog.authz] no credential configured — the platform requires an                          authenticated caller, decisions will be rejected"
                     );
-                    tdf_iroh_s3::authz::ServiceCredential::None
+                    tdf_core::authz::ServiceCredential::None
                 };
-                let entity_mode: tdf_iroh_s3::authz::EntityMode = cat
+                let entity_mode: tdf_core::authz::EntityMode = cat
                     .authz
                     .entity_mode
                     .parse()
