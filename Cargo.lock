@@ -3518,7 +3518,7 @@ dependencies = [
  "rustc-hash",
  "rustls 0.23.37",
  "rustls-pki-types",
- "rustls-platform-verifier 0.7.0",
+ "rustls-platform-verifier",
  "slab",
  "sorted-index-buffer",
  "thiserror 2.0.18",
@@ -3734,8 +3734,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "opentdf"
-version = "0.11.1"
-source = "git+https://github.com/arkavo-org/opentdf-rs#adfdcf427f67dc0b77ea20ef4b6d139a384bd3dc"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fd9521b1dc98540670f8b4dd989eced59e1c02e5ee7a5c2d23009b0b5793811"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -3751,8 +3752,9 @@ dependencies = [
 
 [[package]]
 name = "opentdf-crypto"
-version = "0.11.1"
-source = "git+https://github.com/arkavo-org/opentdf-rs#adfdcf427f67dc0b77ea20ef4b6d139a384bd3dc"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "812c8bd4ab5bb80f8b687975d7778473523634633dde56852c59d6a26687682e"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3772,8 +3774,9 @@ dependencies = [
 
 [[package]]
 name = "opentdf-protocol"
-version = "0.11.1"
-source = "git+https://github.com/arkavo-org/opentdf-rs#adfdcf427f67dc0b77ea20ef4b6d139a384bd3dc"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7eb9bd50c0ff5a30b6ac53879a494b698b1a88525c5cd41646140cf1a80aa573"
 dependencies = [
  "base64",
  "chrono",
@@ -4523,7 +4526,7 @@ dependencies = [
  "pin-project-lite",
  "rustls 0.23.37",
  "rustls-pki-types",
- "rustls-platform-verifier 0.6.2",
+ "rustls-platform-verifier",
  "sync_wrapper",
  "tokio",
  "tokio-rustls 0.26.4",
@@ -4664,27 +4667,6 @@ checksum = "be040f8b0a225e40375822a563fa9524378b9d63112f53e19ffff34df5d33fdd"
 dependencies = [
  "web-time",
  "zeroize",
-]
-
-[[package]]
-name = "rustls-platform-verifier"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d99feebc72bae7ab76ba994bb5e121b8d83d910ca40b36e0921f53becc41784"
-dependencies = [
- "core-foundation 0.10.1",
- "core-foundation-sys",
- "jni 0.21.1",
- "log",
- "once_cell",
- "rustls 0.23.37",
- "rustls-native-certs",
- "rustls-platform-verifier-android",
- "rustls-webpki 0.103.10",
- "security-framework",
- "security-framework-sys",
- "webpki-root-certs",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
