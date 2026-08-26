@@ -84,7 +84,7 @@ action = "read"
 # Decision protocol. Default is OpenTDF ConnectRPC JSON
 # GetDecisionMultiResource. "authzen" uses AuthZEN Access Evaluations
 # after GET {endpoint}/.well-known/authzen-configuration (endpoint is
-# then the PDP base, e.g. https://kas.arkavo.net). Do not set
+# then the PDP base, e.g. https://platform.arkavo.net). Do not set
 # protocol = "authzen" in production until operators confirm no
 # attribute value carries an obligation trigger (a non-empty
 # context.obligations.required fail-closes a permit).
