@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use tdf_iroh_s3::attributes::{self, AttributeSet};
 use tdf_iroh_s3::auth::CwtVerifier;
-use tdf_iroh_s3::authz::{ConnectAuthzClient, DecisionProvider, DenyAll};
+use tdf_iroh_s3::authz::{
+    AuthZenClient, AuthzProtocol, ConnectAuthzClient, DecisionProvider, DenyAll,
+};
 use tdf_iroh_s3::catalog_api::{self, CatalogApiState, CatalogCache};
 use tdf_iroh_s3::config::Config;
 use tdf_iroh_s3::node::TdfIrohNode;
@@ -190,20 +192,46 @@ async fn main() -> Result<()> {
                     );
                     tdf_iroh_s3::authz::ServiceCredential::None
                 };
-                let entity_mode: tdf_iroh_s3::authz::EntityMode = cat
+                let protocol: AuthzProtocol = cat
                     .authz
-                    .entity_mode
+                    .protocol
                     .parse()
-                    .map_err(|e: String| anyhow::anyhow!(e))?;
-                let provider =
-                    ConnectAuthzClient::new(cat.authz.endpoint.clone(), credential, entity_mode);
-                router = router.merge(catalog_router(
-                    cache,
-                    provider,
-                    Arc::clone(&verifier),
-                    cat.authz.action.clone(),
-                    environment,
-                ));
+                    .map_err(|e: String| anyhow::anyhow!("[catalog.authz] {e}"))?;
+                match protocol {
+                    AuthzProtocol::Authzen => {
+                        info!(
+                            "Catalog authz protocol authzen (PDP {})",
+                            cat.authz.endpoint
+                        );
+                        let provider = AuthZenClient::new(cat.authz.endpoint.clone(), credential);
+                        router = router.merge(catalog_router(
+                            cache,
+                            provider,
+                            Arc::clone(&verifier),
+                            cat.authz.action.clone(),
+                            environment,
+                        ));
+                    }
+                    AuthzProtocol::OpentdfV2 => {
+                        let entity_mode: tdf_iroh_s3::authz::EntityMode = cat
+                            .authz
+                            .entity_mode
+                            .parse()
+                            .map_err(|e: String| anyhow::anyhow!(e))?;
+                        let provider = ConnectAuthzClient::new(
+                            cat.authz.endpoint.clone(),
+                            credential,
+                            entity_mode,
+                        );
+                        router = router.merge(catalog_router(
+                            cache,
+                            provider,
+                            Arc::clone(&verifier),
+                            cat.authz.action.clone(),
+                            environment,
+                        ));
+                    }
+                }
             }
             info!(
                 "Catalog endpoint enabled (group attribute {})",
