@@ -81,14 +81,12 @@ cache_ttl_secs = 30
 [catalog.authz]
 endpoint = "https://platform.arkavo.net"
 action = "read"
-# Decision protocol. Default is OpenTDF ConnectRPC JSON
-# GetDecisionMultiResource. "authzen" uses AuthZEN Access Evaluations
-# after GET {endpoint}/.well-known/authzen-configuration (endpoint is
-# then the PDP base, e.g. https://platform.arkavo.net). Do not set
-# protocol = "authzen" in production until operators confirm no
-# attribute value carries an obligation trigger (a non-empty
-# context.obligations.required fail-closes a permit).
-protocol = "opentdf-v2"
+# Decision protocol. Default is AuthZEN Access Evaluations
+# (GET {endpoint}/.well-known/authzen-configuration, then POST
+# access_evaluations_endpoint with the catalog-node service CWT).
+# No users on this catalog — hard cutover. Rollback:
+# protocol = "opentdf-v2"
+protocol = "authzen"
 token_url = "https://identity.arkavo.net/oauth/token"
 client_id = "catalog-node"
 # The secret is read from the CATALOG_AUTHZ_CLIENT_SECRET environment
@@ -130,9 +128,10 @@ with whether the requesting entity chain is entitled to it:
 # Anonymous: full listing, nothing entitled (public storefront)
 curl https://iroh.arkavo.net/catalog/12345678
 
-# With a person entity (Arkavo CWT) — decisions come from the configured
-# PDP over the full chain PE -> device NPE(s) -> environment. Repeat
-# X-Entity-Token once per DeviceCheck CWT (not comma-separated):
+# With a person entity (Arkavo CWT) — decisions come from AuthZEN
+# /access/v1/evaluations on platform.arkavo.net (catalog-node service CWT
+# is the PEP Bearer; the PE CWT is SARC subject). Repeat X-Entity-Token
+# once per DeviceCheck CWT (not comma-separated):
 curl https://iroh.arkavo.net/catalog/12345678 \
   -H "Authorization: Bearer <pe-cwt>" \
   -H "X-Entity-Token: <devicecheck-cwt>" \

@@ -98,11 +98,11 @@ impl std::str::FromStr for EntityMode {
     }
 }
 
-/// PEP↔PDP decision protocol. Default stays ConnectRPC JSON.
+/// PEP↔PDP decision protocol. Default is AuthZEN; `opentdf-v2` is rollback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AuthzProtocol {
-    #[default]
     OpentdfV2,
+    #[default]
     Authzen,
 }
 
@@ -111,8 +111,8 @@ impl std::str::FromStr for AuthzProtocol {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
-            "opentdf-v2" | "" => Ok(AuthzProtocol::OpentdfV2),
-            "authzen" => Ok(AuthzProtocol::Authzen),
+            "authzen" | "" => Ok(AuthzProtocol::Authzen),
+            "opentdf-v2" => Ok(AuthzProtocol::OpentdfV2),
             other => Err(format!("invalid protocol {other:?} (opentdf-v2|authzen)")),
         }
     }
