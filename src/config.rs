@@ -12,6 +12,67 @@ pub struct Config {
     pub http: HttpConfig,
     #[serde(default)]
     pub catalog: CatalogConfig,
+    #[serde(default)]
+    pub publishing: PublishingConfig,
+}
+
+/// Creator publishing gate and moderation (tdf-iroh-s3#17). On by default:
+/// pushes need a publish session and tag writes need the entitlement.
+#[derive(Debug, Deserialize)]
+pub struct PublishingConfig {
+    /// `false` restores open pushes and tag writes (development only).
+    #[serde(default = "default_true")]
+    pub required: bool,
+    /// Entitlement required in the publisher CWT's `arkavo_entitlements`.
+    #[serde(default = "default_publish_entitlement")]
+    pub entitlement: String,
+    /// Required `aud` on publisher CWTs (identity.arkavo.net passkey tokens
+    /// carry `arkavo`). Empty disables the audience check.
+    #[serde(default = "default_publisher_audience")]
+    pub audience: String,
+    /// How long a publish session lets an iroh endpoint push.
+    #[serde(default = "default_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+    /// Service client IDs (`sub = client:<id>`) allowed to suspend creators
+    /// and block content. Empty disables the operator API (503).
+    #[serde(default)]
+    pub operator_client_ids: Vec<String>,
+    /// How often moderation records are re-read from S3.
+    #[serde(default = "default_moderation_refresh_secs")]
+    pub moderation_refresh_secs: u64,
+}
+
+impl Default for PublishingConfig {
+    fn default() -> Self {
+        Self {
+            required: true,
+            entitlement: default_publish_entitlement(),
+            audience: default_publisher_audience(),
+            session_ttl_secs: default_session_ttl_secs(),
+            operator_client_ids: Vec::new(),
+            moderation_refresh_secs: default_moderation_refresh_secs(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_publish_entitlement() -> String {
+    crate::moderation::DEFAULT_PUBLISH_ENTITLEMENT.to_string()
+}
+
+fn default_publisher_audience() -> String {
+    "arkavo".to_string()
+}
+
+fn default_session_ttl_secs() -> u64 {
+    900
+}
+
+fn default_moderation_refresh_secs() -> u64 {
+    30
 }
 
 /// Catalog (see tdf-iroh-s3#5). When enabled, every ingested blob gets a

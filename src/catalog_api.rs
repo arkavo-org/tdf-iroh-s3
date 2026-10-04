@@ -179,6 +179,8 @@ pub struct CatalogApiState<S: CatalogStore, D: DecisionProvider> {
     /// Environment claims this node asserts (e.g. its region). None ⇒ no
     /// environment entity is appended.
     pub environment: Option<serde_json::Value>,
+    /// Blocked content is left out of listings (tdf-iroh-s3#17).
+    pub moderation: Option<Arc<crate::moderation::Moderation>>,
 }
 
 #[derive(Serialize)]
@@ -229,10 +231,22 @@ async fn get_catalog<S: CatalogStore, D: DecisionProvider>(
         return Err(err(StatusCode::BAD_REQUEST, "invalid group"));
     }
 
-    let entries = state.cache.entries(&group).await.map_err(|e| {
+    let cached = state.cache.entries(&group).await.map_err(|e| {
         warn!(%group, error = %e, "Catalog listing failed");
         err(StatusCode::BAD_GATEWAY, "storage unavailable")
     })?;
+    // Filtered at serve time, so a block applies at once without evicting
+    // the listing cache.
+    let entries: Vec<CatalogEntry> = cached
+        .iter()
+        .filter(|e| {
+            !state
+                .moderation
+                .as_ref()
+                .is_some_and(|m| m.is_blocked(&e.hash))
+        })
+        .cloned()
+        .collect();
 
     // Assemble and verify the entity chain. Verification failures are 401 —
     // a presented-but-invalid credential is an error, not anonymity.
@@ -520,6 +534,7 @@ mod tests {
             verifier: Arc::new(CwtVerifier::with_static_keys(vec![(b"kid-1".to_vec(), vk)])),
             action: "read".into(),
             environment,
+            moderation: None,
         });
         let token = mint(
             &sk,
@@ -993,5 +1008,32 @@ mod tests {
             body["error"],
             "entity token subject does not match bearer subject"
         );
+    }
+
+    #[tokio::test]
+    async fn blocked_items_are_left_out_of_listings() {
+        let (_, vk) = keypair();
+        let store = Arc::new(MemCatalog::new(HashMap::from([(
+            "camp1".to_string(),
+            vec![entry(&"aa".repeat(32)), entry(&"bb".repeat(32))],
+        )])));
+        let moderation = Arc::new(crate::moderation::Moderation::default());
+        let state = Arc::new(CatalogApiState {
+            cache: CatalogCache::new(store, Duration::from_secs(30)),
+            provider: crate::authz::DenyAll,
+            verifier: Arc::new(CwtVerifier::with_static_keys(vec![(b"kid-1".to_vec(), vk)])),
+            action: "read".into(),
+            environment: None,
+            moderation: Some(Arc::clone(&moderation)),
+        });
+        let app = router(state);
+        let (_, body) = get_json(&app, "/catalog/camp1", &[]).await;
+        assert_eq!(body["items"].as_array().unwrap().len(), 2);
+        // Applies at once, without waiting for the listing cache.
+        moderation.block_for_test(&"AA".repeat(32));
+        let (_, body) = get_json(&app, "/catalog/camp1", &[]).await;
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["hash"], "bb".repeat(32));
     }
 }

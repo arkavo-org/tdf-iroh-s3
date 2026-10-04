@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod catalog_api;
 pub mod config;
 pub mod ingest;
+pub mod moderation;
 pub mod node;
 pub mod secret_key;
 pub mod ssm;
