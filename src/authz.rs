@@ -404,8 +404,31 @@ impl AuthZenClient {
             .access_evaluations_endpoint
             .filter(|s| !s.is_empty())
             .context("discovery missing access_evaluations_endpoint")?;
+        // The service CWT is posted to this URL, so it must stay on the
+        // configured PDP's origin; a spoofed or misconfigured discovery
+        // document is an error, not a redirect.
+        anyhow::ensure!(
+            same_origin(&url, &self.endpoint),
+            "discovered access_evaluations_endpoint {url} is not on {}",
+            self.endpoint
+        );
         *self.evaluations_url.lock().await = Some(url.clone());
         Ok(url)
+    }
+}
+
+/// The facade's per-request evaluation limit (arkavo-rs `MAX_EVALUATIONS`).
+pub(crate) const MAX_EVALUATIONS: usize = 500;
+
+/// Whether `url` has the same scheme, host and port as `base`.
+fn same_origin(url: &str, base: &str) -> bool {
+    match (reqwest::Url::parse(url), reqwest::Url::parse(base)) {
+        (Ok(u), Ok(b)) => {
+            u.scheme() == b.scheme()
+                && u.host_str() == b.host_str()
+                && u.port_or_known_default() == b.port_or_known_default()
+        }
+        _ => false,
     }
 }
 
@@ -435,11 +458,28 @@ impl DecisionProvider for AuthZenClient {
             return Ok(HashMap::new());
         }
         let url = self.evaluations_endpoint().await?;
-        let body = build_authzen_request(&req)?;
+        // The facade refuses more than MAX_EVALUATIONS per request, so a
+        // large group is decided in batches and merged.
+        let mut decisions = HashMap::with_capacity(req.resources.len());
+        for chunk in req.resources.chunks(MAX_EVALUATIONS) {
+            let part = DecisionRequest {
+                chain: req.chain.clone(),
+                action: req.action.clone(),
+                resources: chunk.to_vec(),
+            };
+            decisions.extend(self.decide_batch(&url, &part).await?);
+        }
+        Ok(decisions)
+    }
+}
+
+impl AuthZenClient {
+    async fn decide_batch(&self, url: &str, req: &DecisionRequest) -> Result<Decisions> {
+        let body = build_authzen_request(req)?;
 
         let mut http_req = self
             .http
-            .post(&url)
+            .post(url)
             .header("Content-Type", "application/json")
             .json(&body);
         if let Some(token) = self.bearer().await? {
@@ -567,13 +607,32 @@ fn allowlist_environment(claims: &Value) -> Value {
     Value::Object(out)
 }
 
+/// Fields of `arkavo_patreon` that may reach the PDP: an allowlist, so
+/// anything an issuer adds later (tokens, e-mail) is dropped. Mirrors the
+/// facade's `cwt_subject::sanitize_patreon`.
+const PATREON_ALLOWED: [&str; 5] = [
+    "role",
+    "patreon_user_id",
+    "memberships",
+    "verified_at",
+    "cache_expires_at",
+];
+
 fn sanitize_patreon(p: &Value) -> Value {
     let Some(obj) = p.as_object() else {
-        return p.clone();
+        return Value::Object(Map::new());
     };
-    let mut out = obj.clone();
-    if out.get("role").and_then(Value::as_str) == Some("consumer") {
-        out.remove("campaign_id");
+    let mut out = Map::new();
+    for k in PATREON_ALLOWED {
+        if let Some(v) = obj.get(k) {
+            out.insert(k.into(), v.clone());
+        }
+    }
+    // Only a creator may carry campaign_id.
+    if obj.get("role").and_then(Value::as_str) == Some("creator")
+        && let Some(v) = obj.get("campaign_id")
+    {
+        out.insert("campaign_id".into(), v.clone());
     }
     Value::Object(out)
 }
@@ -948,5 +1007,102 @@ mod tests {
             resources: vec![],
         };
         assert!(build_authzen_request(&req).is_err());
+    }
+
+    /// A PDP that answers `decision: true` for every evaluation and counts
+    /// requests; its discovery document names `evaluations_url`.
+    async fn spawn_pdp(
+        evaluations_url: Option<String>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) -> String {
+        use axum::routing::{get, post};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let eval = evaluations_url.unwrap_or_else(|| format!("{base}/access/v1/evaluations"));
+        let app = axum::Router::new()
+            .route(
+                "/.well-known/authzen-configuration",
+                get(move || {
+                    let eval = eval.clone();
+                    async move { axum::Json(json!({ "access_evaluations_endpoint": eval })) }
+                }),
+            )
+            .route(
+                "/access/v1/evaluations",
+                post(move |axum::Json(body): axum::Json<Value>| {
+                    let calls = std::sync::Arc::clone(&calls);
+                    async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let n = body["evaluations"].as_array().map_or(0, Vec::len);
+                        assert!(n <= MAX_EVALUATIONS, "batch of {n}");
+                        axum::Json(json!({
+                            "evaluations": (0..n).map(|_| json!({ "decision": true })).collect::<Vec<_>>()
+                        }))
+                    }
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        base
+    }
+
+    fn many(n: usize) -> DecisionRequest {
+        DecisionRequest {
+            chain: vec![pe("tok")],
+            action: "read".into(),
+            resources: (0..n).map(|i| (format!("h{i}"), vec![])).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn large_groups_are_decided_in_batches() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let base = spawn_pdp(None, std::sync::Arc::clone(&calls)).await;
+        let client = AuthZenClient::new(base, ServiceCredential::None);
+        let d = client.decide(many(1_201)).await.unwrap();
+        assert_eq!(d.len(), 1_201);
+        assert!(d.values().all(|&v| v));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_discovered_endpoint_off_origin_is_refused() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let base = spawn_pdp(
+            Some("https://evil.example/access/v1/evaluations".into()),
+            std::sync::Arc::clone(&calls),
+        )
+        .await;
+        let client = AuthZenClient::new(base, ServiceCredential::Static("svc".into()));
+        assert!(client.decide(many(1)).await.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn origin_comparison() {
+        assert!(same_origin("https://p.test/a", "https://p.test"));
+        assert!(same_origin("https://p.test:443/a", "https://p.test"));
+        assert!(!same_origin("http://p.test/a", "https://p.test"));
+        assert!(!same_origin("https://p.test:8443/a", "https://p.test"));
+        assert!(!same_origin("https://q.test/a", "https://p.test"));
+        assert!(!same_origin("not a url", "https://p.test"));
+    }
+
+    #[test]
+    fn patreon_claim_is_allowlisted() {
+        let p = json!({
+            "role": "consumer",
+            "patreon_user_id": "1",
+            "campaign_id": "c",
+            "memberships": [],
+            "access_token": "secret",
+        });
+        let out = sanitize_patreon(&p);
+        assert!(out.get("access_token").is_none());
+        assert!(out.get("campaign_id").is_none());
+        assert_eq!(out["patreon_user_id"], "1");
+        let mut creator = p.clone();
+        creator["role"] = json!("creator");
+        assert_eq!(sanitize_patreon(&creator)["campaign_id"], "c");
+        assert_eq!(sanitize_patreon(&json!("x")), json!({}));
     }
 }

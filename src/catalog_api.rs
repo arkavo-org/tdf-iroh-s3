@@ -376,9 +376,10 @@ async fn build_chain<S: CatalogStore, D: DecisionProvider>(
                 "entity token subject does not match bearer subject",
             ));
         }
-        let Some(aud) = claims.aud.as_str() else {
-            return Err(err(StatusCode::UNAUTHORIZED, "invalid entity token"));
-        };
+        // verify_device guarantees the DeviceCheck audience is present; the
+        // PDP's device schema takes exactly that string, whatever else `aud`
+        // listed.
+        let aud = crate::auth::DEVICECHECK_AUD;
         let Some(kid) = claims.kid.as_deref().filter(|k| !k.is_empty()) else {
             return Err(err(StatusCode::UNAUTHORIZED, "invalid entity token"));
         };

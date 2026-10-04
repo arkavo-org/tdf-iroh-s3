@@ -106,6 +106,8 @@ pub struct VerifiedClaims {
     pub aud: Aud,
     pub exp: i64,
     pub iat: i64,
+    /// RFC 8392 `nbf`, when present.
+    pub nbf: Option<i64>,
     pub cti: Vec<u8>,
     /// unpadded base64url of `cnf.kid`, when the token carries a confirmation key.
     pub kid: Option<String>,
@@ -208,11 +210,9 @@ impl CwtVerifier {
                 },
             )
             .await?;
-        // Device schema `aud` is a single string equal to the DeviceCheck audience.
-        match claims.aud.as_str() {
-            Some(a) if a == DEVICECHECK_AUD => {}
-            _ => return Err(AuthError::Audience),
-        }
+        // authnz-rs mints `aud = ["arkavo:devicecheck", <platform audience>]`
+        // when a platform audience is configured; `verify_with` has already
+        // required the DeviceCheck audience to be among them.
         if claims.kid.as_ref().is_none_or(|k| k.is_empty()) {
             return Err(AuthError::MissingClaim("kid"));
         }
@@ -238,6 +238,11 @@ impl CwtVerifier {
         match sign1.protected.header.alg {
             Some(coset::Algorithm::Assigned(coset::iana::Algorithm::ES256)) => {}
             _ => return Err(AuthError::Algorithm),
+        }
+        // RFC 9052 3.1: reject a message marking any header critical; this
+        // verifier processes none.
+        if !sign1.protected.header.crit.is_empty() {
+            return Err(AuthError::Malformed);
         }
         let kid = sign1.protected.header.key_id.clone();
         if kid.is_empty() {
@@ -280,6 +285,9 @@ impl CwtVerifier {
             return Err(AuthError::Expired);
         }
         if claims.iat > now + SKEW_SECS {
+            return Err(AuthError::NotYetValid);
+        }
+        if claims.nbf.is_some_and(|nbf| nbf > now + SKEW_SECS) {
             return Err(AuthError::NotYetValid);
         }
         Ok(claims)
@@ -426,6 +434,7 @@ fn parse_claims(payload: &[u8]) -> Result<VerifiedClaims, AuthError> {
     let mut aud = None;
     let mut exp = None;
     let mut iat = None;
+    let mut nbf = None;
     let mut cti = None;
     let mut kid = None;
     let mut patreon_user_id = None;
@@ -457,6 +466,9 @@ fn parse_claims(payload: &[u8]) -> Result<VerifiedClaims, AuthError> {
                         let Value::Text(s) = item else {
                             return Err(AuthError::Malformed);
                         };
+                        if s.is_empty() {
+                            return Err(AuthError::Malformed);
+                        }
                         members.push(s);
                     }
                     if members.is_empty() {
@@ -466,6 +478,11 @@ fn parse_claims(payload: &[u8]) -> Result<VerifiedClaims, AuthError> {
                 }
                 (4, Value::Integer(n)) => exp = i64::try_from(i128::from(n)).ok(),
                 (6, Value::Integer(n)) => iat = i64::try_from(i128::from(n)).ok(),
+                (5, Value::Integer(n)) => {
+                    nbf = Some(i64::try_from(i128::from(n)).map_err(|_| AuthError::Malformed)?);
+                }
+                // A present nbf of any other type must not skip enforcement.
+                (5, _) => return Err(AuthError::Malformed),
                 (7, Value::Bytes(b)) => cti = Some(b),
                 (8, Value::Map(m)) => kid = parse_cnf_kid(&m)?,
                 _ => {}
@@ -496,13 +513,23 @@ fn parse_claims(payload: &[u8]) -> Result<VerifiedClaims, AuthError> {
         }
     }
 
+    let non_empty = |v: Option<String>, name: &'static str| match v {
+        Some(s) if !s.is_empty() => Ok(s),
+        _ => Err(AuthError::MissingClaim(name)),
+    };
+    if matches!(&aud, Some(Aud::One(s)) if s.is_empty()) {
+        return Err(AuthError::MissingClaim("aud"));
+    }
     Ok(VerifiedClaims {
-        iss: iss.ok_or(AuthError::MissingClaim("iss"))?,
-        sub: sub.ok_or(AuthError::MissingClaim("sub"))?,
+        iss: non_empty(iss, "iss")?,
+        sub: non_empty(sub, "sub")?,
         aud: aud.ok_or(AuthError::MissingClaim("aud"))?,
         exp: exp.ok_or(AuthError::MissingClaim("exp"))?,
         iat: iat.ok_or(AuthError::MissingClaim("iat"))?,
-        cti: cti.ok_or(AuthError::MissingClaim("cti"))?,
+        nbf,
+        cti: cti
+            .filter(|c| !c.is_empty())
+            .ok_or(AuthError::MissingClaim("cti"))?,
         kid,
         patreon_user_id,
         email,
@@ -1138,5 +1165,131 @@ mod tests {
             v.verify_device(&no_cnf, NOW).await.unwrap_err(),
             AuthError::MissingClaim("kid")
         ));
+    }
+
+    #[tokio::test]
+    async fn device_token_with_platform_audience_is_accepted() {
+        // authnz-rs adds OIDC_PLATFORM_AUDIENCE to DeviceCheck tokens.
+        let (sk, vk) = keypair();
+        let entries = vec![
+            (
+                Value::Integer(1.into()),
+                Value::Text("https://identity.test".into()),
+            ),
+            (Value::Integer(2.into()), Value::Text("u1".into())),
+            (
+                Value::Integer(3.into()),
+                Value::Array(vec![
+                    Value::Text(DEVICECHECK_AUD.into()),
+                    Value::Text("https://platform.test".into()),
+                ]),
+            ),
+            (Value::Integer(4.into()), Value::Integer((NOW + 600).into())),
+            (Value::Integer(6.into()), Value::Integer(NOW.into())),
+            (Value::Integer(7.into()), Value::Bytes(vec![1; 16])),
+            (
+                Value::Integer(8.into()),
+                Value::Map(vec![(
+                    Value::Integer(2.into()),
+                    Value::Bytes(b"dev".to_vec()),
+                )]),
+            ),
+        ];
+        let token = mint_map(&sk, b"kid-1", entries);
+        let claims = verifier(b"kid-1", vk)
+            .verify_device(&token, NOW)
+            .await
+            .unwrap();
+        assert!(claims.aud.contains(DEVICECHECK_AUD));
+    }
+
+    fn base(sub: &str, cti: &[u8]) -> Vec<(Value, Value)> {
+        vec![
+            (
+                Value::Integer(1.into()),
+                Value::Text("https://identity.test".into()),
+            ),
+            (Value::Integer(2.into()), Value::Text(sub.into())),
+            (Value::Integer(3.into()), Value::Text("arkavo".into())),
+            (Value::Integer(4.into()), Value::Integer((NOW + 600).into())),
+            (Value::Integer(6.into()), Value::Integer(NOW.into())),
+            (Value::Integer(7.into()), Value::Bytes(cti.to_vec())),
+        ]
+    }
+
+    #[tokio::test]
+    async fn rejects_future_nbf_and_malformed_nbf() {
+        let (sk, vk) = keypair();
+        let v = verifier(b"kid-1", vk);
+        let mut e = base("u1", b"c");
+        e.push((
+            Value::Integer(5.into()),
+            Value::Integer((NOW + 3600).into()),
+        ));
+        let err = v
+            .verify(&mint_map(&sk, b"kid-1", e), NOW)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::NotYetValid));
+
+        let mut e = base("u1", b"c");
+        e.push((Value::Integer(5.into()), Value::Text("soon".into())));
+        let err = v
+            .verify(&mint_map(&sk, b"kid-1", e), NOW)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::Malformed));
+
+        let mut e = base("u1", b"c");
+        e.push((Value::Integer(5.into()), Value::Integer((NOW - 10).into())));
+        assert!(v.verify(&mint_map(&sk, b"kid-1", e), NOW).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_identifiers() {
+        let (sk, vk) = keypair();
+        let v = verifier(b"kid-1", vk);
+        for e in [base("", b"c"), base("u1", b"")] {
+            assert!(v.verify(&mint_map(&sk, b"kid-1", e), NOW).await.is_err());
+        }
+        let mut e = base("u1", b"c");
+        e[2] = (
+            Value::Integer(3.into()),
+            Value::Array(vec![
+                Value::Text("arkavo".into()),
+                Value::Text(String::new()),
+            ]),
+        );
+        assert!(v.verify(&mint_map(&sk, b"kid-1", e), NOW).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_critical_headers() {
+        use coset::{CoseSign1Builder, HeaderBuilder, iana};
+        use p256::ecdsa::signature::Signer;
+        let (sk, vk) = keypair();
+        let mut payload = Vec::new();
+        ciborium::ser::into_writer(&Value::Map(base("u1", b"c")), &mut payload).unwrap();
+        let protected = HeaderBuilder::new()
+            .algorithm(iana::Algorithm::ES256)
+            .key_id(b"kid-1".to_vec())
+            .add_critical(iana::HeaderParameter::ContentType)
+            .build();
+        let sign1 = CoseSign1Builder::new()
+            .protected(protected)
+            .payload(payload)
+            .create_signature(b"", |m| {
+                let sig: Signature = sk.sign(m);
+                sig.to_bytes().to_vec()
+            })
+            .build();
+        let mut out = CWT_TAG_PREFIX.to_vec();
+        out.extend_from_slice(&sign1.to_vec().unwrap());
+        let token = URL_SAFE_NO_PAD.encode(out);
+        let err = verifier(b"kid-1", vk)
+            .verify(&token, NOW)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::Malformed));
     }
 }
