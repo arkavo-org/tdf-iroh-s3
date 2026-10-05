@@ -8,9 +8,12 @@
 //! served via the network protocol). We verify accessibility by fetching the
 //! blob back from the node over the iroh-blobs GET protocol.
 
+use std::sync::Arc;
+use std::time::Duration;
 use tdf_iroh_s3::config::{
-    CatalogConfig, Config, HttpConfig, IrohConfig, S3Config, ValidationConfig,
+    CatalogConfig, Config, HttpConfig, IrohConfig, PublishingConfig, S3Config, ValidationConfig,
 };
+use tdf_iroh_s3::moderation::{Moderation, PublishGate};
 use tdf_iroh_s3::node::TdfIrohNode;
 use tdf_iroh_s3::test_cli::iroh_client::IrohTestClient;
 
@@ -29,6 +32,7 @@ fn test_config(data_dir: &str) -> Config {
         validation: ValidationConfig::default(),
         http: HttpConfig::default(),
         catalog: CatalogConfig::default(),
+        publishing: PublishingConfig::default(),
     }
 }
 
@@ -97,6 +101,71 @@ async fn test_push_invalid_blob_does_not_crash_node() {
 
     client.shutdown().await.unwrap();
     node.shutdown().await.unwrap();
+}
+
+/// A gated node (tdf-iroh-s3#17): pushes need a publish session for the
+/// pushing endpoint, and blocked hashes are not served.
+#[tokio::test(flavor = "current_thread")]
+async fn test_gated_node_needs_a_session_and_refuses_blocked_fetches() {
+    // SAFETY: current_thread runtime ensures no other threads read env vars concurrently.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+    }
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let config = test_config(tmp_dir.path().to_str().unwrap());
+    let gate = Arc::new(PublishGate::new(Arc::new(Moderation::default())));
+    let node = TdfIrohNode::spawn_with_gate(config, Some(Arc::clone(&gate)))
+        .await
+        .unwrap();
+    let node_id = node.addr().id;
+
+    // No session: the push is refused and nothing is stored. (The pusher
+    // may not see the refusal; the node simply never takes the blob.)
+    let stranger = IrohTestClient::new().await.unwrap();
+    let refused = vec![0x11u8; 128];
+    let _ = stranger.push_to_node(node_id, &refused).await;
+    let hash = blake3_hash(&refused);
+    let probe = IrohTestClient::new().await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), probe.fetch_from_node(node_id, hash))
+            .await
+            .map_or(true, |r| r.is_err()),
+        "a refused push must not be stored"
+    );
+    probe.shutdown().await.unwrap();
+
+    // A session for this endpoint: the push lands and is served.
+    let creator = IrohTestClient::new().await.unwrap();
+    gate.open_session(
+        creator.endpoint_id(),
+        "arkavo:creator-1",
+        Duration::from_secs(60),
+    );
+    let accepted = vec![0x22u8; 128];
+    let hash = creator
+        .push_to_node(node_id, &accepted)
+        .await
+        .map_err(|e| format!("{e:#}"))
+        .unwrap();
+    let viewer = IrohTestClient::new().await.unwrap();
+    let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
+    assert_eq!(fetched.as_ref(), accepted.as_slice());
+
+    // Blocked: no longer served to anyone.
+    gate.moderation.block_for_test(&hash.to_hex());
+    let other = IrohTestClient::new().await.unwrap();
+    assert!(other.fetch_from_node(node_id, hash).await.is_err());
+
+    for c in [stranger, creator, viewer, other] {
+        c.shutdown().await.unwrap();
+    }
+    node.shutdown().await.unwrap();
+}
+
+fn blake3_hash(data: &[u8]) -> iroh_blobs::Hash {
+    iroh_blobs::Hash::new(data)
 }
 
 fn create_test_tdf() -> Vec<u8> {

@@ -172,6 +172,16 @@ curl -X PUT https://iroh.arkavo.net/tags/catalog/arkavo:<user-id> \
 The blob itself is then fetched over the Iroh blobs protocol by hash.
 TLS terminates in front of the listener (ALB / reverse proxy).
 
+## Publishing and moderation
+
+Publishing is gated by default (`[publishing] required = true`).
+
+- A tag write needs the Arkavo creator-publishing entitlement in the CWT.
+- An iroh push is accepted only from an endpoint that first opened a publish session with `POST /publish/sessions`.
+- Operators suspend creators and block content hashes through `/moderation/*`.
+
+See [docs/publishing-and-moderation.md](docs/publishing-and-moderation.md).
+
 ## Run
 
 ```bash

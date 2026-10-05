@@ -294,4 +294,60 @@ impl S3Client {
             .context("Failed to DELETE tag from S3")?;
         Ok(())
     }
+
+    fn moderation_prefix(&self, kind: &str) -> String {
+        format!("{}moderation/{}/", self.prefix, kind)
+    }
+
+    /// Write one moderation record (`moderation/<kind>/<key>`).
+    pub async fn put_moderation_record(&self, kind: &str, key: &str, body: Bytes) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(format!("{}{}", self.moderation_prefix(kind), key))
+            .content_type("application/json")
+            .body(body.into())
+            .send()
+            .await
+            .context("Failed to PUT moderation record to S3")?;
+        Ok(())
+    }
+
+    /// Every record under `moderation/<kind>/`, paginating as needed.
+    pub async fn list_moderation_records(&self, kind: &str) -> Result<Vec<Bytes>> {
+        let prefix = self.moderation_prefix(kind);
+        let mut out = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&prefix);
+            if let Some(token) = &continuation {
+                req = req.continuation_token(token);
+            }
+            let resp = req
+                .send()
+                .await
+                .context("Failed to LIST moderation records in S3")?;
+            for obj in resp.contents() {
+                let Some(key) = obj.key() else { continue };
+                let got = self
+                    .client
+                    .get_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .send()
+                    .await
+                    .context("Failed to GET moderation record from S3")?;
+                out.push(got.body.collect().await?.into_bytes());
+            }
+            match resp.next_continuation_token() {
+                Some(token) => continuation = Some(token.to_string()),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
 }

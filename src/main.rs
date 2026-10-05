@@ -13,9 +13,11 @@ use tdf_iroh_s3::authz::{
 };
 use tdf_iroh_s3::catalog_api::{self, CatalogApiState, CatalogCache};
 use tdf_iroh_s3::config::Config;
+use tdf_iroh_s3::moderation::{self, Moderation, ModerationApi, PublishGate, PublishPolicy};
 use tdf_iroh_s3::node::TdfIrohNode;
 use tdf_iroh_s3::ssm;
-use tdf_iroh_s3::tags_api::{self, ApiState};
+use tdf_iroh_s3::store::s3::S3Client;
+use tdf_iroh_s3::tags_api::{self, ApiState, TagPublishing};
 
 #[derive(Parser)]
 #[command(
@@ -45,7 +47,38 @@ async fn main() -> Result<()> {
     );
     info!("Assertion check: {}", config.validation.assertion.enabled);
 
-    let node = TdfIrohNode::spawn(config).await?;
+    // Creator publishing gate (tdf-iroh-s3#17). Moderation records are read
+    // before the node accepts anything, and startup fails if they cannot be:
+    // a node that forgot its suspensions must not come up.
+    let gate = if config.publishing.required {
+        let store = S3Client::new(&config.s3.bucket, &config.s3.region, &config.s3.prefix).await?;
+        let view = Arc::new(Moderation::default());
+        view.reload(&store)
+            .await
+            .context("Failed to load moderation records")?;
+        view.spawn_refresh(
+            Arc::new(store),
+            std::time::Duration::from_secs(config.publishing.moderation_refresh_secs.max(5)),
+        );
+        info!(
+            "Publishing gate on: entitlement {}, {} suspension(s), {} block(s)",
+            config.publishing.entitlement,
+            view.active_suspensions().len(),
+            view.active_blocks().len()
+        );
+        if !config.http.enabled {
+            tracing::warn!(
+                "[publishing] required but [http] disabled: no publish session can be opened, so every push is refused"
+            );
+        }
+        Some(Arc::new(PublishGate::new(view)))
+    } else {
+        tracing::warn!("[publishing] required = false: pushes and tag writes are open");
+        None
+    };
+    let moderation = gate.as_ref().map(|g| Arc::clone(&g.moderation));
+
+    let node = TdfIrohNode::spawn_with_gate(config, gate.clone()).await?;
     let addr = node.addr();
     info!("Node running at {}", addr.id);
 
@@ -69,12 +102,36 @@ async fn main() -> Result<()> {
             http_cfg.cose_keys_url.clone(),
             expected_iss,
         ));
+        let pub_cfg = &node.config.publishing;
+        let policy = Arc::new(PublishPolicy {
+            entitlement: Some(pub_cfg.entitlement.clone()).filter(|e| !e.is_empty()),
+            audience: Some(pub_cfg.audience.clone()).filter(|a| !a.is_empty()),
+            session_ttl: std::time::Duration::from_secs(pub_cfg.session_ttl_secs),
+            operator_client_ids: pub_cfg.operator_client_ids.iter().cloned().collect(),
+        });
         let state = Arc::new(ApiState {
             store: Arc::clone(&node.s3_client),
             verifier: Arc::clone(&verifier),
             tag_prefix: http_cfg.tag_prefix.clone(),
+            publishing: gate.as_ref().map(|g| TagPublishing {
+                policy: Arc::clone(&policy),
+                moderation: Arc::clone(&g.moderation),
+            }),
         });
         let mut router = tags_api::router(state);
+        if let Some(g) = &gate {
+            if policy.operator_client_ids.is_empty() {
+                tracing::warn!(
+                    "[publishing] operator_client_ids empty: the moderation API answers 503"
+                );
+            }
+            router = router.merge(moderation::router(Arc::new(ModerationApi {
+                store: Arc::clone(&node.s3_client),
+                verifier: Arc::clone(&verifier),
+                gate: Arc::clone(g),
+                policy: Arc::clone(&policy),
+            })));
+        }
 
         // Catalog: public attribute definitions + the entitled-catalog
         // endpoint. Attributes are never hardcoded — the definitions
@@ -140,6 +197,7 @@ async fn main() -> Result<()> {
                     Arc::clone(&verifier),
                     cat.authz.action.clone(),
                     environment,
+                    moderation.clone(),
                 ));
             } else {
                 let credential = if !cat.authz.token_url.is_empty() {
@@ -210,6 +268,7 @@ async fn main() -> Result<()> {
                             Arc::clone(&verifier),
                             cat.authz.action.clone(),
                             environment,
+                            moderation.clone(),
                         ));
                     }
                     AuthzProtocol::OpentdfV2 => {
@@ -229,6 +288,7 @@ async fn main() -> Result<()> {
                             Arc::clone(&verifier),
                             cat.authz.action.clone(),
                             environment,
+                            moderation.clone(),
                         ));
                     }
                 }
@@ -265,6 +325,7 @@ fn catalog_router<D: DecisionProvider>(
     verifier: Arc<CwtVerifier>,
     action: String,
     environment: Option<serde_json::Value>,
+    moderation: Option<Arc<Moderation>>,
 ) -> axum::Router {
     catalog_api::router(Arc::new(CatalogApiState {
         cache,
@@ -272,5 +333,6 @@ fn catalog_router<D: DecisionProvider>(
         verifier,
         action,
         environment,
+        moderation,
     }))
 }

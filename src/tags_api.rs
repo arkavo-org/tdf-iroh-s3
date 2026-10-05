@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::auth::{AuthError, CwtVerifier};
+use crate::auth::{AuthError, CwtVerifier, VerifiedClaims};
+use crate::moderation::{Moderation, PublishPolicy};
 
 /// Storage the tag API needs. `S3Client` is the production implementation;
 /// tests use an in-memory store.
@@ -59,6 +60,14 @@ pub struct ApiState<S: TagStore> {
     /// cached key set.
     pub verifier: Arc<CwtVerifier>,
     pub tag_prefix: String,
+    /// The creator publishing gate (tdf-iroh-s3#17). `None` keeps tag
+    /// writes open to any verified subject (development only).
+    pub publishing: Option<TagPublishing>,
+}
+
+pub struct TagPublishing {
+    pub policy: Arc<PublishPolicy>,
+    pub moderation: Arc<Moderation>,
 }
 
 #[derive(Serialize)]
@@ -110,7 +119,24 @@ async fn get_tag<S: TagStore>(
     if !valid_tag_name(&name) {
         return Err(error_json(StatusCode::BAD_REQUEST, "invalid tag name"));
     }
+    // A suspended creator's catalog may be hidden; a blocked hash is never
+    // handed out.
+    let hidden = |hash: Option<&str>| {
+        state.publishing.as_ref().is_some_and(|p| {
+            hash.is_some_and(|h| p.moderation.is_blocked(h))
+                || name
+                    .strip_prefix(&state.tag_prefix)
+                    .and_then(|sub| p.moderation.suspension(sub))
+                    .is_some_and(|s| s.hide_catalog)
+        })
+    };
+    if hidden(None) {
+        return Err(error_json(StatusCode::NOT_FOUND, "tag not found"));
+    }
     match state.store.get_tag(&name).await {
+        Ok(Some(hash)) if hidden(Some(&hash)) => {
+            Err(error_json(StatusCode::NOT_FOUND, "tag not found"))
+        }
         Ok(Some(hash)) => Ok(Json(TagResponse { name, hash })),
         Ok(None) => Err(error_json(StatusCode::NOT_FOUND, "tag not found")),
         Err(e) => {
@@ -130,20 +156,33 @@ async fn put_tag<S: TagStore>(
         return Err(error_json(StatusCode::BAD_REQUEST, "invalid tag name"));
     }
 
-    let token = bearer_token(&headers)
-        .ok_or_else(|| error_json(StatusCode::UNAUTHORIZED, "missing bearer token"))?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let claims = state.verifier.verify(token, now).await.map_err(|e| {
-        let status = match e {
-            AuthError::KeySet(_) => StatusCode::BAD_GATEWAY,
-            _ => StatusCode::UNAUTHORIZED,
-        };
-        warn!(error = %e, "Tag write rejected: token verification failed");
-        error_json(status, "invalid token")
-    })?;
+    let claims: VerifiedClaims = match &state.publishing {
+        // Entitled, unsuspended person tokens only.
+        Some(p) => p
+            .policy
+            .publisher(&state.verifier, &p.moderation, &headers)
+            .await
+            .map_err(|(status, msg)| {
+                warn!(%status, reason = msg, "Tag write rejected");
+                error_json(status, msg)
+            })?,
+        None => {
+            let token = bearer_token(&headers)
+                .ok_or_else(|| error_json(StatusCode::UNAUTHORIZED, "missing bearer token"))?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            state.verifier.verify(token, now).await.map_err(|e| {
+                let status = match e {
+                    AuthError::KeySet(_) => StatusCode::BAD_GATEWAY,
+                    _ => StatusCode::UNAUTHORIZED,
+                };
+                warn!(error = %e, "Tag write rejected: token verification failed");
+                error_json(status, "invalid token")
+            })?
+        }
+    };
 
     // Namespace binding: a subject may only move its own tag.
     let expected = format!("{}{}", state.tag_prefix, claims.sub);
@@ -160,6 +199,15 @@ async fn put_tag<S: TagStore>(
             StatusCode::BAD_REQUEST,
             "hash must be 64 hex chars",
         ));
+    }
+
+    if state
+        .publishing
+        .as_ref()
+        .is_some_and(|p| p.moderation.is_blocked(&body.hash))
+    {
+        warn!(tag = %name, hash = %body.hash, "Tag write rejected: content is blocked");
+        return Err(error_json(StatusCode::FORBIDDEN, "content is blocked"));
     }
 
     // No dangling pointers: the catalog blob must already be ingested
@@ -257,6 +305,7 @@ mod tests {
             store: Arc::clone(&store),
             verifier: Arc::new(CwtVerifier::with_static_keys(vec![(b"kid-1".to_vec(), vk)])),
             tag_prefix: "catalog/".to_string(),
+            publishing: None,
         });
         let token = mint(
             &sk,
@@ -409,6 +458,7 @@ mod tests {
             store: Arc::clone(&store),
             verifier: Arc::new(CwtVerifier::with_static_keys(vec![(b"kid-1".to_vec(), vk)])),
             tag_prefix: "catalog/".to_string(),
+            publishing: None,
         });
         let router = router(state);
         let expired = mint(
@@ -427,5 +477,151 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// A gated router (tdf-iroh-s3#17) and creator tokens with and without
+    /// the publishing entitlement.
+    struct Gated {
+        router: Router,
+        store: Arc<MemStore>,
+        moderation: Arc<Moderation>,
+        entitled: String,
+        unentitled: String,
+    }
+
+    fn gated() -> Gated {
+        use crate::auth::test_support::mint_with_aud;
+        use crate::moderation::DEFAULT_PUBLISH_ENTITLEMENT;
+        use ciborium::value::Value;
+        let (sk, vk) = keypair();
+        let store = Arc::new(MemStore::new());
+        let moderation = Arc::new(Moderation::default());
+        let state = Arc::new(ApiState {
+            store: Arc::clone(&store),
+            verifier: Arc::new(CwtVerifier::with_static_keys(vec![(b"kid-1".to_vec(), vk)])),
+            tag_prefix: "catalog/".to_string(),
+            publishing: Some(TagPublishing {
+                policy: Arc::new(PublishPolicy {
+                    entitlement: Some(DEFAULT_PUBLISH_ENTITLEMENT.into()),
+                    audience: Some("arkavo".into()),
+                    session_ttl: std::time::Duration::from_secs(60),
+                    operator_client_ids: Default::default(),
+                }),
+                moderation: Arc::clone(&moderation),
+            }),
+        });
+        let tok = |ents: &[&str]| {
+            mint_with_aud(
+                &sk,
+                b"kid-1",
+                "https://identity.test",
+                "arkavo:creator-1",
+                "arkavo",
+                now(),
+                now() + 3600,
+                &[(
+                    "arkavo_entitlements",
+                    Value::Array(ents.iter().map(|e| Value::Text((*e).into())).collect()),
+                )],
+            )
+        };
+        Gated {
+            router: router(state),
+            store,
+            moderation,
+            entitled: tok(&[DEFAULT_PUBLISH_ENTITLEMENT]),
+            unentitled: tok(&["https://arkavo.ai/attr/action/value/read"]),
+        }
+    }
+
+    #[tokio::test]
+    async fn gated_put_needs_the_entitlement() {
+        let g = gated();
+        g.store.blobs.lock().await.push(blob_hash());
+        let (status, _) = put(
+            &g.router,
+            "catalog/arkavo:creator-1",
+            &blob_hash(),
+            Some(&g.unentitled),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = put(
+            &g.router,
+            "catalog/arkavo:creator-1",
+            &blob_hash(),
+            Some(&g.entitled),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn gated_put_refuses_blocked_content_and_suspended_creators() {
+        let g = gated();
+        let hash = blob_hash();
+        g.store.blobs.lock().await.push(hash.clone());
+        g.moderation.block_for_test(&hash);
+        let (status, body) = put(
+            &g.router,
+            "catalog/arkavo:creator-1",
+            &hash,
+            Some(&g.entitled),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+        let other = "cd".repeat(32);
+        g.store.blobs.lock().await.push(other.clone());
+        g.moderation.suspend_for_test("creator-1", false);
+        let (status, body) = put(
+            &g.router,
+            "catalog/arkavo:creator-1",
+            &other,
+            Some(&g.entitled),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("suspended"));
+    }
+
+    #[tokio::test]
+    async fn a_hidden_catalog_or_blocked_target_is_not_resolved() {
+        let g = gated();
+        let hash = blob_hash();
+        g.store
+            .tags
+            .lock()
+            .await
+            .insert("catalog/arkavo:creator-1".into(), hash.clone());
+        assert_eq!(
+            get_status(&g.router, "catalog/arkavo:creator-1").await.0,
+            StatusCode::OK
+        );
+
+        // Suspended without hiding: still resolves.
+        g.moderation.suspend_for_test("creator-1", false);
+        assert_eq!(
+            get_status(&g.router, "catalog/arkavo:creator-1").await.0,
+            StatusCode::OK
+        );
+        // Hidden: 404.
+        g.moderation.suspend_for_test("creator-1", true);
+        assert_eq!(
+            get_status(&g.router, "catalog/arkavo:creator-1").await.0,
+            StatusCode::NOT_FOUND
+        );
+
+        let g = gated();
+        g.store
+            .tags
+            .lock()
+            .await
+            .insert("catalog/arkavo:creator-1".into(), hash.clone());
+        g.moderation.block_for_test(&hash);
+        assert_eq!(
+            get_status(&g.router, "catalog/arkavo:creator-1").await.0,
+            StatusCode::NOT_FOUND
+        );
     }
 }

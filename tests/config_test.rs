@@ -106,3 +106,35 @@ client_secret_param = "/custom/path"
     let config: Config = toml::from_str(toml_str).unwrap();
     assert_eq!(config.catalog.authz.client_secret_param, "/custom/path");
 }
+
+#[test]
+fn test_publishing_defaults_to_gated() {
+    let config: Config = toml::from_str("[s3]\nbucket = \"b\"\nregion = \"us-east-1\"\n").unwrap();
+    let p = &config.publishing;
+    assert!(p.required);
+    assert_eq!(
+        p.entitlement,
+        "https://patreon.arkavo.com/attr/arkavo-creator/value/publish"
+    );
+    assert_eq!(p.audience, "arkavo");
+    assert_eq!(p.session_ttl_secs, 900);
+    assert!(p.operator_client_ids.is_empty());
+}
+
+#[test]
+fn test_publishing_config() {
+    let toml_str = r#"
+[s3]
+bucket = "b"
+region = "us-east-1"
+
+[publishing]
+required = false
+operator_client_ids = ["moderation"]
+session_ttl_secs = 60
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert!(!config.publishing.required);
+    assert_eq!(config.publishing.operator_client_ids, vec!["moderation"]);
+    assert_eq!(config.publishing.session_ttl_secs, 60);
+}

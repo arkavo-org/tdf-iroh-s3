@@ -46,6 +46,11 @@ impl IrohTestClient {
         Ok(Self { endpoint, store })
     }
 
+    /// This client's endpoint ID, which a publish session names.
+    pub fn endpoint_id(&self) -> EndpointId {
+        self.endpoint.id()
+    }
+
     /// Add bytes to the local store and return the hash.
     pub async fn add_bytes(&self, data: &[u8]) -> Result<Hash> {
         let tag_info = self
