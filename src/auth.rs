@@ -108,6 +108,9 @@ pub struct VerifiedClaims {
     pub iat: i64,
     /// RFC 8392 `nbf`, when present.
     pub nbf: Option<i64>,
+    /// Required by the Arkavo CWT profile (identity.arkavo.net mints a
+    /// random 16-byte `cti` on every token). Checked for presence only:
+    /// nothing here keeps a replay cache.
     pub cti: Vec<u8>,
     /// unpadded base64url of `cnf.kid`, when the token carries a confirmation key.
     pub kid: Option<String>,

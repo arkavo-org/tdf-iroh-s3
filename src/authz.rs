@@ -1,9 +1,14 @@
-//! Entitlement decisions for the catalog, delegated to the OpenTDF
-//! authorization service (authorization.v2) — this node never evaluates
-//! policy locally, so there is exactly one PDP (the platform).
+//! Entitlement decisions for the catalog, delegated to one PDP (the
+//! platform) — this node never evaluates policy locally.
 //!
-//! Requests are made over ConnectRPC's JSON mapping (a plain HTTP POST of
-//! the proto-JSON request — no codegen needed).
+//! Two clients, chosen by `[catalog.authz] protocol`:
+//! - `authzen` (default): [`AuthZenClient`] posts AuthZEN 1.0 access
+//!   evaluations to the arkavo-rs facade, found through
+//!   `/.well-known/authzen-configuration` (same origin, https only), in
+//!   batches of at most 500, pairing answers to items one-to-one.
+//! - `opentdf-v2` (rollback): [`ConnectAuthzClient`] calls the OpenTDF
+//!   authorization service (authorization.v2) over ConnectRPC's JSON
+//!   mapping (a plain HTTP POST of the proto-JSON request — no codegen).
 //!
 //! ## Contract (verified against the platform source)
 //!
@@ -412,6 +417,10 @@ impl AuthZenClient {
             "discovered access_evaluations_endpoint {url} is not on {}",
             self.endpoint
         );
+        anyhow::ensure!(
+            https_or_loopback(&url),
+            "discovered access_evaluations_endpoint {url} is not https"
+        );
         *self.evaluations_url.lock().await = Some(url.clone());
         Ok(url)
     }
@@ -419,6 +428,24 @@ impl AuthZenClient {
 
 /// The facade's per-request evaluation limit (arkavo-rs `MAX_EVALUATIONS`).
 pub(crate) const MAX_EVALUATIONS: usize = 500;
+
+/// https, or plain http only to a loopback host (tests, local sidecars).
+fn https_or_loopback(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    match u.scheme() {
+        "https" => true,
+        "http" => u.host_str().is_some_and(|h| {
+            h == "localhost"
+                || h.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }),
+        _ => false,
+    }
+}
 
 /// Whether `url` has the same scheme, host and port as `base`.
 fn same_origin(url: &str, base: &str) -> bool {
@@ -496,7 +523,7 @@ impl AuthZenClient {
             anyhow::bail!("AuthZEN evaluations returned {status}");
         }
         let parsed: EvaluationsResponse = resp.json().await.context("AuthZEN response JSON")?;
-        Ok(map_evaluations(&req.resources, &parsed.evaluations))
+        map_evaluations(&req.resources, &parsed.evaluations)
     }
 }
 
@@ -653,20 +680,30 @@ pub(crate) fn evaluation_entitled(decision: bool, context: Option<&Value>) -> bo
     decision && !required_obligations_nonempty(context)
 }
 
+/// AuthZEN answers evaluations in request order and does not echo resource
+/// ids, so the only safe pairing is one-to-one by position: any count
+/// mismatch fails the whole batch (→ `unavailable`, nothing entitled)
+/// rather than stamping a decision on the wrong hash.
 fn map_evaluations(
     resources: &[(String, Vec<String>)],
     evaluations: &[EvaluationEntry],
-) -> Decisions {
-    resources
+) -> Result<Decisions> {
+    anyhow::ensure!(
+        evaluations.len() == resources.len(),
+        "AuthZEN returned {} evaluations for {} resources",
+        evaluations.len(),
+        resources.len()
+    );
+    Ok(resources
         .iter()
-        .enumerate()
-        .map(|(i, (id, _))| {
-            let entitled = evaluations
-                .get(i)
-                .is_some_and(|e| evaluation_entitled(e.decision, e.context.as_ref()));
-            (id.clone(), entitled)
+        .zip(evaluations)
+        .map(|((id, _), e)| {
+            (
+                id.clone(),
+                evaluation_entitled(e.decision, e.context.as_ref()),
+            )
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -1011,9 +1048,24 @@ mod tests {
 
     /// A PDP that answers `decision: true` for every evaluation and counts
     /// requests; its discovery document names `evaluations_url`.
+    #[derive(Clone, Copy)]
+    enum Pdp {
+        Answers,
+        OneShort,
+        ServerError,
+    }
+
     async fn spawn_pdp(
         evaluations_url: Option<String>,
         calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) -> String {
+        spawn_pdp_as(evaluations_url, calls, Pdp::Answers).await
+    }
+
+    async fn spawn_pdp_as(
+        evaluations_url: Option<String>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        mode: Pdp,
     ) -> String {
         use axum::routing::{get, post};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1032,12 +1084,21 @@ mod tests {
                 post(move |axum::Json(body): axum::Json<Value>| {
                     let calls = std::sync::Arc::clone(&calls);
                     async move {
+                        use axum::response::IntoResponse;
                         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let n = body["evaluations"].as_array().map_or(0, Vec::len);
                         assert!(n <= MAX_EVALUATIONS, "batch of {n}");
+                        let answered = match mode {
+                            Pdp::Answers => n,
+                            Pdp::OneShort => n.saturating_sub(1),
+                            Pdp::ServerError => {
+                                return axum::http::StatusCode::BAD_GATEWAY.into_response();
+                            }
+                        };
                         axum::Json(json!({
-                            "evaluations": (0..n).map(|_| json!({ "decision": true })).collect::<Vec<_>>()
+                            "evaluations": (0..answered).map(|_| json!({ "decision": true })).collect::<Vec<_>>()
                         }))
+                        .into_response()
                     }
                 }),
             );
@@ -1104,5 +1165,41 @@ mod tests {
         creator["role"] = json!("creator");
         assert_eq!(sanitize_patreon(&creator)["campaign_id"], "c");
         assert_eq!(sanitize_patreon(&json!("x")), json!({}));
+    }
+
+    #[tokio::test]
+    async fn a_short_or_failed_answer_entitles_nothing() {
+        for mode in [Pdp::OneShort, Pdp::ServerError] {
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let base = spawn_pdp_as(None, std::sync::Arc::clone(&calls), mode).await;
+            let client = AuthZenClient::new(base, ServiceCredential::None);
+            assert!(client.decide(many(3)).await.is_err());
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn evaluations_pair_one_to_one_or_not_at_all() {
+        let res = vec![("a".to_string(), vec![]), ("b".to_string(), vec![])];
+        let yes = || EvaluationEntry {
+            decision: true,
+            context: None,
+        };
+        let d = map_evaluations(&res, &[yes(), yes()]).unwrap();
+        assert_eq!((d["a"], d["b"]), (true, true));
+        assert!(map_evaluations(&res, &[yes()]).is_err());
+        assert!(map_evaluations(&res, &[yes(), yes(), yes()]).is_err());
+    }
+
+    #[test]
+    fn discovered_endpoints_must_be_https_off_loopback() {
+        assert!(https_or_loopback(
+            "https://platform.arkavo.net/access/v1/evaluations"
+        ));
+        assert!(https_or_loopback("http://127.0.0.1:9/x"));
+        assert!(https_or_loopback("http://localhost:9/x"));
+        assert!(https_or_loopback("http://[::1]:9/x"));
+        assert!(!https_or_loopback("http://platform.arkavo.net/x"));
+        assert!(!https_or_loopback("ftp://127.0.0.1/x"));
     }
 }
