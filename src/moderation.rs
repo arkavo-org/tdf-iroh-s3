@@ -36,6 +36,7 @@ pub const DEFAULT_PUBLISH_ENTITLEMENT: &str =
 
 const SUSPENSIONS: &str = "suspensions";
 const BLOCKS: &str = "blocks";
+const AUDIT: &str = "audit";
 const MAX_REASON_CHARS: usize = 1_000;
 
 pub fn now_secs() -> i64 {
@@ -501,6 +502,48 @@ pub fn router<S: ModerationStore>(state: Arc<ModerationApi<S>>) -> Router {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SessionRequest {
     endpoint_id: String,
+    /// Unix seconds when the client signed; within [`SESSION_SKEW_SECS`].
+    timestamp: i64,
+    /// Hex Ed25519 signature by the endpoint's secret key over
+    /// [`session_message`]: proof that the caller holds the endpoint.
+    signature: String,
+}
+
+/// How far a session signature's timestamp may be from the node's clock.
+pub const SESSION_SKEW_SECS: i64 = 300;
+
+/// The bytes a publisher signs with its iroh endpoint key to open a
+/// session. Binding the bearer token (by BLAKE3 hash) means a captured
+/// signature cannot be replayed with another subject's token, and the
+/// timestamp bounds replay with the same one.
+pub fn session_message(endpoint: &EndpointId, bearer_token: &str, timestamp: i64) -> Vec<u8> {
+    format!(
+        "tdf-iroh-s3 publish-session v1\n{endpoint}\n{}\n{timestamp}",
+        blake3::hash(bearer_token.as_bytes()).to_hex()
+    )
+    .into_bytes()
+}
+
+fn verify_possession(
+    endpoint: &EndpointId,
+    bearer_token: &str,
+    timestamp: i64,
+    signature_hex: &str,
+) -> Result<(), (StatusCode, &'static str)> {
+    if (now_secs() - timestamp).abs() > SESSION_SKEW_SECS {
+        return Err((StatusCode::BAD_REQUEST, "timestamp out of range"));
+    }
+    let bytes: [u8; 64] = hex::decode(signature_hex.trim())
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or((StatusCode::BAD_REQUEST, "invalid signature"))?;
+    let signature = iroh_base::Signature::from_bytes(&bytes);
+    endpoint
+        .verify(
+            &session_message(endpoint, bearer_token, timestamp),
+            &signature,
+        )
+        .map_err(|_| (StatusCode::FORBIDDEN, "signature does not match endpointId"))
 }
 
 async fn open_session<S: ModerationStore>(
@@ -515,6 +558,8 @@ async fn open_session<S: ModerationStore>(
         .map_err(fail)?;
     let endpoint = EndpointId::from_str(body.endpoint_id.trim())
         .map_err(|_| fail((StatusCode::BAD_REQUEST, "invalid endpointId")))?;
+    let token = bearer(&headers).unwrap_or_default();
+    verify_possession(&endpoint, token, body.timestamp, &body.signature).map_err(fail)?;
     s.gate
         .open_session(endpoint, &claims.sub, s.policy.session_ttl);
     let expires_at = now_secs() + s.policy.session_ttl.as_secs() as i64;
@@ -575,6 +620,24 @@ async fn persist<S: ModerationStore, T: Serialize>(
         })
 }
 
+/// Append an immutable audit event under `moderation/audit/<kind>/<key>/`.
+/// Current-state objects are overwritten on each change; these are not, so
+/// every suspend, block and lift stays on record.
+async fn audit<S: ModerationStore, T: Serialize>(
+    store: &S,
+    action: &str,
+    kind: &str,
+    key: &str,
+    record: &T,
+) -> ApiResult<()> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let event = serde_json::json!({ "action": action, "record": record });
+    persist(store, AUDIT, &format!("{kind}/{key}/{nanos:020}"), &event).await
+}
+
 async fn list_suspensions<S: ModerationStore>(
     State(s): State<Arc<ModerationApi<S>>>,
     headers: HeaderMap,
@@ -611,6 +674,7 @@ async fn suspend<S: ModerationStore>(
         lifted_by: None,
         lifted_at: None,
     };
+    audit(s.store.as_ref(), "suspend", SUSPENSIONS, &subject, &record).await?;
     persist(s.store.as_ref(), SUSPENSIONS, &subject, &record).await?;
     s.gate.moderation.apply_suspension(record.clone());
     info!(audit = "suspend", %subject, by = %record.by, report = ?record.report_id, hide = record.hide_catalog, "Creator suspended");
@@ -634,6 +698,14 @@ async fn lift_suspension<S: ModerationStore>(
         .ok_or_else(|| fail((StatusCode::NOT_FOUND, "no active suspension")))?;
     record.lifted_by = Some(by);
     record.lifted_at = Some(now_secs());
+    audit(
+        s.store.as_ref(),
+        "lift_suspension",
+        SUSPENSIONS,
+        &record.subject,
+        &record,
+    )
+    .await?;
     persist(s.store.as_ref(), SUSPENSIONS, &record.subject, &record).await?;
     s.gate.moderation.apply_suspension(record.clone());
     info!(audit = "lift_suspension", subject = %record.subject, by = ?record.lifted_by, "Suspension lifted");
@@ -681,6 +753,7 @@ async fn block<S: ModerationStore>(
         lifted_by: None,
         lifted_at: None,
     };
+    audit(s.store.as_ref(), "block", BLOCKS, &hash, &record).await?;
     persist(s.store.as_ref(), BLOCKS, &hash, &record).await?;
     s.gate.moderation.apply_block(record.clone());
     info!(audit = "block", %hash, by = %record.by, report = ?record.report_id, "Content blocked");
@@ -707,6 +780,7 @@ async fn lift_block<S: ModerationStore>(
         .ok_or_else(|| fail((StatusCode::NOT_FOUND, "no active block")))?;
     record.lifted_by = Some(by);
     record.lifted_at = Some(now_secs());
+    audit(s.store.as_ref(), "lift_block", BLOCKS, &hash, &record).await?;
     persist(s.store.as_ref(), BLOCKS, &hash, &record).await?;
     s.gate.moderation.apply_block(record.clone());
     info!(audit = "lift_block", %hash, by = ?record.lifted_by, "Block lifted");
@@ -845,24 +919,36 @@ mod tests {
         (status, serde_json::from_slice(&bytes).unwrap_or_default())
     }
 
-    fn endpoint() -> EndpointId {
+    fn key() -> iroh::SecretKey {
         use std::sync::atomic::{AtomicU8, Ordering};
         static SEED: AtomicU8 = AtomicU8::new(1);
-        iroh::SecretKey::from_bytes(&[SEED.fetch_add(1, Ordering::Relaxed); 32]).public()
+        iroh::SecretKey::from_bytes(&[SEED.fetch_add(1, Ordering::Relaxed); 32])
+    }
+
+    fn endpoint() -> EndpointId {
+        key().public()
+    }
+
+    /// A session request signed by `sk` for `bearer`.
+    fn signed(sk: &iroh::SecretKey, bearer: &str) -> Option<serde_json::Value> {
+        let ep = sk.public();
+        let ts = now_secs();
+        let sig = sk.sign(&session_message(&ep, bearer, ts));
+        Some(serde_json::json!({
+            "endpointId": ep.to_string(),
+            "timestamp": ts,
+            "signature": hex::encode(sig.to_bytes()),
+        }))
     }
 
     #[tokio::test]
     async fn an_entitled_creator_opens_a_session_and_may_push() {
         let h = harness();
-        let ep = endpoint();
-        let (status, body) = call(
-            &h.app,
-            "POST",
-            "/publish/sessions",
-            &creator("arkavo:u1"),
-            Some(serde_json::json!({ "endpointId": ep.to_string() })),
-        )
-        .await;
+        let sk = key();
+        let ep = sk.public();
+        let tok = creator("arkavo:u1");
+        let (status, body) =
+            call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         assert_eq!(body["subject"], "u1");
         h.gate.connected(7, Some(ep));
@@ -883,7 +969,7 @@ mod tests {
     #[tokio::test]
     async fn sessions_need_the_entitlement_audience_and_a_person() {
         let h = harness();
-        let body = Some(serde_json::json!({ "endpointId": endpoint().to_string() }));
+        let sk = key();
         for (t, want) in [
             (token("u1", "arkavo", &[], &[]), StatusCode::FORBIDDEN),
             (
@@ -901,7 +987,7 @@ mod tests {
             ),
             ("garbage".to_string(), StatusCode::UNAUTHORIZED),
         ] {
-            let (status, _) = call(&h.app, "POST", "/publish/sessions", &t, body.clone()).await;
+            let (status, _) = call(&h.app, "POST", "/publish/sessions", &t, signed(&sk, &t)).await;
             assert_eq!(status, want, "{t}");
         }
     }
@@ -909,15 +995,11 @@ mod tests {
     #[tokio::test]
     async fn suspension_is_audited_stops_sessions_and_pushes_and_can_be_lifted() {
         let h = harness();
-        let ep = endpoint();
-        call(
-            &h.app,
-            "POST",
-            "/publish/sessions",
-            &creator("u1"),
-            Some(serde_json::json!({ "endpointId": ep.to_string() })),
-        )
-        .await;
+        let sk = key();
+        let ep = sk.public();
+        let tok = creator("u1");
+        let (status, _) = call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
+        assert_eq!(status, StatusCode::CREATED);
         h.gate.connected(1, Some(ep));
 
         let (status, rec) = call(
@@ -941,14 +1023,7 @@ mod tests {
             h.gate.authorize_push(1, &"b".repeat(64)),
             Err(PushRefusal::Suspended)
         );
-        let (status, _) = call(
-            &h.app,
-            "POST",
-            "/publish/sessions",
-            &creator("u1"),
-            Some(serde_json::json!({ "endpointId": ep.to_string() })),
-        )
-        .await;
+        let (status, _) = call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
 
         let (status, lifted) = call(
@@ -1117,5 +1192,109 @@ mod tests {
             m.is_suspended("u1"),
             "a storage blip must not lift a suspension"
         );
+    }
+
+    #[tokio::test]
+    async fn a_session_needs_proof_of_the_endpoint_key() {
+        let h = harness();
+        let tok = creator("u1");
+        let mine = key();
+        let victim = key().public();
+
+        // Someone else's endpoint ID, signed with my key: refused.
+        let mut body = signed(&mine, &tok).unwrap();
+        body["endpointId"] = serde_json::json!(victim.to_string());
+        let (status, _) = call(&h.app, "POST", "/publish/sessions", &tok, Some(body)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // A signature made for another token cannot be replayed with this one.
+        let other = creator("u2");
+        let (status, _) = call(
+            &h.app,
+            "POST",
+            "/publish/sessions",
+            &tok,
+            signed(&mine, &other),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Stale timestamp, missing or malformed signature.
+        let ep = mine.public();
+        let old = now_secs() - SESSION_SKEW_SECS - 10;
+        let stale = serde_json::json!({
+            "endpointId": ep.to_string(),
+            "timestamp": old,
+            "signature": hex::encode(mine.sign(&session_message(&ep, &tok, old)).to_bytes()),
+        });
+        let (status, _) = call(&h.app, "POST", "/publish/sessions", &tok, Some(stale)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        for bad in [
+            serde_json::json!({ "endpointId": ep.to_string() }),
+            serde_json::json!({ "endpointId": ep.to_string(), "timestamp": now_secs(), "signature": "zz" }),
+        ] {
+            let (status, _) = call(&h.app, "POST", "/publish/sessions", &tok, Some(bad)).await;
+            assert!(status.is_client_error(), "{status}");
+        }
+        h.gate.connected(5, Some(victim));
+        assert_eq!(
+            h.gate.authorize_push(5, &"a".repeat(64)),
+            Err(PushRefusal::NoSession)
+        );
+    }
+
+    #[tokio::test]
+    async fn every_change_is_kept_in_the_audit_history() {
+        let h = harness();
+        let op = operator();
+        let body = |r: &str| Some(serde_json::json!({ "reason": r }));
+        call(
+            &h.app,
+            "PUT",
+            "/moderation/suspensions/u1",
+            &op,
+            body("first"),
+        )
+        .await;
+        call(&h.app, "DELETE", "/moderation/suspensions/u1", &op, None).await;
+        call(
+            &h.app,
+            "PUT",
+            "/moderation/suspensions/u1",
+            &op,
+            body("second"),
+        )
+        .await;
+        let hash = "e".repeat(64);
+        call(
+            &h.app,
+            "PUT",
+            &format!("/moderation/blocks/{hash}"),
+            &op,
+            body("takedown"),
+        )
+        .await;
+
+        let records = h.store.records.lock().unwrap();
+        let mut events: Vec<(String, serde_json::Value)> = records
+            .iter()
+            .filter(|(k, _)| k.starts_with("audit/"))
+            .map(|(k, v)| (k.clone(), serde_json::from_slice(v).unwrap()))
+            .collect();
+        events.sort_by(|a, b| a.0.cmp(&b.0));
+        let actions: Vec<&str> = events
+            .iter()
+            .map(|(_, e)| e["action"].as_str().unwrap())
+            .collect();
+        assert_eq!(actions, ["block", "suspend", "lift_suspension", "suspend"]);
+        let reasons: Vec<&str> = events
+            .iter()
+            .filter(|(k, _)| k.starts_with("audit/suspensions/u1/"))
+            .map(|(_, e)| e["record"]["reason"].as_str().unwrap())
+            .collect();
+        assert_eq!(reasons, ["first", "first", "second"]);
+        // The current record is the latest; history survives the overwrite.
+        let current: Suspension = serde_json::from_slice(&records["suspensions/u1"]).unwrap();
+        assert_eq!(current.reason, "second");
     }
 }

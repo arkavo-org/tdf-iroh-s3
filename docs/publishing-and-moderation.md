@@ -20,12 +20,22 @@ A publisher's CWT must:
 
 ### 1. Open a publish session for the iroh endpoint that will push
 
+The caller must prove it holds the endpoint's key. It signs the following bytes with its iroh secret key (Ed25519, `SecretKey::sign`):
+
+```text
+tdf-iroh-s3 publish-session v1\n<endpointId>\n<blake3-hex of the bearer token string>\n<timestamp>
+```
+
+`timestamp` is Unix seconds and must be within 300 s of the node's clock. Binding the bearer token means a captured signature can't be reused with another subject's token.
+
 ```bash
 curl -X POST https://iroh.arkavo.net/publish/sessions \
   -H "Authorization: Bearer <cwt>" -H "Content-Type: application/json" \
-  -d '{"endpointId":"<this device's iroh endpoint id>"}'
+  -d '{"endpointId":"<endpoint id>","timestamp":<unix>,"signature":"<128 hex chars>"}'
 # 201 {"endpointId":"…","subject":"<sub>","expiresAt":<unix>}
 ```
+
+A signature that doesn't match `endpointId` returns 403. A stale timestamp or a malformed signature returns 400.
 
 The session lasts `[publishing] session_ttl_secs` (default 900).
 
@@ -77,7 +87,8 @@ Subjects compare in canonical form: `arkavo:<id>` and a bare `<id>` are the same
 
 Each suspension or block is stored as a JSON object under `moderation/suspensions/<subject>` or `moderation/blocks/<hash>`. The object records who set it, when, why and the report ID.
 
-- Lifting one sets `liftedBy` and `liftedAt` instead of deleting it, so the object is the audit trail.
+- Lifting one sets `liftedBy` and `liftedAt` instead of deleting it.
+- Those objects hold only the current state, so every suspend, block and lift also writes an immutable event under `moderation/audit/<suspensions|blocks>/<key>/<ns timestamp>`, as `{"action", "record"}`. A re-suspension or re-block never loses the earlier record.
 - Each change is also logged with an `audit` field.
 
 ### Propagation
@@ -104,4 +115,4 @@ operator_client_ids = ["moderation"]
 moderation_refresh_secs = 30
 ```
 
-The node's IAM role needs `s3:PutObject`, `s3:GetObject` and `s3:ListBucket` on `<prefix>moderation/*`.
+The node's IAM role needs `s3:PutObject`, `s3:GetObject` and `s3:ListBucket` on `<prefix>moderation/*`, which includes `moderation/audit/`.
