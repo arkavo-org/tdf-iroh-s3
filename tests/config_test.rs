@@ -90,6 +90,7 @@ client_id = "catalog-node"
         "/tdf-iroh-s3/catalog-authz-client-secret"
     );
     assert!(config.catalog.authz.client_secret.is_empty());
+    assert_eq!(config.catalog.authz.protocol, "authzen");
 }
 
 #[test]

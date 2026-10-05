@@ -7,11 +7,14 @@
 //!
 //! Entity chain (PE → NPE → NPE):
 //! - PE: `Authorization: Bearer <Arkavo CWT>`.
-//! - NPE: zero or more `X-Entity-Token: <Arkavo CWT>` headers (attested
-//!   app/device tokens). Each must verify and carry the same `sub` as the
-//!   PE — mix-and-match chains are rejected.
+//! - NPE: zero or more repeated `X-Entity-Token: <DeviceCheck CWT>` headers
+//!   (`get_all`, not comma-separated). Each must verify with
+//!   `aud=arkavo:devicecheck` and bind to the PE via `subject_id_bind`
+//!   (a single leading `arkavo:` is stripped; `apple:`/`client:` are not).
 //! - NPE: the environment this node observes (configured region),
 //!   appended server-side; never client-supplied.
+//!
+//! Chain length is capped at `1 + D + E ≤ 8`. Empty listings skip the PDP.
 //!
 //! Decisions are delegated to the OpenTDF authorization service; this
 //! node never evaluates policy. Fail-closed everywhere: no credentials,
@@ -30,9 +33,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::warn;
 
-use crate::auth::CwtVerifier;
+use crate::auth::{CwtVerifier, subject_id_bind};
 use crate::authz::{ChainEntity, DecisionProvider, DecisionRequest};
 use crate::catalog::CatalogEntry;
+
+/// 1 PE + D devices + E environment (E is 0 or 1).
+const MAX_CHAIN_ENTITIES: usize = 8;
 
 /// Read side of the catalog index. `S3Client` is the production impl.
 pub trait CatalogStore: Send + Sync + 'static {
@@ -237,6 +243,7 @@ async fn get_catalog<S: CatalogStore, D: DecisionProvider>(
 
     let (decision, verdicts) = match &chain {
         None => ("anonymous", HashMap::new()),
+        Some(_) if entries.is_empty() => ("evaluated", HashMap::new()),
         Some(chain) => {
             let req = DecisionRequest {
                 chain: chain.clone(),
@@ -299,6 +306,11 @@ async fn build_chain<S: CatalogStore, D: DecisionProvider>(
         ));
     };
 
+    let extra = usize::from(state.environment.is_some());
+    if 1 + npe_tokens.len() + extra > MAX_CHAIN_ENTITIES {
+        return Err(err(StatusCode::BAD_REQUEST, "too many entities"));
+    }
+
     let now = unix_now();
     let pe = state.verifier.verify(pe_token, now).await.map_err(|e| {
         warn!(error = %e, "PE token verification failed");
@@ -321,6 +333,24 @@ async fn build_chain<S: CatalogStore, D: DecisionProvider>(
     if let Some(email) = &pe.email {
         subject_claims.insert("email".into(), email.clone().into());
     }
+    if let Some(v) = pe.email_verified {
+        subject_claims.insert("email_verified".into(), v.into());
+    }
+    if let Some(idp) = &pe.idp {
+        subject_claims.insert("idp".into(), idp.clone().into());
+    }
+    if let Some(id) = &pe.arkavo_account_id {
+        subject_claims.insert("arkavo_account_id".into(), id.clone().into());
+    }
+    if let Some(roles) = &pe.arkavo_roles {
+        subject_claims.insert("arkavo_roles".into(), roles.clone().into());
+    }
+    if let Some(ents) = &pe.arkavo_entitlements {
+        subject_claims.insert("arkavo_entitlements".into(), ents.clone().into());
+    }
+    if let Some(id) = &pe.client_id {
+        subject_claims.insert("client_id".into(), id.clone().into());
+    }
     if let Some(patreon) = &pe.arkavo_patreon {
         subject_claims.insert("arkavo_patreon".into(), patreon.clone());
     }
@@ -331,22 +361,37 @@ async fn build_chain<S: CatalogStore, D: DecisionProvider>(
     }];
 
     for token in npe_tokens {
-        let claims = state.verifier.verify(token, now).await.map_err(|e| {
-            warn!(error = %e, "NPE token verification failed");
-            err(StatusCode::UNAUTHORIZED, "invalid entity token")
-        })?;
-        // Mix-and-match defense: every NPE must be bound to the same subject.
-        if claims.sub != pe.sub {
-            warn!(pe_sub = %pe.sub, npe_sub = %claims.sub, "Entity chain subject mismatch");
+        let claims = state
+            .verifier
+            .verify_device(token, now)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "NPE token verification failed");
+                err(StatusCode::UNAUTHORIZED, "invalid entity token")
+            })?;
+        if subject_id_bind(&claims.sub) != subject_id_bind(&pe.sub) {
+            warn!("Entity chain subject mismatch");
             return Err(err(
                 StatusCode::UNAUTHORIZED,
                 "entity token subject does not match bearer subject",
             ));
         }
+        // verify_device guarantees the DeviceCheck audience is present; the
+        // PDP's device schema takes exactly that string, whatever else `aud`
+        // listed.
+        let aud = crate::auth::DEVICECHECK_AUD;
+        let Some(kid) = claims.kid.as_deref().filter(|k| !k.is_empty()) else {
+            return Err(err(StatusCode::UNAUTHORIZED, "invalid entity token"));
+        };
         chain.push(ChainEntity {
             is_subject: false,
             token: Some(token.to_string()),
-            claims: serde_json::json!({ "sub": claims.sub, "iss": claims.iss }),
+            claims: serde_json::json!({
+                "sub": claims.sub,
+                "iss": claims.iss,
+                "aud": aud,
+                "kid": kid,
+            }),
         });
     }
 
@@ -372,7 +417,9 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::test_support::{keypair, mint};
+    use crate::auth::DEVICECHECK_AUD;
+    use crate::auth::test_support::{keypair, mint, mint_devicecheck, mint_with_aud};
+    use crate::authz::build_authzen_request;
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
@@ -408,11 +455,16 @@ mod tests {
         permit: Vec<String>,
         seen_chain_len: std::sync::Mutex<Option<usize>>,
         seen_subject_claims: std::sync::Mutex<Option<serde_json::Value>>,
+        seen_chain: std::sync::Mutex<Option<Vec<ChainEntity>>>,
+        called: std::sync::atomic::AtomicUsize,
     }
 
     impl DecisionProvider for StubProvider {
         async fn decide(&self, req: DecisionRequest) -> anyhow::Result<crate::authz::Decisions> {
+            self.called
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.seen_chain_len.lock().unwrap() = Some(req.chain.len());
+            *self.seen_chain.lock().unwrap() = Some(req.chain.clone());
             if let Some(pe) = req.chain.iter().find(|e| e.is_subject) {
                 *self.seen_subject_claims.lock().unwrap() = Some(pe.claims.clone());
             }
@@ -462,6 +514,8 @@ mod tests {
                 permit,
                 seen_chain_len: std::sync::Mutex::new(None),
                 seen_subject_claims: std::sync::Mutex::new(None),
+                seen_chain: std::sync::Mutex::new(None),
+                called: std::sync::atomic::AtomicUsize::new(0),
             },
             verifier: Arc::new(CwtVerifier::with_static_keys(vec![(b"kid-1".to_vec(), vk)])),
             action: "read".into(),
@@ -603,20 +657,25 @@ mod tests {
         assert!(!entitled[&*"bb".repeat(32)]);
     }
 
+    fn device(sk: &p256::ecdsa::SigningKey, sub: &str, cnf_kid: &[u8]) -> String {
+        mint_devicecheck(
+            sk,
+            b"kid-1",
+            "https://i.test",
+            sub,
+            now(),
+            now() + 3600,
+            cnf_kid,
+        )
+    }
+
     #[tokio::test]
     async fn npe_with_matching_sub_joins_chain_and_environment_appends() {
         let r = rig(
             vec![],
             Some(json!({ "region": "us-east-1", "kind": "environment" })),
         );
-        let npe = mint(
-            &r.sk,
-            b"kid-1",
-            "https://i.test",
-            "arkavo:u1",
-            now(),
-            now() + 3600,
-        );
+        let npe = device(&r.sk, "arkavo:u1", b"phone-kid");
         let auth = format!("Bearer {}", r.token);
         let (status, _) = get_json(
             &r.router,
@@ -632,35 +691,25 @@ mod tests {
     #[tokio::test]
     async fn npe_sub_mismatch_is_401() {
         let r = rig(vec![], None);
-        let npe = mint(
-            &r.sk,
-            b"kid-1",
-            "https://i.test",
-            "arkavo:other",
-            now(),
-            now() + 3600,
-        );
+        let npe = device(&r.sk, "arkavo:other", b"phone-kid");
         let auth = format!("Bearer {}", r.token);
-        let (status, _) = get_json(
+        let (status, body) = get_json(
             &r.router,
             "/catalog/camp1",
             &[("authorization", &auth), ("x-entity-token", &npe)],
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body["error"],
+            "entity token subject does not match bearer subject"
+        );
     }
 
     #[tokio::test]
     async fn npe_without_pe_is_401() {
         let r = rig(vec![], None);
-        let npe = mint(
-            &r.sk,
-            b"kid-1",
-            "https://i.test",
-            "arkavo:u1",
-            now(),
-            now() + 3600,
-        );
+        let npe = device(&r.sk, "arkavo:u1", b"phone-kid");
         let (status, _) = get_json(&r.router, "/catalog/camp1", &[("x-entity-token", &npe)]).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
@@ -707,5 +756,242 @@ mod tests {
         let (status, body) = get_json(&r.router, "/catalog/no-such-group", &[]).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["items"].as_array().unwrap().len(), 0);
+    }
+
+    const BIND_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    #[tokio::test]
+    async fn pe_arkavo_uuid_binds_bare_devicecheck_sub() {
+        let r = rig(vec![], None);
+        let pe = mint(
+            &r.sk,
+            b"kid-1",
+            "https://i.test",
+            &format!("arkavo:{BIND_UUID}"),
+            now(),
+            now() + 3600,
+        );
+        let npe = device(&r.sk, BIND_UUID, b"phone-kid");
+        let auth = format!("Bearer {pe}");
+        let (status, body) = get_json(
+            &r.router,
+            "/catalog/camp1",
+            &[("authorization", &auth), ("x-entity-token", &npe)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["decision"], "evaluated");
+        assert_eq!(*r.state.provider.seen_chain_len.lock().unwrap(), Some(2));
+        let chain = r.state.provider.seen_chain.lock().unwrap().clone().unwrap();
+        assert_eq!(chain[1].claims["sub"], BIND_UUID);
+        assert_eq!(chain[1].claims["aud"], DEVICECHECK_AUD);
+        assert_eq!(chain[1].claims["kid"], "cGhvbmUta2lk");
+        assert_ne!(chain[0].claims["sub"], chain[1].claims["sub"]);
+    }
+
+    #[tokio::test]
+    async fn unbound_device_sub_is_401_with_bind_error() {
+        let r = rig(vec![], None);
+        let npe = device(&r.sk, "00000000-0000-0000-0000-000000000000", b"phone-kid");
+        let auth = format!("Bearer {}", r.token);
+        let (status, body) = get_json(
+            &r.router,
+            "/catalog/camp1",
+            &[("authorization", &auth), ("x-entity-token", &npe)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body["error"],
+            "entity token subject does not match bearer subject"
+        );
+    }
+
+    #[tokio::test]
+    async fn device_wrong_aud_is_401_invalid_entity_token() {
+        let r = rig(vec![], None);
+        let npe = mint_with_aud(
+            &r.sk,
+            b"kid-1",
+            "https://i.test",
+            "arkavo:u1",
+            "arkavo",
+            now(),
+            now() + 3600,
+            &[],
+        );
+        let auth = format!("Bearer {}", r.token);
+        let (status, body) = get_json(
+            &r.router,
+            "/catalog/camp1",
+            &[("authorization", &auth), ("x-entity-token", &npe)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "invalid entity token");
+    }
+
+    #[tokio::test]
+    async fn two_entity_tokens_join_chain_and_authzen_emits_devices_array() {
+        let r = rig(
+            vec![],
+            Some(json!({ "region": "us-east-1", "kind": "environment" })),
+        );
+        let d1 = device(&r.sk, "arkavo:u1", b"phone-kid");
+        let d2 = device(&r.sk, "arkavo:u1", b"watch-kid");
+        let auth = format!("Bearer {}", r.token);
+        let (status, _) = get_json(
+            &r.router,
+            "/catalog/camp1",
+            &[
+                ("authorization", &auth),
+                ("x-entity-token", &d1),
+                ("x-entity-token", &d2),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(*r.state.provider.seen_chain_len.lock().unwrap(), Some(4));
+        let chain = r.state.provider.seen_chain.lock().unwrap().clone().unwrap();
+        let req = DecisionRequest {
+            chain,
+            action: "read".into(),
+            resources: vec![(
+                "aa".repeat(32),
+                vec!["https://p.example/attr/tier/value/gold".into()],
+            )],
+        };
+        let body = build_authzen_request(&req).unwrap();
+        assert!(body["context"].get("device").is_none());
+        let devices = body["context"]["devices"].as_array().unwrap();
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0]["kid"], "cGhvbmUta2lk");
+        assert_eq!(devices[1]["kid"], "d2F0Y2gta2lk");
+        assert_eq!(body["context"]["environment"]["region"], "us-east-1");
+    }
+
+    #[tokio::test]
+    async fn chain_over_cap_is_400() {
+        let r = rig(
+            vec![],
+            Some(json!({ "region": "us-east-1", "kind": "environment" })),
+        );
+        let auth = format!("Bearer {}", r.token);
+        let devices: Vec<String> = (0..7)
+            .map(|i| device(&r.sk, "arkavo:u1", format!("dev-{i}").as_bytes()))
+            .collect();
+        let mut headers: Vec<(&str, &str)> = vec![("authorization", &auth)];
+        for d in &devices {
+            headers.push(("x-entity-token", d.as_str()));
+        }
+        let (status, body) = get_json(&r.router, "/catalog/camp1", &headers).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "too many entities");
+        assert_eq!(
+            r.state
+                .provider
+                .called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        // Cap is applied before verify: garbage among an over-size set is 400, not 401.
+        let garbage = "not-a-token";
+        headers[1] = ("x-entity-token", garbage);
+        let (status, body) = get_json(&r.router, "/catalog/camp1", &headers).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "too many entities");
+    }
+
+    #[tokio::test]
+    async fn empty_listing_with_bearer_skips_provider() {
+        let r = rig(vec![], None);
+        let auth = format!("Bearer {}", r.token);
+        let (status, body) = get_json(
+            &r.router,
+            "/catalog/no-such-group",
+            &[("authorization", &auth)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["decision"], "evaluated");
+        assert_eq!(body["items"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            r.state
+                .provider
+                .called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(
+            body["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|i| i["entitled"] != true)
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_empty_listing_skips_provider() {
+        let r = rig(vec![], None);
+        let (status, body) = get_json(&r.router, "/catalog/no-such-group", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["decision"], "anonymous");
+        assert_eq!(body["items"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            r.state
+                .provider
+                .called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn apple_and_client_prefixes_do_not_bind() {
+        let r = rig(vec![], None);
+        let pe_apple = mint(
+            &r.sk,
+            b"kid-1",
+            "https://i.test",
+            "apple:x",
+            now(),
+            now() + 3600,
+        );
+        let npe = device(&r.sk, "x", b"phone-kid");
+        let auth = format!("Bearer {pe_apple}");
+        let (status, body) = get_json(
+            &r.router,
+            "/catalog/camp1",
+            &[("authorization", &auth), ("x-entity-token", &npe)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body["error"],
+            "entity token subject does not match bearer subject"
+        );
+
+        let pe_client = mint(
+            &r.sk,
+            b"kid-1",
+            "https://i.test",
+            "client:x",
+            now(),
+            now() + 3600,
+        );
+        let auth = format!("Bearer {pe_client}");
+        let (status, body) = get_json(
+            &r.router,
+            "/catalog/camp1",
+            &[("authorization", &auth), ("x-entity-token", &npe)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body["error"],
+            "entity token subject does not match bearer subject"
+        );
     }
 }

@@ -8,11 +8,13 @@
 //! document) and cached; an unknown `kid` triggers one rate-limited
 //! refetch in case the IdP rotated keys.
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ciborium::value::Value;
 use coset::{AsCborValue, CborSerializable};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -20,8 +22,16 @@ use tracing::{info, warn};
 /// CBOR encoding of tag #6.61 (CWT, RFC 8392 §6).
 const CWT_TAG_PREFIX: [u8; 2] = [0xD8, 0x3D];
 
-/// Clock-skew tolerance for exp/iat checks.
+/// Clock-skew tolerance for exp/iat checks. Expiry is `exp <= now - 60`.
 const SKEW_SECS: i64 = 60;
+
+/// DeviceCheck assertion audience (draft-arkavo-authzen-cwt-00).
+pub const DEVICECHECK_AUD: &str = "arkavo:devicecheck";
+
+/// Strip a single leading `arkavo:` prefix. Does not strip `apple:` or `client:`.
+pub fn subject_id_bind(s: &str) -> &str {
+    s.strip_prefix("arkavo:").unwrap_or(s)
+}
 
 /// Minimum interval between key-set refetches, so a flood of bad-kid
 /// tokens cannot turn this node into an IdP load generator.
@@ -49,8 +59,43 @@ pub enum AuthError {
     MissingClaim(&'static str),
     #[error("issuer mismatch")]
     Issuer,
+    #[error("audience mismatch")]
+    Audience,
+    #[error("duplicate claim key")]
+    DuplicateKey,
     #[error("key set unavailable: {0}")]
     KeySet(String),
+}
+
+/// CWT `aud` (RFC 8392): a single tstr or an array of tstr.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Aud {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Aud {
+    pub fn contains(&self, want: &str) -> bool {
+        match self {
+            Aud::One(s) => s == want,
+            Aud::Many(v) => v.iter().any(|s| s == want),
+        }
+    }
+
+    /// String form used by the device allowlist (`aud` is a JSON string).
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Aud::One(s) => Some(s.as_str()),
+            Aud::Many(v) if v.len() == 1 => Some(v[0].as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// Optional checks layered on top of signature / required-claim verification.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VerifyOpts<'a> {
+    pub expected_aud: Option<&'a str>,
 }
 
 /// The subset of CWT claims the tag and catalog APIs need.
@@ -58,14 +103,29 @@ pub enum AuthError {
 pub struct VerifiedClaims {
     pub iss: String,
     pub sub: String,
+    pub aud: Aud,
     pub exp: i64,
     pub iat: i64,
+    /// RFC 8392 `nbf`, when present.
+    pub nbf: Option<i64>,
+    /// Required by the Arkavo CWT profile (identity.arkavo.net mints a
+    /// random 16-byte `cti` on every token). Checked for presence only:
+    /// nothing here keeps a replay cache.
+    pub cti: Vec<u8>,
+    /// unpadded base64url of `cnf.kid`, when the token carries a confirmation key.
+    pub kid: Option<String>,
     /// `arkavo_patreon.patreon_user_id`, when the token carries the
     /// membership claim — the identifier the platform's Patreon ERS
     /// resolves directly.
     pub patreon_user_id: Option<String>,
     /// `email` claim, when present (the ERS's fallback lookup key).
     pub email: Option<String>,
+    pub email_verified: Option<bool>,
+    pub idp: Option<String>,
+    pub arkavo_account_id: Option<String>,
+    pub arkavo_roles: Option<Vec<String>>,
+    pub arkavo_entitlements: Option<Vec<String>>,
+    pub client_id: Option<String>,
     /// The full verified `arkavo_patreon` claim as JSON (role,
     /// patreon_user_id, campaign_id, memberships[…]), so the catalog node
     /// can forward it verbatim to the platform's claims-passthrough — which
@@ -131,9 +191,44 @@ impl CwtVerifier {
     }
 
     /// Verify a base64url(no pad) CWT and return its claims.
+    /// PE tokens use this path: issuer pin only, no audience pin.
     pub async fn verify(&self, token_b64: &str, now: i64) -> Result<VerifiedClaims, AuthError> {
-        use base64::Engine;
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        self.verify_with(token_b64, now, VerifyOpts::default())
+            .await
+    }
+
+    /// DeviceCheck CWT: after signature verify, `aud` MUST be
+    /// `arkavo:devicecheck` and `cnf.kid` MUST be present.
+    pub async fn verify_device(
+        &self,
+        token_b64: &str,
+        now: i64,
+    ) -> Result<VerifiedClaims, AuthError> {
+        let claims = self
+            .verify_with(
+                token_b64,
+                now,
+                VerifyOpts {
+                    expected_aud: Some(DEVICECHECK_AUD),
+                },
+            )
+            .await?;
+        // authnz-rs mints `aud = ["arkavo:devicecheck", <platform audience>]`
+        // when a platform audience is configured; `verify_with` has already
+        // required the DeviceCheck audience to be among them.
+        if claims.kid.as_ref().is_none_or(|k| k.is_empty()) {
+            return Err(AuthError::MissingClaim("kid"));
+        }
+        Ok(claims)
+    }
+
+    pub async fn verify_with(
+        &self,
+        token_b64: &str,
+        now: i64,
+        opts: VerifyOpts<'_>,
+    ) -> Result<VerifiedClaims, AuthError> {
+        let bytes = URL_SAFE_NO_PAD
             .decode(token_b64.trim())
             .map_err(|_| AuthError::Malformed)?;
 
@@ -146,6 +241,11 @@ impl CwtVerifier {
         match sign1.protected.header.alg {
             Some(coset::Algorithm::Assigned(coset::iana::Algorithm::ES256)) => {}
             _ => return Err(AuthError::Algorithm),
+        }
+        // RFC 9052 3.1: reject a message marking any header critical; this
+        // verifier processes none.
+        if !sign1.protected.header.crit.is_empty() {
+            return Err(AuthError::Malformed);
         }
         let kid = sign1.protected.header.key_id.clone();
         if kid.is_empty() {
@@ -171,19 +271,27 @@ impl CwtVerifier {
         let payload = sign1.payload.as_deref().ok_or(AuthError::Malformed)?;
         let claims = parse_claims(payload)?;
 
-        if claims.exp < now - SKEW_SECS {
+        if let Some(expected) = &self.expected_iss
+            && &claims.iss != expected
+        {
+            return Err(AuthError::Issuer);
+        }
+        if let Some(want) = opts.expected_aud
+            && !claims.aud.contains(want)
+        {
+            return Err(AuthError::Audience);
+        }
+        if claims.iat > claims.exp {
+            return Err(AuthError::Malformed);
+        }
+        if claims.exp <= now - SKEW_SECS {
             return Err(AuthError::Expired);
         }
         if claims.iat > now + SKEW_SECS {
             return Err(AuthError::NotYetValid);
         }
-        // Issuer pinning: a key in the trusted set is necessary but not
-        // sufficient — tokens minted by a different issuer (or for an
-        // unrelated purpose by a co-located IdP) are refused.
-        if let Some(expected) = &self.expected_iss
-            && &claims.iss != expected
-        {
-            return Err(AuthError::Issuer);
+        if claims.nbf.is_some_and(|nbf| nbf > now + SKEW_SECS) {
+            return Err(AuthError::NotYetValid);
         }
         Ok(claims)
     }
@@ -316,31 +424,82 @@ fn p256_from_cose_key(key: &coset::CoseKey) -> anyhow::Result<VerifyingKey> {
     Ok(VerifyingKey::from_sec1_bytes(&sec1)?)
 }
 
-/// Parse the CWT claims map: 1 = iss, 2 = sub, 4 = exp, 6 = iat.
+/// Parse the CWT claims map (RFC 8392 integer labels + Arkavo text claims).
 fn parse_claims(payload: &[u8]) -> Result<VerifiedClaims, AuthError> {
     let value: Value = ciborium::de::from_reader(payload).map_err(|_| AuthError::Malformed)?;
     let Value::Map(entries) = value else {
         return Err(AuthError::Malformed);
     };
 
+    let mut seen = HashSet::new();
     let mut iss = None;
     let mut sub = None;
+    let mut aud = None;
     let mut exp = None;
     let mut iat = None;
+    let mut nbf = None;
+    let mut cti = None;
+    let mut kid = None;
     let mut patreon_user_id = None;
     let mut email = None;
+    let mut email_verified = None;
+    let mut idp = None;
+    let mut arkavo_account_id = None;
+    let mut arkavo_roles = None;
+    let mut arkavo_entitlements = None;
+    let mut client_id = None;
     let mut arkavo_patreon = None;
     for (k, v) in entries {
+        let key_id = match &k {
+            Value::Integer(i) => format!("i:{}", i128::from(*i)),
+            Value::Text(t) => format!("t:{t}"),
+            _ => return Err(AuthError::Malformed),
+        };
+        if !seen.insert(key_id) {
+            return Err(AuthError::DuplicateKey);
+        }
         match k {
             Value::Integer(key) => match (i128::from(key), v) {
                 (1, Value::Text(s)) => iss = Some(s),
                 (2, Value::Text(s)) => sub = Some(s),
+                (3, Value::Text(s)) => aud = Some(Aud::One(s)),
+                (3, Value::Array(a)) => {
+                    let mut members = Vec::with_capacity(a.len());
+                    for item in a {
+                        let Value::Text(s) = item else {
+                            return Err(AuthError::Malformed);
+                        };
+                        if s.is_empty() {
+                            return Err(AuthError::Malformed);
+                        }
+                        members.push(s);
+                    }
+                    if members.is_empty() {
+                        return Err(AuthError::MissingClaim("aud"));
+                    }
+                    aud = Some(Aud::Many(members));
+                }
                 (4, Value::Integer(n)) => exp = i64::try_from(i128::from(n)).ok(),
                 (6, Value::Integer(n)) => iat = i64::try_from(i128::from(n)).ok(),
+                (5, Value::Integer(n)) => {
+                    nbf = Some(i64::try_from(i128::from(n)).map_err(|_| AuthError::Malformed)?);
+                }
+                // A present nbf of any other type must not skip enforcement.
+                (5, _) => return Err(AuthError::Malformed),
+                (7, Value::Bytes(b)) => cti = Some(b),
+                (8, Value::Map(m)) => kid = parse_cnf_kid(&m)?,
                 _ => {}
             },
             Value::Text(key) => match (key.as_str(), v) {
                 ("email", Value::Text(s)) => email = Some(s),
+                ("email_verified", Value::Bool(b)) => email_verified = Some(b),
+                ("idp", Value::Text(s)) => idp = Some(s),
+                ("arkavo_account_id", Value::Text(s)) => arkavo_account_id = Some(s),
+                ("client_id", Value::Text(s)) => client_id = Some(s),
+                ("arkavo_roles", Value::Array(a)) => arkavo_roles = Some(text_array(a)?),
+                ("arkavo_entitlements", Value::Array(a)) => {
+                    arkavo_entitlements = Some(text_array(a)?);
+                }
                 ("arkavo_patreon", patreon @ Value::Map(_)) => {
                     // Keep the whole claim as JSON for forwarding, and pull
                     // patreon_user_id out of it for the token-mode fallback.
@@ -357,15 +516,75 @@ fn parse_claims(payload: &[u8]) -> Result<VerifiedClaims, AuthError> {
         }
     }
 
+    let non_empty = |v: Option<String>, name: &'static str| match v {
+        Some(s) if !s.is_empty() => Ok(s),
+        _ => Err(AuthError::MissingClaim(name)),
+    };
+    if matches!(&aud, Some(Aud::One(s)) if s.is_empty()) {
+        return Err(AuthError::MissingClaim("aud"));
+    }
     Ok(VerifiedClaims {
-        iss: iss.ok_or(AuthError::MissingClaim("iss"))?,
-        sub: sub.ok_or(AuthError::MissingClaim("sub"))?,
+        iss: non_empty(iss, "iss")?,
+        sub: non_empty(sub, "sub")?,
+        aud: aud.ok_or(AuthError::MissingClaim("aud"))?,
         exp: exp.ok_or(AuthError::MissingClaim("exp"))?,
         iat: iat.ok_or(AuthError::MissingClaim("iat"))?,
+        nbf,
+        cti: cti
+            .filter(|c| !c.is_empty())
+            .ok_or(AuthError::MissingClaim("cti"))?,
+        kid,
         patreon_user_id,
         email,
+        email_verified,
+        idp,
+        arkavo_account_id,
+        arkavo_roles,
+        arkavo_entitlements,
+        client_id,
         arkavo_patreon,
     })
+}
+
+fn text_array(a: Vec<Value>) -> Result<Vec<String>, AuthError> {
+    a.into_iter()
+        .map(|v| match v {
+            Value::Text(s) => Ok(s),
+            _ => Err(AuthError::Malformed),
+        })
+        .collect()
+}
+
+/// `cnf` (claim 8): confirmation kid as unpadded base64url.
+/// authnz-rs encodes kid at map key 2 (bytes); RFC 8747 kid is 3.
+fn parse_cnf_kid(map: &[(Value, Value)]) -> Result<Option<String>, AuthError> {
+    let mut seen = HashSet::new();
+    let mut kid_bytes: Option<Vec<u8>> = None;
+    let mut cose_kid: Option<Vec<u8>> = None;
+    for (k, v) in map {
+        let Value::Integer(i) = k else {
+            continue;
+        };
+        let key_id = format!("i:{}", i128::from(*i));
+        if !seen.insert(key_id) {
+            return Err(AuthError::DuplicateKey);
+        }
+        match (k, v) {
+            (Value::Integer(n), Value::Bytes(b)) if matches!(i128::from(*n), 2 | 3) => {
+                kid_bytes = Some(b.clone());
+            }
+            (Value::Integer(n), val) if i128::from(*n) == 1 => {
+                if let Ok(key) = coset::CoseKey::from_cbor_value(val.clone())
+                    && !key.key_id.is_empty()
+                {
+                    cose_kid = Some(key.key_id);
+                }
+            }
+            _ => {}
+        }
+    }
+    let bytes = kid_bytes.or(cose_kid).filter(|b| !b.is_empty());
+    Ok(bytes.map(|b| URL_SAFE_NO_PAD.encode(b)))
 }
 
 /// Convert a CBOR value (as it appears in a CWT claim) to JSON for
@@ -419,6 +638,7 @@ pub(crate) mod test_support {
     //! Mint Arkavo-compatible CWTs for tests, mirroring authnz-rs `cwt::mint`.
 
     use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use coset::{CoseSign1Builder, HeaderBuilder, iana};
     use p256::ecdsa::{SigningKey, signature::Signer};
 
@@ -427,6 +647,7 @@ pub(crate) mod test_support {
     }
 
     /// Mint with additional text-keyed claims, e.g. an `arkavo_patreon` map.
+    /// `aud` defaults to `"arkavo"`; `cti` is 16 zero bytes.
     pub fn mint_with_extras(
         key: &SigningKey,
         kid: &[u8],
@@ -436,16 +657,65 @@ pub(crate) mod test_support {
         exp: i64,
         extras: &[(&str, Value)],
     ) -> String {
-        use base64::Engine;
-        let mut entries: Vec<(Value, Value)> = vec![
-            (Value::Integer(1.into()), Value::Text(iss.into())),
-            (Value::Integer(2.into()), Value::Text(sub.into())),
-            (Value::Integer(4.into()), Value::Integer(exp.into())),
-            (Value::Integer(6.into()), Value::Integer(iat.into())),
-        ];
+        mint_with_aud(key, kid, iss, sub, "arkavo", iat, exp, extras)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mint_with_aud(
+        key: &SigningKey,
+        kid: &[u8],
+        iss: &str,
+        sub: &str,
+        aud: &str,
+        iat: i64,
+        exp: i64,
+        extras: &[(&str, Value)],
+    ) -> String {
+        let mut entries = standard_claims(iss, sub, aud, iat, exp, &[0u8; 16]);
         for (k, v) in extras {
             entries.push((Value::Text((*k).into()), v.clone()));
         }
+        mint_map(key, kid, entries)
+    }
+
+    /// DeviceCheck assertion CWT: `aud=arkavo:devicecheck` and `cnf.kid`.
+    pub fn mint_devicecheck(
+        key: &SigningKey,
+        kid: &[u8],
+        iss: &str,
+        sub: &str,
+        iat: i64,
+        exp: i64,
+        cnf_kid: &[u8],
+    ) -> String {
+        let mut entries = standard_claims(iss, sub, DEVICECHECK_AUD, iat, exp, &[0u8; 16]);
+        let cnf = Value::Map(vec![(
+            Value::Integer(2.into()),
+            Value::Bytes(cnf_kid.to_vec()),
+        )]);
+        entries.push((Value::Integer(8.into()), cnf));
+        mint_map(key, kid, entries)
+    }
+
+    fn standard_claims(
+        iss: &str,
+        sub: &str,
+        aud: &str,
+        iat: i64,
+        exp: i64,
+        cti: &[u8],
+    ) -> Vec<(Value, Value)> {
+        vec![
+            (Value::Integer(1.into()), Value::Text(iss.into())),
+            (Value::Integer(2.into()), Value::Text(sub.into())),
+            (Value::Integer(3.into()), Value::Text(aud.into())),
+            (Value::Integer(4.into()), Value::Integer(exp.into())),
+            (Value::Integer(6.into()), Value::Integer(iat.into())),
+            (Value::Integer(7.into()), Value::Bytes(cti.to_vec())),
+        ]
+    }
+
+    pub fn mint_map(key: &SigningKey, kid: &[u8], entries: Vec<(Value, Value)>) -> String {
         let mut payload = Vec::new();
         ciborium::ser::into_writer(&Value::Map(entries), &mut payload).unwrap();
 
@@ -466,7 +736,7 @@ pub(crate) mod test_support {
         let mut out = Vec::with_capacity(CWT_TAG_PREFIX.len() + inner.len());
         out.extend_from_slice(&CWT_TAG_PREFIX);
         out.extend_from_slice(&inner);
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(out)
+        URL_SAFE_NO_PAD.encode(out)
     }
 
     /// Deterministic test keypair (p256 0.13 wants rand_core 0.6, which the
@@ -485,7 +755,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use test_support::{keypair, mint};
+    use test_support::{keypair, mint, mint_devicecheck, mint_map, mint_with_aud};
 
     const NOW: i64 = 1_900_000_000;
 
@@ -710,5 +980,319 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].0, b"kid-1".to_vec());
         assert_eq!(keys[0].1, vk);
+    }
+
+    #[test]
+    fn subject_id_bind_strips_only_arkavo_prefix() {
+        assert_eq!(
+            subject_id_bind("arkavo:550e8400-e29b-41d4-a716-446655440000"),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(
+            subject_id_bind("550e8400-e29b-41d4-a716-446655440000"),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(subject_id_bind("apple:abc"), "apple:abc");
+        assert_eq!(
+            subject_id_bind("client:catalog-node"),
+            "client:catalog-node"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_requires_aud_and_cti() {
+        let (sk, vk) = keypair();
+        let v = verifier(b"kid-1", vk);
+        let missing_aud = mint_map(
+            &sk,
+            b"kid-1",
+            vec![
+                (Value::Integer(1.into()), Value::Text("i".into())),
+                (Value::Integer(2.into()), Value::Text("s".into())),
+                (
+                    Value::Integer(4.into()),
+                    Value::Integer((NOW + 3600).into()),
+                ),
+                (Value::Integer(6.into()), Value::Integer(NOW.into())),
+                (Value::Integer(7.into()), Value::Bytes(vec![0u8; 16])),
+            ],
+        );
+        assert!(matches!(
+            v.verify(&missing_aud, NOW).await.unwrap_err(),
+            AuthError::MissingClaim("aud")
+        ));
+        let missing_cti = mint_map(
+            &sk,
+            b"kid-1",
+            vec![
+                (Value::Integer(1.into()), Value::Text("i".into())),
+                (Value::Integer(2.into()), Value::Text("s".into())),
+                (Value::Integer(3.into()), Value::Text("arkavo".into())),
+                (
+                    Value::Integer(4.into()),
+                    Value::Integer((NOW + 3600).into()),
+                ),
+                (Value::Integer(6.into()), Value::Integer(NOW.into())),
+            ],
+        );
+        assert!(matches!(
+            v.verify(&missing_cti, NOW).await.unwrap_err(),
+            AuthError::MissingClaim("cti")
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_expired_at_inclusive_skew() {
+        let (sk, vk) = keypair();
+        let token = mint(&sk, b"kid-1", "i", "s", NOW - 120, NOW - 60);
+        let err = verifier(b"kid-1", vk)
+            .verify(&token, NOW)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::Expired));
+    }
+
+    #[tokio::test]
+    async fn rejects_iat_after_exp() {
+        let (sk, vk) = keypair();
+        let token = mint(&sk, b"kid-1", "i", "s", NOW + 10, NOW);
+        let err = verifier(b"kid-1", vk)
+            .verify(&token, NOW)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::Malformed));
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_claim_keys() {
+        let (sk, vk) = keypair();
+        let token = mint_map(
+            &sk,
+            b"kid-1",
+            vec![
+                (
+                    Value::Integer(1.into()),
+                    Value::Text("https://identity.test".into()),
+                ),
+                (
+                    Value::Integer(1.into()),
+                    Value::Text("https://evil.test".into()),
+                ),
+                (Value::Integer(2.into()), Value::Text("arkavo:u1".into())),
+                (Value::Integer(3.into()), Value::Text("arkavo".into())),
+                (
+                    Value::Integer(4.into()),
+                    Value::Integer((NOW + 3600).into()),
+                ),
+                (Value::Integer(6.into()), Value::Integer(NOW.into())),
+                (Value::Integer(7.into()), Value::Bytes(vec![1u8; 16])),
+            ],
+        );
+        let err = verifier(b"kid-1", vk)
+            .verify(&token, NOW)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::DuplicateKey));
+    }
+
+    #[tokio::test]
+    async fn pe_cnf_ignores_unknown_keys() {
+        let (sk, vk) = keypair();
+        let cnf = Value::Map(vec![(
+            Value::Text("x".into()),
+            Value::Text("ignored".into()),
+        )]);
+        let token = mint_map(
+            &sk,
+            b"kid-1",
+            vec![
+                (Value::Integer(1.into()), Value::Text("i".into())),
+                (Value::Integer(2.into()), Value::Text("s".into())),
+                (Value::Integer(3.into()), Value::Text("arkavo".into())),
+                (
+                    Value::Integer(4.into()),
+                    Value::Integer((NOW + 3600).into()),
+                ),
+                (Value::Integer(6.into()), Value::Integer(NOW.into())),
+                (Value::Integer(7.into()), Value::Bytes(vec![0u8; 16])),
+                (Value::Integer(8.into()), cnf),
+            ],
+        );
+        let claims = verifier(b"kid-1", vk).verify(&token, NOW).await.unwrap();
+        assert!(claims.kid.is_none());
+    }
+
+    #[tokio::test]
+    async fn device_token_requires_devicecheck_aud_and_kid() {
+        let (sk, vk) = keypair();
+        let v = verifier(b"kid-1", vk);
+        let ok = mint_devicecheck(
+            &sk,
+            b"kid-1",
+            "https://identity.test",
+            "550e8400-e29b-41d4-a716-446655440000",
+            NOW,
+            NOW + 3600,
+            b"phone-kid",
+        );
+        let claims = v.verify_device(&ok, NOW).await.unwrap();
+        assert_eq!(claims.aud.as_str(), Some(DEVICECHECK_AUD));
+        assert_eq!(claims.kid.as_deref(), Some("cGhvbmUta2lk"));
+
+        let wrong_aud = mint_with_aud(
+            &sk,
+            b"kid-1",
+            "https://identity.test",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "arkavo",
+            NOW,
+            NOW + 3600,
+            &[],
+        );
+        assert!(matches!(
+            v.verify_device(&wrong_aud, NOW).await.unwrap_err(),
+            AuthError::Audience
+        ));
+
+        let no_cnf = mint_with_aud(
+            &sk,
+            b"kid-1",
+            "https://identity.test",
+            "550e8400-e29b-41d4-a716-446655440000",
+            DEVICECHECK_AUD,
+            NOW,
+            NOW + 3600,
+            &[],
+        );
+        assert!(matches!(
+            v.verify_device(&no_cnf, NOW).await.unwrap_err(),
+            AuthError::MissingClaim("kid")
+        ));
+    }
+
+    #[tokio::test]
+    async fn device_token_with_platform_audience_is_accepted() {
+        // authnz-rs adds OIDC_PLATFORM_AUDIENCE to DeviceCheck tokens.
+        let (sk, vk) = keypair();
+        let entries = vec![
+            (
+                Value::Integer(1.into()),
+                Value::Text("https://identity.test".into()),
+            ),
+            (Value::Integer(2.into()), Value::Text("u1".into())),
+            (
+                Value::Integer(3.into()),
+                Value::Array(vec![
+                    Value::Text(DEVICECHECK_AUD.into()),
+                    Value::Text("https://platform.test".into()),
+                ]),
+            ),
+            (Value::Integer(4.into()), Value::Integer((NOW + 600).into())),
+            (Value::Integer(6.into()), Value::Integer(NOW.into())),
+            (Value::Integer(7.into()), Value::Bytes(vec![1; 16])),
+            (
+                Value::Integer(8.into()),
+                Value::Map(vec![(
+                    Value::Integer(2.into()),
+                    Value::Bytes(b"dev".to_vec()),
+                )]),
+            ),
+        ];
+        let token = mint_map(&sk, b"kid-1", entries);
+        let claims = verifier(b"kid-1", vk)
+            .verify_device(&token, NOW)
+            .await
+            .unwrap();
+        assert!(claims.aud.contains(DEVICECHECK_AUD));
+    }
+
+    fn base(sub: &str, cti: &[u8]) -> Vec<(Value, Value)> {
+        vec![
+            (
+                Value::Integer(1.into()),
+                Value::Text("https://identity.test".into()),
+            ),
+            (Value::Integer(2.into()), Value::Text(sub.into())),
+            (Value::Integer(3.into()), Value::Text("arkavo".into())),
+            (Value::Integer(4.into()), Value::Integer((NOW + 600).into())),
+            (Value::Integer(6.into()), Value::Integer(NOW.into())),
+            (Value::Integer(7.into()), Value::Bytes(cti.to_vec())),
+        ]
+    }
+
+    #[tokio::test]
+    async fn rejects_future_nbf_and_malformed_nbf() {
+        let (sk, vk) = keypair();
+        let v = verifier(b"kid-1", vk);
+        let mut e = base("u1", b"c");
+        e.push((
+            Value::Integer(5.into()),
+            Value::Integer((NOW + 3600).into()),
+        ));
+        let err = v
+            .verify(&mint_map(&sk, b"kid-1", e), NOW)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::NotYetValid));
+
+        let mut e = base("u1", b"c");
+        e.push((Value::Integer(5.into()), Value::Text("soon".into())));
+        let err = v
+            .verify(&mint_map(&sk, b"kid-1", e), NOW)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::Malformed));
+
+        let mut e = base("u1", b"c");
+        e.push((Value::Integer(5.into()), Value::Integer((NOW - 10).into())));
+        assert!(v.verify(&mint_map(&sk, b"kid-1", e), NOW).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_identifiers() {
+        let (sk, vk) = keypair();
+        let v = verifier(b"kid-1", vk);
+        for e in [base("", b"c"), base("u1", b"")] {
+            assert!(v.verify(&mint_map(&sk, b"kid-1", e), NOW).await.is_err());
+        }
+        let mut e = base("u1", b"c");
+        e[2] = (
+            Value::Integer(3.into()),
+            Value::Array(vec![
+                Value::Text("arkavo".into()),
+                Value::Text(String::new()),
+            ]),
+        );
+        assert!(v.verify(&mint_map(&sk, b"kid-1", e), NOW).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_critical_headers() {
+        use coset::{CoseSign1Builder, HeaderBuilder, iana};
+        use p256::ecdsa::signature::Signer;
+        let (sk, vk) = keypair();
+        let mut payload = Vec::new();
+        ciborium::ser::into_writer(&Value::Map(base("u1", b"c")), &mut payload).unwrap();
+        let protected = HeaderBuilder::new()
+            .algorithm(iana::Algorithm::ES256)
+            .key_id(b"kid-1".to_vec())
+            .add_critical(iana::HeaderParameter::ContentType)
+            .build();
+        let sign1 = CoseSign1Builder::new()
+            .protected(protected)
+            .payload(payload)
+            .create_signature(b"", |m| {
+                let sig: Signature = sk.sign(m);
+                sig.to_bytes().to_vec()
+            })
+            .build();
+        let mut out = CWT_TAG_PREFIX.to_vec();
+        out.extend_from_slice(&sign1.to_vec().unwrap());
+        let token = URL_SAFE_NO_PAD.encode(out);
+        let err = verifier(b"kid-1", vk)
+            .verify(&token, NOW)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::Malformed));
     }
 }

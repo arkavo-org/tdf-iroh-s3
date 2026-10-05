@@ -132,6 +132,11 @@ pub struct AuthzConfig {
     /// token parser rejects CWTs).
     #[serde(default)]
     pub entity_mode: String,
+    /// Decision protocol: `"authzen"` (default, AuthZEN Access Evaluations
+    /// after well-known discovery) or `"opentdf-v2"` (ConnectRPC JSON
+    /// GetDecisionMultiResource). `opentdf-v2` is rollback only.
+    #[serde(default = "default_authz_protocol")]
+    pub protocol: String,
 }
 
 impl Default for AuthzConfig {
@@ -146,12 +151,17 @@ impl Default for AuthzConfig {
             bearer_token: String::new(),
             environment_region: String::new(),
             entity_mode: String::new(),
+            protocol: default_authz_protocol(),
         }
     }
 }
 
 fn default_authz_action() -> String {
     "read".to_string()
+}
+
+fn default_authz_protocol() -> String {
+    "authzen".to_string()
 }
 
 fn default_authz_client_secret_param() -> String {

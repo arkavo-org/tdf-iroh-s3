@@ -81,6 +81,12 @@ cache_ttl_secs = 30
 [catalog.authz]
 endpoint = "https://platform.arkavo.net"
 action = "read"
+# Decision protocol. Default is AuthZEN Access Evaluations
+# (GET {endpoint}/.well-known/authzen-configuration, then POST
+# access_evaluations_endpoint with the catalog-node service CWT).
+# No users on this catalog — hard cutover. Rollback:
+# protocol = "opentdf-v2"
+protocol = "authzen"
 token_url = "https://identity.arkavo.net/oauth/token"
 client_id = "catalog-node"
 # The secret is read from the CATALOG_AUTHZ_CLIENT_SECRET environment
@@ -122,18 +128,23 @@ with whether the requesting entity chain is entitled to it:
 # Anonymous: full listing, nothing entitled (public storefront)
 curl https://iroh.arkavo.net/catalog/12345678
 
-# With a person entity (Arkavo CWT) — decisions come from the OpenTDF
-# authorization service over the full chain PE -> NPE -> NPE:
+# With a person entity (Arkavo CWT) — decisions come from AuthZEN
+# /access/v1/evaluations on platform.arkavo.net (catalog-node service CWT
+# is the PEP Bearer; the PE CWT is SARC subject). Repeat X-Entity-Token
+# once per DeviceCheck CWT (not comma-separated):
 curl https://iroh.arkavo.net/catalog/12345678 \
   -H "Authorization: Bearer <pe-cwt>" \
-  -H "X-Entity-Token: <attested-device-cwt>"
+  -H "X-Entity-Token: <devicecheck-cwt>" \
+  -H "X-Entity-Token: <second-devicecheck-cwt>"
 ```
 
 Response: `{"group": "...", "decision": "evaluated|anonymous|unavailable",
 "items": [{"hash", "size", "attribute_fqns", "ingested_at", "entitled"}]}`.
-NPE tokens must carry the same subject as the PE; the node appends its own
-observed environment entity. All failure modes degrade to
-`entitled: false`, never to access.
+Each device CWT must have `aud=arkavo:devicecheck` and bind to the PE via
+`subject_id_bind` (strip a single leading `arkavo:` only; `apple:` and
+`client:` are not stripped). Empty listings return `items: []` without
+calling the PDP. The node appends its own observed environment entity.
+All failure modes degrade to `entitled: false`, never to access.
 
 Attribute definitions resolve as URLs: `GET /attributes` (the full set),
 `GET /attr/tier`, `GET /attr/tier/value/supporter` — so an FQN like
