@@ -410,6 +410,7 @@ mod tests {
             store: Arc::clone(&store),
             verifier: Arc::new(CwtVerifier::with_static_keys(vec![(b"kid-1".to_vec(), vk)])),
             tag_prefix: "catalog/".to_string(),
+            catalog_documents: Default::default(),
             publishing: gated.then(|| TagPublishing {
                 policy: Arc::new(PublishPolicy {
                     entitlement: Some(DEFAULT_PUBLISH_ENTITLEMENT.into()),
