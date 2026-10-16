@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_base::TransportAddr;
 use iroh_blobs::BlobsProtocol;
 use iroh_blobs::protocol::{GetRequest, PushRequest};
@@ -8,6 +8,7 @@ use iroh_blobs::store::mem::MemStore;
 use iroh_blobs::{Hash, HashAndFormat};
 use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::str::FromStr;
 
 /// Parse an endpoint ID string into an `EndpointId`.
@@ -30,11 +31,52 @@ pub struct IrohTestClient {
     store: MemStore,
 }
 
+/// Load the Ed25519 secret key stored as 64 hex characters in `path`,
+/// generating and saving a new one (mode 0600) when the file does not
+/// exist. The same file gives `publish-session` and a later push the same
+/// endpoint ID, which a publish session requires.
+pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let bytes: [u8; 32] = hex::decode(text.trim())
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .with_context(|| format!("{} must hold a 32-byte key as hex", path.display()))?;
+            Ok(SecretKey::from_bytes(&bytes))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let key = SecretKey::generate();
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            let mut file = options
+                .open(path)
+                .with_context(|| format!("Failed to create {}", path.display()))?;
+            std::io::Write::write_all(&mut file, hex::encode(key.to_bytes()).as_bytes())
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+            Ok(key)
+        }
+        Err(e) => Err(e).with_context(|| format!("Failed to read {}", path.display())),
+    }
+}
+
 impl IrohTestClient {
     /// Create a new Iroh test client with a memory store and endpoint bound on a random port.
     pub async fn new() -> Result<Self> {
+        Self::with_secret_key(None).await
+    }
+
+    /// Like [`Self::new`], with a fixed endpoint key (a random one when
+    /// `None`). A push to a gated node must come from the endpoint a publish
+    /// session names.
+    pub async fn with_secret_key(secret_key: Option<SecretKey>) -> Result<Self> {
         let store = MemStore::new();
-        let endpoint = Endpoint::builder(presets::N0)
+        let mut builder = Endpoint::builder(presets::N0);
+        if let Some(key) = secret_key {
+            builder = builder.secret_key(key);
+        }
+        let endpoint = builder
             .bind_addr((Ipv4Addr::UNSPECIFIED, 0u16))
             .context("Invalid bind address")?
             .bind()
