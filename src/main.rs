@@ -354,9 +354,9 @@ async fn main() -> Result<()> {
 
     // With TLS on, HTTPS is the only externally reachable API: if it ends,
     // exit non-zero so systemd restarts the node instead of leaving it dark.
-    if let Some(https) = https {
+    let signal = if let Some(https) = https {
         tokio::select! {
-            res = tokio::signal::ctrl_c() => res?,
+            signal = shutdown_signal() => signal?,
             res = https => {
                 let err = match res {
                     Ok(Ok(())) => anyhow::anyhow!("HTTPS listener stopped"),
@@ -368,13 +368,37 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        tokio::signal::ctrl_c().await?;
-    }
-    info!("Shutting down...");
+        shutdown_signal().await?
+    };
+    info!("{signal} received, shutting down...");
     node.shutdown().await?;
     info!("Done.");
 
     Ok(())
+}
+
+/// Wait for Ctrl-C (SIGINT) or, on Unix, SIGTERM, which is what systemd
+/// sends on `systemctl stop`. Returns the signal's name.
+async fn shutdown_signal() -> Result<&'static str> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).context("Installing SIGTERM handler")?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => {
+                r.context("Waiting for Ctrl-C")?;
+                Ok("SIGINT")
+            }
+            _ = term.recv() => Ok("SIGTERM"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("Waiting for Ctrl-C")?;
+        Ok("Ctrl-C")
+    }
 }
 
 fn catalog_router<D: DecisionProvider>(
