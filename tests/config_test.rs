@@ -201,3 +201,36 @@ force_path_style = true
     assert!(config.s3.endpoint_url.is_empty());
     assert!(!config.s3.force_path_style);
 }
+
+#[test]
+fn test_public_addresses_and_http_bind_address() {
+    let toml_str = r#"
+[iroh]
+public_addresses = ["3.91.18.97:11204", "[2001:db8::1]:11204"]
+
+[s3]
+bucket = "test-bucket"
+region = "us-east-1"
+
+[http]
+enabled = true
+bind_address = "127.0.0.1"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    let addrs: Vec<String> = config
+        .iroh
+        .public_addresses
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+    assert_eq!(addrs, ["3.91.18.97:11204", "[2001:db8::1]:11204"]);
+    assert_eq!(config.http.bind_address.to_string(), "127.0.0.1");
+
+    let config: Config = toml::from_str("[s3]\nbucket = \"b\"\nregion = \"r\"\n").unwrap();
+    assert!(config.iroh.public_addresses.is_empty());
+    assert_eq!(config.http.bind_address.to_string(), "0.0.0.0");
+
+    // An address without a port is refused at load.
+    let bad = "[iroh]\npublic_addresses = [\"3.91.18.97\"]\n[s3]\nbucket = \"b\"\nregion = \"r\"\n";
+    assert!(toml::from_str::<Config>(bad).is_err());
+}

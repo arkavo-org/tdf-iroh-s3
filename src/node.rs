@@ -126,6 +126,11 @@ impl TdfIrohNode {
         self.endpoint.addr()
     }
 
+    /// The running endpoint (`GET /node` reads its identity and relay).
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
     pub fn store(&self) -> &FsStore {
         &self.store
     }

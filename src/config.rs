@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
@@ -237,6 +238,12 @@ pub struct IrohConfig {
     pub secret_key_param: String,
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
+    /// Public `ip:port` addresses peers can dial directly, reported by
+    /// `GET /node` as `directAddresses` (for example the instance's elastic
+    /// IP and the iroh port). The node cannot discover these itself behind
+    /// NAT. Empty by default.
+    #[serde(default)]
+    pub public_addresses: Vec<SocketAddr>,
 }
 
 impl Default for IrohConfig {
@@ -245,6 +252,7 @@ impl Default for IrohConfig {
             bind_port: default_bind_port(),
             secret_key_param: default_secret_key_param(),
             data_dir: default_data_dir(),
+            public_addresses: Vec::new(),
         }
     }
 }
@@ -323,6 +331,12 @@ pub struct AssertionConfig {
 pub struct HttpConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Listen address of the plain listener without `[http.tls]`:
+    /// `127.0.0.1` when a TLS proxy on the same host fronts the API; the
+    /// default `0.0.0.0` listens on every interface. With `[http.tls]` the
+    /// plain listener is always `127.0.0.1`.
+    #[serde(default = "default_http_bind_address")]
+    pub bind_address: IpAddr,
     #[serde(default = "default_http_bind_port")]
     pub bind_port: u16,
     #[serde(default)]
@@ -369,6 +383,7 @@ impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            bind_address: default_http_bind_address(),
             bind_port: default_http_bind_port(),
             cose_keys_url: String::new(),
             expected_issuer: String::new(),
@@ -376,6 +391,10 @@ impl Default for HttpConfig {
             tls: None,
         }
     }
+}
+
+fn default_http_bind_address() -> IpAddr {
+    IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
 }
 
 fn default_http_bind_port() -> u16 {

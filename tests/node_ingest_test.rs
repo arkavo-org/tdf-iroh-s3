@@ -23,6 +23,7 @@ fn test_config(data_dir: &str) -> Config {
             bind_port: 0, // Random port
             secret_key_param: String::new(),
             data_dir: data_dir.to_string(),
+            public_addresses: Vec::new(),
         },
         s3: S3Config {
             bucket: "test-bucket".to_string(),
@@ -186,4 +187,50 @@ fn create_test_tdf() -> Vec<u8> {
         .policy(policy)
         .to_bytes()
         .unwrap()
+}
+
+/// `GET /node` reports the running endpoint's ID and the configured public
+/// addresses.
+#[tokio::test(flavor = "current_thread")]
+async fn test_node_route_reports_the_running_endpoint() {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    // SAFETY: current_thread runtime ensures no other threads read env vars concurrently.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+    }
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(tmp_dir.path().to_str().unwrap());
+    config.iroh.public_addresses = vec!["203.0.113.7:11204".parse().unwrap()];
+    let node = TdfIrohNode::spawn(config).await.unwrap();
+
+    let app = tdf_iroh_s3::node_api::router(tdf_iroh_s3::node_api::live(
+        node.endpoint().clone(),
+        &node.config.iroh.public_addresses,
+    ));
+    let res = app
+        .oneshot(
+            axum::http::Request::get("/node")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+
+    let id = body["endpointId"].as_str().unwrap();
+    assert_eq!(id, node.addr().id.to_string());
+    assert_eq!(id.len(), 64);
+    assert!(id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+    assert!(body["relayUrl"].is_null() || body["relayUrl"].is_string());
+    assert_eq!(
+        body["directAddresses"],
+        serde_json::json!(["203.0.113.7:11204"])
+    );
+
+    node.shutdown().await.unwrap();
 }
