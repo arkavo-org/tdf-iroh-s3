@@ -38,6 +38,22 @@ region = "us-east-1"
     assert_eq!(config.iroh.bind_port, 11204);
     assert!(config.validation.required_attributes.is_empty());
     assert!(!config.validation.assertion.enabled);
+    assert_eq!(config.validation.max_blob_bytes, 4_294_967_296);
+}
+
+#[test]
+fn test_max_blob_bytes_is_configurable() {
+    let toml_str = r#"
+[s3]
+bucket = "test-bucket"
+region = "us-east-1"
+
+[validation]
+max_blob_bytes = 1048576
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.validation.max_blob_bytes, 1_048_576);
+    assert!(config.validation.required_attributes.is_empty());
 }
 
 #[test]

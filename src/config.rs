@@ -269,12 +269,34 @@ pub struct S3Config {
     pub prefix: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct ValidationConfig {
     #[serde(default)]
     pub required_attributes: Vec<String>,
     #[serde(default)]
     pub assertion: AssertionConfig,
+    /// Pushed blobs larger than this many bytes are refused at ingest.
+    /// Ingest holds the whole blob in memory, so keep this below the
+    /// instance's free RAM.
+    #[serde(default = "default_max_blob_bytes")]
+    pub max_blob_bytes: u64,
+}
+
+impl Default for ValidationConfig {
+    fn default() -> Self {
+        Self {
+            required_attributes: Vec::new(),
+            assertion: AssertionConfig::default(),
+            max_blob_bytes: default_max_blob_bytes(),
+        }
+    }
+}
+
+/// 4 GiB, the largest `payloadSize` a creator catalog may name.
+pub const DEFAULT_MAX_BLOB_BYTES: u64 = 4_294_967_296;
+
+fn default_max_blob_bytes() -> u64 {
+    DEFAULT_MAX_BLOB_BYTES
 }
 
 #[derive(Debug, Default, Deserialize)]

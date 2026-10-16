@@ -7,6 +7,7 @@ fn test_ingest_validates_before_accepting() {
     let config = ValidationConfig {
         required_attributes: vec!["https://example.com/attr/storage/value/permanent".to_string()],
         assertion: Default::default(),
+        ..Default::default()
     };
 
     let result = validate_blob(&valid_tdf, &config);
@@ -23,6 +24,7 @@ fn test_ingest_rejects_invalid_blob() {
     let config = ValidationConfig {
         required_attributes: vec![],
         assertion: Default::default(),
+        ..Default::default()
     };
 
     let result = validate_blob(&garbage, &config);
@@ -125,4 +127,50 @@ fn derive_artifacts_ungrouped_policy_yields_no_entries() {
     };
     let derived = derive_artifacts(&manifest, &"ee".repeat(32), 1, 0, &config).unwrap();
     assert!(derived.entries.is_empty());
+}
+
+#[test]
+fn blobs_over_max_blob_bytes_are_refused() {
+    let tdf = create_tdf_with_attribute("https://example.com/attr/storage/value/permanent");
+    let at_limit = ValidationConfig {
+        max_blob_bytes: tdf.len() as u64,
+        ..Default::default()
+    };
+    assert!(validate_blob(&tdf, &at_limit).is_ok());
+
+    let below = ValidationConfig {
+        max_blob_bytes: tdf.len() as u64 - 1,
+        ..Default::default()
+    };
+    let err = validate_blob(&tdf, &below).unwrap_err();
+    assert!(format!("{err:#}").contains("max_blob_bytes"), "{err:#}");
+}
+
+/// The store path refuses an oversize blob before reading it, and before
+/// any S3 call (the mock client would fail one).
+#[tokio::test]
+async fn ingest_from_store_refuses_an_oversize_blob() {
+    use iroh_blobs::store::fs::FsStore;
+    use tdf_iroh_s3::config::CatalogConfig;
+    use tdf_iroh_s3::ingest::ingest_from_store;
+    use tdf_iroh_s3::store::s3::S3Client;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::load(dir.path()).await.unwrap();
+    let tdf = create_tdf_with_attribute("https://example.com/attr/storage/value/permanent");
+    let hash = store.add_slice(&tdf).await.unwrap().hash;
+    // The size check reads the blob's bitfield, not its bytes.
+    assert_eq!(store.observe(hash).await.unwrap().size(), tdf.len() as u64);
+    let s3 = S3Client::new_mock("test-bucket", "us-east-1", "");
+    let config = ValidationConfig {
+        max_blob_bytes: 16,
+        ..Default::default()
+    };
+
+    let err = match ingest_from_store(hash, &store, &config, &CatalogConfig::default(), &s3).await {
+        Err(e) => e,
+        Ok(_) => panic!("an oversize blob must be refused"),
+    };
+    assert!(format!("{err:#}").contains("max_blob_bytes"), "{err:#}");
+    store.shutdown().await.unwrap();
 }
