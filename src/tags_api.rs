@@ -47,12 +47,46 @@ pub trait TagStore: Send + Sync + 'static {
     fn get_catalog_document(
         &self,
         hash_hex: &str,
-    ) -> impl Future<Output = anyhow::Result<Option<Bytes>>> + Send;
+    ) -> impl Future<Output = anyhow::Result<Option<StoredDocument>>> + Send;
+    /// Whether a catalog document is stored, without reading its body.
+    fn head_catalog_document(
+        &self,
+        hash_hex: &str,
+    ) -> impl Future<Output = anyhow::Result<Option<DocumentHead>>> + Send;
+    /// Store a document with its owner recorded alongside.
     fn put_catalog_document(
         &self,
         hash_hex: &str,
         body: Bytes,
+        owner: &str,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+}
+
+/// A stored catalog document.
+#[derive(Debug, Clone)]
+pub struct StoredDocument {
+    pub body: Bytes,
+    /// The owner recorded with the document at upload; `None` for a
+    /// document stored without it.
+    pub owner: Option<String>,
+}
+
+impl StoredDocument {
+    /// The recorded owner, or the owner the bytes name for a document
+    /// stored without one. `None` when neither is available.
+    pub fn owner(&self) -> Option<String> {
+        self.owner
+            .clone()
+            .or_else(|| creator_catalog::parse(&self.body).ok().map(|d| d.owner))
+    }
+}
+
+/// A HEAD of a stored catalog document.
+#[derive(Debug, Clone)]
+pub struct DocumentHead {
+    /// As [`StoredDocument::owner`]: `None` when the document was stored
+    /// without it.
+    pub owner: Option<String>,
 }
 
 // Inherent methods take precedence over trait methods in method-call
@@ -70,12 +104,25 @@ impl TagStore for crate::store::s3::S3Client {
         Self::blob_size(self, hash_hex).await
     }
 
-    async fn get_catalog_document(&self, hash_hex: &str) -> anyhow::Result<Option<Bytes>> {
-        Self::get_catalog_document(self, hash_hex).await
+    async fn get_catalog_document(&self, hash_hex: &str) -> anyhow::Result<Option<StoredDocument>> {
+        Ok(Self::get_catalog_document(self, hash_hex)
+            .await?
+            .map(|(body, owner)| StoredDocument { body, owner }))
     }
 
-    async fn put_catalog_document(&self, hash_hex: &str, body: Bytes) -> anyhow::Result<()> {
-        Self::put_catalog_document(self, hash_hex, body).await
+    async fn head_catalog_document(&self, hash_hex: &str) -> anyhow::Result<Option<DocumentHead>> {
+        Ok(Self::head_catalog_document(self, hash_hex)
+            .await?
+            .map(|owner| DocumentHead { owner }))
+    }
+
+    async fn put_catalog_document(
+        &self,
+        hash_hex: &str,
+        body: Bytes,
+        owner: &str,
+    ) -> anyhow::Result<()> {
+        Self::put_catalog_document(self, hash_hex, body, owner).await
     }
 }
 
@@ -216,7 +263,7 @@ async fn put_tag<S: TagStore>(
     // every writable tag is `<tag_prefix><sub>`; no tag outside the prefix
     // can be written.)
     let owned = match state.store.get_catalog_document(&body.hash).await {
-        Ok(Some(doc)) => creator_catalog::parse(&doc).is_ok_and(|d| d.owner == claims.sub),
+        Ok(Some(doc)) => creator_catalog::parse(&doc.body).is_ok_and(|d| d.owner == claims.sub),
         Ok(None) => false,
         Err(e) => {
             warn!(error = %e, "Catalog document lookup failed");
@@ -291,7 +338,7 @@ pub(crate) mod test_support {
     pub struct MemStore {
         pub tags: Mutex<HashMap<String, String>>,
         pub blobs: Mutex<HashMap<String, u64>>,
-        pub catalog_documents: Mutex<HashMap<String, Bytes>>,
+        pub catalog_documents: Mutex<HashMap<String, StoredDocument>>,
         /// Every call fails, as an unreachable store would.
         pub down: std::sync::atomic::AtomicBool,
     }
@@ -332,16 +379,41 @@ pub(crate) mod test_support {
             self.up()?;
             Ok(self.blobs.lock().await.get(hash_hex).copied())
         }
-        async fn get_catalog_document(&self, hash_hex: &str) -> anyhow::Result<Option<Bytes>> {
+        async fn get_catalog_document(
+            &self,
+            hash_hex: &str,
+        ) -> anyhow::Result<Option<StoredDocument>> {
             self.up()?;
             Ok(self.catalog_documents.lock().await.get(hash_hex).cloned())
         }
-        async fn put_catalog_document(&self, hash_hex: &str, body: Bytes) -> anyhow::Result<()> {
+        async fn head_catalog_document(
+            &self,
+            hash_hex: &str,
+        ) -> anyhow::Result<Option<DocumentHead>> {
             self.up()?;
-            self.catalog_documents
+            Ok(self
+                .catalog_documents
                 .lock()
                 .await
-                .insert(hash_hex.to_string(), body);
+                .get(hash_hex)
+                .map(|d| DocumentHead {
+                    owner: d.owner.clone(),
+                }))
+        }
+        async fn put_catalog_document(
+            &self,
+            hash_hex: &str,
+            body: Bytes,
+            owner: &str,
+        ) -> anyhow::Result<()> {
+            self.up()?;
+            self.catalog_documents.lock().await.insert(
+                hash_hex.to_string(),
+                StoredDocument {
+                    body,
+                    owner: Some(owner.to_string()),
+                },
+            );
             Ok(())
         }
     }
@@ -409,7 +481,7 @@ mod tests {
         let bytes = catalog(owner, entries);
         let hash = blake3::hash(&bytes).to_hex().to_string();
         store
-            .put_catalog_document(&hash, Bytes::from(bytes))
+            .put_catalog_document(&hash, Bytes::from(bytes), owner)
             .await
             .unwrap();
         hash

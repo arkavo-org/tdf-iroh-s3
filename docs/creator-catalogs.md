@@ -114,9 +114,12 @@ A catalog that hasn't changed produces the same hash. Uploading it again is harm
 
 This route is public.
 
-- **200:** the stored bytes, with `Content-Type: application/json` and `Cache-Control: public, max-age=31536000, immutable`.
+- **200:** the stored bytes, with `Content-Type: application/json`, `ETag: "<hash>"` and `Cache-Control: public, max-age=300`.
+- **304:** no body, with the same `ETag` and `Cache-Control`, when `If-None-Match` names `"<hash>"` (or its weak form `W/"<hash>"`, or `*`), the document is stored, and it is not hidden.
 - **400:** `invalid hash`. The hash must be 64 lowercase hex characters.
-- **404:** `catalog not found`, including when the document's hash is blocked.
+- **404:** `catalog not found`, also when the document's hash is blocked or its owner is suspended with `hideCatalog`, and also in answer to `If-None-Match`.
+
+The bytes behind a hash never change, but the node may later block a document or hide its owner's catalog. So a client or proxy reuses a document for at most 5 minutes and then revalidates it, and a block or `hideCatalog` reaches readers within that time. The node records each document's `owner` alongside it when it stores it.
 
 ### `GET /tags/catalog/{sub}`: find a creator's current catalog
 

@@ -4,6 +4,10 @@ use bytes::Bytes;
 
 use crate::config::S3Config;
 
+/// User metadata key holding a catalog document's owner
+/// (`x-amz-meta-owner`).
+pub const CATALOG_OWNER_METADATA: &str = "owner";
+
 pub struct S3Client {
     client: Client,
     bucket: String,
@@ -263,13 +267,20 @@ impl S3Client {
     }
 
     /// Store a creator catalog document under `catalog-documents/<hash>`,
-    /// byte for byte.
-    pub async fn put_catalog_document(&self, hash_hex: &str, body: Bytes) -> Result<()> {
+    /// byte for byte, with its owner as object metadata (`x-amz-meta-owner`)
+    /// so a read can apply the owner's suspension without parsing it.
+    pub async fn put_catalog_document(
+        &self,
+        hash_hex: &str,
+        body: Bytes,
+        owner: &str,
+    ) -> Result<()> {
         self.client
             .put_object()
             .bucket(&self.bucket)
             .key(self.catalog_document_key(hash_hex))
             .content_type("application/json")
+            .metadata(CATALOG_OWNER_METADATA, owner)
             .body(body.into())
             .send()
             .await
@@ -277,7 +288,12 @@ impl S3Client {
         Ok(())
     }
 
-    pub async fn get_catalog_document(&self, hash_hex: &str) -> Result<Option<Bytes>> {
+    /// A stored catalog document and its `owner` metadata (`None` for a
+    /// document stored without it).
+    pub async fn get_catalog_document(
+        &self,
+        hash_hex: &str,
+    ) -> Result<Option<(Bytes, Option<String>)>> {
         match self
             .client
             .get_object()
@@ -287,8 +303,12 @@ impl S3Client {
             .await
         {
             Ok(resp) => {
+                let owner = resp
+                    .metadata()
+                    .and_then(|m| m.get(CATALOG_OWNER_METADATA))
+                    .cloned();
                 let data = resp.body.collect().await?;
-                Ok(Some(data.into_bytes()))
+                Ok(Some((data.into_bytes(), owner)))
             }
             Err(e) => {
                 if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
@@ -296,6 +316,35 @@ impl S3Client {
                 } else {
                     Err(anyhow::anyhow!(
                         "Failed to GET catalog document from S3: {}",
+                        e
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Whether a catalog document is stored, and its `owner` metadata, from
+    /// a HEAD (no body).
+    pub async fn head_catalog_document(&self, hash_hex: &str) -> Result<Option<Option<String>>> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_document_key(hash_hex))
+            .send()
+            .await
+        {
+            Ok(head) => Ok(Some(
+                head.metadata()
+                    .and_then(|m| m.get(CATALOG_OWNER_METADATA))
+                    .cloned(),
+            )),
+            Err(e) => {
+                if e.as_service_error().is_some_and(|se| se.is_not_found()) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Failed to HEAD catalog document in S3: {}",
                         e
                     ))
                 }

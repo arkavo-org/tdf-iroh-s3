@@ -182,7 +182,7 @@ async fn put_catalog<S: TagStore>(
     let entries = doc.entries.len();
     state
         .store
-        .put_catalog_document(&hash, bytes)
+        .put_catalog_document(&hash, bytes, &sub)
         .await
         .map_err(|e| storage_unavailable("Catalog document write", e))?;
     let name = format!("{}{}", state.tag_prefix, sub);
@@ -209,9 +209,15 @@ fn is_json(headers: &HeaderMap) -> bool {
         .is_some_and(|m| m.trim().eq_ignore_ascii_case("application/json"))
 }
 
+/// How long a client or proxy may reuse a catalog document. The bytes
+/// never change, but a later block or `hideCatalog` suspension must reach
+/// readers, so the reuse is short and revalidated with the ETag.
+pub const CATALOG_DOCUMENT_CACHE_CONTROL: &str = "public, max-age=300";
+
 async fn get_catalog_document<S: TagStore>(
     State(state): State<Arc<ApiState<S>>>,
     Path(hash): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     if !is_lower_hex_hash(&hash) {
         return Err(fail(StatusCode::BAD_REQUEST, "invalid hash"));
@@ -219,18 +225,80 @@ async fn get_catalog_document<S: TagStore>(
     if is_blocked(&state, &hash) {
         return Err(fail(StatusCode::NOT_FOUND, "catalog not found"));
     }
+    let not_found = || fail(StatusCode::NOT_FOUND, "catalog not found");
+    let etag = format!("\"{hash}\"");
+    let cache_headers = [
+        (header::ETAG, etag.clone()),
+        (
+            header::CACHE_CONTROL,
+            CATALOG_DOCUMENT_CACHE_CONTROL.to_string(),
+        ),
+    ];
+
+    // A client holding this version revalidates: a HEAD answers whether it
+    // is still stored and whose it is, without reading the body.
+    if if_none_match(&headers, &etag) {
+        let head = match state.store.head_catalog_document(&hash).await {
+            Ok(Some(head)) => head,
+            Ok(None) => return Err(not_found()),
+            Err(e) => return Err(storage_unavailable("Catalog document lookup", e)),
+        };
+        let owner = match head.owner {
+            Some(owner) => Some(owner),
+            // Stored without owner metadata: the bytes name the owner. Only
+            // a gated node hides anything, so only it needs them.
+            None if state.publishing.is_some() => {
+                match state.store.get_catalog_document(&hash).await {
+                    Ok(Some(doc)) => doc.owner(),
+                    Ok(None) => return Err(not_found()),
+                    Err(e) => return Err(storage_unavailable("Catalog document read", e)),
+                }
+            }
+            None => None,
+        };
+        if owner_hidden(&state, owner.as_deref()) {
+            return Err(not_found());
+        }
+        return Ok((StatusCode::NOT_MODIFIED, cache_headers).into_response());
+    }
+
     match state.store.get_catalog_document(&hash).await {
-        Ok(Some(bytes)) => Ok((
-            [
-                (header::CONTENT_TYPE, "application/json"),
-                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
-            ],
-            bytes,
-        )
-            .into_response()),
-        Ok(None) => Err(fail(StatusCode::NOT_FOUND, "catalog not found")),
+        Ok(Some(doc)) => {
+            if state.publishing.is_some() && owner_hidden(&state, doc.owner().as_deref()) {
+                return Err(not_found());
+            }
+            Ok((
+                cache_headers,
+                [(header::CONTENT_TYPE, "application/json")],
+                doc.body,
+            )
+                .into_response())
+        }
+        Ok(None) => Err(not_found()),
         Err(e) => Err(storage_unavailable("Catalog document read", e)),
     }
+}
+
+/// True when the document's owner is suspended with `hideCatalog` on this
+/// (gated) node.
+fn owner_hidden<S: TagStore>(state: &ApiState<S>, owner: Option<&str>) -> bool {
+    state.publishing.as_ref().is_some_and(|p| {
+        owner
+            .and_then(|o| p.moderation.suspension(o))
+            .is_some_and(|s| s.hide_catalog)
+    })
+}
+
+/// Whether `If-None-Match` names `etag`: `*`, the tag itself, or its weak
+/// form `W/"..."`, alone or in a comma-separated list.
+fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .any(|t| t == "*" || t.strip_prefix("W/").unwrap_or(t) == etag)
 }
 
 async fn get_blob<S: TagStore>(
@@ -401,10 +469,11 @@ mod tests {
                 "size": bytes.len(),
             })
         );
-        assert_eq!(
-            h.store.catalog_documents.lock().await[&want],
-            Bytes::from(bytes.clone())
-        );
+        {
+            let stored = &h.store.catalog_documents.lock().await[&want];
+            assert_eq!(stored.body, Bytes::from(bytes.clone()));
+            assert_eq!(stored.owner.as_deref(), Some(SUB), "owner recorded");
+        }
 
         // Readers: tag, then the document, byte for byte.
         let r = get(&h.app, &format!("/tags/catalog/{SUB}")).await;
@@ -417,10 +486,8 @@ mod tests {
         assert_eq!(r.status, StatusCode::OK);
         assert_eq!(r.body, Bytes::from(bytes.clone()));
         assert_eq!(r.headers[header::CONTENT_TYPE], "application/json");
-        assert_eq!(
-            r.headers[header::CACHE_CONTROL],
-            "public, max-age=31536000, immutable"
-        );
+        assert_eq!(r.headers[header::CACHE_CONTROL], "public, max-age=300");
+        assert_eq!(r.headers[header::ETAG], format!("\"{want}\"").as_str());
 
         // Uploading the same catalog again is harmless.
         let r = put_catalog(&h.app, SUB, Some(&creator()), bytes).await;
@@ -783,6 +850,112 @@ mod tests {
         // ...and the tag pointing at it no longer resolves.
         let r = get(&h.app, &format!("/tags/catalog/{SUB}")).await;
         assert_eq!(r.status, StatusCode::NOT_FOUND);
+    }
+
+    async fn get_with(app: &Router, path: &str, if_none_match: &str) -> Reply {
+        send(
+            app,
+            Request::get(path)
+                .header(header::IF_NONE_MATCH, if_none_match)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_held_version_revalidates_with_its_etag() {
+        let h = harness(true);
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
+        let r = put_catalog(&h.app, SUB, Some(&creator()), doc()).await;
+        let hash = r.json()["hash"].as_str().unwrap().to_string();
+        let path = format!("/catalog-documents/{hash}");
+        let etag = format!("\"{hash}\"");
+
+        for held in [
+            etag.clone(),
+            format!("W/{etag}"),
+            format!("\"{}\", {etag}", payload(7)),
+            "*".to_string(),
+        ] {
+            let r = get_with(&h.app, &path, &held).await;
+            assert_eq!(r.status, StatusCode::NOT_MODIFIED, "{held}");
+            assert!(r.body.is_empty(), "{held}");
+            assert_eq!(r.headers[header::ETAG], etag.as_str());
+            assert_eq!(r.headers[header::CACHE_CONTROL], "public, max-age=300");
+        }
+
+        // Another version, or none held: the full document.
+        let r = get_with(&h.app, &path, &format!("\"{}\"", payload(7))).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(r.body, Bytes::from(doc()));
+
+        // A document that is not stored is 404 even to a matching tag.
+        let missing = format!("/catalog-documents/{}", payload(9));
+        let r = get_with(&h.app, &missing, "*").await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::NOT_FOUND, "catalog not found")
+        );
+
+        // A block reaches a client that revalidates.
+        h.moderation.block_for_test(&hash);
+        let r = get_with(&h.app, &path, &etag).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::NOT_FOUND, "catalog not found")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hidden_owner_hides_the_document() {
+        let h = harness(true);
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
+        let r = put_catalog(&h.app, SUB, Some(&creator()), doc()).await;
+        let hash = r.json()["hash"].as_str().unwrap().to_string();
+        let path = format!("/catalog-documents/{hash}");
+        let etag = format!("\"{hash}\"");
+
+        // Suspended without hideCatalog: still served.
+        h.moderation.suspend_for_test(SUB, false);
+        assert_eq!(get(&h.app, &path).await.status, StatusCode::OK);
+
+        // With hideCatalog: 404 to a plain read and to a revalidation.
+        h.moderation.suspend_for_test(SUB, true);
+        let r = get(&h.app, &path).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::NOT_FOUND, "catalog not found")
+        );
+        let r = get_with(&h.app, &path, &etag).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+
+        // A document stored without owner metadata: the owner its bytes name
+        // is hidden the same way.
+        let legacy = catalog(SUB, vec![]);
+        let legacy_hash = blake3::hash(&legacy).to_hex().to_string();
+        h.store.catalog_documents.lock().await.insert(
+            legacy_hash.clone(),
+            crate::tags_api::StoredDocument {
+                body: Bytes::from(legacy),
+                owner: None,
+            },
+        );
+        let legacy_path = format!("/catalog-documents/{legacy_hash}");
+        assert_eq!(
+            get(&h.app, &legacy_path).await.status,
+            StatusCode::NOT_FOUND
+        );
+        let r = get_with(&h.app, &legacy_path, &format!("\"{legacy_hash}\"")).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+
+        // An ungated node hides nothing.
+        let ungated = harness(false);
+        ungated.store.catalog_documents.lock().await.insert(
+            hash.clone(),
+            h.store.catalog_documents.lock().await[&hash].clone(),
+        );
+        assert_eq!(get(&ungated.app, &path).await.status, StatusCode::OK);
     }
 
     #[tokio::test]
