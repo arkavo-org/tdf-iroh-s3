@@ -303,6 +303,35 @@ pub struct HttpConfig {
     pub expected_issuer: String,
     #[serde(default = "default_tag_prefix")]
     pub tag_prefix: String,
+    /// HTTPS listener. When set, the node terminates TLS itself and the
+    /// plain listener on `bind_port` binds to loopback only.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+/// TLS for the HTTP API, terminated by the node (rustls). The PEM cert
+/// chain and key are read from disk and reloaded when either file changes;
+/// on EC2 `tdf-iroh-s3-cert-sync` keeps them current from ACM.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TlsConfig {
+    #[serde(default = "default_https_bind_port")]
+    pub bind_port: u16,
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    /// Exportable ACM certificate the cert-sync job exports into
+    /// `cert_path`/`key_path`. The node itself never calls ACM.
+    #[serde(default)]
+    pub acm_certificate_arn: String,
+    #[serde(default = "default_tls_reload_check_secs")]
+    pub reload_check_secs: u64,
+}
+
+fn default_https_bind_port() -> u16 {
+    443
+}
+
+fn default_tls_reload_check_secs() -> u64 {
+    60
 }
 
 impl Default for HttpConfig {
@@ -313,6 +342,7 @@ impl Default for HttpConfig {
             cose_keys_url: String::new(),
             expected_issuer: String::new(),
             tag_prefix: default_tag_prefix(),
+            tls: None,
         }
     }
 }

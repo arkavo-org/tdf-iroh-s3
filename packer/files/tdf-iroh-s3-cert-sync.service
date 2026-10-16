@@ -1,0 +1,8 @@
+[Unit]
+Description=Export the TDF-Iroh-S3 HTTPS certificate from ACM
+After=network-online.target tdf-iroh-s3.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tdf-iroh-s3-cert-sync

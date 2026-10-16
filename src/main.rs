@@ -18,6 +18,7 @@ use tdf_iroh_s3::node::TdfIrohNode;
 use tdf_iroh_s3::ssm;
 use tdf_iroh_s3::store::s3::S3Client;
 use tdf_iroh_s3::tags_api::{self, ApiState, TagPublishing};
+use tdf_iroh_s3::tls;
 
 #[derive(Parser)]
 #[command(
@@ -299,11 +300,26 @@ async fn main() -> Result<()> {
             );
         }
 
-        let listener = tokio::net::TcpListener::bind(("0.0.0.0", http_cfg.bind_port)).await?;
+        // With TLS on, the plain listener stays for on-host checks only.
+        let plain_host = if http_cfg.tls.is_some() {
+            "127.0.0.1"
+        } else {
+            "0.0.0.0"
+        };
+        let listener = tokio::net::TcpListener::bind((plain_host, http_cfg.bind_port)).await?;
         info!(
-            "HTTP tag API listening on port {} (tag prefix {:?})",
-            http_cfg.bind_port, http_cfg.tag_prefix
+            "HTTP tag API listening on {}:{} (tag prefix {:?})",
+            plain_host, http_cfg.bind_port, http_cfg.tag_prefix
         );
+        if let Some(tls_cfg) = &http_cfg.tls {
+            let tls_router = router.clone();
+            let tls_cfg = tls_cfg.clone();
+            tokio::spawn(async move {
+                if let Err(e) = tls::serve_https(&tls_cfg, tls_router).await {
+                    tracing::error!("HTTPS API exited: {e:#}");
+                }
+            });
+        }
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, router).await {
                 tracing::error!("HTTP tag API exited: {e}");
