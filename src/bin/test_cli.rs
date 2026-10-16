@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
         }
         Commands::PushRaw { node, addr, data } => {
             let endpoint_addr = parse_addr(&node, &addr)?;
-            tdf_iroh_s3::test_cli::push_raw::push_raw_file(endpoint_addr.id, &data).await?;
+            tdf_iroh_s3::test_cli::push_raw::push_raw_file(endpoint_addr, &data).await?;
         }
         Commands::Push {
             node,
