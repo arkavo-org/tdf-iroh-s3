@@ -64,6 +64,26 @@ impl S3Client {
         }
     }
 
+    /// A client for a loopback S3 stand-in at `endpoint_url`, with static
+    /// credentials, for tests.
+    #[cfg(test)]
+    pub fn for_endpoint(bucket: &str, endpoint_url: &str) -> Self {
+        let config = aws_sdk_s3::config::Builder::new()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test", "test", None, None, "test",
+            ))
+            .endpoint_url(endpoint_url)
+            .force_path_style(true)
+            .build();
+        Self {
+            client: Client::from_conf(config),
+            bucket: bucket.to_string(),
+            prefix: String::new(),
+        }
+    }
+
     pub fn blob_key(&self, hash_hex: &str) -> String {
         format!("{}blobs/{}", self.prefix, hash_hex)
     }

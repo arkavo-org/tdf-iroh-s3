@@ -161,6 +161,59 @@ impl IrohTestClient {
         Ok(hash)
     }
 
+    /// Push `children` as a hash sequence in one request: the sequence's
+    /// blob and every child. Returns the sequence's hash. A node that takes
+    /// only single blobs refuses it.
+    pub async fn push_hash_seq_to_node(
+        &self,
+        addr: impl Into<EndpointAddr>,
+        children: &[&[u8]],
+    ) -> Result<Hash> {
+        let mut hashes = Vec::with_capacity(children.len());
+        for child in children {
+            hashes.push(self.add_bytes(child).await?);
+        }
+        let seq: iroh_blobs::hashseq::HashSeq = hashes.into_iter().collect();
+        let root = self.add_bytes(&seq.into_inner()).await?;
+        let conn = self
+            .endpoint
+            .connect(addr, iroh_blobs::ALPN)
+            .await
+            .context("Failed to connect to remote node")?;
+        let _conn_guard = conn.clone();
+        let request = PushRequest::new(root, iroh_blobs::protocol::ChunkRangesSeq::all());
+        self.store
+            .remote()
+            .execute_push(conn, request)
+            .await
+            .context("Failed to push hash sequence to remote node")?;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        Ok(root)
+    }
+
+    /// Get `hash` and, reading it as a hash sequence, every blob it lists,
+    /// in one request.
+    pub async fn get_hash_seq_from_node(
+        &self,
+        addr: impl Into<EndpointAddr>,
+        hash: Hash,
+    ) -> Result<()> {
+        let conn = self
+            .endpoint
+            .connect(addr, iroh_blobs::ALPN)
+            .await
+            .context("Failed to connect to remote node")?;
+        self.store
+            .remote()
+            .execute_get(
+                conn,
+                GetRequest::new(hash, iroh_blobs::protocol::ChunkRangesSeq::all()),
+            )
+            .await
+            .context("Failed to get hash sequence from remote node")?;
+        Ok(())
+    }
+
     /// Fetch a blob from a remote node by hash. A blob already complete in
     /// this client's store is returned without asking the node, so a client
     /// that pushed a blob cannot use this to check the node has it.
