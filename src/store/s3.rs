@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use bytes::Bytes;
 
+use crate::config::S3Config;
+
 pub struct S3Client {
     client: Client,
     bucket: String,
@@ -11,15 +13,33 @@ pub struct S3Client {
 impl S3Client {
     /// Create a new S3 client using the default AWS credential chain (IAM role on EC2).
     pub async fn new(bucket: &str, region: &str, prefix: &str) -> Result<Self> {
-        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(aws_sdk_s3::config::Region::new(region.to_string()))
+        Self::from_config(&S3Config {
+            bucket: bucket.to_string(),
+            region: region.to_string(),
+            prefix: prefix.to_string(),
+            endpoint_url: String::new(),
+            force_path_style: false,
+        })
+        .await
+    }
+
+    /// Create a client from the `[s3]` section: the default AWS credential
+    /// chain, plus the endpoint and addressing overrides an S3-compatible
+    /// store (LocalStack, MinIO) needs.
+    pub async fn from_config(config: &S3Config) -> Result<Self> {
+        let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new(config.region.clone()))
             .load()
             .await;
-        let client = Client::new(&config);
+        let mut builder = aws_sdk_s3::config::Builder::from(&sdk_config)
+            .force_path_style(config.force_path_style);
+        if !config.endpoint_url.is_empty() {
+            builder = builder.endpoint_url(&config.endpoint_url);
+        }
         Ok(Self {
-            client,
-            bucket: bucket.to_string(),
-            prefix: prefix.to_string(),
+            client: Client::from_conf(builder.build()),
+            bucket: config.bucket.clone(),
+            prefix: config.prefix.clone(),
         })
     }
 

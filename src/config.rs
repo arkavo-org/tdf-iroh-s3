@@ -267,6 +267,15 @@ pub struct S3Config {
     pub region: String,
     #[serde(default)]
     pub prefix: String,
+    /// An S3-compatible endpoint such as LocalStack or MinIO
+    /// (`http://127.0.0.1:4566`). Empty uses AWS, or `AWS_ENDPOINT_URL_S3` /
+    /// `AWS_ENDPOINT_URL` when set.
+    #[serde(default)]
+    pub endpoint_url: String,
+    /// Put the bucket in the request path instead of the host name. Most
+    /// S3-compatible endpoints need this; AWS does not.
+    #[serde(default)]
+    pub force_path_style: bool,
 }
 
 #[derive(Debug, Deserialize)]

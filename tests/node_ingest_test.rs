@@ -28,6 +28,8 @@ fn test_config(data_dir: &str) -> Config {
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
             prefix: String::new(),
+            endpoint_url: String::new(),
+            force_path_style: false,
         },
         validation: ValidationConfig::default(),
         http: HttpConfig::default(),

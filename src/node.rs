@@ -40,7 +40,7 @@ impl TdfIrohNode {
         let config = Arc::new(config);
 
         let s3_client = Arc::new(
-            S3Client::new(&config.s3.bucket, &config.s3.region, &config.s3.prefix)
+            S3Client::from_config(&config.s3)
                 .await
                 .context("Failed to create S3 client")?,
         );

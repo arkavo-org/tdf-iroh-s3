@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
     // before the node accepts anything, and startup fails if they cannot be:
     // a node that forgot its suspensions must not come up.
     let gate = if config.publishing.required {
-        let store = S3Client::new(&config.s3.bucket, &config.s3.region, &config.s3.prefix).await?;
+        let store = S3Client::from_config(&config.s3).await?;
         let view = Arc::new(Moderation::default());
         view.reload(&store)
             .await

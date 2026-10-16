@@ -183,3 +183,21 @@ region = "us-east-1"
     let config: Config = toml::from_str(toml_str).unwrap();
     assert!(config.http.tls.is_none());
 }
+
+#[test]
+fn test_s3_compatible_endpoint() {
+    let toml_str = r#"
+[s3]
+bucket = "test-bucket"
+region = "us-east-1"
+endpoint_url = "http://127.0.0.1:4566"
+force_path_style = true
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.s3.endpoint_url, "http://127.0.0.1:4566");
+    assert!(config.s3.force_path_style);
+
+    let config: Config = toml::from_str("[s3]\nbucket = \"b\"\nregion = \"r\"\n").unwrap();
+    assert!(config.s3.endpoint_url.is_empty());
+    assert!(!config.s3.force_path_style);
+}
