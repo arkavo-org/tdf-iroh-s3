@@ -71,19 +71,22 @@ impl FakeS3 {
     async fn start() -> (Self, String) {
         let s3 = Self::default();
         let puts = Arc::clone(&s3.puts);
-        let app = axum::Router::new().fallback(move |method: Method, uri: Uri, _body: Bytes| {
-            let puts = Arc::clone(&puts);
-            async move {
-                if method == Method::PUT {
-                    let path = uri.path();
-                    let key = path.strip_prefix(&format!("/{BUCKET}/")).unwrap_or(path);
-                    puts.lock().unwrap().push(key.to_string());
-                    (StatusCode::OK, [("etag", "\"fake\"")]).into_response()
-                } else {
-                    StatusCode::NOT_FOUND.into_response()
+        let app = axum::Router::new()
+            .fallback(move |method: Method, uri: Uri, _body: Bytes| {
+                let puts = Arc::clone(&puts);
+                async move {
+                    if method == Method::PUT {
+                        let path = uri.path();
+                        let key = path.strip_prefix(&format!("/{BUCKET}/")).unwrap_or(path);
+                        puts.lock().unwrap().push(key.to_string());
+                        (StatusCode::OK, [("etag", "\"fake\"")]).into_response()
+                    } else {
+                        StatusCode::NOT_FOUND.into_response()
+                    }
                 }
-            }
-        });
+            })
+            // Blobs can be larger than axum's default 2 MB body limit.
+            .layer(axum::extract::DefaultBodyLimit::disable());
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -452,5 +455,71 @@ async fn test_node_route_reports_the_running_endpoint() {
         serde_json::json!(["203.0.113.7:11204"])
     );
 
+    node.shutdown().await.unwrap();
+}
+
+/// A TDF of about `payload` bytes, larger than the store inlines.
+fn create_large_test_tdf(payload: usize) -> Vec<u8> {
+    use opentdf::prelude::*;
+    let policy = PolicyBuilder::new()
+        .id_auto()
+        .dissemination(["test@example.com"])
+        .build()
+        .unwrap();
+    Tdf::encrypt(vec![0x42u8; payload])
+        .kas_url("https://kas.example.com")
+        .policy(policy)
+        .to_bytes()
+        .unwrap()
+}
+
+/// Another endpoint pushing the hash of an ingested TDF and abandoning the
+/// push mid-transfer neither withholds nor deletes it: the node keeps
+/// serving it, through a collector run.
+#[tokio::test(flavor = "current_thread")]
+async fn test_an_abandoned_re_push_cannot_condemn_a_held_blob() {
+    let (node, s3, _data_dir) = spawn_node(None).await;
+    let node_id = node.addr().id;
+
+    let tdf = create_large_test_tdf(20 * 1024 * 1024);
+    let owner = IrohTestClient::new().await.unwrap();
+    let held = owner.push_to_node(node_id, &tdf).await.unwrap();
+    assert!(s3.wait_for_put(&blob_key(held)).await);
+
+    let attacker = IrohTestClient::new().await.unwrap();
+    let pushed = attacker
+        .push_to_node_abandoned(node_id, &tdf, Duration::from_millis(150))
+        .await
+        .unwrap();
+    assert_eq!(pushed, held);
+
+    // Served at once to a client that pushed nothing...
+    let viewer = IrohTestClient::new().await.unwrap();
+    let fetched = viewer.fetch_from_node(node_id, held).await.unwrap();
+    assert!(fetched.as_ref() == tdf.as_slice());
+    assert!(!node.quarantine().is_withheld(&held));
+
+    // ...and after a collector run, which a refused blob forces.
+    let garbage = vec![0xDEu8; 64 * 1024];
+    let refused = owner.push_to_node(node_id, &garbage).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while node.quarantine().is_refused(&refused)
+        || node.store().observe(refused).await.unwrap().size() != 0
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the refused blob is deleted"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    node.store().sync_db().await.unwrap();
+    assert!(node.store().observe(held).await.unwrap().is_complete());
+    let viewer = IrohTestClient::new().await.unwrap();
+    let fetched = viewer.fetch_from_node(node_id, held).await.unwrap();
+    assert!(fetched.as_ref() == tdf.as_slice());
+
+    for c in [owner, attacker, viewer] {
+        c.shutdown().await.unwrap();
+    }
     node.shutdown().await.unwrap();
 }

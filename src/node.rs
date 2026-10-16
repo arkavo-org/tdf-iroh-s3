@@ -69,7 +69,7 @@ impl TdfIrohNode {
                 .await
                 .context("Failed to load FsStore")?
         };
-        quarantine.attach(store.clone().into());
+        quarantine.attach(store.clone().into(), Arc::clone(&s3_client));
 
         let mut builder = Endpoint::builder(presets::N0);
         if !config.iroh.secret_key_param.is_empty() {
@@ -250,7 +250,7 @@ async fn run_ingest_loop(
                             },
                         };
                         info!(%hash, subject = ?owner.as_ref().map(|o| &o.0), "Push accepted");
-                        let pending = ingester.quarantine.pushed(hash);
+                        let pending = ingester.quarantine.track(hash).await;
                         msg.tx.send(Ok(())).await.ok();
                         let ingester = Arc::clone(&ingester);
                         tokio::spawn(async move {

@@ -140,6 +140,27 @@ impl IrohTestClient {
         Ok(hash)
     }
 
+    /// Start pushing `data` and abandon the push after `run_for`, closing
+    /// the connection mid-transfer: a push that ends early, for tests.
+    pub async fn push_to_node_abandoned(
+        &self,
+        addr: impl Into<EndpointAddr>,
+        data: &[u8],
+        run_for: std::time::Duration,
+    ) -> Result<Hash> {
+        let hash = self.add_bytes(data).await?;
+        let conn = self
+            .endpoint
+            .connect(addr, iroh_blobs::ALPN)
+            .await
+            .context("Failed to connect to remote node")?;
+        let request = PushRequest::from(GetRequest::blob(hash));
+        let push = self.store.remote().execute_push(conn.clone(), request);
+        let _ = tokio::time::timeout(run_for, push).await;
+        conn.close(0u32.into(), b"abandoned");
+        Ok(hash)
+    }
+
     /// Fetch a blob from a remote node by hash. A blob already complete in
     /// this client's store is returned without asking the node, so a client
     /// that pushed a blob cannot use this to check the node has it.

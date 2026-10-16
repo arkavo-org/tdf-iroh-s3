@@ -1,19 +1,30 @@
 //! Pushed blobs the node withholds, and the deletion of refused ones.
 //!
-//! A push is *pending* from the moment the node accepts it until ingest
-//! validates it. A push that does not validate (too large, not a TDF,
-//! incomplete, or ingest gave up before validating) is *refused*. The node
-//! serves neither: get, get_many and observe of a withheld hash are refused.
+//! A push of a hash the node does not already hold is *tracked*: it is
+//! *pending* from the moment the node accepts it until ingest validates it.
+//! A tracked push that does not validate (too large, not a TDF, incomplete,
+//! or ingest gave up before validating) is *refused*. The node serves
+//! neither: get, get_many and observe of a withheld hash are refused.
+//!
+//! A refusal never touches content the node already accepted. A push is
+//! not tracked when its hash was already complete in the store and not
+//! refused, or validated earlier by this process: re-pushing it cannot
+//! change it (the store verifies every chunk against the hash), so a
+//! re-push that aborts or fails changes nothing. A hash that any push
+//! validates is never refused afterwards, and validation lifts an earlier
+//! refusal of it, so a failed push racing a good one cannot condemn it.
+//! Before deleting, the collector also asks S3: a hash with an ingested
+//! `blobs/<hash>` is a validated TDF and is kept.
 //!
 //! iroh-blobs deletes blobs only through its garbage collector (its
 //! `delete` is crate-private), which removes every blob that nothing
 //! protects. The node configures it with [`Quarantine::gc_config`]: a run
 //! happens only while some blob is refused, and it protects every stored
-//! blob except the refused ones, plus every pending push. So it deletes
-//! exactly the refused blobs, and never a blob in transit or one served
-//! today. Refused hashes are kept in `<data_dir>/refused-blobs`, one per
-//! line, until the collector has removed them, so a restart does not
-//! forget them.
+//! blob except the refused ones confirmed absent from S3, plus every
+//! pending push. So it deletes exactly those refused blobs, never a blob
+//! in transit or one served today. Refused hashes are kept in
+//! `<data_dir>/refused-blobs`, one per line, until the collector has
+//! removed them, so a restart does not forget them.
 //!
 //! One window remains: a push that starts between the protect callback and
 //! the collector's sweep, and writes nothing in that time, can lose its
@@ -31,18 +42,22 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+use crate::store::s3::S3Client;
+
 pub struct Quarantine {
-    /// Accepted pushes not yet validated, with how many of each are in
+    /// Tracked pushes not yet validated, with how many of each are in
     /// flight.
     pending: Mutex<HashMap<Hash, usize>>,
     /// Refused blobs still in the store.
     refused: Mutex<HashSet<Hash>>,
+    /// Hashes some push validated in this process. Never refused.
+    validated: Mutex<HashSet<Hash>>,
     /// Where `refused` is kept across restarts.
     file: PathBuf,
     /// Serializes writes of `file`, so the last one written is the newest.
     write_lock: tokio::sync::Mutex<()>,
-    /// The store, once loaded (the collector is configured before).
-    store: OnceLock<Store>,
+    /// The store and S3, once loaded (the collector is configured before).
+    attached: OnceLock<(Store, Arc<S3Client>)>,
 }
 
 impl Quarantine {
@@ -65,15 +80,17 @@ impl Quarantine {
         Ok(Arc::new(Self {
             pending: Mutex::default(),
             refused: Mutex::new(refused),
+            validated: Mutex::default(),
             file,
             write_lock: tokio::sync::Mutex::new(()),
-            store: OnceLock::new(),
+            attached: OnceLock::new(),
         }))
     }
 
-    /// Give the collector the store it deletes from.
-    pub fn attach(&self, store: Store) {
-        let _ = self.store.set(store);
+    /// Give the quarantine the store it deletes from, and S3 to confirm a
+    /// refused hash was never ingested before deleting it.
+    pub fn attach(&self, store: Store, s3: Arc<S3Client>) {
+        let _ = self.attached.set((store, s3));
     }
 
     /// The garbage collector configuration that deletes refused blobs,
@@ -103,18 +120,28 @@ impl Quarantine {
         }
     }
 
-    /// A push the node accepted. Withheld until [`PendingPush::validated`];
-    /// refused if dropped before that.
-    pub fn pushed(self: &Arc<Self>, hash: Hash) -> PendingPush {
-        *lock(&self.pending).entry(hash).or_default() += 1;
-        // Pushed again: this push decides now. Saved, so a restart does not
-        // delete it if it validates.
-        if lock(&self.refused).remove(&hash) {
-            self.spawn_persist();
+    /// A push the node accepted. Tracked (withheld until
+    /// [`PendingPush::validated`], refused if dropped before that) unless
+    /// the node already holds the hash: complete in the store and not
+    /// refused, or validated by this process.
+    pub async fn track(self: &Arc<Self>, hash: Hash) -> PendingPush {
+        let refused = self.is_refused(&hash);
+        let already_held = !refused
+            && (self.is_validated(&hash)
+                || match self.attached.get() {
+                    Some((store, _)) => store
+                        .observe(hash)
+                        .await
+                        .is_ok_and(|bitfield| bitfield.is_complete()),
+                    None => false,
+                });
+        if !already_held {
+            *lock(&self.pending).entry(hash).or_default() += 1;
         }
         PendingPush {
             quarantine: Arc::clone(self),
             hash,
+            tracked: !already_held,
             validated: false,
         }
     }
@@ -129,6 +156,10 @@ impl Quarantine {
         lock(&self.refused).contains(hash)
     }
 
+    fn is_validated(&self, hash: &Hash) -> bool {
+        lock(&self.validated).contains(hash)
+    }
+
     fn settle(&self, hash: Hash) {
         let mut pending = lock(&self.pending);
         if let Some(n) = pending.get_mut(&hash) {
@@ -139,9 +170,29 @@ impl Quarantine {
         }
     }
 
+    /// `hash` validated: it is never refused, and an earlier refusal of it
+    /// is lifted.
+    fn mark_validated(self: &Arc<Self>, hash: Hash) {
+        lock(&self.validated).insert(hash);
+        if lock(&self.refused).remove(&hash) {
+            info!(%hash, "Refusal lifted: another push of this blob validated");
+            self.spawn_persist();
+        }
+    }
+
     fn refuse(self: &Arc<Self>, hash: Hash) {
+        // mark_validated adds to `validated` before it removes from
+        // `refused`, so checking `validated` again after inserting catches a
+        // validation that ran in between.
+        if self.is_validated(&hash) {
+            return;
+        }
+        info!(%hash, "Pushed blob refused; it will be deleted");
         lock(&self.refused).insert(hash);
-        self.settle(hash);
+        if self.is_validated(&hash) {
+            lock(&self.refused).remove(&hash);
+            return;
+        }
         self.spawn_persist();
     }
 
@@ -156,13 +207,14 @@ impl Quarantine {
     }
 
     /// The hashes this collector run must keep: every stored blob except
-    /// the refused ones, and every pending push. `None` skips the run, when
-    /// nothing is refused or the store cannot be listed.
-    async fn keep_set(&self) -> Option<HashSet<Hash>> {
+    /// the refused ones S3 confirms were never ingested, and every pending
+    /// push. `None` skips the run, when there is nothing to delete or the
+    /// store cannot be listed.
+    async fn keep_set(self: &Arc<Self>) -> Option<HashSet<Hash>> {
         if lock(&self.refused).is_empty() {
             return None;
         }
-        let store = self.store.get()?.clone();
+        let (store, s3) = self.attached.get()?.clone();
         // Commit pending writes first, so the listing includes a blob
         // refused a moment ago; otherwise it would be pruned below before it
         // was ever deleted.
@@ -189,17 +241,38 @@ impl Quarantine {
             info!(count = pruned, "Refused blobs deleted from the store");
             self.persist().await;
         }
-        if refused.is_empty() {
+
+        // Delete only what S3 confirms was never ingested. An ingested
+        // blob validated (perhaps before a restart): lift its refusal. When
+        // S3 cannot answer, keep the blob this run.
+        let mut doomed = HashSet::new();
+        for hash in refused {
+            match s3.blob_size(&hash.to_hex()).await {
+                Ok(None) => {
+                    doomed.insert(hash);
+                }
+                Ok(Some(_)) => self.mark_validated(hash),
+                Err(e) => {
+                    warn!(%hash, error = %e, "Ingest check failed; keeping the refused blob for now")
+                }
+            }
+        }
+        // A push of the hash may have started meanwhile.
+        let pending = lock(&self.pending).keys().copied().collect::<Vec<_>>();
+        for hash in &pending {
+            doomed.remove(hash);
+        }
+        if doomed.is_empty() {
             return None;
         }
 
         debug!(
-            refused = refused.len(),
+            doomed = doomed.len(),
             stored = stored.len(),
             "Garbage collection deletes refused blobs"
         );
-        let mut keep: HashSet<Hash> = stored.difference(&refused).copied().collect();
-        keep.extend(lock(&self.pending).keys().copied());
+        let mut keep: HashSet<Hash> = stored.difference(&doomed).copied().collect();
+        keep.extend(pending);
         Some(keep)
     }
 
@@ -235,27 +308,37 @@ impl Quarantine {
     }
 }
 
-/// A push being ingested. Dropping it before [`Self::validated`] refuses
-/// the blob: only a blob that validated is ever served.
+/// A push being ingested. Dropping a tracked one before [`Self::validated`]
+/// refuses the blob: only a blob that validated is ever served. Dropping an
+/// untracked one (a re-push of a blob the node holds) changes nothing.
 pub struct PendingPush {
     quarantine: Arc<Quarantine>,
     hash: Hash,
+    tracked: bool,
     validated: bool,
 }
 
 impl PendingPush {
-    /// The blob validated: it may be served.
+    /// Whether this push decides the blob's fate (the node did not hold it).
+    pub fn is_tracked(&self) -> bool {
+        self.tracked
+    }
+
+    /// The blob validated: it may be served, and is never refused.
     pub fn validated(mut self) {
         self.validated = true;
-        self.quarantine.settle(self.hash);
+        self.quarantine.mark_validated(self.hash);
+        if self.tracked {
+            self.quarantine.settle(self.hash);
+        }
     }
 }
 
 impl Drop for PendingPush {
     fn drop(&mut self) {
-        if !self.validated {
-            info!(hash = %self.hash, "Pushed blob refused; it will be deleted");
+        if self.tracked && !self.validated {
             self.quarantine.refuse(self.hash);
+            self.quarantine.settle(self.hash);
         }
     }
 }
@@ -267,27 +350,41 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh_blobs::store::fs::FsStore;
 
     fn hash(n: u8) -> Hash {
         Hash::new([n])
     }
 
-    #[tokio::test]
-    async fn a_push_is_withheld_until_it_validates() {
+    /// A quarantine attached to a fresh store (S3 is a mock: it is only
+    /// asked when the collector runs, which these tests do not do).
+    async fn attached() -> (Arc<Quarantine>, FsStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let q = Quarantine::load(dir.path()).await.unwrap();
-        let push = q.pushed(hash(1));
+        let store = FsStore::load(dir.path().join("store")).await.unwrap();
+        q.attach(
+            store.clone().into(),
+            Arc::new(S3Client::new_mock("b", "us-east-1", "")),
+        );
+        (q, store, dir)
+    }
+
+    #[tokio::test]
+    async fn a_new_push_is_withheld_until_it_validates() {
+        let (q, store, _dir) = attached().await;
+        let push = q.track(hash(1)).await;
+        assert!(push.is_tracked());
         assert!(q.is_withheld(&hash(1)));
         push.validated();
         assert!(!q.is_withheld(&hash(1)));
         assert!(!q.is_refused(&hash(1)));
+        store.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn a_push_dropped_before_validating_is_refused_and_remembered() {
-        let dir = tempfile::tempdir().unwrap();
-        let q = Quarantine::load(dir.path()).await.unwrap();
-        drop(q.pushed(hash(2)));
+    async fn a_new_push_dropped_before_validating_is_refused_and_remembered() {
+        let (q, store, dir) = attached().await;
+        drop(q.track(hash(2)).await);
         assert!(q.is_refused(&hash(2)));
         assert!(q.is_withheld(&hash(2)));
 
@@ -300,24 +397,71 @@ mod tests {
         }
         let again = Quarantine::load(dir.path()).await.unwrap();
         assert!(again.is_refused(&hash(2)));
-
-        // Pushed again: pending, no longer refused, until it decides.
-        let push = again.pushed(hash(2));
-        assert!(!again.is_refused(&hash(2)));
-        assert!(again.is_withheld(&hash(2)));
-        push.validated();
-        assert!(!again.is_withheld(&hash(2)));
+        store.shutdown().await.unwrap();
     }
 
+    /// A push of a blob the store already holds decides nothing: dropping
+    /// it unvalidated (an aborted or failed re-push) neither withholds nor
+    /// refuses the blob.
     #[tokio::test]
-    async fn concurrent_pushes_of_one_hash_settle_separately() {
-        let dir = tempfile::tempdir().unwrap();
-        let q = Quarantine::load(dir.path()).await.unwrap();
-        let a = q.pushed(hash(3));
-        let b = q.pushed(hash(3));
-        a.validated();
-        assert!(q.is_withheld(&hash(3)), "the second push is still pending");
-        b.validated();
-        assert!(!q.is_withheld(&hash(3)));
+    async fn a_re_push_of_a_held_blob_cannot_condemn_it() {
+        let (q, store, _dir) = attached().await;
+        let held = store.add_slice(vec![9u8; 40_000]).await.unwrap().hash;
+
+        let push = q.track(held).await;
+        assert!(!push.is_tracked());
+        assert!(!q.is_withheld(&held), "a re-push does not withhold");
+        drop(push);
+        assert!(!q.is_refused(&held));
+        assert!(!q.is_withheld(&held));
+
+        // Also when the blob validated earlier in this process.
+        let other = hash(3);
+        q.track(other).await.validated();
+        let push = q.track(other).await;
+        assert!(!push.is_tracked());
+        drop(push);
+        assert!(!q.is_refused(&other));
+        store.shutdown().await.unwrap();
+    }
+
+    /// Two pushes of one new blob: whichever order they end in, one that
+    /// validates keeps the blob.
+    #[tokio::test]
+    async fn a_failed_push_racing_a_good_one_cannot_condemn_it() {
+        let (q, store, _dir) = attached().await;
+
+        // The failed push ends first: refused, then lifted by the good one.
+        let good = q.track(hash(4)).await;
+        let bad = q.track(hash(4)).await;
+        drop(bad);
+        assert!(q.is_withheld(&hash(4)), "withheld while the good push runs");
+        good.validated();
+        assert!(!q.is_refused(&hash(4)));
+        assert!(!q.is_withheld(&hash(4)));
+
+        // The good push ends first: the failed one cannot refuse it.
+        let good = q.track(hash(5)).await;
+        let bad = q.track(hash(5)).await;
+        good.validated();
+        drop(bad);
+        assert!(!q.is_refused(&hash(5)));
+        assert!(!q.is_withheld(&hash(5)));
+        store.shutdown().await.unwrap();
+    }
+
+    /// A refused blob pushed again stays refused unless this push validates.
+    #[tokio::test]
+    async fn a_refused_blob_stays_refused_unless_a_push_validates() {
+        let (q, store, _dir) = attached().await;
+        drop(q.track(hash(6)).await);
+        let again = q.track(hash(6)).await;
+        assert!(again.is_tracked(), "a refused hash is not held");
+        drop(again);
+        assert!(q.is_refused(&hash(6)));
+
+        q.track(hash(6)).await.validated();
+        assert!(!q.is_refused(&hash(6)));
+        store.shutdown().await.unwrap();
     }
 }
