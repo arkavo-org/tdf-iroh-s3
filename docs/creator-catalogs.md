@@ -1,0 +1,195 @@
+# Creator catalogs and distribution
+
+This is the contract between three parties:
+
+- the tdf-iroh-s3 node at iroh.arkavo.net, which this repository builds;
+- the Creator app, which publishes;
+- the Arkavo iOS viewer, which reads.
+
+It covers four things: how a creator's recordings are published, how a viewer finds and downloads them, the catalog document format, and the HTTP routes involved. Publishing sessions and moderation are covered in [publishing-and-moderation.md](publishing-and-moderation.md).
+
+## Model
+
+- **A recording is one TDF archive, addressed by the BLAKE3 hash of its bytes.**
+  - The creator pushes it to the node over iroh.
+  - The node validates it as a TDF, stores it, and serves it to any peer by hash.
+  - Whether a viewer may play it is decided by the TDF's key access, not by the node.
+- **A creator's catalog is one JSON document listing their published recordings.**
+  - The node stores each version by the BLAKE3 hash of its exact bytes.
+  - The tag `catalog/<sub>` points at the current version.
+- **Readers never trust a catalog because of where it came from.**
+  - The document's bytes must hash to the value the tag names.
+  - Its `owner` must equal the subject the reader asked for.
+  - The node only accepts a document whose `owner` equals the subject of the uploader's token.
+
+## Subjects
+
+`<sub>` is the `sub` claim of the publisher's Arkavo CWT, exactly as minted. For the passkey session token, that is the account UUID in lowercase, for example `5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10`.
+
+- The node compares tag and catalog names to `sub` byte for byte. It does not canonicalize them, so `catalog/<uuid>` and `catalog/arkavo:<uuid>` are different tags.
+- Links carry the same string:
+  - `https://app.arkavo.com/creator?sub=<sub>`
+  - `https://app.arkavo.com/content?sub=<sub>&id=<contentID>`
+
+## Catalog document, `arkavo.creator-catalog/1`
+
+The document is UTF-8 JSON, at most **262 144 bytes**. The node stores the uploaded bytes verbatim, and the hash covers those bytes.
+
+```json
+{
+  "schema": "arkavo.creator-catalog/1",
+  "owner": "5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10",
+  "entries": [
+    {
+      "contentID": "rec-2b9c4f1e0d8a4c7f",
+      "version": 2,
+      "payloadHash": "4f8a…64 lowercase hex…",
+      "payloadSize": 7342067,
+      "title": "Studio session",
+      "publishedAt": "2026-10-16T14:30:00Z",
+      "attributeFQNs": ["https://patreon.arkavo.com/attr/campaign/value/12345678"]
+    }
+  ]
+}
+```
+
+**Top-level fields**
+
+| Field | Rule |
+|---|---|
+| `schema` | Exactly `"arkavo.creator-catalog/1"`. Readers reject any other value. |
+| `owner` | Must equal the tag's `<sub>`: 1–248 bytes of `[A-Za-z0-9:._@-]`, not containing `..`. |
+| `entries` | An array of 0–1000 entries. An empty array is a valid catalog with nothing published. |
+
+**Entry fields**
+
+| Field | Rule |
+|---|---|
+| `contentID` | 1–256 bytes of `[A-Za-z0-9:._@-]`, not containing `..`. It is unique within the document and stays the same when the creator republishes a recording. |
+| `version` | An integer from 1 to 9007199254740991 (2⁵³−1). A republish with different bytes uses a larger version. |
+| `payloadHash` | 64 lowercase hex characters: the BLAKE3 hash of the TDF bytes. At upload, it must name a blob the node has ingested and not blocked. |
+| `payloadSize` | An integer from 1 to 4294967296 (4 GiB): the TDF's size in bytes. |
+| `title` | Optional. A string of 1–512 UTF-8 bytes. |
+| `publishedAt` | RFC 3339 UTC to the second with a `Z` suffix (`YYYY-MM-DDTHH:MM:SSZ`). |
+| `attributeFQNs` | An array of 0–32 `https://` URLs, each at most 512 bytes: the data attributes in the TDF's policy, for display. They grant nothing. |
+
+**Rules for keys**
+
+- Unknown keys are rejected, at the top level and in entries.
+- A key that appears twice in one JSON object is rejected.
+- Entry order carries no meaning. Readers sort.
+
+## HTTP routes
+
+TLS terminates in front of the node. Every error body is `{"error":"<message>"}`.
+
+### `PUT /catalogs/{sub}`: publish a catalog
+
+The request:
+
+- needs the header `Authorization: Bearer <Arkavo CWT>`;
+- needs the header `Content-Type: application/json`;
+- carries the document's exact bytes as its body.
+
+The node checks the following in order. Each failure returns its own status.
+
+1. **The token passes the publishing checks** in [publishing-and-moderation.md](publishing-and-moderation.md): the audience, the entitlement, a person rather than a service, and a subject that isn't suspended.
+   - 401 when the token is missing or invalid.
+   - 403 for an entitlement, service-token or suspension failure.
+   - On a node with `[publishing] required = false`, the token still has to verify. The publishing checks are skipped.
+2. **`{sub}` equals the token's `sub`.** Otherwise 403 `catalog does not match token subject`.
+3. **The body is at most 262 144 bytes.** Otherwise 413 `catalog too large`.
+4. **The body is a valid `arkavo.creator-catalog/1` document whose `owner` equals `{sub}`.** Otherwise 422 `invalid catalog: <reason>`.
+5. **No entry's `payloadHash` is blocked.** Otherwise 403 `content is blocked`.
+6. **Every `payloadHash` is an ingested blob.** Otherwise 422 `payload <hash> is not ingested`.
+7. **The node stores the bytes and moves the tag.**
+   - It stores the bytes at `catalog-documents/<blake3>` and points the tag `catalog/<sub>` at that hash.
+   - 200 `{"name":"catalog/<sub>","hash":"<blake3 hex>","size":<bytes>}`.
+
+A catalog that hasn't changed produces the same hash. Uploading it again is harmless.
+
+### `GET /catalog-documents/{hash}`: read a catalog
+
+This route is public.
+
+- **200:** the stored bytes, with `Content-Type: application/json` and `Cache-Control: public, max-age=31536000, immutable`.
+- **400:** `invalid hash`. The hash must be 64 lowercase hex characters.
+- **404:** `catalog not found`.
+
+### `GET /tags/catalog/{sub}`: find a creator's current catalog
+
+This route is public and existed before this contract.
+
+- **200:** `{"name":"catalog/<sub>","hash":"<hex>"}`.
+- **404:** there is no catalog, the creator is suspended with `hideCatalog`, or the catalog is blocked.
+
+### `PUT /tags/catalog/{sub}`: point the tag at an earlier catalog
+
+This route needs the same token checks as `PUT /catalogs/{sub}`.
+
+- The body is `{"hash":"<hex>"}`.
+- For a name under the catalog tag prefix, the hash must be a stored catalog document whose `owner` equals `{sub}`. Otherwise 422 `hash does not reference a catalog document of this subject`.
+- Success returns **204**.
+- Tags outside the prefix keep the earlier rule: the hash must be an ingested blob.
+
+### `GET /blobs/{hash}`: confirm ingest
+
+This route is public. It is how a publisher confirms ingest before naming a hash in a catalog.
+
+- **200:** `{"hash":"<hex>","size":<bytes>}`, when the hash is an ingested TDF that is not blocked.
+- **404:** `blob not found`. The hash was never pushed, is still being ingested, failed validation, or is blocked.
+- **400:** `invalid hash`.
+
+### `GET /node`: the node's iroh identity
+
+This route is public.
+
+- 200 `{"endpointId":"<64 lowercase hex>","relayUrl":"<url>"|null,"directAddresses":["<ip:port>", …]}`.
+- `directAddresses` comes from `[iroh] public_addresses`. It is empty when that setting isn't configured.
+
+Creator reads the node to push to from this route. The iOS viewer does not. The viewer dials only the endpoint ID and addresses compiled into its release configuration, so a different value here never redirects it.
+
+## Publishing a recording (Creator)
+
+1. **Find the node.** `GET /node` gives the endpoint ID, relay and addresses.
+2. **Open a publish session.**
+   - Creator calls `POST /publish/sessions` with its iroh endpoint ID, and signs with its endpoint key (see [publishing-and-moderation.md](publishing-and-moderation.md)).
+   - A 404 means the node is ungated (`required = false`). Continue without a session.
+3. **Push the TDF** to the node over iroh. The push returns the BLAKE3 hash.
+4. **Confirm ingest.** Poll `GET /blobs/<hash>` until it returns 200 with the expected size.
+   - Wait at most 120 s.
+   - A 404 after that means the node refused the archive.
+5. **Read the current catalog.**
+   - `GET /tags/catalog/<sub>`, then `GET /catalog-documents/<hash>`.
+   - A 404 on the tag means there is no catalog yet.
+6. **Merge the entry.** Find it by `contentID`.
+   - If the payload hash is unchanged, keep the entry as it is.
+   - Otherwise write the new hash, size and `publishedAt`, with `version` one higher than the old entry's.
+7. **Publish the catalog** with `PUT /catalogs/<sub>`.
+
+To remove a recording, Creator uploads the catalog without its entry. The TDF stays on the node, but no catalog lists it.
+
+## Reading a catalog and downloading (viewer)
+
+1. **Find the current catalog.** `GET https://iroh.arkavo.net/tags/catalog/<sub>`, without credentials.
+2. **Fetch and verify it.**
+   - `GET /catalog-documents/<hash>`, reading at most 262 144 bytes.
+   - The BLAKE3 hash of the bytes must equal `<hash>`.
+   - The document must be valid, and its `owner` must equal `<sub>`.
+3. **Download a recording.** Fetch `payloadHash` over iroh, from the endpoint ID compiled into the viewer.
+   - Reject the download if it is larger than `payloadSize`.
+   - Verify the BLAKE3 hash before using the file.
+
+## Archive layout accepted at ingest
+
+A pushed blob is ingested only when it is a ZIP holding an OpenTDF manifest. Ingest accepts either of two layouts:
+
+- **The spec layout:**
+  - the manifest is `manifest.json`;
+  - the payload is the member that `payload.url` names (`0.payload` in Arkavo's FairPlay key-envelope archives);
+  - extra members, such as fMP4 playlists, init segments and media segments, are allowed.
+- **The legacy layout:** `0.manifest.json` with `0.payload`.
+
+The manifest must parse as an OpenTDF manifest, with every required field present.
+
+Blobs larger than `[validation] max_blob_bytes` are refused. The default is 4 GiB.
