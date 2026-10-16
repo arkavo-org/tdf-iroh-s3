@@ -138,6 +138,7 @@ async fn main() -> Result<()> {
             .merge(node_api::router(node_api::live(
                 node.endpoint().clone(),
                 &node.config.iroh.public_addresses,
+                node.config.validation.max_blob_bytes,
             )));
         if let Some(g) = &gate {
             if policy.operator_client_ids.is_empty() {

@@ -194,7 +194,7 @@ specified in [docs/creator-catalogs.md](docs/creator-catalogs.md).
 | Route | Access | Purpose |
 |---|---|---|
 | `GET /healthz` | public | Liveness. |
-| `GET /node` | public | `{"endpointId","relayUrl","directAddresses"}`: the iroh endpoint publishers push to. |
+| `GET /node` | public | `{"endpointId","relayUrl","directAddresses","maxBlobBytes"}`: the iroh endpoint publishers push to, and the largest archive ingest accepts. |
 | `GET /blobs/{hash}` | public | `{"hash","size"}` once a pushed TDF is ingested; 404 until then, or if refused or blocked. |
 | `PUT /catalogs/{sub}` | publisher CWT | Publish a `arkavo.creator-catalog/1` document; moves `catalog/<sub>`. |
 | `GET /catalog-documents/{hash}` | public | A stored catalog document, byte for byte (immutable). |

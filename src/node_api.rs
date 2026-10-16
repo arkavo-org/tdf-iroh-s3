@@ -21,6 +21,9 @@ pub struct NodeInfo {
     pub relay_url: Option<String>,
     /// `[iroh] public_addresses`, as `ip:port`.
     pub direct_addresses: Vec<String>,
+    /// `[validation] max_blob_bytes`: the largest archive ingest accepts, so a
+    /// publisher can refuse a larger one before uploading it.
+    pub max_blob_bytes: u64,
 }
 
 /// Produces the current [`NodeInfo`] for each request.
@@ -29,7 +32,11 @@ pub type NodeInfoSource = Arc<dyn Fn() -> NodeInfo + Send + Sync>;
 /// Read the running endpoint on every request (its home relay can change);
 /// the direct addresses are the configured public ones, because a node
 /// behind NAT or an EC2 elastic IP cannot see its own public address.
-pub fn live(endpoint: Endpoint, public_addresses: &[SocketAddr]) -> NodeInfoSource {
+pub fn live(
+    endpoint: Endpoint,
+    public_addresses: &[SocketAddr],
+    max_blob_bytes: u64,
+) -> NodeInfoSource {
     let direct_addresses: Vec<String> = public_addresses.iter().map(|a| a.to_string()).collect();
     Arc::new(move || {
         let addr = endpoint.addr();
@@ -37,6 +44,7 @@ pub fn live(endpoint: Endpoint, public_addresses: &[SocketAddr]) -> NodeInfoSour
             endpoint_id: addr.id.to_string(),
             relay_url: addr.relay_urls().next().map(|u| u.to_string()),
             direct_addresses: direct_addresses.clone(),
+            max_blob_bytes,
         }
     })
 }
@@ -70,6 +78,7 @@ mod tests {
             endpoint_id: "ab".repeat(32),
             relay_url: Some("https://relay.example./".into()),
             direct_addresses: vec!["3.91.18.97:11204".into()],
+            max_blob_bytes: 2_147_483_648,
         })
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -79,6 +88,7 @@ mod tests {
                 "endpointId": "ab".repeat(32),
                 "relayUrl": "https://relay.example./",
                 "directAddresses": ["3.91.18.97:11204"],
+                "maxBlobBytes": 2_147_483_648u64,
             })
         );
     }
@@ -89,6 +99,7 @@ mod tests {
             endpoint_id: "ab".repeat(32),
             relay_url: None,
             direct_addresses: vec![],
+            max_blob_bytes: 4_294_967_296,
         })
         .await;
         assert_eq!(body["relayUrl"], serde_json::Value::Null);

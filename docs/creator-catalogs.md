@@ -145,14 +145,15 @@ This route is public. It is how a publisher confirms ingest before naming a hash
 
 This route is public.
 
-- 200 `{"endpointId":"<64 lowercase hex>","relayUrl":"<url>"|null,"directAddresses":["<ip:port>", …]}`.
+- 200 `{"endpointId":"<64 lowercase hex>","relayUrl":"<url>"|null,"directAddresses":["<ip:port>", …],"maxBlobBytes":<bytes>}`.
 - `directAddresses` comes from `[iroh] public_addresses`. It is empty when that setting isn't configured.
+- `maxBlobBytes` is `[validation] max_blob_bytes`, the largest archive ingest accepts.
 
 Creator reads the node to push to from this route. The iOS viewer does not. The viewer dials only the endpoint ID and addresses compiled into its release configuration, so a different value here never redirects it.
 
 ## Publishing a recording (Creator)
 
-1. **Find the node.** `GET /node` gives the endpoint ID, relay and addresses.
+1. **Find the node.** `GET /node` gives the endpoint ID, relay, addresses and the largest archive the node accepts. Don't push a larger one.
 2. **Open a publish session.**
    - Creator calls `POST /publish/sessions` with its iroh endpoint ID, and signs with its endpoint key (see [publishing-and-moderation.md](publishing-and-moderation.md)).
    - A 404 means the node is ungated (`required = false`). Continue without a session.

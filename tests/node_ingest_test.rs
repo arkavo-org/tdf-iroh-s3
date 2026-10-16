@@ -209,6 +209,7 @@ async fn test_node_route_reports_the_running_endpoint() {
     let app = tdf_iroh_s3::node_api::router(tdf_iroh_s3::node_api::live(
         node.endpoint().clone(),
         &node.config.iroh.public_addresses,
+        node.config.validation.max_blob_bytes,
     ));
     let res = app
         .oneshot(
