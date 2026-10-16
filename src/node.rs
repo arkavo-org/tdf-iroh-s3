@@ -73,11 +73,12 @@ impl TdfIrohNode {
 
         // iroh-blobs 0.103's EventSender::request() reads only `mask.get`, for
         // every request type (get, get_many, push, observe). With a gate,
-        // Intercept lets the loop refuse a request; its update stream then
-        // just closes when the transfer ends, which `wait_and_ingest`
-        // handles. (InterceptLog would reset any request whose update
-        // stream the loop stopped reading.) `connected: Intercept` reports
-        // each connection's authenticated endpoint ID: the pusher.
+        // Intercept lets the loop refuse a request. In both Intercept and
+        // Notify the update stream carries no events and closes when the
+        // transfer ends, which `wait_and_ingest` waits for. (InterceptLog
+        // would reset any request whose update stream the loop stopped
+        // reading.) `connected: Intercept` reports each connection's
+        // authenticated endpoint ID: the pusher.
         let mask = if gate.is_some() {
             EventMask {
                 connected: ConnectMode::Intercept,
@@ -308,12 +309,15 @@ async fn wait_and_ingest(
         }
     }
     if !completed {
-        // Notify mode doesn't provide RequestUpdate events — the stream closes
-        // immediately. The blob should already be in the store by this point.
-        info!(%hash, "Push notification received, checking store");
+        // In Notify and Intercept modes the stream carries no events.
+        // iroh-blobs holds its sender until the push handler returns, after
+        // the data is written (or the transfer fails), so the stream closes
+        // when the transfer ends, never at the notification.
+        info!(%hash, "Push transfer ended, checking store");
     }
 
-    // Blob is written — ingest with small retry for FsStore async DB propagation
+    // The transfer is over. Retry briefly for FsStore's async DB
+    // propagation; an aborted transfer leaves the blob incomplete.
     for attempt in 0..10 {
         match ingest_from_store(hash, store, &config.validation, &config.catalog, s3_client).await {
             Ok(Some(result)) => {
@@ -334,6 +338,6 @@ async fn wait_and_ingest(
             }
         }
     }
-    error!(%hash, "Blob not readable after transfer completed");
+    error!(%hash, "Blob incomplete after the push ended");
     false
 }
