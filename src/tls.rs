@@ -25,13 +25,14 @@ const LOAD_RETRY: Duration = Duration::from_secs(10);
 /// treated as fatal, so the iroh node keeps running meanwhile. Only a failure
 /// of the listener itself is returned.
 pub async fn serve_https(cfg: &TlsConfig, router: Router) -> anyhow::Result<()> {
-    let config = load_when_ready(&cfg.cert_path, &cfg.key_path).await;
+    let (config, loaded) = load_when_ready(&cfg.cert_path, &cfg.key_path).await;
 
     tokio::spawn(reload_on_change(
         config.clone(),
         cfg.cert_path.clone(),
         cfg.key_path.clone(),
         Duration::from_secs(cfg.reload_check_secs.max(1)),
+        loaded,
     ));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.bind_port));
@@ -42,9 +43,14 @@ pub async fn serve_https(cfg: &TlsConfig, router: Router) -> anyhow::Result<()> 
         .with_context(|| format!("HTTPS listener on port {}", cfg.bind_port))
 }
 
-async fn load_when_ready(cert_path: &Path, key_path: &Path) -> RustlsConfig {
+type Mtimes = (Option<SystemTime>, Option<SystemTime>);
+
+/// Load the pair, returning it with the mtimes read *before* the load, so a
+/// rewrite that lands after it still differs from the reload baseline.
+async fn load_when_ready(cert_path: &Path, key_path: &Path) -> (RustlsConfig, Mtimes) {
     let mut last_err = String::new();
     loop {
+        let before = mtimes(cert_path, key_path);
         let res = if cert_path.exists() && key_path.exists() {
             RustlsConfig::from_pem_file(cert_path, key_path)
                 .await
@@ -53,7 +59,7 @@ async fn load_when_ready(cert_path: &Path, key_path: &Path) -> RustlsConfig {
             Err("cert or key file missing".to_string())
         };
         match res {
-            Ok(config) => return config,
+            Ok(config) => return (config, before),
             Err(e) => {
                 if e != last_err {
                     warn!(
@@ -77,14 +83,16 @@ async fn reload_on_change(
     cert_path: PathBuf,
     key_path: PathBuf,
     every: Duration,
+    mut loaded: Mtimes,
 ) {
-    let mut loaded = mtimes(&cert_path, &key_path);
     loop {
         tokio::time::sleep(every).await;
         let now = mtimes(&cert_path, &key_path);
         if now == loaded {
             continue;
         }
+        // Same idea as at startup: record `now` before reading, so a write
+        // racing this reload is caught on the next tick.
         match config.reload_from_pem_file(&cert_path, &key_path).await {
             Ok(()) => {
                 info!("TLS certificate reloaded from {}", cert_path.display());
@@ -95,7 +103,7 @@ async fn reload_on_change(
     }
 }
 
-fn mtimes(cert: &Path, key: &Path) -> (Option<SystemTime>, Option<SystemTime>) {
+fn mtimes(cert: &Path, key: &Path) -> Mtimes {
     let m = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     (m(cert), m(key))
 }
