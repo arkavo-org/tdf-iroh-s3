@@ -200,11 +200,18 @@ pub fn is_utc_timestamp(s: &str) -> bool {
 }
 
 /// An `https://` URL of at most 512 bytes with a host, in visible ASCII.
+///
+/// The URL must parse (WHATWG rules, as browsers and Foundation read it)
+/// with scheme `https` and a non-empty host. The literal `https://`
+/// followed by something other than `/` is required as well, because the
+/// parser repairs `https:///a` into host `a`, which a strict reader refuses.
 fn is_https_url(s: &str) -> bool {
     s.len() <= MAX_ATTRIBUTE_FQN_BYTES
+        && s.bytes().all(|b| b.is_ascii_graphic())
         && s.strip_prefix("https://")
             .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
-        && s.bytes().all(|b| b.is_ascii_graphic())
+        && url::Url::parse(s)
+            .is_ok_and(|u| u.scheme() == "https" && u.host_str().is_some_and(|h| !h.is_empty()))
 }
 
 /// Deserializes any JSON value, failing on an object that repeats a key.
@@ -579,6 +586,17 @@ mod tests {
         assert!(parse(&entry_with(|e| e["attributeFQNs"] = json!([max]))).is_ok());
         let fqns: Vec<String> = (0..32).map(|i| format!("https://a.example/{i}")).collect();
         assert!(parse(&entry_with(|e| e["attributeFQNs"] = json!(fqns))).is_ok());
+        for good in [
+            "https://a.example:8443/attr/x/value/y",
+            "https://[2001:db8::1]/attr/x",
+            "https://192.0.2.7/attr/x",
+            "https://user@a.example/attr/x",
+        ] {
+            assert!(
+                parse(&entry_with(|e| e["attributeFQNs"] = json!([good]))).is_ok(),
+                "{good}"
+            );
+        }
 
         let fqns: Vec<String> = (0..33).map(|i| format!("https://a.example/{i}")).collect();
         assert!(reason(&entry_with(|e| e["attributeFQNs"] = json!(fqns))).contains("at most 32"));
@@ -587,6 +605,13 @@ mod tests {
             "HTTPS://a.example/attr/x".to_string(),
             "https://".to_string(),
             "https:///path".to_string(),
+            // No host: the parser refuses these, a prefix check alone did not.
+            "https://?x".to_string(),
+            "https://#fragment".to_string(),
+            "https://:443/attr".to_string(),
+            "https://user@/attr".to_string(),
+            "https://a.example:99999/attr".to_string(),
+            "https://exa%00mple/attr".to_string(),
             "https://a.example/with space".to_string(),
             format!("https://a.example/{}", "v".repeat(512 - 17)),
             "ftp://a.example".to_string(),
