@@ -47,6 +47,16 @@ You can roll the release out in either of two ways.
 
   Edit `/etc/tdf-iroh-s3/config.toml` on the instance before the restart.
 
+  `systemctl stop` and `restart` send SIGTERM, which the node handles by shutting down cleanly. To confirm that the last stop was clean:
+
+  ```bash
+  ssh ec2-user@3.91.18.97 'sudo journalctl -u tdf-iroh-s3 | grep -E "SIGTERM received|Done\." | tail -2'
+  # ... SIGTERM received, shutting down...
+  # ... Done.
+  ```
+
+  The first restart onto this release stops a binary without SIGTERM handling, so nothing matches until the restart after that.
+
 Either way the NodeId stays the same. It comes from the SSM parameter `[iroh] secret_key_param` (default `/tdf-iroh-s3/node-secret-key`), not from the instance.
 
 - The iOS viewer compiles the endpoint ID and addresses into its release configuration.
