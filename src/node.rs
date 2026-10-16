@@ -275,7 +275,7 @@ async fn run_ingest_loop(
                     Some(ProviderMessage::GetRequestReceived(msg)) => {
                         let hash = msg.inner.request.hash;
                         if blocked(&hash) {
-                            info!(%hash, "Fetch of blocked content refused");
+                            info!(%hash, "Fetch of withheld or blocked content refused");
                             msg.tx.send(Err(AbortReason::Permission)).await.ok();
                         } else {
                             msg.tx.send(Ok(())).await.ok();
@@ -283,7 +283,7 @@ async fn run_ingest_loop(
                     }
                     Some(ProviderMessage::GetManyRequestReceived(msg)) => {
                         if msg.inner.request.hashes.iter().any(&blocked) {
-                            info!("Fetch of blocked content refused (get_many)");
+                            info!("Fetch of withheld or blocked content refused (get_many)");
                             msg.tx.send(Err(AbortReason::Permission)).await.ok();
                         } else {
                             msg.tx.send(Ok(())).await.ok();
@@ -292,7 +292,7 @@ async fn run_ingest_loop(
                     Some(ProviderMessage::ObserveRequestReceived(msg)) => {
                         let hash = msg.inner.request.hash;
                         if blocked(&hash) {
-                            info!(%hash, "Observe of blocked content refused");
+                            info!(%hash, "Observe of withheld or blocked content refused");
                             msg.tx.send(Err(AbortReason::Permission)).await.ok();
                         } else {
                             msg.tx.send(Ok(())).await.ok();
