@@ -160,17 +160,24 @@ fn check_zip64_entry_counts<R: Read + Seek>(reader: &mut R, len: u64) -> Result<
         if files != u16::MAX && cd_offset != u32::MAX {
             continue; // not ZIP64
         }
+        // Every end record that defers to ZIP64 counts, so a tail packed
+        // with them costs a bounded amount of work.
+        candidates += 1;
+        if candidates > MAX_ZIP64_CANDIDATES {
+            bail!("TDF archive has more than {MAX_ZIP64_CANDIDATES} ZIP64 end records");
+        }
+        // The locator sits just before the end record; it is in the tail
+        // unless the end record starts the window.
         let eocd_at = tail_start + p as u64;
         let Some(locator_at) = eocd_at.checked_sub(LOCATOR_LEN) else {
             continue;
         };
-        let locator = read_at(reader, locator_at, LOCATOR_LEN)?;
+        let locator = match p.checked_sub(LOCATOR_LEN as usize) {
+            Some(q) => tail[q..p].to_vec(),
+            None => read_at(reader, locator_at, LOCATOR_LEN)?,
+        };
         if locator[..4] != LOCATOR {
             continue;
-        }
-        candidates += 1;
-        if candidates > MAX_ZIP64_CANDIDATES {
-            bail!("TDF archive has more than {MAX_ZIP64_CANDIDATES} ZIP64 end records");
         }
         // The reader looks for the ZIP64 end record forward from where the
         // locator says it is, up to the locator.

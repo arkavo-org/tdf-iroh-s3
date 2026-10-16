@@ -257,3 +257,23 @@ fn a_central_directory_over_its_read_limit_is_rejected() {
     let error = error_chain(validate_tdf_structure(&bytes));
     assert!(error.contains("central directory exceeds"), "{error}");
 }
+
+/// A tail packed with end records deferring to ZIP64 is refused after a
+/// few, so it cannot make validation do work per record.
+#[test]
+fn a_tail_packed_with_zip64_end_records_is_rejected() {
+    let mut bytes = fairplay_layout(FAIRPLAY_MANIFEST, "0.payload");
+    let mut record = Vec::new();
+    record.extend_from_slice(b"PK\x05\x06");
+    record.extend_from_slice(&[0, 0, 0, 0]);
+    record.extend_from_slice(&u16::MAX.to_le_bytes());
+    record.extend_from_slice(&u16::MAX.to_le_bytes());
+    record.extend_from_slice(&u32::MAX.to_le_bytes());
+    record.extend_from_slice(&u32::MAX.to_le_bytes());
+    record.extend_from_slice(&0u16.to_le_bytes());
+    for _ in 0..1000 {
+        bytes.extend_from_slice(&record);
+    }
+    let error = error_chain(validate_tdf_structure(&bytes));
+    assert!(error.contains("more than 4 ZIP64 end records"), "{error}");
+}
