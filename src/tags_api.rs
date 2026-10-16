@@ -343,10 +343,8 @@ async fn put_tag<S: TagStore>(
 
     // The earlier catalog passes today's payload checks, as a new upload
     // would: a block, or a payload gone from storage, since it was
-    // published keeps the tag off it. Every payload is looked up, including
-    // those the current catalog shares: the shortcut `PUT /catalogs` takes
-    // for those trusts a check made when the current catalog was published.
-    crate::catalogs_api::check_payloads(&state, &doc.entries, &Default::default())
+    // published keeps the tag off it.
+    crate::catalogs_api::check_payloads(&state, &doc.entries)
         .await
         .map_err(|(status, msg)| {
             warn!(tag = %name, hash = %body.hash, %status, reason = %msg, "Tag write rejected");

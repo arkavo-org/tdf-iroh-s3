@@ -118,15 +118,14 @@ async fn put_catalog<S: TagStore>(
 
     // 5. The document itself is not blocked (no tag may point at blocked
     //    content), then 6–8: its payloads pass the checks every catalog a
-    //    tag points at must pass. Payloads the current catalog already lists
-    //    were verified when it was published and are not looked up again.
+    //    tag points at must pass, each looked up again: a payload the
+    //    current catalog lists may have left storage since it was published.
     let hash = blake3::hash(&bytes).to_hex().to_string();
     if is_blocked(&state, &hash) {
         warn!(%sub, "Catalog upload rejected: content is blocked");
         return Err(fail(StatusCode::FORBIDDEN, "content is blocked"));
     }
-    let verified = verified_payloads(&state, &sub).await;
-    check_payloads(&state, &doc.entries, &verified)
+    check_payloads(&state, &doc.entries)
         .await
         .map_err(|(status, msg)| {
             warn!(%sub, %status, reason = %msg, "Catalog upload rejected");
@@ -156,53 +155,16 @@ async fn put_catalog<S: TagStore>(
     })))
 }
 
-/// Payload sizes listed by `sub`'s current catalog (the document its tag
-/// points at). They were checked when that catalog was published, so an
-/// edit need not look them up again. Empty when there is no current
-/// catalog, or it cannot be read or is not `sub`'s.
-pub(crate) async fn verified_payloads<S: TagStore>(
-    state: &ApiState<S>,
-    sub: &str,
-) -> HashMap<String, u64> {
-    let name = format!("{}{}", state.tag_prefix, sub);
-    let current = match state.store.get_tag(&name).await {
-        Ok(Some(hash)) => hash,
-        Ok(None) => return HashMap::new(),
-        Err(e) => {
-            warn!(error = %e, %sub, "Current catalog lookup failed; checking every payload");
-            return HashMap::new();
-        }
-    };
-    let doc = match state.store.get_catalog_document(&current).await {
-        Ok(Some(doc)) => doc,
-        Ok(None) => return HashMap::new(),
-        Err(e) => {
-            warn!(error = %e, %sub, "Current catalog read failed; checking every payload");
-            return HashMap::new();
-        }
-    };
-    match creator_catalog::parse(&doc.body) {
-        Ok(catalog) if catalog.owner == sub => catalog
-            .entries
-            .into_iter()
-            .map(|e| (e.payload_hash, e.payload_size))
-            .collect(),
-        _ => HashMap::new(),
-    }
-}
-
 /// The payload checks for a catalog a tag will point at, in the contract's
 /// order: no payload blocked (403 `content is blocked`), every payload an
 /// ingested blob (422 `payload <hash> is not ingested`, the first missing
 /// one in entry order), and every entry's `payloadSize` equal to that
 /// blob's size (422 `payload <hash> size does not match`, the first
-/// mismatching entry). Payloads in `verified` take their size from it;
-/// the rest are looked up, each distinct hash once, at most
+/// mismatching entry). Each distinct hash is looked up once, at most
 /// [`INGEST_CHECK_CONCURRENCY`] at a time.
 pub(crate) async fn check_payloads<S: TagStore>(
     state: &ApiState<S>,
     entries: &[CreatorCatalogEntry],
-    verified: &HashMap<String, u64>,
 ) -> Result<(), (StatusCode, String)> {
     if entries.iter().any(|e| is_blocked(state, &e.payload_hash)) {
         return Err((StatusCode::FORBIDDEN, "content is blocked".to_string()));
@@ -212,10 +174,10 @@ pub(crate) async fn check_payloads<S: TagStore>(
     let lookups: Vec<String> = entries
         .iter()
         .map(|e| e.payload_hash.as_str())
-        .filter(|h| !verified.contains_key(*h) && seen.insert(h))
+        .filter(|h| seen.insert(h))
         .map(str::to_string)
         .collect();
-    let mut sizes = verified.clone();
+    let mut sizes = HashMap::with_capacity(lookups.len());
     let mut checks = futures::stream::iter(lookups)
         .map(|payload| {
             let store = Arc::clone(&state.store);
@@ -867,10 +829,10 @@ mod tests {
         assert_eq!(h.store.tags.lock().await.len(), 1);
     }
 
-    /// An edit looks up only payloads the current catalog does not list,
-    /// each distinct hash once.
+    /// An edit looks up every payload, including those the current catalog
+    /// lists, each distinct hash once.
     #[tokio::test]
-    async fn an_edit_looks_up_only_new_payloads() {
+    async fn an_edit_looks_up_every_payload() {
         use std::sync::atomic::Ordering::Relaxed;
         let h = harness(true);
         for n in 1..=4 {
@@ -891,7 +853,7 @@ mod tests {
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
         assert_eq!(lookups(), 2);
 
-        // Adding one recording looks up only that one.
+        // An edit looks up every distinct payload again, listed or new.
         let second = catalog(
             SUB,
             vec![
@@ -902,25 +864,28 @@ mod tests {
         );
         let r = put_catalog(&h.app, SUB, Some(&creator()), second).await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
-        assert_eq!(lookups(), 3);
+        assert_eq!(lookups(), 5);
 
-        // A listed payload with another size is refused without a lookup.
-        let mut wrong = entry("rec-1", &payload(1));
-        wrong["payloadSize"] = serde_json::json!(PAYLOAD_SIZE + 1);
-        let r = put_catalog(&h.app, SUB, Some(&creator()), catalog(SUB, vec![wrong])).await;
+        // A payload gone from storage since the current catalog listed it
+        // is refused.
+        h.store.blobs.lock().await.remove(&payload(1));
+        let third = catalog(
+            SUB,
+            vec![entry("rec-1", &payload(1)), entry("rec-2", &payload(2))],
+        );
+        let r = put_catalog(&h.app, SUB, Some(&creator()), third).await;
         assert_eq!(
             (r.status, r.error()),
             (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                format!("payload {} size does not match", payload(1))
+                format!("payload {} is not ingested", payload(1))
             )
         );
-        assert_eq!(lookups(), 3);
 
         // Blocks still apply to listed payloads.
-        h.moderation.block_for_test(&payload(1));
-        let third = catalog(SUB, vec![entry("rec-1", &payload(1))]);
-        let r = put_catalog(&h.app, SUB, Some(&creator()), third).await;
+        h.moderation.block_for_test(&payload(2));
+        let fourth = catalog(SUB, vec![entry("rec-2", &payload(2))]);
+        let r = put_catalog(&h.app, SUB, Some(&creator()), fourth).await;
         assert_eq!(
             (r.status, r.error().as_str()),
             (StatusCode::FORBIDDEN, "content is blocked")
