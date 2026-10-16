@@ -5,6 +5,17 @@
 //!
 //! Writes <dir>/cose-keys.bin and <dir>/token.txt. Deterministic key — test
 //! use only.
+//!
+//! Optional fourth and fifth arguments set the subject (default
+//! `catalog-node`) and a comma-separated `arkavo_entitlements` list, which
+//! mints a creator token a local node accepts for publishing:
+//!
+//!   cargo run --example mint_test_idp -- /tmp/idp http://127.0.0.1:9999 arkavo \
+//!       5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10 \
+//!       https://patreon.arkavo.com/attr/arkavo-creator/value/publish
+//!
+//! Serve <dir> over HTTP and point the node's `[http] cose_keys_url` at
+//! `<iss>/cose-keys.bin`, with `expected_issuer = <iss>`.
 
 use base64::Engine;
 use ciborium::value::Value;
@@ -24,6 +35,16 @@ fn main() {
         .get(3)
         .map(String::as_str)
         .unwrap_or("http://localhost:8080");
+    let sub = args.get(4).map(String::as_str).unwrap_or("catalog-node");
+    let entitlements: Vec<Value> = args
+        .get(5)
+        .map(|list| {
+            list.split(',')
+                .filter(|e| !e.is_empty())
+                .map(|e| Value::Text(e.into()))
+                .collect()
+        })
+        .unwrap_or_default();
 
     std::fs::create_dir_all(dir).expect("create output dir");
 
@@ -51,15 +72,18 @@ fn main() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let claims: Vec<(Value, Value)> = vec![
+    // cti: unique per mint, as authnz-rs issues it (the node requires one).
+    let cti = blake3::hash(format!("{sub}{now}").as_bytes()).as_bytes()[..16].to_vec();
+    let mut claims: Vec<(Value, Value)> = vec![
         (Value::Integer(1.into()), Value::Text(iss.into())),
-        (Value::Integer(2.into()), Value::Text("catalog-node".into())),
+        (Value::Integer(2.into()), Value::Text(sub.into())),
         (Value::Integer(3.into()), Value::Text(aud.into())),
         (
             Value::Integer(4.into()),
             Value::Integer((now + 86_400).into()),
         ),
         (Value::Integer(6.into()), Value::Integer(now.into())),
+        (Value::Integer(7.into()), Value::Bytes(cti)),
         (
             Value::Text("azp".into()),
             Value::Text("catalog-node".into()),
@@ -69,6 +93,12 @@ fn main() {
             Value::Array(vec![Value::Text("opentdf-admin".into())]),
         ),
     ];
+    if !entitlements.is_empty() {
+        claims.push((
+            Value::Text("arkavo_entitlements".into()),
+            Value::Array(entitlements),
+        ));
+    }
     let mut payload = Vec::new();
     ciborium::ser::into_writer(&Value::Map(claims), &mut payload).unwrap();
 
@@ -91,5 +121,5 @@ fn main() {
     std::fs::write(format!("{dir}/token.txt"), &token).unwrap();
 
     println!("wrote {dir}/cose-keys.bin ({} bytes)", key_set_bytes.len());
-    println!("wrote {dir}/token.txt (iss={iss}, aud={aud}, azp=catalog-node)");
+    println!("wrote {dir}/token.txt (iss={iss}, aud={aud}, sub={sub}, azp=catalog-node)");
 }
