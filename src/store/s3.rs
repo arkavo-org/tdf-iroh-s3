@@ -77,6 +77,10 @@ impl S3Client {
         format!("{}catalog-index/{}/{}", self.prefix, group, hash_hex)
     }
 
+    pub fn catalog_document_key(&self, hash_hex: &str) -> String {
+        format!("{}catalog-documents/{}", self.prefix, hash_hex)
+    }
+
     pub async fn put_blob(&self, hash_hex: &str, data: Bytes) -> Result<()> {
         self.client
             .put_object()
@@ -228,6 +232,75 @@ impl S3Client {
             .await
             .context("Failed to read outboard body from S3")?;
         Ok(data.into_bytes())
+    }
+
+    /// The stored size of an ingested blob, or `None` when there is no
+    /// such blob.
+    pub async fn blob_size(&self, hash_hex: &str) -> Result<Option<u64>> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(self.blob_key(hash_hex))
+            .send()
+            .await
+        {
+            Ok(head) => {
+                let size = head
+                    .content_length()
+                    .and_then(|n| u64::try_from(n).ok())
+                    .context("S3 HEAD of a blob returned no content length")?;
+                Ok(Some(size))
+            }
+            Err(e) => {
+                if e.as_service_error().is_some_and(|se| se.is_not_found()) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!("Failed to HEAD blob in S3: {}", e))
+                }
+            }
+        }
+    }
+
+    /// Store a creator catalog document under `catalog-documents/<hash>`,
+    /// byte for byte.
+    pub async fn put_catalog_document(&self, hash_hex: &str, body: Bytes) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_document_key(hash_hex))
+            .content_type("application/json")
+            .body(body.into())
+            .send()
+            .await
+            .context("Failed to PUT catalog document to S3")?;
+        Ok(())
+    }
+
+    pub async fn get_catalog_document(&self, hash_hex: &str) -> Result<Option<Bytes>> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_document_key(hash_hex))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let data = resp.body.collect().await?;
+                Ok(Some(data.into_bytes()))
+            }
+            Err(e) => {
+                if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Failed to GET catalog document from S3: {}",
+                        e
+                    ))
+                }
+            }
+        }
     }
 
     pub async fn has_blob(&self, hash_hex: &str) -> Result<bool> {

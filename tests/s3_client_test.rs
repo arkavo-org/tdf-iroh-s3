@@ -10,6 +10,10 @@ async fn test_s3_key_generation() {
         format!("outboards/{}", hash_hex)
     );
     assert_eq!(client.tag_key("my-tag"), "tags/my-tag".to_string());
+    assert_eq!(
+        client.catalog_document_key(hash_hex),
+        format!("catalog-documents/{}", hash_hex)
+    );
 }
 
 #[tokio::test]
@@ -19,5 +23,9 @@ async fn test_s3_key_with_prefix() {
     assert_eq!(
         client.blob_key(hash_hex),
         format!("myprefix/blobs/{}", hash_hex)
+    );
+    assert_eq!(
+        client.catalog_document_key(hash_hex),
+        format!("myprefix/catalog-documents/{}", hash_hex)
     );
 }

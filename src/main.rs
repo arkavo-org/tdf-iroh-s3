@@ -12,6 +12,7 @@ use tdf_iroh_s3::authz::{
     AuthZenClient, AuthzProtocol, ConnectAuthzClient, DecisionProvider, DenyAll,
 };
 use tdf_iroh_s3::catalog_api::{self, CatalogApiState, CatalogCache};
+use tdf_iroh_s3::catalogs_api;
 use tdf_iroh_s3::config::Config;
 use tdf_iroh_s3::moderation::{self, Moderation, ModerationApi, PublishGate, PublishPolicy};
 use tdf_iroh_s3::node::TdfIrohNode;
@@ -124,7 +125,10 @@ async fn main() -> Result<()> {
                 moderation: Arc::clone(&g.moderation),
             }),
         });
-        let mut router = tags_api::router(state);
+        // Tags and the creator catalog routes exist whenever HTTP does; on
+        // an ungated node they still verify tokens but skip the publishing
+        // checks.
+        let mut router = tags_api::router(Arc::clone(&state)).merge(catalogs_api::router(state));
         if let Some(g) = &gate {
             if policy.operator_client_ids.is_empty() {
                 tracing::warn!(
