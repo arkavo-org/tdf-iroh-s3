@@ -155,11 +155,16 @@ struct PutTagRequest {
 
 #[derive(Serialize)]
 struct ErrorResponse {
-    error: &'static str,
+    error: String,
 }
 
-fn error_json(status: StatusCode, error: &'static str) -> (StatusCode, Json<ErrorResponse>) {
-    (status, Json(ErrorResponse { error }))
+fn error_json(status: StatusCode, error: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        status,
+        Json(ErrorResponse {
+            error: error.into(),
+        }),
+    )
 }
 
 pub fn router<S: TagStore>(state: Arc<ApiState<S>>) -> Router {
@@ -209,7 +214,25 @@ async fn get_tag<S: TagStore>(
         Ok(Some(hash)) if hidden(Some(&hash)) => {
             Err(error_json(StatusCode::NOT_FOUND, "tag not found"))
         }
-        Ok(Some(hash)) => Ok(Json(TagResponse { name, hash })),
+        Ok(Some(hash)) => {
+            // A catalog tag resolves only to a stored catalog document. Tags
+            // written before catalog documents existed may name a TDF blob;
+            // for those there is no catalog yet.
+            if name.starts_with(&state.tag_prefix) {
+                match state.store.head_catalog_document(&hash).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        info!(tag = %name, %hash, "Catalog tag names no catalog document");
+                        return Err(error_json(StatusCode::NOT_FOUND, "tag not found"));
+                    }
+                    Err(e) => {
+                        warn!(tag = %name, error = %e, "Catalog document lookup failed");
+                        return Err(error_json(StatusCode::BAD_GATEWAY, "storage unavailable"));
+                    }
+                }
+            }
+            Ok(Json(TagResponse { name, hash }))
+        }
         Ok(None) => Err(error_json(StatusCode::NOT_FOUND, "tag not found")),
         Err(e) => {
             warn!(tag = %name, error = %e, "Tag lookup failed");
@@ -261,21 +284,35 @@ async fn put_tag<S: TagStore>(
     // its own subject, so rolling back to an earlier version can never
     // borrow someone else's catalog. (The namespace binding above means
     // every writable tag is `<tag_prefix><sub>`; no tag outside the prefix
-    // can be written.)
-    let owned = match state.store.get_catalog_document(&body.hash).await {
-        Ok(Some(doc)) => creator_catalog::parse(&doc.body).is_ok_and(|d| d.owner == claims.sub),
-        Ok(None) => false,
+    // can be written.) New catalogs go through `PUT /catalogs/{sub}`; this
+    // route only moves the tag between stored ones.
+    let doc = match state.store.get_catalog_document(&body.hash).await {
+        Ok(Some(stored)) => creator_catalog::parse(&stored.body)
+            .ok()
+            .filter(|d| d.owner == claims.sub),
+        Ok(None) => None,
         Err(e) => {
             warn!(error = %e, "Catalog document lookup failed");
             return Err(error_json(StatusCode::BAD_GATEWAY, "storage unavailable"));
         }
     };
-    if !owned {
+    let Some(doc) = doc else {
         return Err(error_json(
             StatusCode::UNPROCESSABLE_ENTITY,
             "hash does not reference a catalog document of this subject",
         ));
-    }
+    };
+
+    // The earlier catalog passes today's payload checks, as a new upload
+    // would: a block, or a payload gone from storage, since it was
+    // published keeps the tag off it.
+    let verified = crate::catalogs_api::verified_payloads(&state, &claims.sub).await;
+    crate::catalogs_api::check_payloads(&state, &doc.entries, &verified)
+        .await
+        .map_err(|(status, msg)| {
+            warn!(tag = %name, hash = %body.hash, %status, reason = %msg, "Tag write rejected");
+            error_json(status, msg)
+        })?;
 
     state.store.put_tag(&name, &body.hash).await.map_err(|e| {
         warn!(tag = %name, error = %e, "Tag write failed");
@@ -339,6 +376,8 @@ pub(crate) mod test_support {
         pub tags: Mutex<HashMap<String, String>>,
         pub blobs: Mutex<HashMap<String, u64>>,
         pub catalog_documents: Mutex<HashMap<String, StoredDocument>>,
+        /// How many times `blob_size` was asked (one S3 HEAD each).
+        pub blob_lookups: std::sync::atomic::AtomicUsize,
         /// Every call fails, as an unreachable store would.
         pub down: std::sync::atomic::AtomicBool,
     }
@@ -377,6 +416,8 @@ pub(crate) mod test_support {
         }
         async fn blob_size(&self, hash_hex: &str) -> anyhow::Result<Option<u64>> {
             self.up()?;
+            self.blob_lookups
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(self.blobs.lock().await.get(hash_hex).copied())
         }
         async fn get_catalog_document(
@@ -472,12 +513,26 @@ mod tests {
         "ab".repeat(32)
     }
 
-    /// Store a catalog document for `owner` listing `n` entries; its hash.
+    /// The `payloadSize` of `creator_catalog::test_support::entry`.
+    const PAYLOAD_SIZE: u64 = 7_342_067;
+
+    /// Store a catalog document for `owner` listing `n` entries of the
+    /// ingested blob; its hash.
     async fn store_catalog(store: &MemStore, owner: &str, n: usize) -> String {
         use crate::creator_catalog::test_support::entry;
+        store.ingest(&blob_hash(), PAYLOAD_SIZE).await;
         let entries = (0..n)
             .map(|i| entry(&format!("rec-{i}"), &blob_hash()))
             .collect();
+        store_document(store, owner, entries).await
+    }
+
+    /// Store a catalog document for `owner` listing `entries`; its hash.
+    async fn store_document(
+        store: &MemStore,
+        owner: &str,
+        entries: Vec<serde_json::Value>,
+    ) -> String {
         let bytes = catalog(owner, entries);
         let hash = blake3::hash(&bytes).to_hex().to_string();
         store
@@ -799,7 +854,7 @@ mod tests {
     #[tokio::test]
     async fn a_hidden_catalog_or_blocked_target_is_not_resolved() {
         let g = gated();
-        let hash = blob_hash();
+        let hash = store_catalog(&g.store, "arkavo:creator-1", 1).await;
         g.store
             .tags
             .lock()
@@ -824,6 +879,7 @@ mod tests {
         );
 
         let g = gated();
+        let hash = store_catalog(&g.store, "arkavo:creator-1", 1).await;
         g.store
             .tags
             .lock()
@@ -834,5 +890,82 @@ mod tests {
             get_status(&g.router, "catalog/arkavo:creator-1").await.0,
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// A catalog tag written before catalog documents existed may name a
+    /// TDF blob. It resolves as "no catalog", so Creator starts a fresh one
+    /// and a viewer shows none, instead of both failing on
+    /// `GET /catalog-documents`.
+    #[tokio::test]
+    async fn a_catalog_tag_naming_no_catalog_document_is_not_found() {
+        let h = harness();
+        h.store.ingest(&blob_hash(), PAYLOAD_SIZE).await;
+        h.store
+            .tags
+            .lock()
+            .await
+            .insert("catalog/arkavo:creator-1".into(), blob_hash());
+        let (status, body) = get_status(&h.router, "catalog/arkavo:creator-1").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("tag not found"), "{body}");
+
+        // Once the creator publishes, the tag resolves.
+        let hash = store_catalog(&h.store, "arkavo:creator-1", 1).await;
+        let (status, _) = put(&h.router, "catalog/arkavo:creator-1", &hash, Some(&h.token)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            get_status(&h.router, "catalog/arkavo:creator-1").await.0,
+            StatusCode::OK
+        );
+
+        // A tag outside the catalog prefix is not a catalog tag.
+        h.store
+            .tags
+            .lock()
+            .await
+            .insert("other/name".into(), blob_hash());
+        assert_eq!(get_status(&h.router, "other/name").await.0, StatusCode::OK);
+    }
+
+    /// Rolling the tag back applies today's payload checks to the earlier
+    /// catalog, as publishing it again would.
+    #[tokio::test]
+    async fn a_rollback_applies_the_payload_checks() {
+        use crate::creator_catalog::test_support::entry;
+        const TAG: &str = "catalog/arkavo:creator-1";
+
+        // A payload blocked since the catalog was published.
+        let g = gated();
+        let earlier = store_catalog(&g.store, "arkavo:creator-1", 1).await;
+        g.moderation.block_for_test(&blob_hash());
+        let (status, body) = put(&g.router, TAG, &earlier, Some(&g.entitled)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("content is blocked"), "{body}");
+        assert!(g.store.tags.lock().await.is_empty());
+
+        // A payload that is not an ingested blob.
+        let h = harness();
+        let missing = "cd".repeat(32);
+        let hash =
+            store_document(&h.store, "arkavo:creator-1", vec![entry("rec-1", &missing)]).await;
+        let (status, body) = put(&h.router, TAG, &hash, Some(&h.token)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            body.contains(&format!("payload {missing} is not ingested")),
+            "{body}"
+        );
+
+        // A payloadSize that differs from the stored blob.
+        h.store.ingest(&blob_hash(), PAYLOAD_SIZE).await;
+        let mut wrong = entry("rec-1", &blob_hash());
+        wrong["payloadSize"] = serde_json::json!(PAYLOAD_SIZE - 1);
+        let hash = store_document(&h.store, "arkavo:creator-1", vec![wrong]).await;
+        let (status, body) = put(&h.router, TAG, &hash, Some(&h.token)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            body.contains(&format!("payload {} size does not match", blob_hash())),
+            "{body}"
+        );
+        assert!(h.store.tags.lock().await.is_empty());
     }
 }

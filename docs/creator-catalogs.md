@@ -126,14 +126,20 @@ The bytes behind a hash never change, but the node may later block a document or
 This route is public and existed before this contract.
 
 - **200:** `{"name":"catalog/<sub>","hash":"<hex>"}`.
-- **404:** there is no catalog, the creator is suspended with `hideCatalog`, or the catalog is blocked.
+- **404:** `tag not found`. There is no catalog, the creator is suspended with `hideCatalog`, the catalog is blocked, or the tag does not name a stored catalog document.
+
+The tag `catalog/<sub>` existed before catalog documents, and an older tag may name a TDF blob instead of a catalog. The node answers such a tag with 404, as if there were no catalog. Creator then starts a new catalog, and a viewer shows that the creator has none, rather than both failing on `GET /catalog-documents`.
 
 ### `PUT /tags/catalog/{sub}`: point the tag at an earlier catalog
+
+This route only moves the tag between catalogs the node already stores, for example to roll back to an earlier version. A new catalog is published with `PUT /catalogs/{sub}`.
 
 This route needs the same token checks as `PUT /catalogs/{sub}`.
 
 - The body is `{"hash":"<hex>"}`.
-- The hash must be a stored catalog document whose `owner` equals `{sub}`. Otherwise 422 `hash does not reference a catalog document of this subject`.
+- The hash must not be blocked. Otherwise 403 `content is blocked`.
+- The hash must be a stored catalog document whose `owner` equals `{sub}`. Otherwise 422 `hash does not reference a catalog document of this subject`. A TDF blob's hash is refused this way.
+- The document's entries must pass the same payload checks as an upload, steps 6–8 of `PUT /catalogs/{sub}`: no payload blocked (403 `content is blocked`), every payload ingested (422 `payload <hash> is not ingested`), and every `payloadSize` matching (422 `payload <hash> size does not match`). So a rollback never brings back a recording blocked since that version was published.
 - Success returns **204**.
 
 ### `GET /blobs/{hash}`: confirm ingest

@@ -20,11 +20,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use futures::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::creator_catalog::{self, MAX_CATALOG_BYTES, is_lower_hex_hash};
+use crate::creator_catalog::{self, CreatorCatalogEntry, MAX_CATALOG_BYTES, is_lower_hex_hash};
 use crate::tags_api::{ApiState, TagStore, authorize_publisher, is_blocked};
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
@@ -116,68 +116,24 @@ async fn put_catalog<S: TagStore>(
         ));
     }
 
-    // 5. Nothing blocked: no listed payload, and not the document itself
-    //    (no tag may point at blocked content).
+    // 5. The document itself is not blocked (no tag may point at blocked
+    //    content), then 6–8: its payloads pass the checks every catalog a
+    //    tag points at must pass. Payloads the current catalog already lists
+    //    were verified when it was published and are not looked up again.
     let hash = blake3::hash(&bytes).to_hex().to_string();
-    if doc
-        .entries
-        .iter()
-        .any(|e| is_blocked(&state, &e.payload_hash))
-        || is_blocked(&state, &hash)
-    {
+    if is_blocked(&state, &hash) {
         warn!(%sub, "Catalog upload rejected: content is blocked");
         return Err(fail(StatusCode::FORBIDDEN, "content is blocked"));
     }
+    let verified = verified_payloads(&state, &sub).await;
+    check_payloads(&state, &doc.entries, &verified)
+        .await
+        .map_err(|(status, msg)| {
+            warn!(%sub, %status, reason = %msg, "Catalog upload rejected");
+            fail(status, msg)
+        })?;
 
-    // 6. Every payload is an ingested blob. Checked in entry order, so the
-    //    reported hash is the first missing one.
-    let mut payloads: Vec<String> = Vec::with_capacity(doc.entries.len());
-    for e in &doc.entries {
-        if !payloads.contains(&e.payload_hash) {
-            payloads.push(e.payload_hash.clone());
-        }
-    }
-    let mut checks = futures::stream::iter(payloads)
-        .map(|payload| {
-            let store = Arc::clone(&state.store);
-            async move {
-                let found = store.blob_size(&payload).await;
-                (payload, found)
-            }
-        })
-        .buffered(INGEST_CHECK_CONCURRENCY);
-    let mut sizes: HashMap<String, u64> = HashMap::with_capacity(doc.entries.len());
-    while let Some((payload, found)) = checks.next().await {
-        match found {
-            Ok(Some(size)) => {
-                sizes.insert(payload, size);
-            }
-            Ok(None) => {
-                return Err(fail(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("payload {payload} is not ingested"),
-                ));
-            }
-            Err(e) => return Err(storage_unavailable("Payload ingest check", e)),
-        }
-    }
-
-    // 7. Every entry's payloadSize is the stored blob's size (what
-    //    `GET /blobs` reports), in entry order. Per entry, not per hash: two
-    //    entries naming one payload are each checked.
-    if let Some(e) = doc
-        .entries
-        .iter()
-        .find(|e| sizes.get(&e.payload_hash) != Some(&e.payload_size))
-    {
-        warn!(%sub, payload = %e.payload_hash, "Catalog upload rejected: payload size mismatch");
-        return Err(fail(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("payload {} size does not match", e.payload_hash),
-        ));
-    }
-
-    // 8. Store the exact bytes, then move the tag.
+    // 9. Store the exact bytes, then move the tag.
     let size = bytes.len();
     let entries = doc.entries.len();
     state
@@ -198,6 +154,107 @@ async fn put_catalog<S: TagStore>(
         "hash": hash,
         "size": size,
     })))
+}
+
+/// Payload sizes listed by `sub`'s current catalog (the document its tag
+/// points at). They were checked when that catalog was published, so an
+/// edit need not look them up again. Empty when there is no current
+/// catalog, or it cannot be read or is not `sub`'s.
+pub(crate) async fn verified_payloads<S: TagStore>(
+    state: &ApiState<S>,
+    sub: &str,
+) -> HashMap<String, u64> {
+    let name = format!("{}{}", state.tag_prefix, sub);
+    let current = match state.store.get_tag(&name).await {
+        Ok(Some(hash)) => hash,
+        Ok(None) => return HashMap::new(),
+        Err(e) => {
+            warn!(error = %e, %sub, "Current catalog lookup failed; checking every payload");
+            return HashMap::new();
+        }
+    };
+    let doc = match state.store.get_catalog_document(&current).await {
+        Ok(Some(doc)) => doc,
+        Ok(None) => return HashMap::new(),
+        Err(e) => {
+            warn!(error = %e, %sub, "Current catalog read failed; checking every payload");
+            return HashMap::new();
+        }
+    };
+    match creator_catalog::parse(&doc.body) {
+        Ok(catalog) if catalog.owner == sub => catalog
+            .entries
+            .into_iter()
+            .map(|e| (e.payload_hash, e.payload_size))
+            .collect(),
+        _ => HashMap::new(),
+    }
+}
+
+/// The payload checks for a catalog a tag will point at, in the contract's
+/// order: no payload blocked (403 `content is blocked`), every payload an
+/// ingested blob (422 `payload <hash> is not ingested`, the first missing
+/// one in entry order), and every entry's `payloadSize` equal to that
+/// blob's size (422 `payload <hash> size does not match`, the first
+/// mismatching entry). Payloads in `verified` take their size from it;
+/// the rest are looked up, each distinct hash once, at most
+/// [`INGEST_CHECK_CONCURRENCY`] at a time.
+pub(crate) async fn check_payloads<S: TagStore>(
+    state: &ApiState<S>,
+    entries: &[CreatorCatalogEntry],
+    verified: &HashMap<String, u64>,
+) -> Result<(), (StatusCode, String)> {
+    if entries.iter().any(|e| is_blocked(state, &e.payload_hash)) {
+        return Err((StatusCode::FORBIDDEN, "content is blocked".to_string()));
+    }
+
+    let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
+    let lookups: Vec<String> = entries
+        .iter()
+        .map(|e| e.payload_hash.as_str())
+        .filter(|h| !verified.contains_key(*h) && seen.insert(h))
+        .map(str::to_string)
+        .collect();
+    let mut sizes = verified.clone();
+    let mut checks = futures::stream::iter(lookups)
+        .map(|payload| {
+            let store = Arc::clone(&state.store);
+            async move {
+                let found = store.blob_size(&payload).await;
+                (payload, found)
+            }
+        })
+        .buffered(INGEST_CHECK_CONCURRENCY);
+    while let Some((payload, found)) = checks.next().await {
+        match found {
+            Ok(Some(size)) => {
+                sizes.insert(payload, size);
+            }
+            Ok(None) => {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("payload {payload} is not ingested"),
+                ));
+            }
+            Err(e) => {
+                warn!(error = %e, "Payload ingest check failed");
+                return Err((StatusCode::BAD_GATEWAY, "storage unavailable".to_string()));
+            }
+        }
+    }
+
+    // Per entry, not per hash: two entries naming one payload are each
+    // checked.
+    if let Some(e) = entries
+        .iter()
+        .find(|e| sizes.get(&e.payload_hash) != Some(&e.payload_size))
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("payload {} size does not match", e.payload_hash),
+        ));
+    }
+    Ok(())
 }
 
 /// `application/json`, with or without parameters such as `charset`.
@@ -807,6 +864,66 @@ mod tests {
         let r = put_catalog(&h.app, SUB, Some(&creator()), doc()).await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
         assert_eq!(h.store.tags.lock().await.len(), 1);
+    }
+
+    /// An edit looks up only payloads the current catalog does not list,
+    /// each distinct hash once.
+    #[tokio::test]
+    async fn an_edit_looks_up_only_new_payloads() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let h = harness(true);
+        for n in 1..=4 {
+            h.store.ingest(&payload(n), PAYLOAD_SIZE).await;
+        }
+        let lookups = || h.store.blob_lookups.load(Relaxed);
+
+        // First publish: both payloads, the duplicate once.
+        let first = catalog(
+            SUB,
+            vec![
+                entry("rec-1", &payload(1)),
+                entry("rec-2", &payload(2)),
+                entry("rec-2b", &payload(2)),
+            ],
+        );
+        let r = put_catalog(&h.app, SUB, Some(&creator()), first).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        assert_eq!(lookups(), 2);
+
+        // Adding one recording looks up only that one.
+        let second = catalog(
+            SUB,
+            vec![
+                entry("rec-1", &payload(1)),
+                entry("rec-2", &payload(2)),
+                entry("rec-3", &payload(3)),
+            ],
+        );
+        let r = put_catalog(&h.app, SUB, Some(&creator()), second).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        assert_eq!(lookups(), 3);
+
+        // A listed payload with another size is refused without a lookup.
+        let mut wrong = entry("rec-1", &payload(1));
+        wrong["payloadSize"] = serde_json::json!(PAYLOAD_SIZE + 1);
+        let r = put_catalog(&h.app, SUB, Some(&creator()), catalog(SUB, vec![wrong])).await;
+        assert_eq!(
+            (r.status, r.error()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("payload {} size does not match", payload(1))
+            )
+        );
+        assert_eq!(lookups(), 3);
+
+        // Blocks still apply to listed payloads.
+        h.moderation.block_for_test(&payload(1));
+        let third = catalog(SUB, vec![entry("rec-1", &payload(1))]);
+        let r = put_catalog(&h.app, SUB, Some(&creator()), third).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::FORBIDDEN, "content is blocked")
+        );
     }
 
     #[tokio::test]

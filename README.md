@@ -198,8 +198,8 @@ specified in [docs/creator-catalogs.md](docs/creator-catalogs.md).
 | `GET /blobs/{hash}` | public | `{"hash","size"}` once a pushed TDF is ingested; 404 until then, or if refused or blocked. |
 | `PUT /catalogs/{sub}` | publisher CWT | Publish a `arkavo.creator-catalog/1` document; moves `catalog/<sub>`. |
 | `GET /catalog-documents/{hash}` | public | A stored catalog document, byte for byte (`ETag`, cached 5 minutes, `If-None-Match` → 304). |
-| `GET /tags/{name}` | public | Resolve a tag, e.g. `catalog/<sub>`. |
-| `PUT /tags/catalog/{sub}` | publisher CWT | Point the tag at an earlier catalog document of the same subject. |
+| `GET /tags/{name}` | public | Resolve a tag, e.g. `catalog/<sub>`. A catalog tag that names no stored catalog document (an older tag naming a TDF blob) is 404. |
+| `PUT /tags/catalog/{sub}` | publisher CWT | Roll the tag back to an earlier catalog document of the same subject; its payloads are checked again. New catalogs go through `PUT /catalogs/{sub}`. |
 | `POST /publish/sessions` | publisher CWT | Gated nodes only (404, empty body, when ungated); see below. |
 
 ```bash
