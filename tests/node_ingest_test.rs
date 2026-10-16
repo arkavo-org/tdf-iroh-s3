@@ -523,3 +523,45 @@ async fn test_an_abandoned_re_push_cannot_condemn_a_held_blob() {
     }
     node.shutdown().await.unwrap();
 }
+
+/// A push larger than max_blob_bytes is stopped while it transfers: the
+/// node closes its connection once the push's declared size is known, so it
+/// never stores the whole blob, and refuses and deletes what arrived.
+#[tokio::test(flavor = "current_thread")]
+async fn test_an_oversize_push_is_stopped_mid_transfer() {
+    let (node, s3, _data_dir) =
+        spawn_node_with(None, |c| c.validation.max_blob_bytes = 1024 * 1024).await;
+    let node_id = node.addr().id;
+
+    let oversize = vec![0x5Au8; 50 * 1024 * 1024];
+    let hash = Hash::new(&oversize);
+    let pusher = IrohTestClient::new().await.unwrap();
+    let result = pusher.push_to_node(node_id, &oversize).await;
+    let error = format!("{:#}", result.expect_err("the node stops the push"));
+    assert!(error.contains("max_blob_bytes"), "{error}");
+
+    // Only the first part arrived, it is refused, and it is deleted.
+    node.store().sync_db().await.unwrap();
+    let bitfield = node.store().observe(hash).await.unwrap();
+    assert!(!bitfield.is_complete(), "the whole blob never arrived");
+    assert!(node.quarantine().is_refused(&hash));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while node.quarantine().is_refused(&hash)
+        || node.store().observe(hash).await.unwrap().size() != 0
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the partial push is deleted"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!s3.has_put(&blob_key(hash)));
+
+    // A push within the limit still goes through.
+    let tdf = create_test_tdf();
+    let hash = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    assert!(s3.wait_for_put(&blob_key(hash)).await);
+
+    pusher.shutdown().await.unwrap();
+    node.shutdown().await.unwrap();
+}

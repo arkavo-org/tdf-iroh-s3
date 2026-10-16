@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
+use futures::StreamExt;
 use iroh::endpoint::presets;
-use iroh::protocol::Router;
+use iroh::endpoint::{Connection, VarInt};
+use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::BlobsProtocol;
 use iroh_blobs::provider::events::{
@@ -9,6 +11,7 @@ use iroh_blobs::provider::events::{
 };
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::fs::options::Options;
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -125,7 +128,11 @@ impl TdfIrohNode {
         };
         let (event_sender, event_rx) = EventSender::channel(64, mask);
 
-        let blobs = BlobsProtocol::new(&store, Some(event_sender));
+        let connections = Arc::new(Connections::default());
+        let blobs = TrackedBlobs {
+            inner: BlobsProtocol::new(&store, Some(event_sender)),
+            connections: Arc::clone(&connections),
+        };
 
         let router = Router::builder(endpoint.clone())
             .accept(iroh_blobs::ALPN, blobs)
@@ -137,6 +144,7 @@ impl TdfIrohNode {
         // Spawn the ingest background task
         {
             let ingester = Arc::new(Ingester {
+                connections,
                 quarantine: Arc::clone(&quarantine),
                 store: store.clone(),
                 s3_client: Arc::clone(&s3_client),
@@ -195,6 +203,8 @@ impl TdfIrohNode {
 
 /// What ingesting a pushed blob needs.
 struct Ingester {
+    /// Open connections, so an oversize push's can be closed.
+    connections: Arc<Connections>,
     quarantine: Arc<Quarantine>,
     store: FsStore,
     s3_client: Arc<S3Client>,
@@ -238,6 +248,7 @@ async fn run_ingest_loop(
                 match msg {
                     Some(ProviderMessage::PushRequestReceived(msg)) => {
                         let hash = msg.inner.request.hash;
+                        let connection_id = msg.inner.connection_id;
                         let owner = match &gate {
                             None => None,
                             Some(g) => match g.authorize_push(msg.inner.connection_id, &hash.to_hex()) {
@@ -254,7 +265,7 @@ async fn run_ingest_loop(
                         msg.tx.send(Ok(())).await.ok();
                         let ingester = Arc::clone(&ingester);
                         tokio::spawn(async move {
-                            if wait_and_ingest(hash, msg.rx, pending, &ingester).await
+                            if wait_and_ingest(hash, msg.rx, connection_id, pending, &ingester).await
                                 && let Some((subject, endpoint)) = owner
                             {
                                 record_owner(&ingester.s3_client, hash, subject, endpoint).await;
@@ -350,12 +361,38 @@ async fn record_owner(
 async fn wait_and_ingest(
     hash: iroh_blobs::Hash,
     mut rx: irpc::channel::mpsc::Receiver<RequestUpdate>,
+    connection_id: u64,
     pending: PendingPush,
     ingester: &Ingester,
 ) -> bool {
+    // A push carries its size in its first 8 bytes, and the store records
+    // it with the first chunks written. When it exceeds max_blob_bytes, the
+    // connection is closed then, so the push stops long before it can fill
+    // the disk. Only a push of a hash the node does not hold is watched.
+    let max = ingester.config.validation.max_blob_bytes;
+    let watched = pending.is_tracked();
+    let mut oversize = Box::pin(async {
+        if watched {
+            oversize_push(&ingester.store, hash, max).await
+        } else {
+            std::future::pending().await
+        }
+    });
+
     // Wait for the push transfer to complete
     let mut completed = false;
-    while let Ok(Some(update)) = rx.recv().await {
+    loop {
+        let update = tokio::select! {
+            update = rx.recv() => update,
+            size = &mut oversize => {
+                warn!(%hash, size, max, "Push exceeds max_blob_bytes; closing its connection");
+                ingester.connections.close(connection_id, b"blob exceeds max_blob_bytes");
+                return false;
+            }
+        };
+        let Ok(Some(update)) = update else {
+            break;
+        };
         match update {
             RequestUpdate::Started(s) => {
                 info!(%hash, size = s.size, "Push transfer started");
@@ -372,6 +409,8 @@ async fn wait_and_ingest(
             }
         }
     }
+    // The transfer is over; stop watching its size.
+    drop(oversize);
     if !completed {
         // In Notify and Intercept modes the stream carries no events.
         // iroh-blobs holds its sender until the push handler returns, after
@@ -432,4 +471,62 @@ async fn wait_and_ingest(
     }
     error!(%hash, "Blob incomplete after the push ended");
     false
+}
+
+/// Resolves with the size `hash`'s push declared once that exceeds `max`;
+/// otherwise never. The size is fixed by the hash, so once a size within
+/// `max` is known there is nothing left to watch.
+async fn oversize_push(store: &FsStore, hash: iroh_blobs::Hash, max: u64) -> u64 {
+    if let Ok(updates) = store.observe(hash).stream().await {
+        tokio::pin!(updates);
+        while let Some(bitfield) = updates.next().await {
+            match bitfield.size() {
+                0 => continue,
+                size if size > max => return size,
+                _ => break,
+            }
+        }
+    }
+    std::future::pending().await
+}
+
+/// Open connections of the blobs protocol, by the id iroh-blobs reports in
+/// its events (`Connection::stable_id`).
+#[derive(Debug, Default)]
+struct Connections(std::sync::Mutex<HashMap<u64, Connection>>);
+
+impl Connections {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Connection>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Close connection `id`, if it is still open, with application error
+    /// code 1 and `reason`.
+    fn close(&self, id: u64, reason: &[u8]) {
+        if let Some(conn) = self.lock().get(&id) {
+            conn.close(VarInt::from_u32(1), reason);
+        }
+    }
+}
+
+/// The blobs protocol, keeping each open connection in [`Connections`] so
+/// the ingest loop can close the one carrying an oversize push.
+#[derive(Debug, Clone)]
+struct TrackedBlobs {
+    inner: BlobsProtocol,
+    connections: Arc<Connections>,
+}
+
+impl ProtocolHandler for TrackedBlobs {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        let id = conn.stable_id() as u64;
+        self.connections.lock().insert(id, conn.clone());
+        let result = self.inner.accept(conn).await;
+        self.connections.lock().remove(&id);
+        result
+    }
+
+    async fn shutdown(&self) {
+        self.inner.shutdown().await
+    }
 }
