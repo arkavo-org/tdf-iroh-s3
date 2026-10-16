@@ -7,15 +7,19 @@ and stores them in Amazon S3. Serves stored blobs back to any requesting peer.
 
 1. Peers send blobs over Iroh's P2P QUIC protocol
 2. Each blob is validated as a valid TDF (Trusted Data Format):
-   - At most `[validation] max_blob_bytes` (default 4 GiB)
+   - At most `[validation] max_blob_bytes` (default 4 GiB − 1); a larger
+     push is stopped while it transfers
    - A ZIP holding an OpenTDF manifest: `manifest.json` with the payload in
      the member `payload.url` names (other members, such as HLS playlists
      and fMP4 segments, are allowed), or the legacy `0.manifest.json` +
      `0.payload`
    - Required attributes present in the policy
    - Optional assertion signature verification
-3. Valid blobs are stored in S3, keyed by BLAKE3 content hash
-4. Any peer can retrieve blobs by hash — the TDF encryption layer handles access control
+3. Valid blobs are stored in S3, keyed by BLAKE3 content hash. Ingest reads
+   the blob from a file and streams it to S3; it never holds it in memory.
+4. Any peer can retrieve blobs by hash — the TDF encryption layer handles access control.
+   A pushed blob is served only once it validates; a refused one is never
+   served, and the store's garbage collector deletes it.
 
 Creators publish a catalog of their recordings as a JSON document the node
 stores by hash, behind the tag `catalog/<sub>`. The contract between the
@@ -50,9 +54,12 @@ region = "us-east-1"
 required_attributes = [
     "https://example.com/attr/storage/value/permanent"
 ]
-# Larger pushes are refused. Ingest holds the blob in memory, so keep this
-# below the instance's free RAM. Default 4294967295 (4 GiB − 1, the viewer's limit).
+# Larger pushes are refused, and stopped while they transfer. Memory does
+# not bound this; disk does (docs/deploy-runbook.md). Default 4294967295
+# (4 GiB − 1, the viewer's limit).
 max_blob_bytes = 4294967295
+# Pushes validated and uploaded at once, each with a scratch copy on disk.
+max_concurrent_ingests = 1
 
 [validation.assertion]
 enabled = false

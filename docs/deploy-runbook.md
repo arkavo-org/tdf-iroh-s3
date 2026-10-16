@@ -76,9 +76,11 @@ bind_port = 11204
 public_addresses = ["<public ip>:11204"]
 
 [validation]
-# Larger pushes are refused. The default is 4 GiB (the largest payloadSize
-# a catalog may name).
+# Larger pushes are refused, and stopped while they transfer. The default is
+# 4294967295 (4 GiB − 1, the largest payloadSize a catalog may name).
 max_blob_bytes = 4294967295
+# Pushes validated and uploaded at once; each holds a scratch copy on disk.
+max_concurrent_ingests = 1
 
 [http]
 enabled = true
@@ -87,12 +89,22 @@ cose_keys_url = "https://identity.arkavo.net/.well-known/cose-keys"
 expected_issuer = "https://identity.arkavo.net"
 ```
 
-**Memory.** Ingest holds the whole blob in memory: it reads the blob from the iroh store, validates it, and uploads it to S3. A `t4g.medium` has 4 GiB of RAM, so a blob near the 4 GiB default will exhaust memory before it is refused for any other reason.
+**Memory.** Ingest does not hold a blob in memory.
+- It exports the pushed blob from the iroh store to a scratch file under `<data_dir>/ingest`.
+- It validates the blob from that file, reading only the ZIP central directory and the manifest (at most 4 MiB).
+- It uploads the blob to S3 streaming from the file.
 
-- On this instance type, set `max_blob_bytes = 2147483648` (2 GiB), or move to an instance with more memory. `GET /node` reports the limit as `maxBlobBytes`, and Creator refuses a larger recording before uploading it.
-- The node refuses a blob over the limit before reading it, so a lower limit is safe.
+So memory no longer limits `max_blob_bytes`, and the 4294967295 default stays, also on a `t4g.medium`. The earlier advice to lower it to 2147483648 there was about RAM and no longer applies. Lower it only to limit how much disk one push can take. `GET /node` reports the limit as `maxBlobBytes`, and Creator refuses a larger recording before uploading it.
 
-Keep the rest of the config as it is: `[s3]`, `[publishing]` (gated by default) and `[catalog]`.
+**Disk.** The data volume (`[iroh] data_dir`) holds:
+- **Every blob the node serves.** The iroh store keeps each ingested TDF; it is the copy viewers download. S3 holds a second copy, which the node does not read back.
+- **Pushes in flight,** each up to `max_blob_bytes`. A push that declares a larger size is stopped after its first few hundred KiB. Nothing limits how many pushes run at once, and on a node with `[publishing] required = false` anyone can push. So size the free space for the bursts you expect, and watch it.
+- **One scratch copy per ingest in progress**, `max_concurrent_ingests` × `max_blob_bytes` at most. With a reflink-capable filesystem the copy shares the blob's blocks and takes no space: XFS shows `reflink=1` in `xfs_info /var/lib/tdf-iroh-s3`.
+- **Refused blobs,** until the store's garbage collector deletes them. A blob that is not a valid TDF, or a push that stops early, is never served, and is deleted within about `[iroh] gc_interval_secs` (default 60).
+
+As a rule, beyond the stored blobs, keep free at least (pushes you expect at once + `max_concurrent_ingests`) × `max_blob_bytes`. With the defaults and one push at a time, that is 8 GiB, or 4 GiB with reflinks.
+
+Keep the rest of the config as deployed: `[s3]`, `[publishing]` and `[catalog]`. Production runs `[publishing] required = false`; keep that. Creator works either way: on an ungated node `POST /publish/sessions` answers 404, and Creator pushes without a session.
 
 ## 4. TLS for iroh.arkavo.net
 

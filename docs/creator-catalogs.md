@@ -170,6 +170,8 @@ Creator reads the node to push to from this route. The iOS viewer does not. The 
 3. **Push the TDF** to the node over iroh. The push returns the BLAKE3 hash.
    - The push's result does not say whether the node accepted it. A gated node refuses a push from an endpoint without a session by aborting the request, but the pusher may see no error: the iroh-blobs client in this repository's test CLI reports such a push as successful.
    - Only step 4 confirms that the node has the TDF.
+   - A push larger than `maxBlobBytes` is stopped while it transfers: the node closes the connection with the reason `blob exceeds max_blob_bytes`.
+   - The node serves a pushed blob over iroh only once it validates. A blob it refuses is never served and is deleted.
 4. **Confirm ingest.** Poll `GET /blobs/<hash>` until it returns 200 with the expected size.
    - Wait at most 120 s.
    - A 404 after that means the node refused the push or the archive.
@@ -204,6 +206,6 @@ A pushed blob is ingested only when it is a ZIP holding an OpenTDF manifest. Ing
   - extra members, such as fMP4 playlists, init segments and media segments, are allowed.
 - **The legacy layout:** `0.manifest.json` with `0.payload`.
 
-The manifest must parse as an OpenTDF manifest, with every required field present.
+The manifest must parse as an OpenTDF manifest, with every required field present, and be at most 4 MiB. The payload member must exist; ingest does not read its bytes.
 
 Blobs larger than `[validation] max_blob_bytes` are refused. The default is 4294967295 bytes (4 GiB − 1), the largest `payloadSize`.
