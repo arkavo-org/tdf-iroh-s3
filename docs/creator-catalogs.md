@@ -158,7 +158,7 @@ Creator reads the node to push to from this route. The iOS viewer does not. The 
    - A 404 means the node is ungated (`required = false`). Continue without a session.
    - That 404 has an empty body, not `{"error":…}`. Check only the status.
 3. **Push the TDF** to the node over iroh. The push returns the BLAKE3 hash.
-   - The push's result does not say whether the node accepted it. A gated node that refuses a push, for example one from an endpoint without a session, does not report the refusal to the pusher, and the push appears to succeed.
+   - The push's result does not say whether the node accepted it. A gated node refuses a push from an endpoint without a session by aborting the request, but the pusher may see no error: the iroh-blobs client in this repository's test CLI reports such a push as successful.
    - Only step 4 confirms that the node has the TDF.
 4. **Confirm ingest.** Poll `GET /blobs/<hash>` until it returns 200 with the expected size.
    - Wait at most 120 s.
