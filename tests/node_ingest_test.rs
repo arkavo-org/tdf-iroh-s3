@@ -626,57 +626,186 @@ async fn test_hash_sequence_requests_are_refused() {
     node.shutdown().await.unwrap();
 }
 
+/// Wait until `done`, failing with `what` after 20 s.
+async fn wait_until<F: std::future::Future<Output = bool>>(
+    what: &str,
+    mut done: impl FnMut() -> F,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !done().await {
+        assert!(tokio::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// After a restart, or on a store written by builds that did not validate
-/// first, a stored blob is served only once S3 shows it was ingested. One
-/// that never was is refused and deleted.
+/// first, a stored blob is served only once it is known valid. One S3
+/// holds is served at once. One S3 lacks is ingested again on its first
+/// fetch: a good TDF whose upload failed is uploaded and served, and one
+/// that never validated is refused and deleted.
 #[tokio::test(flavor = "current_thread")]
 async fn test_a_stored_blob_is_served_only_once_known_valid() {
     use iroh_blobs::store::fs::FsStore;
     use iroh_blobs::store::fs::options::Options;
 
-    // A store left with an ingested TDF and a blob that never validated,
-    // neither tagged, as pushes leave them.
+    // A store left with an ingested TDF, a TDF whose upload failed, and a
+    // blob that never validated, none tagged, as pushes leave them.
     let data_dir = tempfile::tempdir().unwrap();
     let tdf = create_test_tdf();
+    let unuploaded_tdf = create_test_tdf();
     let garbage = vec![0xDEu8; 64 * 1024];
-    let (ingested, never) = {
+    let (ingested, unuploaded, never) = {
         let root = data_dir.path();
         let store = FsStore::load_with_opts(root.join("blobs.db"), Options::new(root))
             .await
             .unwrap();
         let ingested = store.add_slice(&tdf).temp_tag().await.unwrap().hash();
+        let unuploaded = store
+            .add_slice(&unuploaded_tdf)
+            .temp_tag()
+            .await
+            .unwrap()
+            .hash();
         let never = store.add_slice(&garbage).temp_tag().await.unwrap().hash();
         store.sync_db().await.unwrap();
         store.shutdown().await.unwrap();
-        (ingested, never)
+        (ingested, unuploaded, never)
     };
     let (s3, endpoint_url) = FakeS3::start().await;
     s3.ingested(ingested, tdf.len() as u64);
-    let (node, _s3, _data_dir) = spawn_node_on(data_dir, s3, endpoint_url, None, |_| {}).await;
+    let (node, s3, _data_dir) = spawn_node_on(data_dir, s3, endpoint_url, None, |_| {}).await;
     let node_id = node.addr().id;
+    let q = node.quarantine();
 
+    // Ingested: served at once.
     let viewer = IrohTestClient::new().await.unwrap();
-    assert_refused_for_permission(viewer.fetch_from_node(node_id, never).await, "get");
-    assert!(node.quarantine().is_refused(&never));
     let fetched = viewer.fetch_from_node(node_id, ingested).await.unwrap();
     assert_eq!(fetched.as_ref(), tdf.as_slice());
-    assert!(node.quarantine().is_validated(&ingested));
+    assert!(q.is_validated(&ingested));
 
-    // The collector deletes the blob that never validated, and keeps the
-    // ingested one.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while node.quarantine().is_refused(&never)
-        || node.store().observe(never).await.unwrap().size() != 0
-    {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the unvalidated blob is deleted"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    // Never validated: refused, then deleted by the collector.
+    assert_refused_for_permission(viewer.fetch_from_node(node_id, never).await, "get");
+    wait_until("the unvalidated blob is refused", || async {
+        q.is_refused(&never)
+    })
+    .await;
+    wait_until("the unvalidated blob is deleted", || async {
+        !q.is_refused(&never) && node.store().observe(never).await.unwrap().size() == 0
+    })
+    .await;
+
+    // Valid but never uploaded: refused at first, uploaded, then served.
+    assert_refused_for_permission(viewer.fetch_from_node(node_id, unuploaded).await, "get");
+    assert!(
+        s3.wait_for_put(&blob_key(unuploaded)).await,
+        "uploaded on recovery"
+    );
+    wait_until("the recovered blob validates", || async {
+        q.is_validated(&unuploaded)
+    })
+    .await;
+    let fetched = viewer.fetch_from_node(node_id, unuploaded).await.unwrap();
+    assert_eq!(fetched.as_ref(), unuploaded_tdf.as_slice());
+    assert!(!q.is_refused(&unuploaded));
+
     node.store().sync_db().await.unwrap();
-    assert!(node.store().observe(ingested).await.unwrap().is_complete());
-
+    for kept in [ingested, unuploaded] {
+        assert!(node.store().observe(kept).await.unwrap().is_complete());
+    }
     viewer.shutdown().await.unwrap();
+    node.shutdown().await.unwrap();
+}
+
+/// A push of a hash S3 holds but the node's store lacks (a fresh node) is
+/// tracked like a new push: abandoned partway, its partial data is refused
+/// and deleted rather than kept and served; pushed whole, it validates and
+/// is served.
+#[tokio::test(flavor = "current_thread")]
+async fn test_a_push_of_an_ingested_hash_the_store_lacks_is_tracked() {
+    let (s3, endpoint_url) = FakeS3::start().await;
+    let tdf = create_large_test_tdf(20 * 1024 * 1024);
+    let hash = Hash::new(&tdf);
+    s3.ingested(hash, tdf.len() as u64);
+    let (node, s3, _data_dir) =
+        spawn_node_on(tempfile::tempdir().unwrap(), s3, endpoint_url, None, |_| {}).await;
+    let node_id = node.addr().id;
+    let q = node.quarantine();
+
+    let pusher = IrohTestClient::new().await.unwrap();
+    pusher
+        .push_to_node_abandoned(node_id, &tdf, Duration::from_millis(150))
+        .await
+        .unwrap();
+    wait_until("the partial push is refused", || async {
+        q.is_refused(&hash)
+    })
+    .await;
+    assert!(!q.is_validated(&hash));
+    wait_until("the partial push is deleted", || async {
+        !q.is_refused(&hash) && node.store().observe(hash).await.unwrap().size() == 0
+    })
+    .await;
+
+    let pusher = IrohTestClient::new().await.unwrap();
+    pusher.push_to_node(node_id, &tdf).await.unwrap();
+    assert!(
+        s3.wait_for_put(&format!("manifests/{}", hash.to_hex()))
+            .await
+    );
+    wait_until("the full push validates", || async {
+        q.is_validated(&hash)
+    })
+    .await;
+    let viewer = IrohTestClient::new().await.unwrap();
+    let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
+    assert!(fetched.as_ref() == tdf.as_slice());
+
+    for c in [pusher, viewer] {
+        c.shutdown().await.unwrap();
+    }
+    node.shutdown().await.unwrap();
+}
+
+/// A single get of a hash the node does not hold is not refused by the
+/// node: it approves the request and iroh-blobs answers "not found". A
+/// get_many or observe naming one is refused: a get_many reads its blobs in
+/// turn, so a hash absent at approval could be pushed, unvalidated, before
+/// the request reaches it (and iroh-blobs ends a get_many at a missing blob
+/// anyway); an observe could create an entry for it.
+#[tokio::test(flavor = "current_thread")]
+async fn test_only_a_single_get_may_name_a_missing_hash() {
+    let (node, s3, _data_dir) = spawn_node(None).await;
+    let node_id = node.addr().id;
+    let tdf = create_test_tdf();
+    let pusher = IrohTestClient::new().await.unwrap();
+    let held = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    assert!(s3.wait_for_put(&blob_key(held)).await);
+
+    let viewer = IrohTestClient::new().await.unwrap();
+    let missing = Hash::new(b"not on the node");
+    let error = format!(
+        "{:#}",
+        viewer
+            .fetch_from_node(node_id, missing)
+            .await
+            .expect_err("not found")
+    );
+    assert!(
+        !error.contains("reset by peer: error 1"),
+        "get refused for permission: {error}"
+    );
+    assert_refused_for_permission(
+        viewer.get_many_from_node(node_id, &[held, missing]).await,
+        "get_many",
+    );
+    // An observe could create an entry for the hash; it is refused.
+    assert_refused_for_permission(viewer.observe_on_node(node_id, missing).await, "observe");
+    // The held blob alone is served.
+    let fetched = viewer.fetch_from_node(node_id, held).await.unwrap();
+    assert_eq!(fetched.as_ref(), tdf.as_slice());
+
+    for c in [pusher, viewer] {
+        c.shutdown().await.unwrap();
+    }
     node.shutdown().await.unwrap();
 }

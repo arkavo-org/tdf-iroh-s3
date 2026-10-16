@@ -1,35 +1,44 @@
 //! Which blobs the node serves, and the deletion of refused ones.
 //!
-//! The node serves a blob only once it is known to be a valid TDF: this
-//! process validated it, or S3 holds `blobs/<hash>`, which only ingest
-//! writes and only after validating. Everything else in the store is
-//! withheld: get, get_many and observe of it are refused. That covers a
-//! push in transit, a push that failed, and anything left in the store by
-//! a crash or by builds that did not validate before storing. S3's answer
-//! is asked once per hash and remembered.
+//! The node serves a blob only once it is *validated*: known to be a valid
+//! TDF and complete in the local store. A hash becomes validated when this
+//! process validates it, or when the store holds it complete and S3 holds
+//! `blobs/<hash>` (which only ingest writes, after validating). Everything
+//! else in the store is withheld: get, get_many and observe of it are
+//! refused. That covers a push in transit, a push that failed, and anything
+//! a crash or earlier builds left in the store. The validated set is a
+//! bounded cache ([`VALIDATED_CAPACITY`]); S3 and the store answer for a
+//! hash it has dropped.
 //!
-//! A push of a hash the node does not already hold (validated, or in S3)
-//! is *tracked*: *pending* from the moment the node accepts it until
-//! ingest validates it. A tracked push that does not validate (too large,
-//! not a TDF, incomplete, or ingest gave up before validating) is
-//! *refused*, and so is a stored blob a fetch found complete but absent
-//! from S3. A refusal never touches content the node holds: a push of a
-//! held hash is not tracked, a hash that any push validates is never
-//! refused afterwards, and validation lifts an earlier refusal of it.
-//! Before deleting, the collector also asks S3, and an ingested hash is
-//! kept.
+//! A stored blob that is not known valid is *recovered* the first time a
+//! fetch finds it: ingested again (validated, then uploaded), as if just
+//! pushed. A good TDF whose upload failed is uploaded then, and served; one
+//! that does not validate, or an incomplete leftover, is refused.
+//!
+//! A push of a hash the node does not hold (validated, or complete in the
+//! store and in S3) is *tracked*, as is a recovery: *pending* from the
+//! moment the node accepts it until ingest validates it. Of the pending
+//! pushes of a hash, the last to end without validating refuses it, unless
+//! another validated it; a push that ends while another is pending leaves
+//! the decision to that one. So a failed push racing a good one, or a fetch
+//! racing a push, never condemns a blob, and a hash any push validates is
+//! never refused afterwards (validation lifts an earlier refusal). A push
+//! that fails for the node's own reasons (it could not read the store,
+//! export or read the blob, or the node is shutting down) is released
+//! without refusing it; a fetch recovers a released blob again only after
+//! [`RECOVERY_COOLDOWN`].
 //!
 //! iroh-blobs deletes blobs only through its garbage collector (its
 //! `delete` is crate-private), which removes every blob that nothing
 //! protects. The node configures it with [`Quarantine::gc_config`]: a run
 //! happens only while some blob is refused, and it protects every stored
-//! blob except the refused ones confirmed absent from S3, plus every
-//! pending push and every validated hash. So it deletes exactly those
-//! refused blobs, never a blob in transit or one served today. Refused
-//! hashes are kept in `<data_dir>/refused-blobs`, one per line, until the
-//! collector has removed them. A refusal lost to a crash before it was
-//! saved leaves the blob on disk, still withheld, until a fetch or a push
-//! refuses it again.
+//! blob except the refused ones it may delete (incomplete, or complete but
+//! absent from S3), plus every pending push and every hash validated or
+//! released during the run. So it deletes exactly those refused blobs, never a blob in
+//! transit or one served today. Refused hashes are kept in
+//! `<data_dir>/refused-blobs`, one per line, until the collector has
+//! removed them. A refusal lost to a crash before it was saved leaves the
+//! blob on disk, still withheld, until a fetch recovers it.
 //!
 //! One window remains: a push that starts between the protect callback and
 //! the collector's sweep, and writes nothing in that time, can lose its
@@ -53,15 +62,40 @@ use crate::store::s3::S3Client;
 
 /// S3 lookups (`blobs/<hash>` HEADs) in flight at once, across fetches,
 /// pushes and the collector.
-const S3_LOOKUPS: usize = 16;
+pub const S3_LOOKUPS: usize = 16;
 
-/// Whether the node may serve a hash, as far as it knows without asking S3.
+/// Most hashes remembered as validated. A forgotten hash costs one S3
+/// lookup the next time it is fetched or pushed.
+pub const VALIDATED_CAPACITY: usize = 200_000;
+
+/// How long after a released ingest a fetch may recover the blob again.
+pub const RECOVERY_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Most released hashes remembered for [`RECOVERY_COOLDOWN`].
+const RELEASED_CAPACITY: usize = 10_000;
+
+/// Whether the node may serve a hash, as far as memory knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Serve {
     Yes,
     No,
-    /// Not seen yet: [`Quarantine::check_stored`] decides.
+    /// Not known: [`Quarantine::check_stored`] decides.
     Ask,
+}
+
+/// What [`Quarantine::check_stored`] found for a hash.
+pub enum Stored {
+    /// Validated: served.
+    Serve,
+    /// The store holds none of it: there is nothing to serve.
+    Absent,
+    /// A push of it is pending, or it is refused.
+    Withheld,
+    /// S3 could not answer: not served this time.
+    Unknown,
+    /// Stored, but not known valid. The caller ingests it with this tracked
+    /// push: served once it validates, refused if it does not.
+    Recover(PendingPush),
 }
 
 pub struct Quarantine {
@@ -70,11 +104,18 @@ pub struct Quarantine {
     pending: Mutex<HashMap<Hash, usize>>,
     /// Refused blobs still in the store.
     refused: Mutex<HashSet<Hash>>,
-    /// Hashes this process validated, or found in S3: served, and never
+    /// Hashes known valid and complete in the store: served, and never
     /// refused.
-    validated: Mutex<HashSet<Hash>>,
+    validated: Mutex<Validated>,
     /// Bounds concurrent S3 lookups.
     lookups: Semaphore,
+    /// Hashes whose ingest was released (the node's own failure), and when:
+    /// a fetch does not recover one again until [`RECOVERY_COOLDOWN`] has
+    /// passed.
+    released: Mutex<HashMap<Hash, std::time::Instant>>,
+    /// Set once the node shuts down: a push ended by the shutdown is
+    /// released, not refused.
+    closing: std::sync::atomic::AtomicBool,
     /// Where `refused` is kept across restarts.
     file: PathBuf,
     /// Serializes writes of `file`, so the last one written is the newest.
@@ -84,6 +125,50 @@ pub struct Quarantine {
     /// The node's runtime. The collector runs on the store's own runtime,
     /// which has no IO driver, so its S3 checks run here instead.
     runtime: tokio::runtime::Handle,
+}
+
+/// The validated hashes, in two generations: a hash is added to `current`,
+/// and when `current` reaches half of [`VALIDATED_CAPACITY`] it becomes
+/// `previous` (dropping the old `previous`). A hit in `previous` moves the
+/// hash back to `current`, so hashes in use stay.
+#[derive(Default)]
+struct Validated {
+    current: HashSet<Hash>,
+    previous: HashSet<Hash>,
+    /// While the collector runs, the hashes validated or released since it
+    /// started: it may not have listed them.
+    during_collection: Option<HashSet<Hash>>,
+}
+
+impl Validated {
+    fn contains(&mut self, hash: &Hash) -> bool {
+        if self.current.contains(hash) {
+            return true;
+        }
+        if self.previous.remove(hash) {
+            self.add(*hash);
+            return true;
+        }
+        false
+    }
+
+    fn insert(&mut self, hash: Hash) {
+        self.protect(hash);
+        self.add(hash);
+    }
+
+    /// Keep `hash` from the running collection, if one runs.
+    fn protect(&mut self, hash: Hash) {
+        if let Some(during) = &mut self.during_collection {
+            during.insert(hash);
+        }
+    }
+
+    fn add(&mut self, hash: Hash) {
+        if self.current.insert(hash) && self.current.len() >= VALIDATED_CAPACITY / 2 {
+            self.previous = std::mem::take(&mut self.current);
+        }
+    }
 }
 
 impl Quarantine {
@@ -108,6 +193,8 @@ impl Quarantine {
             refused: Mutex::new(refused),
             validated: Mutex::default(),
             lookups: Semaphore::new(S3_LOOKUPS),
+            released: Mutex::default(),
+            closing: std::sync::atomic::AtomicBool::new(false),
             file,
             write_lock: tokio::sync::Mutex::new(()),
             attached: OnceLock::new(),
@@ -154,23 +241,24 @@ impl Quarantine {
     }
 
     /// A push the node accepted. Tracked (withheld until
-    /// [`PendingPush::validated`], refused if dropped before that) unless
-    /// the node already holds the hash: validated, or in S3. When S3 cannot
+    /// [`PendingPush::validated`]) unless the node already holds the hash:
+    /// validated, or complete in the store and in S3. When S3 cannot
     /// answer, the push is tracked.
     pub async fn track(self: &Arc<Self>, hash: Hash) -> PendingPush {
-        let already_held = self.is_validated(&hash) || self.ingested(hash).await == Some(true);
-        if !already_held {
-            *lock(&self.pending).entry(hash).or_default() += 1;
+        if self.is_validated(&hash) {
+            return PendingPush::new(self, hash, false);
         }
-        PendingPush {
-            quarantine: Arc::clone(self),
-            hash,
-            tracked: !already_held,
-            validated: false,
+        // Pending while the store and S3 are asked, so no fetch is approved
+        // for the hash meanwhile.
+        *lock(&self.pending).entry(hash).or_default() += 1;
+        let held = self.complete_and_ingested(hash).await == Some(true);
+        if held {
+            self.settle(hash);
         }
+        PendingPush::new(self, hash, !held)
     }
 
-    /// Whether the node may serve `hash`, without waiting on S3.
+    /// Whether the node may serve `hash`, from memory alone.
     pub fn serve(&self, hash: &Hash) -> Serve {
         if self.is_validated(hash) {
             Serve::Yes
@@ -181,46 +269,90 @@ impl Quarantine {
         }
     }
 
-    /// Decide a hash [`Self::serve`] answered [`Serve::Ask`] for: served
-    /// when the store holds it complete and S3 holds it (remembered as
-    /// validated). A stored blob that S3 lacks did not validate: it is
-    /// refused, and deleted. A hash the store lacks is not served, nor is
-    /// any hash while S3 cannot answer.
-    pub async fn check_stored(self: &Arc<Self>, hash: Hash) -> bool {
-        if self.serve(&hash) != Serve::Ask {
-            return self.serve(&hash) == Serve::Yes;
+    /// Look `hash` up in the store, and in S3 when the store holds it
+    /// complete. A complete blob S3 holds becomes validated. A stored blob
+    /// S3 lacks, or an incomplete one, is returned for recovery, unless a
+    /// push of it is pending (that push decides) or its last ingest was
+    /// released within [`RECOVERY_COOLDOWN`].
+    pub async fn check_stored(self: &Arc<Self>, hash: Hash) -> Stored {
+        match self.serve(&hash) {
+            Serve::Yes => return Stored::Serve,
+            Serve::No => return Stored::Withheld,
+            Serve::Ask => {}
         }
         let Some((store, _)) = self.attached.get() else {
-            return false;
+            return Stored::Unknown;
         };
-        let stored = match store.observe(hash).await {
+        let bitfield = match store.observe(hash).await {
             Ok(bitfield) => bitfield,
-            Err(_) => return false,
-        };
-        if !stored.is_complete() {
-            if stored.size() > 0 {
-                // Left by a push that never finished.
-                self.refuse(hash);
+            Err(e) => {
+                warn!(%hash, error = %e, "Store lookup failed");
+                return Stored::Unknown;
             }
-            return false;
+        };
+        if bitfield.ranges.is_empty() {
+            return Stored::Absent;
         }
-        match self.ingested(hash).await {
-            Some(true) => true,
-            Some(false) => {
-                warn!(%hash, "Stored blob was never ingested; refusing it");
-                self.refuse(hash);
+        if bitfield.is_complete() {
+            match self.lookup(hash).await {
+                Ok(Some(_)) => {
+                    self.mark_validated(hash);
+                    return Stored::Serve;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(%hash, error = %e, "Ingest lookup failed");
+                    return Stored::Unknown;
+                }
+            }
+        }
+        if self.recently_released(&hash) {
+            return Stored::Withheld;
+        }
+        match self.track_if_idle(hash) {
+            Some(recovery) => Stored::Recover(recovery),
+            None => Stored::Withheld,
+        }
+    }
+
+    fn recently_released(&self, hash: &Hash) -> bool {
+        let mut released = lock(&self.released);
+        match released.get(hash) {
+            Some(at) if at.elapsed() < RECOVERY_COOLDOWN => true,
+            Some(_) => {
+                released.remove(hash);
                 false
             }
             None => false,
         }
     }
 
-    /// Whether S3 holds `blobs/<hash>`; `None` when it cannot answer. A
-    /// hash it holds is remembered as validated.
-    async fn ingested(self: &Arc<Self>, hash: Hash) -> Option<bool> {
-        let (_, s3) = self.attached.get()?;
-        let _permit = self.lookups.acquire().await.ok()?;
-        match s3.blob_size(&hash.to_hex()).await {
+    fn note_released(&self, hash: Hash) {
+        let mut released = lock(&self.released);
+        if released.len() >= RELEASED_CAPACITY {
+            released.retain(|_, at| at.elapsed() < RECOVERY_COOLDOWN);
+            if released.len() >= RELEASED_CAPACITY {
+                released.clear();
+            }
+        }
+        released.insert(hash, std::time::Instant::now());
+    }
+
+    /// The node is shutting down: a push ended from here on is released,
+    /// not refused, since the shutdown ended it, not the blob.
+    pub fn close(&self) {
+        self.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// `Some(true)` when the store holds `hash` complete and S3 holds it
+    /// (it becomes validated); `None` when either cannot answer.
+    async fn complete_and_ingested(self: &Arc<Self>, hash: Hash) -> Option<bool> {
+        let (store, _) = self.attached.get()?;
+        if !store.observe(hash).await.ok()?.is_complete() {
+            return Some(false);
+        }
+        match self.lookup(hash).await {
             Ok(Some(_)) => {
                 self.mark_validated(hash);
                 Some(true)
@@ -233,16 +365,36 @@ impl Quarantine {
         }
     }
 
+    /// S3's `blobs/<hash>` size, or `None` when absent; at most
+    /// [`S3_LOOKUPS`] at once.
+    async fn lookup(&self, hash: Hash) -> anyhow::Result<Option<u64>> {
+        let (_, s3) = self.attached.get().context("S3 not attached")?;
+        let _permit = self.lookups.acquire().await?;
+        s3.blob_size(&hash.to_hex()).await
+    }
+
+    /// A tracked push of `hash` for recovery, unless one is pending.
+    fn track_if_idle(self: &Arc<Self>, hash: Hash) -> Option<PendingPush> {
+        let mut pending = lock(&self.pending);
+        if pending.contains_key(&hash) {
+            return None;
+        }
+        pending.insert(hash, 1);
+        Some(PendingPush::new(self, hash, true))
+    }
+
     /// Whether `hash` is refused and waiting for deletion.
     pub fn is_refused(&self, hash: &Hash) -> bool {
         lock(&self.refused).contains(hash)
     }
 
-    /// Whether this process validated `hash`, or found it in S3.
+    /// Whether `hash` is known valid and complete in the store (and still
+    /// remembered).
     pub fn is_validated(&self, hash: &Hash) -> bool {
         lock(&self.validated).contains(hash)
     }
 
+    /// A tracked push of `hash` ended, validated or released.
     fn settle(&self, hash: Hash) {
         let mut pending = lock(&self.pending);
         if let Some(n) = pending.get_mut(&hash) {
@@ -253,30 +405,53 @@ impl Quarantine {
         }
     }
 
-    /// `hash` validated: it is never refused, and an earlier refusal of it
-    /// is lifted.
-    fn mark_validated(self: &Arc<Self>, hash: Hash) {
-        lock(&self.validated).insert(hash);
-        if lock(&self.refused).remove(&hash) {
-            info!(%hash, "Refusal lifted: another push of this blob validated");
+    /// A tracked push of `hash` ended without validating. The last pending
+    /// push refuses the hash, unless it validated meanwhile.
+    fn end_unvalidated(self: &Arc<Self>, hash: Hash) {
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            self.settle(hash);
+            return;
+        }
+        let refused = {
+            let mut pending = lock(&self.pending);
+            let last = match pending.get_mut(&hash) {
+                Some(n) if *n > 1 => {
+                    *n -= 1;
+                    false
+                }
+                Some(_) => {
+                    pending.remove(&hash);
+                    true
+                }
+                None => false,
+            };
+            // mark_validated adds to `validated` before it removes from
+            // `refused`, so checking `validated` again after inserting
+            // catches a validation that ran in between.
+            last && !self.is_validated(&hash) && {
+                lock(&self.refused).insert(hash);
+                if self.is_validated(&hash) {
+                    lock(&self.refused).remove(&hash);
+                    false
+                } else {
+                    true
+                }
+            }
+        };
+        if refused {
+            info!(%hash, "Pushed blob refused; it will be deleted");
             self.spawn_persist();
         }
     }
 
-    fn refuse(self: &Arc<Self>, hash: Hash) {
-        // mark_validated adds to `validated` before it removes from
-        // `refused`, so checking `validated` again after inserting catches a
-        // validation that ran in between.
-        if self.is_validated(&hash) {
-            return;
+    /// `hash` is known valid and complete in the store: it is served, never
+    /// refused, and an earlier refusal of it is lifted.
+    fn mark_validated(self: &Arc<Self>, hash: Hash) {
+        lock(&self.validated).insert(hash);
+        if lock(&self.refused).remove(&hash) {
+            info!(%hash, "Refusal lifted: the blob validated");
+            self.spawn_persist();
         }
-        info!(%hash, "Pushed blob refused; it will be deleted");
-        lock(&self.refused).insert(hash);
-        if self.is_validated(&hash) {
-            lock(&self.refused).remove(&hash);
-            return;
-        }
-        self.spawn_persist();
     }
 
     fn spawn_persist(self: &Arc<Self>) {
@@ -290,18 +465,49 @@ impl Quarantine {
     }
 
     /// The hashes this collector run must keep: every stored blob except
-    /// the refused ones S3 confirms were never ingested, every pending push
-    /// (seen before or after the listing) and every validated hash. `None`
+    /// the refused ones it may delete, every pending push (seen before or
+    /// after the listing) and every hash validated or released during the
+    /// run. `None`
     /// skips the run, when there is nothing to delete or the store cannot
     /// be listed.
     async fn keep_set(self: &Arc<Self>) -> Option<HashSet<Hash>> {
         if lock(&self.refused).is_empty() {
             return None;
         }
-        let (store, s3) = self.attached.get()?.clone();
+        lock(&self.validated).during_collection = Some(HashSet::new());
+        let plan = self.plan_collection().await;
+        // Pending pushes before validations: a push that validates after
+        // this read is recorded as validated during the run.
+        let pending: Vec<Hash> = lock(&self.pending).keys().copied().collect();
+        let during = lock(&self.validated)
+            .during_collection
+            .take()
+            .unwrap_or_default();
+        let (stored, mut doomed, mut keep) = plan?;
+        keep.extend(pending);
+        keep.extend(during);
+        doomed.retain(|h| !keep.contains(h));
+        if doomed.is_empty() {
+            return None;
+        }
+        debug!(
+            doomed = doomed.len(),
+            stored = stored.len(),
+            "Garbage collection deletes refused blobs"
+        );
+        keep.extend(stored.difference(&doomed).copied());
+        Some(keep)
+    }
+
+    /// The stored hashes, the refused ones to delete, and the pending
+    /// pushes seen before listing the store.
+    async fn plan_collection(
+        self: &Arc<Self>,
+    ) -> Option<(HashSet<Hash>, HashSet<Hash>, HashSet<Hash>)> {
+        let (store, _) = self.attached.get()?.clone();
         // Before listing: a push accepted from here on is pending at the
-        // end, or settled (validated, or refused).
-        let mut keep: HashSet<Hash> = lock(&self.pending).keys().copied().collect();
+        // end, or settled.
+        let keep: HashSet<Hash> = lock(&self.pending).keys().copied().collect();
         // Commit pending writes first, so the listing includes a blob
         // refused a moment ago; otherwise it would be pruned below before it
         // was ever deleted.
@@ -329,43 +535,46 @@ impl Quarantine {
             self.persist().await;
         }
 
-        // Delete only what S3 confirms was never ingested. An ingested
-        // blob validated (perhaps before a restart): lift its refusal. When
-        // S3 cannot answer, keep the blob this run.
         let mut doomed = HashSet::new();
-        let mut lookups = futures::stream::iter(refused)
+        let mut fates = futures::stream::iter(refused)
             .map(|hash| {
-                let s3 = Arc::clone(&s3);
-                async move { (hash, s3.blob_size(&hash.to_hex()).await) }
+                let quarantine = Arc::clone(self);
+                let store = store.clone();
+                async move { (hash, quarantine.may_delete(&store, hash).await) }
             })
             .buffer_unordered(S3_LOOKUPS);
-        while let Some((hash, found)) = lookups.next().await {
-            match found {
-                Ok(None) => {
-                    doomed.insert(hash);
-                }
-                Ok(Some(_)) => self.mark_validated(hash),
-                Err(e) => {
-                    warn!(%hash, error = %e, "Ingest check failed; keeping the refused blob for now")
-                }
+        while let Some((hash, delete)) = fates.next().await {
+            if delete {
+                doomed.insert(hash);
             }
         }
+        Some((stored, doomed, keep))
+    }
 
-        // A push of a hash may have started, or validated, meanwhile.
-        keep.extend(lock(&self.pending).keys().copied());
-        keep.extend(lock(&self.validated).iter().copied());
-        doomed.retain(|h| !keep.contains(h));
-        if doomed.is_empty() {
-            return None;
+    /// Whether the collector may delete refused `hash`: incomplete in the
+    /// store, or complete but absent from S3. A complete blob S3 holds
+    /// validated (perhaps before a restart): its refusal is lifted. When
+    /// the store or S3 cannot answer, the blob is kept this run.
+    async fn may_delete(self: &Arc<Self>, store: &Store, hash: Hash) -> bool {
+        match store.observe(hash).await {
+            Ok(bitfield) if bitfield.is_complete() => {}
+            Ok(_) => return true,
+            Err(e) => {
+                warn!(%hash, error = %e, "Store lookup failed; keeping the refused blob for now");
+                return false;
+            }
         }
-
-        debug!(
-            doomed = doomed.len(),
-            stored = stored.len(),
-            "Garbage collection deletes refused blobs"
-        );
-        keep.extend(stored.difference(&doomed).copied());
-        Some(keep)
+        match self.lookup(hash).await {
+            Ok(None) => true,
+            Ok(Some(_)) => {
+                self.mark_validated(hash);
+                false
+            }
+            Err(e) => {
+                warn!(%hash, error = %e, "Ingest check failed; keeping the refused blob for now");
+                false
+            }
+        }
     }
 
     /// Write the refused hashes to `file`, replacing it atomically.
@@ -400,27 +609,51 @@ impl Quarantine {
     }
 }
 
-/// A push being ingested. Dropping a tracked one before [`Self::validated`]
-/// refuses the blob: only a blob that validated is ever served. Dropping an
-/// untracked one (a re-push of a blob the node holds) changes nothing.
+/// A push, or a recovery, being ingested. Dropping a tracked one before
+/// [`Self::validated`] or [`Self::release`] ends it unvalidated: the last
+/// pending push of a hash to end that way refuses it. Dropping an untracked
+/// one (a re-push of a blob the node holds) changes nothing.
 pub struct PendingPush {
     quarantine: Arc<Quarantine>,
     hash: Hash,
     tracked: bool,
-    validated: bool,
+    settled: bool,
 }
 
 impl PendingPush {
+    fn new(quarantine: &Arc<Quarantine>, hash: Hash, tracked: bool) -> Self {
+        Self {
+            quarantine: Arc::clone(quarantine),
+            hash,
+            tracked,
+            settled: false,
+        }
+    }
+
     /// Whether this push decides the blob's fate (the node did not hold it).
     pub fn is_tracked(&self) -> bool {
         self.tracked
     }
 
-    /// The blob validated: it may be served, and is never refused.
+    /// The blob validated: it is served, and never refused.
     pub fn validated(mut self) {
-        self.validated = true;
+        self.settled = true;
         self.quarantine.mark_validated(self.hash);
         if self.tracked {
+            self.quarantine.settle(self.hash);
+        }
+    }
+
+    /// The node could not finish checking the blob (for its own reasons,
+    /// not the blob's): end the push without refusing it. The blob stays
+    /// withheld until a later push, or a fetch after
+    /// [`RECOVERY_COOLDOWN`], checks it again.
+    pub fn release(mut self) {
+        self.settled = true;
+        if self.tracked {
+            // Kept from a running collection, which may not have listed it.
+            lock(&self.quarantine.validated).protect(self.hash);
+            self.quarantine.note_released(self.hash);
             self.quarantine.settle(self.hash);
         }
     }
@@ -428,9 +661,8 @@ impl PendingPush {
 
 impl Drop for PendingPush {
     fn drop(&mut self) {
-        if self.tracked && !self.validated {
-            self.quarantine.refuse(self.hash);
-            self.quarantine.settle(self.hash);
+        if self.tracked && !self.settled {
+            self.quarantine.end_unvalidated(self.hash);
         }
     }
 }
@@ -449,25 +681,28 @@ mod tests {
     }
 
     /// A loopback S3 that answers `HEAD blobs/<hash>` for the hashes in
-    /// `ingested`, and 404 for any other.
+    /// `ingested`, and 404 for any other, after `delay`.
     #[derive(Clone, Default)]
     struct FakeS3 {
         ingested: Arc<Mutex<HashSet<Hash>>>,
+        delay: Arc<Mutex<Duration>>,
     }
 
     impl FakeS3 {
         async fn start(&self) -> String {
             use axum::http::{StatusCode, Uri, header};
             use axum::response::IntoResponse;
-            let ingested = Arc::clone(&self.ingested);
+            let s3 = self.clone();
             let app = axum::Router::new().fallback(move |uri: Uri| {
-                let ingested = Arc::clone(&ingested);
+                let s3 = s3.clone();
                 async move {
+                    let delay = *lock(&s3.delay);
+                    tokio::time::sleep(delay).await;
                     let found = uri
                         .path()
                         .rsplit_once("/blobs/")
                         .and_then(|(_, hex)| hex.parse::<Hash>().ok())
-                        .is_some_and(|h| lock(&ingested).contains(&h));
+                        .is_some_and(|h| lock(&s3.ingested).contains(&h));
                     if found {
                         (StatusCode::OK, [(header::CONTENT_LENGTH, "1")]).into_response()
                     } else {
@@ -537,17 +772,22 @@ mod tests {
         store.shutdown().await.unwrap();
     }
 
-    /// A push of a blob the node holds (ingested, or validated in this
-    /// process) decides nothing: dropping it unvalidated (an aborted or
-    /// failed re-push) neither withholds nor refuses the blob.
+    /// A push of a blob the node holds (complete in the store and ingested,
+    /// or validated in this process) decides nothing: dropping it
+    /// unvalidated (an aborted or failed re-push) neither withholds nor
+    /// refuses the blob.
     #[tokio::test]
     async fn a_re_push_of_a_held_blob_cannot_condemn_it() {
         let (q, store, s3, _dir) = attached().await;
-        let held = hash(3);
+        let held = stored(&store, &[3u8; 40_000]).await;
         s3.ingest(held);
         let push = q.track(held).await;
         assert!(!push.is_tracked());
-        assert_eq!(q.serve(&held), Serve::Yes, "an ingested hash is served");
+        assert_eq!(
+            q.serve(&held),
+            Serve::Yes,
+            "a stored, ingested hash is served"
+        );
         drop(push);
         assert!(!q.is_refused(&held));
         assert_eq!(q.serve(&held), Serve::Yes);
@@ -559,6 +799,20 @@ mod tests {
         assert!(!push.is_tracked());
         drop(push);
         assert!(!q.is_refused(&other));
+        store.shutdown().await.unwrap();
+    }
+
+    /// A hash S3 holds but the store lacks is not held: its push is tracked
+    /// like a new one, and a failed push refuses the partial data.
+    #[tokio::test]
+    async fn an_ingested_hash_the_store_lacks_is_not_held() {
+        let (q, store, s3, _dir) = attached().await;
+        s3.ingest(hash(5));
+        let push = q.track(hash(5)).await;
+        assert!(push.is_tracked());
+        assert_eq!(q.serve(&hash(5)), Serve::No);
+        drop(push);
+        assert!(q.is_refused(&hash(5)));
         store.shutdown().await.unwrap();
     }
 
@@ -575,38 +829,54 @@ mod tests {
         store.shutdown().await.unwrap();
     }
 
-    /// Two pushes of one new blob: whichever order they end in, one that
-    /// validates keeps the blob, and it is served from then on.
+    /// Of the pending pushes of a hash, the last to end decides: one that
+    /// fails while another is pending refuses nothing, and one that
+    /// validates keeps the blob whatever the others do.
     #[tokio::test]
-    async fn a_failed_push_racing_a_good_one_cannot_condemn_it() {
+    async fn the_last_pending_push_decides() {
         let (q, store, _s3, _dir) = attached().await;
 
-        // The failed push ends first: refused, then lifted by the good one.
-        let good = q.track(hash(5)).await;
-        let bad = q.track(hash(5)).await;
+        // The failed push ends first: nothing refused while the other runs.
+        let good = q.track(hash(6)).await;
+        let bad = q.track(hash(6)).await;
         drop(bad);
-        assert_eq!(
-            q.serve(&hash(5)),
-            Serve::No,
-            "withheld while the good push runs"
-        );
+        assert!(!q.is_refused(&hash(6)), "the other push decides");
+        assert_eq!(q.serve(&hash(6)), Serve::No, "withheld while it runs");
         good.validated();
-        assert!(!q.is_refused(&hash(5)));
-        assert_eq!(q.serve(&hash(5)), Serve::Yes);
+        assert!(!q.is_refused(&hash(6)));
+        assert_eq!(q.serve(&hash(6)), Serve::Yes);
 
         // The good push ends first: served at once, though the other push
         // is still in flight, and that one cannot refuse it.
-        let good = q.track(hash(6)).await;
-        let stalled = q.track(hash(6)).await;
+        let good = q.track(hash(7)).await;
+        let stalled = q.track(hash(7)).await;
         good.validated();
         assert_eq!(
-            q.serve(&hash(6)),
+            q.serve(&hash(7)),
             Serve::Yes,
             "a stalled push does not withhold"
         );
         drop(stalled);
-        assert!(!q.is_refused(&hash(6)));
-        assert_eq!(q.serve(&hash(6)), Serve::Yes);
+        assert!(!q.is_refused(&hash(7)));
+
+        // Both fail: the second refuses.
+        let first = q.track(hash(8)).await;
+        let second = q.track(hash(8)).await;
+        drop(first);
+        assert!(!q.is_refused(&hash(8)));
+        drop(second);
+        assert!(q.is_refused(&hash(8)));
+        store.shutdown().await.unwrap();
+    }
+
+    /// A push the node could not finish checking is released: not refused,
+    /// still not served.
+    #[tokio::test]
+    async fn a_released_push_refuses_nothing() {
+        let (q, store, _s3, _dir) = attached().await;
+        q.track(hash(9)).await.release();
+        assert!(!q.is_refused(&hash(9)));
+        assert_eq!(q.serve(&hash(9)), Serve::Ask);
         store.shutdown().await.unwrap();
     }
 
@@ -614,49 +884,57 @@ mod tests {
     #[tokio::test]
     async fn a_refused_blob_stays_refused_unless_a_push_validates() {
         let (q, store, _s3, _dir) = attached().await;
-        drop(q.track(hash(7)).await);
-        let again = q.track(hash(7)).await;
+        drop(q.track(hash(10)).await);
+        let again = q.track(hash(10)).await;
         assert!(again.is_tracked(), "a refused hash is not held");
         drop(again);
-        assert!(q.is_refused(&hash(7)));
+        assert!(q.is_refused(&hash(10)));
 
-        q.track(hash(7)).await.validated();
-        assert!(!q.is_refused(&hash(7)));
+        q.track(hash(10)).await.validated();
+        assert!(!q.is_refused(&hash(10)));
         store.shutdown().await.unwrap();
     }
 
     /// A hash first seen in a fetch: served when stored complete and
-    /// ingested; refused, for deletion, when stored but never ingested;
-    /// not served, and not refused, when the store lacks it.
+    /// ingested; recovered (a tracked push to ingest again) when stored but
+    /// not ingested, or incomplete; absent when the store lacks it.
     #[tokio::test]
     async fn a_fetch_of_an_unseen_hash_asks_the_store_and_s3() {
         let (q, store, s3, _dir) = attached().await;
         let ingested = stored(&store, &[1u8; 40_000]).await;
         s3.ingest(ingested);
         let never = stored(&store, &[2u8; 40_000]).await;
-        let absent = hash(8);
+        let absent = hash(11);
         store.sync_db().await.unwrap();
 
         for h in [ingested, never, absent] {
             assert_eq!(q.serve(&h), Serve::Ask);
         }
-        assert!(q.check_stored(ingested).await);
+        assert!(matches!(q.check_stored(ingested).await, Stored::Serve));
         assert_eq!(q.serve(&ingested), Serve::Yes, "remembered");
 
-        assert!(!q.check_stored(never).await);
-        assert!(q.is_refused(&never));
-        assert_eq!(q.serve(&never), Serve::No, "remembered");
+        let Stored::Recover(recovery) = q.check_stored(never).await else {
+            panic!("a stored blob S3 lacks is recovered");
+        };
+        assert!(recovery.is_tracked());
+        assert!(
+            matches!(q.check_stored(never).await, Stored::Withheld),
+            "one recovery at a time"
+        );
+        drop(recovery);
+        assert!(q.is_refused(&never), "a recovery that fails refuses");
 
-        assert!(!q.check_stored(absent).await);
+        assert!(matches!(q.check_stored(absent).await, Stored::Absent));
         assert!(!q.is_refused(&absent));
         store.shutdown().await.unwrap();
     }
 
-    /// The collector keeps every pending push and every validated hash,
-    /// including those the store listing missed (a push that landed while
-    /// the collector waited on S3), and deletes only refused blobs S3 lacks.
+    /// The collector deletes a refused blob that is incomplete, or complete
+    /// but absent from S3; lifts one S3 holds; and keeps every pending push
+    /// and every hash validated or released while it waits on S3, though the
+    /// store listing missed them.
     #[tokio::test]
-    async fn the_collector_keeps_pending_and_validated_hashes() {
+    async fn the_collector_keeps_pending_and_freshly_validated_hashes() {
         let (q, store, s3, _dir) = attached().await;
         let refused = stored(&store, &[3u8; 40_000]).await;
         let kept = stored(&store, &[4u8; 40_000]).await;
@@ -664,16 +942,96 @@ mod tests {
         drop(q.track(refused).await);
         drop(q.track(lifted).await);
         s3.ingest(lifted);
-        let pending = q.track(hash(9)).await;
-        q.track(hash(10)).await.validated();
+        let pending = q.track(hash(12)).await;
+        store.sync_db().await.unwrap();
 
-        let keep = q.keep_set().await.expect("a refused blob to delete");
+        // S3 answers slowly; one push validates meanwhile, and another is
+        // released after a failure of the node's own.
+        *lock(&s3.delay) = Duration::from_millis(300);
+        let (keep, ()) = tokio::join!(q.keep_set(), async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            q.track(hash(13)).await.validated();
+            q.track(hash(14)).await.release();
+        });
+        let keep = keep.expect("a refused blob to delete");
         assert!(!keep.contains(&refused));
-        for h in [kept, lifted, hash(9), hash(10)] {
+        for h in [kept, lifted, hash(12), hash(13), hash(14)] {
             assert!(keep.contains(&h), "{h} kept");
         }
         assert!(!q.is_refused(&lifted), "an ingested hash is lifted");
+        assert!(lock(&q.validated).during_collection.is_none());
         drop(pending);
         store.shutdown().await.unwrap();
+    }
+
+    /// While a push waits on S3 to learn whether the node holds its hash,
+    /// the hash is pending: no fetch is approved for it meanwhile.
+    #[tokio::test]
+    async fn a_push_is_pending_while_it_asks_s3() {
+        let (q, store, s3, _dir) = attached().await;
+        let held = stored(&store, &[6u8; 40_000]).await;
+        s3.ingest(held);
+        *lock(&s3.delay) = Duration::from_millis(300);
+        let (push, ()) = tokio::join!(q.track(held), async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(q.serve(&held), Serve::No, "pending while S3 answers");
+        });
+        assert!(
+            !push.is_tracked(),
+            "held: S3 has it, the store has it whole"
+        );
+        assert_eq!(q.serve(&held), Serve::Yes);
+        drop(push);
+        assert!(!q.is_refused(&held));
+        store.shutdown().await.unwrap();
+    }
+
+    /// Once the node shuts down, a push it ends is released, not refused.
+    #[tokio::test]
+    async fn a_push_ended_by_shutdown_is_not_refused() {
+        let (q, store, _s3, _dir) = attached().await;
+        let push = q.track(hash(15)).await;
+        q.close();
+        drop(push);
+        assert!(!q.is_refused(&hash(15)));
+        assert_eq!(q.serve(&hash(15)), Serve::Ask);
+        store.shutdown().await.unwrap();
+    }
+
+    /// A blob whose ingest was released is not recovered again by fetches
+    /// until the cooldown passes.
+    #[tokio::test]
+    async fn a_released_blob_is_not_recovered_at_once() {
+        let (q, store, _s3, _dir) = attached().await;
+        let blob = stored(&store, &[8u8; 40_000]).await;
+        store.sync_db().await.unwrap();
+        let Stored::Recover(recovery) = q.check_stored(blob).await else {
+            panic!("recovered");
+        };
+        recovery.release();
+        assert!(matches!(q.check_stored(blob).await, Stored::Withheld));
+        assert!(!q.is_refused(&blob));
+        store.shutdown().await.unwrap();
+    }
+
+    /// The validated set keeps at most VALIDATED_CAPACITY hashes, dropping
+    /// the oldest generation; a hash in use moves to the newest.
+    #[test]
+    fn the_validated_set_is_bounded() {
+        let mut v = Validated::default();
+        let h = |i: usize| Hash::new(i.to_le_bytes());
+        v.insert(h(0));
+        v.insert(h(1));
+        for i in 2..VALIDATED_CAPACITY / 2 + 1 {
+            v.insert(h(i));
+        }
+        // h(0) and h(1) are in the older generation now; using h(1) keeps it.
+        assert!(v.contains(&h(1)));
+        for i in VALIDATED_CAPACITY..VALIDATED_CAPACITY * 3 / 2 {
+            v.insert(h(i));
+        }
+        assert!(!v.contains(&h(0)), "the oldest are dropped");
+        assert!(v.contains(&h(1)), "a hash in use stays");
+        assert!(v.current.len() + v.previous.len() <= VALIDATED_CAPACITY);
     }
 }

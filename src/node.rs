@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::Config;
 use crate::ingest::{self, IngestError};
 use crate::moderation::{BlobOwner, PublishGate, now_secs};
-use crate::quarantine::{PendingPush, Quarantine, Serve};
+use crate::quarantine::{PendingPush, Quarantine, S3_LOOKUPS, Serve, Stored};
 use crate::secret_key;
 use crate::store::s3::S3Client;
 
@@ -158,6 +158,7 @@ impl TdfIrohNode {
                 permits: Arc::new(Semaphore::new(
                     config.validation.max_concurrent_ingests.get(),
                 )),
+                recoveries: Arc::new(Semaphore::new(RECOVERIES)),
             });
             let cancel = cancel.clone();
             tokio::spawn(async move {
@@ -196,6 +197,8 @@ impl TdfIrohNode {
     }
 
     pub async fn shutdown(self) -> Result<()> {
+        // Pushes and recoveries the shutdown ends are released, not refused.
+        self.quarantine.close();
         self.cancel.cancel();
         self.router
             .shutdown()
@@ -218,6 +221,8 @@ struct Ingester {
     scratch_dir: PathBuf,
     /// `[validation] max_concurrent_ingests` permits.
     permits: Arc<Semaphore>,
+    /// Bounds recoveries ([`RECOVERIES`]).
+    recoveries: Arc<Semaphore>,
 }
 
 async fn run_ingest_loop(
@@ -227,27 +232,13 @@ async fn run_ingest_loop(
     cancel: CancellationToken,
 ) {
     info!("Ingest loop started");
-    let quarantine = &ingester.quarantine;
     let blocked = |hash: &iroh_blobs::Hash| {
         gate.as_ref()
             .is_some_and(|g| g.moderation.is_blocked(&hash.to_hex()))
     };
-    // Whether `hashes` may be served: `Some` when memory decides, `None`
-    // when a hash must be checked against the store and S3.
-    let serve = |hashes: &[iroh_blobs::Hash]| {
-        let mut ask = false;
-        for hash in hashes {
-            if blocked(hash) {
-                return Some(false);
-            }
-            match quarantine.serve(hash) {
-                Serve::Yes => {}
-                Serve::No => return Some(false),
-                Serve::Ask => ask = true,
-            }
-        }
-        (!ask).then_some(true)
-    };
+    // Fetches checked against the store and S3 at once; more are refused
+    // as rate limited until some finish.
+    let checks = Arc::new(Semaphore::new(FETCH_CHECKS));
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -289,6 +280,8 @@ async fn run_ingest_loop(
                         tokio::spawn(async move {
                             let pending = ingester.quarantine.track(hash).await;
                             msg.tx.send(Ok(())).await.ok();
+                            // Recorded once the blob validates (it is served
+                            // from then on), whether or not its upload works.
                             if wait_and_ingest(hash, msg.rx, connection_id, pending, &ingester).await
                                 && let Some((subject, endpoint)) = owner
                             {
@@ -303,18 +296,21 @@ async fn run_ingest_loop(
                             msg.tx.send(Err(AbortReason::Permission)).await.ok();
                             continue;
                         }
-                        let quarantine = Arc::clone(quarantine);
-                        answer_fetch(serve(&[hash]), &[hash], quarantine, msg.tx, "get").await;
+                        let fetch = Fetch { request: "get", hashes: vec![hash], tx: msg.tx };
+                        fetch.answer(&ingester, &blocked, &checks).await;
                     }
                     Some(ProviderMessage::GetManyRequestReceived(msg)) => {
                         let hashes = msg.inner.request.hashes.clone();
-                        let quarantine = Arc::clone(quarantine);
-                        answer_fetch(serve(&hashes), &hashes, quarantine, msg.tx, "get_many").await;
+                        let fetch = Fetch { request: "get_many", hashes, tx: msg.tx };
+                        fetch.answer(&ingester, &blocked, &checks).await;
                     }
                     Some(ProviderMessage::ObserveRequestReceived(msg)) => {
-                        let hash = msg.inner.request.hash;
-                        let quarantine = Arc::clone(quarantine);
-                        answer_fetch(serve(&[hash]), &[hash], quarantine, msg.tx, "observe").await;
+                        let fetch = Fetch {
+                            request: "observe",
+                            hashes: vec![msg.inner.request.hash],
+                            tx: msg.tx,
+                        };
+                        fetch.answer(&ingester, &blocked, &checks).await;
                     }
                     Some(ProviderMessage::ClientConnected(msg)) => {
                         if let Some(g) = &gate {
@@ -351,51 +347,125 @@ async fn run_ingest_loop(
     }
 }
 
-/// Answer a get, get_many or observe of `hashes`: at once when memory
-/// decides (`decided`), otherwise from a task that checks each undecided
-/// hash against the store and S3.
-async fn answer_fetch(
-    decided: Option<bool>,
-    hashes: &[iroh_blobs::Hash],
-    quarantine: Arc<Quarantine>,
-    tx: irpc::channel::oneshot::Sender<Result<(), AbortReason>>,
+/// Fetches (get, get_many, observe) checked against the store and S3 at
+/// once.
+const FETCH_CHECKS: usize = 256;
+
+/// Stored blobs being ingested again (recovered) at once, waiting for an
+/// ingest permit or holding one.
+const RECOVERIES: usize = 64;
+
+/// A get, get_many or observe waiting for its answer.
+struct Fetch {
     request: &'static str,
-) {
-    let answer = |serve: bool| {
-        if serve {
-            Ok(())
-        } else {
-            info!(request, hashes = ?hashes.first(), "Fetch of unvalidated or blocked content refused");
-            Err(AbortReason::Permission)
+    hashes: Vec<iroh_blobs::Hash>,
+    tx: irpc::channel::oneshot::Sender<Result<(), AbortReason>>,
+}
+
+impl Fetch {
+    /// Answer from memory when it decides every hash: served when each is
+    /// validated, refused when any is blocked or withheld. Otherwise check
+    /// the hashes against the store and S3 in a task of its own, one of at
+    /// most [`FETCH_CHECKS`].
+    async fn answer(
+        self,
+        ingester: &Arc<Ingester>,
+        blocked: &impl Fn(&iroh_blobs::Hash) -> bool,
+        checks: &Arc<Semaphore>,
+    ) {
+        let mut ask = false;
+        for hash in &self.hashes {
+            let serve = if blocked(hash) {
+                Serve::No
+            } else {
+                ingester.quarantine.serve(hash)
+            };
+            match serve {
+                Serve::Yes => {}
+                Serve::No => return self.send(Err(AbortReason::Permission)).await,
+                Serve::Ask => ask = true,
+            }
         }
-    };
-    match decided {
-        Some(serve) => {
-            tx.send(answer(serve)).await.ok();
+        if !ask {
+            return self.send(Ok(())).await;
         }
-        None => {
-            let hashes = hashes.to_vec();
-            tokio::spawn(async move {
-                let mut serve = true;
-                for hash in &hashes {
-                    if !quarantine.check_stored(*hash).await {
-                        serve = false;
-                        break;
+        let Ok(permit) = Arc::clone(checks).try_acquire_owned() else {
+            return self.send(Err(AbortReason::RateLimited)).await;
+        };
+        let ingester = Arc::clone(ingester);
+        // Only a single get is approved for a hash the store lacks: its
+        // export starts at once and finds nothing. A get_many reads its
+        // blobs one after another, so a hash absent at approval could be
+        // pushed, unvalidated, before the request reaches it (iroh-blobs
+        // ends a get_many at a missing blob anyway); and an observe of an
+        // absent hash can create an entry for it in the store.
+        let absent_ok = self.request == "get";
+        tokio::spawn(async move {
+            let answer = check_fetch(&ingester, &self.hashes, absent_ok).await;
+            self.send(answer).await;
+            drop(permit);
+        });
+    }
+
+    async fn send(self, answer: Result<(), AbortReason>) {
+        if let Err(reason) = &answer {
+            info!(
+                request = self.request,
+                hash = ?self.hashes.first(),
+                count = self.hashes.len(),
+                ?reason,
+                "Fetch refused: content not known valid, blocked, or too many checks"
+            );
+        }
+        self.tx.send(answer).await.ok();
+    }
+}
+
+/// Check each hash against the store and S3, at most [`S3_LOOKUPS`] at
+/// once. Served when every hash is validated, or absent when `absent_ok`
+/// (iroh-blobs then reports it as not found). At most [`RECOVERIES`] stored
+/// blobs are recovered at once. A stored blob not known valid is refused
+/// for now, and ingested again in the background: a good one is served
+/// once that validates it.
+async fn check_fetch(
+    ingester: &Arc<Ingester>,
+    hashes: &[iroh_blobs::Hash],
+    absent_ok: bool,
+) -> Result<(), AbortReason> {
+    // Every check runs to its end: a recovery dropped unstarted would
+    // refuse its blob.
+    let mut checks = futures::stream::iter(hashes.iter().copied())
+        .map(|hash| {
+            let quarantine = Arc::clone(&ingester.quarantine);
+            async move { (hash, quarantine.check_stored(hash).await) }
+        })
+        .buffer_unordered(S3_LOOKUPS);
+    let mut answer = Ok(());
+    while let Some((hash, stored)) = checks.next().await {
+        match stored {
+            Stored::Serve => {}
+            Stored::Absent if absent_ok => {}
+            Stored::Absent | Stored::Withheld | Stored::Unknown => {
+                answer = Err(AbortReason::Permission)
+            }
+            Stored::Recover(recovery) => {
+                match Arc::clone(&ingester.recoveries).try_acquire_owned() {
+                    Ok(permit) => {
+                        info!(%hash, "Stored blob not known valid; ingesting it again");
+                        let ingester = Arc::clone(ingester);
+                        tokio::spawn(async move {
+                            ingest_stored(hash, recovery, &ingester).await;
+                            drop(permit);
+                        });
                     }
+                    // Enough recoveries wait already; a later fetch retries.
+                    Err(_) => recovery.release(),
                 }
-                if !serve {
-                    info!(request, hash = ?hashes.first(), "Fetch of unvalidated content refused");
-                }
-                tx.send(if serve {
-                    Ok(())
-                } else {
-                    Err(AbortReason::Permission)
-                })
-                .await
-                .ok();
-            });
+                answer = Err(AbortReason::Permission);
+            }
         }
     }
+    answer
 }
 
 /// Record who pushed a blob, so a suspension can be traced to content.
@@ -420,9 +490,10 @@ async fn record_owner(
     }
 }
 
-/// Wait for a push to land and ingest it. `true` when the blob was ingested.
-/// Dropping `pending` without validating refuses the blob, so every path
-/// that does not reach validation leaves it withheld and to be deleted.
+/// Wait for a push to land and ingest it. `true` when the blob validated
+/// (it is served from then on, whether or not its upload worked).
+/// A transfer that aborts is still checked: the store may hold the whole
+/// blob already.
 async fn wait_and_ingest(
     hash: iroh_blobs::Hash,
     mut rx: irpc::channel::mpsc::Receiver<RequestUpdate>,
@@ -469,8 +540,9 @@ async fn wait_and_ingest(
                 break;
             }
             RequestUpdate::Aborted(_) => {
+                // Check the store anyway: the blob may be complete already.
                 warn!(%hash, "Push transfer aborted");
-                return false;
+                break;
             }
         }
     }
@@ -484,16 +556,31 @@ async fn wait_and_ingest(
         info!(%hash, "Push transfer ended, checking store");
     }
 
-    // The transfer is over. Retry briefly for FsStore's async DB
-    // propagation; an aborted transfer leaves the blob incomplete. This
-    // waits without an ingest permit, so an abandoned push holds up no one.
+    ingest_stored(hash, pending, ingester).await
+}
+
+/// Ingest the blob the store holds for `hash` once it is complete:
+/// validate, then upload. `true` when it validated. Dropping `pending`
+/// unvalidated ends it as refused (see `quarantine`), so every path that
+/// finds the blob incomplete or invalid refuses it; a failure of the node's
+/// own (the store cannot answer, export fails) releases it instead.
+async fn ingest_stored(hash: iroh_blobs::Hash, pending: PendingPush, ingester: &Ingester) -> bool {
+    // Retry briefly for FsStore's async DB propagation; an aborted transfer
+    // leaves the blob incomplete. This waits without an ingest permit, so
+    // an abandoned push holds up no one.
     let mut complete = false;
     for attempt in 0..10 {
-        if let Ok(bitfield) = ingester.store.observe(hash).await
-            && bitfield.is_complete()
-        {
-            complete = true;
-            break;
+        match ingester.store.observe(hash).await {
+            Ok(bitfield) if bitfield.is_complete() => {
+                complete = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error!(%hash, error = %e, "Store lookup failed; the blob stays withheld");
+                pending.release();
+                return false;
+            }
         }
         debug!(%hash, attempt, "Blob not yet complete, retrying");
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -506,6 +593,7 @@ async fn wait_and_ingest(
     // At most `max_concurrent_ingests` blobs are exported, validated and
     // uploaded at once; each holds a scratch copy on disk meanwhile.
     let Ok(_permit) = ingester.permits.acquire().await else {
+        pending.release();
         return false;
     };
     let config = &ingester.config;
@@ -530,8 +618,8 @@ async fn wait_and_ingest(
                     true
                 }
                 Err(e) => {
-                    error!(%hash, error = %e, "Ingest failed");
-                    false
+                    error!(%hash, error = %e, "Upload failed; the blob is served from this node only");
+                    true
                 }
             }
         }
@@ -544,7 +632,8 @@ async fn wait_and_ingest(
             false
         }
         Err(IngestError::Failed(e)) => {
-            error!(%hash, error = format!("{e:#}"), "Ingest failed");
+            error!(%hash, error = format!("{e:#}"), "Ingest failed; the blob stays withheld");
+            pending.release();
             false
         }
     }
