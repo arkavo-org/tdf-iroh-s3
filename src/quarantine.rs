@@ -58,6 +58,9 @@ pub struct Quarantine {
     write_lock: tokio::sync::Mutex<()>,
     /// The store and S3, once loaded (the collector is configured before).
     attached: OnceLock<(Store, Arc<S3Client>)>,
+    /// The node's runtime. The collector runs on the store's own runtime,
+    /// which has no IO driver, so its S3 checks run here instead.
+    runtime: tokio::runtime::Handle,
 }
 
 impl Quarantine {
@@ -84,6 +87,7 @@ impl Quarantine {
             file,
             write_lock: tokio::sync::Mutex::new(()),
             attached: OnceLock::new(),
+            runtime: tokio::runtime::Handle::current(),
         }))
     }
 
@@ -102,9 +106,14 @@ impl Quarantine {
             add_protected: Some(Arc::new(move |live: &mut HashSet<Hash>| {
                 let quarantine = Arc::clone(&quarantine);
                 Box::pin(async move {
-                    // The callback's future must be Sync; store requests
-                    // are not, so they run in a task of their own.
-                    match tokio::spawn(async move { quarantine.keep_set().await }).await {
+                    // The callback's future must be Sync; store and S3
+                    // requests are not, so they run in a task of their own,
+                    // on the node's runtime (S3 needs its IO driver).
+                    let runtime = quarantine.runtime.clone();
+                    match runtime
+                        .spawn(async move { quarantine.keep_set().await })
+                        .await
+                    {
                         Ok(Some(keep)) => {
                             live.extend(keep);
                             ProtectOutcome::Continue
