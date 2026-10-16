@@ -245,6 +245,14 @@ pub struct IrohConfig {
     /// NAT. Empty by default.
     #[serde(default)]
     pub public_addresses: Vec<SocketAddr>,
+    /// How often the store's garbage collector checks for refused blobs to
+    /// delete (it runs only while some are waiting). Seconds; default 60.
+    #[serde(default = "default_gc_interval_secs")]
+    pub gc_interval_secs: u64,
+}
+
+fn default_gc_interval_secs() -> u64 {
+    60
 }
 
 impl Default for IrohConfig {
@@ -254,6 +262,7 @@ impl Default for IrohConfig {
             secret_key_param: default_secret_key_param(),
             data_dir: default_data_dir(),
             public_addresses: Vec::new(),
+            gc_interval_secs: default_gc_interval_secs(),
         }
     }
 }

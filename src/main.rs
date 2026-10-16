@@ -36,7 +36,11 @@ struct Cli {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            // The store's garbage collector logs at info each time it skips
+            // a run, which it does every interval while no refused blob is
+            // waiting for deletion.
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,iroh_blobs::store::gc=warn")),
         )
         .init();
 

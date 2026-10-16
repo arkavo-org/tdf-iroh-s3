@@ -34,6 +34,7 @@ fn test_config(data_dir: &str) -> Config {
             secret_key_param: String::new(),
             data_dir: data_dir.to_string(),
             public_addresses: Vec::new(),
+            gc_interval_secs: 1,
         },
         s3: S3Config {
             bucket: BUCKET.to_string(),
@@ -110,10 +111,19 @@ impl FakeS3 {
 
 /// A node writing to a fresh [`FakeS3`], gated when `gate` is given.
 async fn spawn_node(gate: Option<Arc<PublishGate>>) -> (TdfIrohNode, FakeS3, tempfile::TempDir) {
+    spawn_node_with(gate, |_| {}).await
+}
+
+/// [`spawn_node`], with `edit` applied to the configuration.
+async fn spawn_node_with(
+    gate: Option<Arc<PublishGate>>,
+    edit: impl FnOnce(&mut Config),
+) -> (TdfIrohNode, FakeS3, tempfile::TempDir) {
     set_dummy_aws_credentials();
     let (s3, endpoint_url) = FakeS3::start().await;
     let data_dir = tempfile::tempdir().unwrap();
     let mut config = test_config(data_dir.path().to_str().unwrap());
+    edit(&mut config);
     config.s3.endpoint_url = endpoint_url;
     config.s3.force_path_style = true;
     let node = TdfIrohNode::spawn_with_gate(config, gate).await.unwrap();
@@ -188,23 +198,80 @@ async fn test_ungated_push_is_ingested_and_served() {
     node.shutdown().await.unwrap();
 }
 
+/// A blob that is not a TDF is refused: never served, not ingested, and
+/// deleted from the node's store by the garbage collector, which keeps the
+/// blobs that validated.
 #[tokio::test(flavor = "current_thread")]
-async fn test_push_invalid_blob_does_not_crash_node() {
-    let (node, s3, _data_dir) = spawn_node(None).await;
+async fn test_a_refused_blob_is_withheld_and_deleted() {
+    // The collector first runs 4 s after start, after the refusal below.
+    let (node, s3, _data_dir) = spawn_node_with(None, |c| c.iroh.gc_interval_secs = 4).await;
     let node_id = node.addr().id;
 
-    // Garbage (non-TDF) bytes are stored and served, but not ingested.
-    let garbage = vec![0xDEu8; 256];
     let pusher = IrohTestClient::new().await.unwrap();
-    let hash = pusher.push_to_node(node_id, &garbage).await.unwrap();
-    let viewer = IrohTestClient::new().await.unwrap();
-    let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
-    assert_eq!(fetched.as_ref(), garbage.as_slice());
-    assert!(!s3.has_put(&blob_key(hash)));
-
-    // The ingest loop survives the rejection: the next TDF is ingested.
     let tdf = create_test_tdf();
-    let hash = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    let kept = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    assert!(s3.wait_for_put(&blob_key(kept)).await);
+
+    // Larger than the store inlines (16 KiB), so it is a file on disk.
+    let garbage = vec![0xDEu8; 64 * 1024];
+    let refused = pusher.push_to_node(node_id, &garbage).await.unwrap();
+
+    // Refused while still in the store...
+    let deadline = tokio::time::Instant::now() + INGEST_TIMEOUT;
+    while !node.quarantine().is_refused(&refused) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the blob is refused"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // (The store commits its database in batches; reads trail writes until
+    // a sync.)
+    node.store().sync_db().await.unwrap();
+    let bitfield = node.store().observe(refused).await.unwrap();
+    assert!(
+        bitfield.is_complete(),
+        "the refused blob was stored: {bitfield:?}"
+    );
+    // Not served to a client that did not push it while it waits.
+    let viewer = IrohTestClient::new().await.unwrap();
+    assert_refused_for_permission(viewer.fetch_from_node(node_id, refused).await, "get");
+    assert!(!s3.has_put(&blob_key(refused)));
+
+    // ...then deleted by the collector, whose next run forgets it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let bitfield = node.store().observe(refused).await.unwrap();
+        if bitfield.size() == 0 && !node.quarantine().is_refused(&refused) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the refused blob is deleted, bitfield: {bitfield:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(matches!(
+        node.store().status(refused).await.unwrap(),
+        BlobStatus::NotFound
+    ));
+    let viewer = IrohTestClient::new().await.unwrap();
+    assert!(
+        viewer.fetch_from_node(node_id, refused).await.is_err(),
+        "a deleted blob is not served"
+    );
+
+    // The collector kept the TDF, which is still served.
+    assert!(matches!(
+        node.store().status(kept).await.unwrap(),
+        BlobStatus::Complete { .. }
+    ));
+    let fetched = viewer.fetch_from_node(node_id, kept).await.unwrap();
+    assert_eq!(fetched.as_ref(), tdf.as_slice());
+
+    // The ingest loop survives the refusal: the next TDF is ingested.
+    let next = create_test_tdf();
+    let hash = pusher.push_to_node(node_id, &next).await.unwrap();
     assert!(s3.wait_for_put(&blob_key(hash)).await);
 
     for c in [pusher, viewer] {
@@ -272,7 +339,7 @@ async fn test_gated_push_needs_a_session() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_gated_node_refuses_blocked_hashes() {
     let gate = Arc::new(PublishGate::new(Arc::new(Moderation::default())));
-    let (node, _s3, _data_dir) = spawn_node(Some(Arc::clone(&gate))).await;
+    let (node, s3, _data_dir) = spawn_node(Some(Arc::clone(&gate))).await;
     let node_id = node.addr().id;
 
     let creator = IrohTestClient::new().await.unwrap();
@@ -281,10 +348,12 @@ async fn test_gated_node_refuses_blocked_hashes() {
         "arkavo:creator-1",
         Duration::from_secs(60),
     );
-    let blocked_bytes = vec![0x22u8; 128];
-    let open_bytes = vec![0x33u8; 256];
+    // TDFs, so both validate and are served until one is blocked.
+    let (blocked_bytes, open_bytes) = (create_test_tdf(), create_test_tdf());
     let blocked = creator.push_to_node(node_id, &blocked_bytes).await.unwrap();
     let open = creator.push_to_node(node_id, &open_bytes).await.unwrap();
+    assert!(s3.wait_for_put(&blob_key(blocked)).await);
+    assert!(s3.wait_for_put(&blob_key(open)).await);
 
     // Served before the block.
     let viewer = IrohTestClient::new().await.unwrap();

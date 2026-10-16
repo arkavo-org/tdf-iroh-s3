@@ -8,9 +8,11 @@ use iroh_blobs::provider::events::{
     RequestUpdate,
 };
 use iroh_blobs::store::fs::FsStore;
+use iroh_blobs::store::fs::options::Options;
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -18,6 +20,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::Config;
 use crate::ingest::{self, IngestError};
 use crate::moderation::{BlobOwner, PublishGate, now_secs};
+use crate::quarantine::{PendingPush, Quarantine};
 use crate::secret_key;
 use crate::store::s3::S3Client;
 
@@ -27,6 +30,7 @@ pub struct TdfIrohNode {
     endpoint: Endpoint,
     pub s3_client: Arc<S3Client>,
     pub config: Arc<Config>,
+    quarantine: Arc<Quarantine>,
     cancel: CancellationToken,
 }
 
@@ -48,9 +52,24 @@ impl TdfIrohNode {
                 .context("Failed to create S3 client")?,
         );
 
-        let store = FsStore::load(&config.iroh.data_dir)
+        // The store's garbage collector deletes refused blobs (and nothing
+        // else): see `quarantine`.
+        let quarantine = Quarantine::load(Path::new(&config.iroh.data_dir))
             .await
-            .context("Failed to load FsStore")?;
+            .context("Failed to load refused blobs")?;
+        let store = {
+            let root = Path::new(&config.iroh.data_dir);
+            let options = Options {
+                gc: Some(
+                    quarantine.gc_config(Duration::from_secs(config.iroh.gc_interval_secs.max(1))),
+                ),
+                ..Options::new(root)
+            };
+            FsStore::load_with_opts(root.join("blobs.db"), options)
+                .await
+                .context("Failed to load FsStore")?
+        };
+        quarantine.attach(store.clone().into());
 
         let mut builder = Endpoint::builder(presets::N0);
         if !config.iroh.secret_key_param.is_empty() {
@@ -76,34 +95,33 @@ impl TdfIrohNode {
 
         // Each request type follows its own field of the mask. A field left
         // at `EventMask::DEFAULT` sends no events; for push, DEFAULT is
-        // `Disabled`, which refuses every push. Ingest starts from push
-        // events, so both masks enable push.
+        // `Disabled`, which refuses every push.
         //
-        // With a gate, every request type is intercepted and
-        // `run_ingest_loop` answers each one. A push needs a publish
-        // session. A blocked hash is refused for get, get_many and observe.
-        // `connected: Intercept` reports each connection's authenticated
-        // endpoint ID, which identifies the pusher. Without a gate, push
-        // events only notify, and no other request type sends events.
+        // Push, get, get_many and observe are intercepted, gated or not, and
+        // `run_ingest_loop` answers each one. A push is recorded as pending
+        // before it is answered, so the blob is withheld (and protected from
+        // the garbage collector) from its first byte. get, get_many and
+        // observe are refused for a withheld hash (a push not yet validated,
+        // or refused), and on a gated node for a blocked hash. With a gate, a
+        // push also needs a publish session, and `connected: Intercept`
+        // reports each connection's authenticated endpoint ID, which
+        // identifies the pusher.
         //
-        // In both Intercept and Notify the update stream carries no events.
-        // It closes when the transfer ends, and `wait_and_ingest` waits for
-        // that. InterceptLog would reset any request whose update stream
-        // the loop stopped reading.
-        let mask = if gate.is_some() {
-            EventMask {
-                connected: ConnectMode::Intercept,
-                get: RequestMode::Intercept,
-                get_many: RequestMode::Intercept,
-                push: RequestMode::Intercept,
-                observe: ObserveMode::Intercept,
-                ..EventMask::DEFAULT
-            }
-        } else {
-            EventMask {
-                push: RequestMode::Notify,
-                ..EventMask::DEFAULT
-            }
+        // The update stream of an intercepted request carries no events. It
+        // closes when the transfer ends, and `wait_and_ingest` waits for
+        // that. InterceptLog would reset any request whose update stream the
+        // loop stopped reading.
+        let mask = EventMask {
+            connected: if gate.is_some() {
+                ConnectMode::Intercept
+            } else {
+                EventMask::DEFAULT.connected
+            },
+            get: RequestMode::Intercept,
+            get_many: RequestMode::Intercept,
+            push: RequestMode::Intercept,
+            observe: ObserveMode::Intercept,
+            ..EventMask::DEFAULT
         };
         let (event_sender, event_rx) = EventSender::channel(64, mask);
 
@@ -119,6 +137,7 @@ impl TdfIrohNode {
         // Spawn the ingest background task
         {
             let ingester = Arc::new(Ingester {
+                quarantine: Arc::clone(&quarantine),
                 store: store.clone(),
                 s3_client: Arc::clone(&s3_client),
                 config: Arc::clone(&config),
@@ -139,6 +158,7 @@ impl TdfIrohNode {
             endpoint,
             s3_client,
             config,
+            quarantine,
             cancel,
         })
     }
@@ -156,6 +176,12 @@ impl TdfIrohNode {
         &self.store
     }
 
+    /// Pushed blobs withheld from serving, and refused ones awaiting
+    /// deletion.
+    pub fn quarantine(&self) -> &Arc<Quarantine> {
+        &self.quarantine
+    }
+
     pub async fn shutdown(self) -> Result<()> {
         self.cancel.cancel();
         self.router
@@ -169,6 +195,7 @@ impl TdfIrohNode {
 
 /// What ingesting a pushed blob needs.
 struct Ingester {
+    quarantine: Arc<Quarantine>,
     store: FsStore,
     s3_client: Arc<S3Client>,
     config: Arc<Config>,
@@ -185,9 +212,13 @@ async fn run_ingest_loop(
     cancel: CancellationToken,
 ) {
     info!("Ingest loop started");
+    // Not served: a blocked hash (gated nodes), or a pushed blob that has
+    // not validated or was refused.
     let blocked = |hash: &iroh_blobs::Hash| {
-        gate.as_ref()
-            .is_some_and(|g| g.moderation.is_blocked(&hash.to_hex()))
+        ingester.quarantine.is_withheld(hash)
+            || gate
+                .as_ref()
+                .is_some_and(|g| g.moderation.is_blocked(&hash.to_hex()))
     };
     loop {
         tokio::select! {
@@ -205,14 +236,6 @@ async fn run_ingest_loop(
                 // never approves it. The match lists every variant, so a new
                 // one is a compile error rather than an unanswered request.
                 match msg {
-                    Some(ProviderMessage::PushRequestReceivedNotify(msg)) => {
-                        let hash = msg.inner.request.hash;
-                        info!(%hash, "Push request received (notify)");
-                        let ingester = Arc::clone(&ingester);
-                        tokio::spawn(async move {
-                            wait_and_ingest(hash, msg.rx, &ingester).await;
-                        });
-                    }
                     Some(ProviderMessage::PushRequestReceived(msg)) => {
                         let hash = msg.inner.request.hash;
                         let owner = match &gate {
@@ -227,10 +250,11 @@ async fn run_ingest_loop(
                             },
                         };
                         info!(%hash, subject = ?owner.as_ref().map(|o| &o.0), "Push accepted");
+                        let pending = ingester.quarantine.pushed(hash);
                         msg.tx.send(Ok(())).await.ok();
                         let ingester = Arc::clone(&ingester);
                         tokio::spawn(async move {
-                            if wait_and_ingest(hash, msg.rx, &ingester).await
+                            if wait_and_ingest(hash, msg.rx, pending, &ingester).await
                                 && let Some((subject, endpoint)) = owner
                             {
                                 record_owner(&ingester.s3_client, hash, subject, endpoint).await;
@@ -281,6 +305,7 @@ async fn run_ingest_loop(
                     // Neither mask enables these notifications.
                     Some(
                         ProviderMessage::ClientConnectedNotify(_)
+                        | ProviderMessage::PushRequestReceivedNotify(_)
                         | ProviderMessage::GetRequestReceivedNotify(_)
                         | ProviderMessage::GetManyRequestReceivedNotify(_)
                         | ProviderMessage::ObserveRequestReceivedNotify(_),
@@ -320,9 +345,12 @@ async fn record_owner(
 }
 
 /// Wait for a push to land and ingest it. `true` when the blob was ingested.
+/// Dropping `pending` without validating refuses the blob, so every path
+/// that does not reach validation leaves it withheld and to be deleted.
 async fn wait_and_ingest(
     hash: iroh_blobs::Hash,
     mut rx: irpc::channel::mpsc::Receiver<RequestUpdate>,
+    pending: PendingPush,
     ingester: &Ingester,
 ) -> bool {
     // Wait for the push transfer to complete
@@ -362,23 +390,31 @@ async fn wait_and_ingest(
     // The transfer is over. Retry briefly for FsStore's async DB
     // propagation; an aborted transfer leaves the blob incomplete.
     for attempt in 0..10 {
-        let result = ingest::ingest_from_store(
+        let result = ingest::validate_from_store(
             hash,
             &ingester.store,
             &config.validation,
-            &config.catalog,
-            &ingester.s3_client,
             &ingester.scratch_dir,
         )
         .await;
         match result {
-            Ok(Some(result)) => {
-                info!(
-                    hash = %result.hash_hex,
-                    size = result.size,
-                    "Blob ingested successfully"
-                );
-                return true;
+            Ok(Some(validated)) => {
+                // Servable from here on, whatever the upload does.
+                pending.validated();
+                return match ingest::upload(validated, &config.catalog, &ingester.s3_client).await {
+                    Ok(result) => {
+                        info!(
+                            hash = %result.hash_hex,
+                            size = result.size,
+                            "Blob ingested successfully"
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        error!(%hash, error = %e, "Ingest failed");
+                        false
+                    }
+                };
             }
             Ok(None) => {
                 debug!(%hash, attempt, "Blob not yet readable, retrying");

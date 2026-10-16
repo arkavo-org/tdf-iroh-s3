@@ -10,6 +10,7 @@ pub mod ingest;
 pub mod moderation;
 pub mod node;
 pub mod node_api;
+pub mod quarantine;
 pub mod secret_key;
 pub mod ssm;
 pub mod store;
