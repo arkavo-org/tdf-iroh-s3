@@ -24,7 +24,8 @@ pub const MAX_OWNER_BYTES: usize = 248;
 pub const MAX_CONTENT_ID_BYTES: usize = 256;
 /// 2^53 - 1, the largest integer every JSON reader represents exactly.
 pub const MAX_VERSION: u64 = 9_007_199_254_740_991;
-/// 4 GiB.
+/// 4 GiB − 1 (`u32::MAX`): the largest TDF a catalog may name, and the
+/// default `[validation] max_blob_bytes` (`config::DEFAULT_MAX_BLOB_BYTES`).
 pub const MAX_PAYLOAD_SIZE: u64 = 4_294_967_295;
 pub const MAX_TITLE_BYTES: usize = 512;
 pub const MAX_ATTRIBUTE_FQNS: usize = 32;

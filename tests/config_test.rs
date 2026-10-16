@@ -38,7 +38,11 @@ region = "us-east-1"
     assert_eq!(config.iroh.bind_port, 11204);
     assert!(config.validation.required_attributes.is_empty());
     assert!(!config.validation.assertion.enabled);
-    assert_eq!(config.validation.max_blob_bytes, 4_294_967_295);
+    assert_eq!(
+        config.validation.max_blob_bytes,
+        tdf_iroh_s3::config::DEFAULT_MAX_BLOB_BYTES
+    );
+    assert_eq!(tdf_iroh_s3::config::DEFAULT_MAX_BLOB_BYTES, 4_294_967_295);
 }
 
 #[test]

@@ -303,26 +303,6 @@ impl S3Client {
         }
     }
 
-    pub async fn has_blob(&self, hash_hex: &str) -> Result<bool> {
-        match self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(self.blob_key(hash_hex))
-            .send()
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                if e.as_service_error().is_some_and(|se| se.is_not_found()) {
-                    Ok(false)
-                } else {
-                    Err(anyhow::anyhow!("Failed to HEAD blob in S3: {}", e))
-                }
-            }
-        }
-    }
-
     pub async fn delete_blob(&self, hash_hex: &str) -> Result<()> {
         self.client
             .delete_object()

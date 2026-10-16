@@ -99,7 +99,7 @@ mod tests {
             endpoint_id: "ab".repeat(32),
             relay_url: None,
             direct_addresses: vec![],
-            max_blob_bytes: 4_294_967_295,
+            max_blob_bytes: crate::config::DEFAULT_MAX_BLOB_BYTES,
         })
         .await;
         assert_eq!(body["relayUrl"], serde_json::Value::Null);

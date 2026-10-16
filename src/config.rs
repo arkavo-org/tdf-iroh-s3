@@ -309,8 +309,8 @@ impl Default for ValidationConfig {
     }
 }
 
-/// 4 GiB, the largest `payloadSize` a creator catalog may name.
-pub const DEFAULT_MAX_BLOB_BYTES: u64 = 4_294_967_295;
+/// The largest `payloadSize` a creator catalog may name.
+pub const DEFAULT_MAX_BLOB_BYTES: u64 = crate::creator_catalog::MAX_PAYLOAD_SIZE;
 
 fn default_max_blob_bytes() -> u64 {
     DEFAULT_MAX_BLOB_BYTES

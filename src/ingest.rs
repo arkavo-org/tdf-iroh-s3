@@ -39,7 +39,7 @@ pub async fn ingest_blob(
     // Step 3: Upload blob to S3 unless already present. Derived artifacts
     // below are written even for duplicate blobs, so a push retried after a
     // partial failure (or content predating the index) self-repairs.
-    if s3_client.has_blob(&hash_hex).await? {
+    if s3_client.blob_size(&hash_hex).await?.is_some() {
         info!(hash = %hash_hex, "Blob already exists in S3, skipping upload");
     } else {
         s3_client
