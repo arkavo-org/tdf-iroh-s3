@@ -329,7 +329,7 @@ async fn wait_and_ingest(
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
             Err(e) => {
-                error!(%hash, error = %e, "Ingest failed");
+                error!(%hash, error = format!("{e:#}"), "Ingest failed");
                 return false;
             }
         }

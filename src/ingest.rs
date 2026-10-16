@@ -108,7 +108,7 @@ pub async fn ingest_from_store(
     // again once read.
     if let Ok(bitfield) = store.observe(hash).await {
         validation::check_blob_size(bitfield.size(), validation_config)
-            .context("Blob rejected by TDF validation")?;
+            .context("Blob refused before reading")?;
     }
 
     // Try to read blob bytes directly. For pushed blobs, get_bytes() works
