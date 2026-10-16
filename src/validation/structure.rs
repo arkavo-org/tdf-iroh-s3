@@ -5,6 +5,15 @@ use std::io::Cursor;
 
 /// Validates that the given bytes are a valid TDF archive with a manifest and payload.
 /// Returns the parsed TdfManifest on success.
+///
+/// Two layouts are accepted (opentdf's `TdfArchive` resolves both):
+/// - the spec layout: `manifest.json`, with the payload in the member that
+///   `payload.url` names (`0.payload` in Arkavo's FairPlay key-envelope
+///   archives). Other members, such as HLS playlists and fMP4 segments, are
+///   allowed alongside it;
+/// - the legacy layout: `0.manifest.json` with `0.payload`.
+///
+/// The manifest must parse as an OpenTDF manifest with every required field.
 pub fn validate_tdf_structure(data: &[u8]) -> Result<TdfManifest> {
     let cursor = Cursor::new(data);
     let mut archive = TdfArchive::new(cursor)

@@ -11,7 +11,7 @@ iroh-blobs = "0.103"
 irpc = "0.17"
 
 # OpenTDF validation
-opentdf = { version = "0.14.2", default-features = false }
+opentdf = { version = "0.16.0", default-features = false }
 
 # AWS S3
 aws-config = { version = "1", features = ["behavior-version-latest"] }

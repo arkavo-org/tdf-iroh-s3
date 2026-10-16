@@ -20,7 +20,7 @@
 //! blob with no grouping attribute is simply in no catalog.
 
 use anyhow::{Context, Result};
-use opentdf::{AttributePolicy, AttributeValue, LogicalOperator, Policy};
+use opentdf::{AttributePolicy, AttributeValue, LogicalOperator};
 use serde::{Deserialize, Serialize};
 
 /// One catalog index entry, stored as `catalog-index/<group>/<hash>`.
@@ -43,13 +43,36 @@ pub struct CatalogEntry {
 /// (`https://<namespace>/attr/<name>/value/<value>`; value-less conditions
 /// such as `Present` yield `https://<namespace>/attr/<name>`). The result
 /// is deduplicated and sorted for deterministic index entries.
+///
+/// `body.dataAttributes` entries come in two shapes, and a policy may mix
+/// them:
+/// - the OpenTDF spec form, `{"attribute": "<FQN>"}`, which the Creator app
+///   and the other SDKs write;
+/// - the structured condition form opentdf-rs writes
+///   (`{"attribute": {"namespace", "name"}, "operator", "value"}`, or a
+///   logical operator over such conditions).
+///
+/// Keys outside `body` (for example Arkavo's `arkavo:*` extensions) are
+/// ignored.
 pub fn extract_attribute_fqns(policy_json: &str) -> Result<Vec<String>> {
-    let policy: Policy =
+    let policy: serde_json::Value =
         serde_json::from_str(policy_json).context("Failed to parse TDF policy JSON")?;
+    let body = policy.get("body").context("TDF policy has no body")?;
+    let attributes = match body.get("dataAttributes") {
+        None | Some(serde_json::Value::Null) => &[][..],
+        Some(serde_json::Value::Array(a)) => a.as_slice(),
+        Some(_) => anyhow::bail!("TDF policy dataAttributes is not an array"),
+    };
 
     let mut fqns = Vec::new();
-    for attr_policy in &policy.body.attributes {
-        collect_fqns(attr_policy, &mut fqns);
+    for attribute in attributes {
+        if let Some(fqn) = attribute.get("attribute").and_then(|a| a.as_str()) {
+            fqns.push(fqn.to_string());
+            continue;
+        }
+        let attr_policy: AttributePolicy = serde_json::from_value(attribute.clone())
+            .context("Failed to parse TDF policy data attribute")?;
+        collect_fqns(&attr_policy, &mut fqns);
     }
     fqns.sort();
     fqns.dedup();
@@ -229,6 +252,42 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn extracts_fqns_from_spec_form_policy() {
+        // The shape Creator writes: `{"attribute": "<FQN>"}` entries, plus
+        // `arkavo:*` keys outside `body`.
+        let json = r#"{
+            "arkavo:fpsProfile": "urn:arkavo:fairplay:key-envelope:1",
+            "body": {
+                "dataAttributes": [
+                    {"attribute": "https://patreon.arkavo.com/attr/campaign/value/12345678"},
+                    {"attribute": "https://patreon.arkavo.com/attr/campaign-tier/value/12345678_free"}
+                ],
+                "dissem": []
+            },
+            "uuid": "00000000-0000-4000-8000-000000000001"
+        }"#;
+        assert_eq!(
+            extract_attribute_fqns(json).unwrap(),
+            vec![
+                "https://patreon.arkavo.com/attr/campaign-tier/value/12345678_free".to_string(),
+                "https://patreon.arkavo.com/attr/campaign/value/12345678".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_or_null_data_attributes_yield_nothing() {
+        for json in [
+            r#"{"body":{"dataAttributes":null,"dissem":null},"uuid":"u"}"#,
+            r#"{"body":{"dissem":[]},"uuid":"u"}"#,
+        ] {
+            assert!(extract_attribute_fqns(json).unwrap().is_empty(), "{json}");
+        }
+        assert!(extract_attribute_fqns(r#"{"uuid":"u"}"#).is_err());
+        assert!(extract_attribute_fqns(r#"{"body":{"dataAttributes":{}}}"#).is_err());
     }
 
     #[test]
