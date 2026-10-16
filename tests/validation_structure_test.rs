@@ -154,3 +154,33 @@ fn fairplay_policy_groups_by_campaign() {
     let groups: Vec<&str> = derived.entries.iter().map(|(g, _)| g.as_str()).collect();
     assert_eq!(groups, ["12345678"]);
 }
+
+/// The manifest is read with a bound: a crafted archive cannot inflate one
+/// into memory.
+#[test]
+fn an_oversize_manifest_is_rejected() {
+    use tdf_iroh_s3::validation::structure::MAX_MANIFEST_BYTES;
+    let mut manifest: serde_json::Value = serde_json::from_str(FAIRPLAY_MANIFEST).unwrap();
+    manifest["padding"] = serde_json::json!("x".repeat(MAX_MANIFEST_BYTES as usize));
+    let bytes = fairplay_layout(&manifest.to_string(), "0.payload");
+    let err = validate_tdf_structure(&bytes).unwrap_err();
+    assert!(format!("{err:#}").contains("exceeds"), "{err:#}");
+}
+
+/// A payload url that escapes the archive or names a manifest is refused,
+/// as opentdf's reader refuses it.
+#[test]
+fn unsafe_payload_urls_are_rejected() {
+    for url in [
+        "../0.payload",
+        "/0.payload",
+        "a\\\\b",
+        "manifest.json",
+        "1.manifest.json",
+    ] {
+        let manifest =
+            FAIRPLAY_MANIFEST.replace("\"url\": \"0.payload\"", &format!("\"url\": \"{url}\""));
+        let bytes = fairplay_layout(&manifest, "0.payload");
+        assert!(validate_tdf_structure(&bytes).is_err(), "{url}");
+    }
+}

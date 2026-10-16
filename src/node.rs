@@ -9,12 +9,14 @@ use iroh_blobs::provider::events::{
 };
 use iroh_blobs::store::fs::FsStore;
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
-use crate::ingest::ingest_from_store;
+use crate::ingest::{self, IngestError};
 use crate::moderation::{BlobOwner, PublishGate, now_secs};
 use crate::secret_key;
 use crate::store::s3::S3Client;
@@ -116,12 +118,18 @@ impl TdfIrohNode {
 
         // Spawn the ingest background task
         {
-            let store = store.clone();
-            let s3_client = Arc::clone(&s3_client);
-            let config = Arc::clone(&config);
+            let ingester = Arc::new(Ingester {
+                store: store.clone(),
+                s3_client: Arc::clone(&s3_client),
+                config: Arc::clone(&config),
+                scratch_dir: ingest::prepare_scratch_dir(&config.iroh.data_dir).await?,
+                permits: Arc::new(Semaphore::new(
+                    config.validation.max_concurrent_ingests.get(),
+                )),
+            });
             let cancel = cancel.clone();
             tokio::spawn(async move {
-                run_ingest_loop(event_rx, store, s3_client, config, gate, cancel).await;
+                run_ingest_loop(event_rx, ingester, gate, cancel).await;
             });
         }
 
@@ -159,11 +167,20 @@ impl TdfIrohNode {
     }
 }
 
-async fn run_ingest_loop(
-    mut rx: tokio::sync::mpsc::Receiver<ProviderMessage>,
+/// What ingesting a pushed blob needs.
+struct Ingester {
     store: FsStore,
     s3_client: Arc<S3Client>,
     config: Arc<Config>,
+    /// `<data_dir>/ingest`, where blobs are exported for validation.
+    scratch_dir: PathBuf,
+    /// `[validation] max_concurrent_ingests` permits.
+    permits: Arc<Semaphore>,
+}
+
+async fn run_ingest_loop(
+    mut rx: tokio::sync::mpsc::Receiver<ProviderMessage>,
+    ingester: Arc<Ingester>,
     gate: Option<Arc<PublishGate>>,
     cancel: CancellationToken,
 ) {
@@ -191,11 +208,9 @@ async fn run_ingest_loop(
                     Some(ProviderMessage::PushRequestReceivedNotify(msg)) => {
                         let hash = msg.inner.request.hash;
                         info!(%hash, "Push request received (notify)");
-                        let store = store.clone();
-                        let s3_client = Arc::clone(&s3_client);
-                        let config = Arc::clone(&config);
+                        let ingester = Arc::clone(&ingester);
                         tokio::spawn(async move {
-                            wait_and_ingest(hash, msg.rx, &store, &s3_client, &config).await;
+                            wait_and_ingest(hash, msg.rx, &ingester).await;
                         });
                     }
                     Some(ProviderMessage::PushRequestReceived(msg)) => {
@@ -213,14 +228,12 @@ async fn run_ingest_loop(
                         };
                         info!(%hash, subject = ?owner.as_ref().map(|o| &o.0), "Push accepted");
                         msg.tx.send(Ok(())).await.ok();
-                        let store = store.clone();
-                        let s3_client = Arc::clone(&s3_client);
-                        let config = Arc::clone(&config);
+                        let ingester = Arc::clone(&ingester);
                         tokio::spawn(async move {
-                            if wait_and_ingest(hash, msg.rx, &store, &s3_client, &config).await
+                            if wait_and_ingest(hash, msg.rx, &ingester).await
                                 && let Some((subject, endpoint)) = owner
                             {
-                                record_owner(&s3_client, hash, subject, endpoint).await;
+                                record_owner(&ingester.s3_client, hash, subject, endpoint).await;
                             }
                         });
                     }
@@ -310,9 +323,7 @@ async fn record_owner(
 async fn wait_and_ingest(
     hash: iroh_blobs::Hash,
     mut rx: irpc::channel::mpsc::Receiver<RequestUpdate>,
-    store: &FsStore,
-    s3_client: &S3Client,
-    config: &Config,
+    ingester: &Ingester,
 ) -> bool {
     // Wait for the push transfer to complete
     let mut completed = false;
@@ -341,10 +352,26 @@ async fn wait_and_ingest(
         info!(%hash, "Push transfer ended, checking store");
     }
 
+    // At most `max_concurrent_ingests` blobs are exported, validated and
+    // uploaded at once; each holds a scratch copy on disk meanwhile.
+    let Ok(_permit) = ingester.permits.acquire().await else {
+        return false;
+    };
+    let config = &ingester.config;
+
     // The transfer is over. Retry briefly for FsStore's async DB
     // propagation; an aborted transfer leaves the blob incomplete.
     for attempt in 0..10 {
-        match ingest_from_store(hash, store, &config.validation, &config.catalog, s3_client).await {
+        let result = ingest::ingest_from_store(
+            hash,
+            &ingester.store,
+            &config.validation,
+            &config.catalog,
+            &ingester.s3_client,
+            &ingester.scratch_dir,
+        )
+        .await;
+        match result {
             Ok(Some(result)) => {
                 info!(
                     hash = %result.hash_hex,
@@ -357,7 +384,11 @@ async fn wait_and_ingest(
                 debug!(%hash, attempt, "Blob not yet readable, retrying");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            Err(e) => {
+            Err(IngestError::Refused(e)) => {
+                warn!(%hash, error = format!("{e:#}"), "Ingest refused the blob");
+                return false;
+            }
+            Err(IngestError::Failed(e)) => {
                 error!(%hash, error = format!("{e:#}"), "Ingest failed");
                 return false;
             }

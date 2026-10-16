@@ -238,3 +238,19 @@ bind_address = "127.0.0.1"
     let bad = "[iroh]\npublic_addresses = [\"3.91.18.97\"]\n[s3]\nbucket = \"b\"\nregion = \"r\"\n";
     assert!(toml::from_str::<Config>(bad).is_err());
 }
+
+#[test]
+fn test_max_concurrent_ingests_defaults_to_one_and_refuses_zero() {
+    let base = "[s3]\nbucket = \"b\"\nregion = \"r\"\n";
+    let config: Config = toml::from_str(base).unwrap();
+    assert_eq!(config.validation.max_concurrent_ingests.get(), 1);
+
+    let config: Config =
+        toml::from_str(&format!("{base}[validation]\nmax_concurrent_ingests = 3\n")).unwrap();
+    assert_eq!(config.validation.max_concurrent_ingests.get(), 3);
+
+    assert!(
+        toml::from_str::<Config>(&format!("{base}[validation]\nmax_concurrent_ingests = 0\n"))
+            .is_err()
+    );
+}

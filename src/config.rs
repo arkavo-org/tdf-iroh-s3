@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
@@ -286,17 +287,22 @@ pub struct S3Config {
     pub force_path_style: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ValidationConfig {
     #[serde(default)]
     pub required_attributes: Vec<String>,
     #[serde(default)]
     pub assertion: AssertionConfig,
-    /// Pushed blobs larger than this many bytes are refused at ingest.
-    /// Ingest holds the whole blob in memory, so keep this below the
-    /// instance's free RAM.
+    /// Pushed blobs larger than this many bytes are refused. Ingest reads
+    /// the blob from a file, so memory does not bound this; disk does (see
+    /// `docs/deploy-runbook.md`).
     #[serde(default = "default_max_blob_bytes")]
     pub max_blob_bytes: u64,
+    /// How many pushed blobs are validated and uploaded at once. Each one in
+    /// progress holds a copy of the blob on disk (none when the filesystem
+    /// supports reflinks). At least 1; default 1.
+    #[serde(default = "default_max_concurrent_ingests")]
+    pub max_concurrent_ingests: NonZeroUsize,
 }
 
 impl Default for ValidationConfig {
@@ -305,8 +311,13 @@ impl Default for ValidationConfig {
             required_attributes: Vec::new(),
             assertion: AssertionConfig::default(),
             max_blob_bytes: default_max_blob_bytes(),
+            max_concurrent_ingests: default_max_concurrent_ingests(),
         }
     }
+}
+
+fn default_max_concurrent_ingests() -> NonZeroUsize {
+    NonZeroUsize::MIN
 }
 
 /// The largest `payloadSize` a creator catalog may name.
@@ -316,7 +327,7 @@ fn default_max_blob_bytes() -> u64 {
     DEFAULT_MAX_BLOB_BYTES
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct AssertionConfig {
     #[serde(default)]
     pub enabled: bool,

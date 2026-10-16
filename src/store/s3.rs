@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
+use aws_sdk_s3::config::RequestChecksumCalculation;
+use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
+use std::path::Path;
 
 use crate::config::S3Config;
 
@@ -91,6 +94,39 @@ impl S3Client {
             .bucket(&self.bucket)
             .key(self.blob_key(hash_hex))
             .body(data.into())
+            .send()
+            .await
+            .context("Failed to PUT blob to S3")?;
+        Ok(())
+    }
+
+    /// Upload a blob from a file of `size` bytes, streaming it: the body is
+    /// read from disk as it is sent, never held in memory.
+    ///
+    /// The SDK's default CRC32 checksum is off for this request. With it, a
+    /// streamed body is sent `aws-chunked`, and aws-runtime 1.7.1 (the
+    /// newest that builds on this crate's Rust 1.91) sends the body as one
+    /// chunk while declaring a Content-Length for 64 KiB chunks, so the
+    /// request never completes. Without it the body is sent as is, with its
+    /// exact length; TLS protects it in transit.
+    pub async fn put_blob_file(&self, hash_hex: &str, path: &Path, size: u64) -> Result<()> {
+        let body = ByteStream::read_from()
+            .path(path)
+            .length(aws_sdk_s3::primitives::Length::Exact(size))
+            .build()
+            .await
+            .with_context(|| format!("Failed to open {} for upload", path.display()))?;
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.blob_key(hash_hex))
+            .content_length(i64::try_from(size).context("blob too large for S3")?)
+            .body(body)
+            .customize()
+            .config_override(
+                aws_sdk_s3::config::Builder::default()
+                    .request_checksum_calculation(RequestChecksumCalculation::WhenRequired),
+            )
             .send()
             .await
             .context("Failed to PUT blob to S3")?;
