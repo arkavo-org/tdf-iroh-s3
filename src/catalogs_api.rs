@@ -20,6 +20,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use futures::StreamExt;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -145,9 +146,12 @@ async fn put_catalog<S: TagStore>(
             }
         })
         .buffered(INGEST_CHECK_CONCURRENCY);
+    let mut sizes: HashMap<String, u64> = HashMap::with_capacity(doc.entries.len());
     while let Some((payload, found)) = checks.next().await {
         match found {
-            Ok(Some(_)) => {}
+            Ok(Some(size)) => {
+                sizes.insert(payload, size);
+            }
             Ok(None) => {
                 return Err(fail(
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -158,7 +162,22 @@ async fn put_catalog<S: TagStore>(
         }
     }
 
-    // 7. Store the exact bytes, then move the tag.
+    // 7. Every entry's payloadSize is the stored blob's size (what
+    //    `GET /blobs` reports), in entry order. Per entry, not per hash: two
+    //    entries naming one payload are each checked.
+    if let Some(e) = doc
+        .entries
+        .iter()
+        .find(|e| sizes.get(&e.payload_hash) != Some(&e.payload_size))
+    {
+        warn!(%sub, payload = %e.payload_hash, "Catalog upload rejected: payload size mismatch");
+        return Err(fail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("payload {} size does not match", e.payload_hash),
+        ));
+    }
+
+    // 8. Store the exact bytes, then move the tag.
     let size = bytes.len();
     let entries = doc.entries.len();
     state
@@ -247,6 +266,8 @@ mod tests {
     use tower::ServiceExt;
 
     const SUB: &str = "5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10";
+    /// The `payloadSize` of `creator_catalog::test_support::entry`.
+    const PAYLOAD_SIZE: u64 = 7_342_067;
     const ISS: &str = "https://identity.test";
 
     struct Harness {
@@ -366,7 +387,7 @@ mod tests {
     #[tokio::test]
     async fn publish_stores_the_exact_bytes_and_moves_the_tag() {
         let h = harness(true);
-        h.store.ingest(&payload(1), 7_342_067).await;
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
         let bytes = doc();
         let want = blake3::hash(&bytes).to_hex().to_string();
 
@@ -418,7 +439,7 @@ mod tests {
     #[tokio::test]
     async fn token_checks_come_first() {
         let h = harness(true);
-        h.store.ingest(&payload(1), 1).await;
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
         let (sk, _) = keypair();
         let expired = mint(
             &sk,
@@ -469,7 +490,7 @@ mod tests {
     #[tokio::test]
     async fn an_ungated_node_still_verifies_the_token() {
         let h = harness(false);
-        h.store.ingest(&payload(1), 1).await;
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
         let r = put_catalog(&h.app, SUB, Some("garbage"), doc()).await;
         assert_eq!(r.status, StatusCode::UNAUTHORIZED);
         let r = put_catalog(&h.app, SUB, None, doc()).await;
@@ -482,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn the_path_must_be_the_token_subject_byte_for_byte() {
         let h = harness(true);
-        h.store.ingest(&payload(1), 1).await;
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
         let tok = token(&format!("arkavo:{SUB}"), &[DEFAULT_PUBLISH_ENTITLEMENT]);
         // The bare UUID is a different subject from arkavo:<uuid>.
         let r = put_catalog(&h.app, SUB, Some(&tok), doc()).await;
@@ -505,7 +526,7 @@ mod tests {
     #[tokio::test]
     async fn the_body_must_be_json() {
         let h = harness(true);
-        h.store.ingest(&payload(1), 1).await;
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
         for content_type in [None, Some("text/plain"), Some("application/jsonx")] {
             let mut req = Request::builder()
                 .method(Method::PUT)
@@ -539,7 +560,7 @@ mod tests {
     #[tokio::test]
     async fn the_body_is_at_most_262144_bytes() {
         let h = harness(true);
-        h.store.ingest(&payload(1), 1).await;
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
         let mut bytes = doc();
         bytes.resize(MAX_CATALOG_BYTES, b' ');
         let r = put_catalog(&h.app, SUB, Some(&creator()), bytes.clone()).await;
@@ -596,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_document_is_422_with_its_reason() {
         let h = harness(true);
-        h.store.ingest(&payload(1), 1).await;
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
         let r = put_catalog(&h.app, SUB, Some(&creator()), b"{\"schema\":1}".to_vec()).await;
         assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(r.error().starts_with("invalid catalog: "), "{}", r.error());
@@ -634,7 +655,7 @@ mod tests {
 
         // A blocked catalog document cannot be republished either.
         let h = harness(true);
-        h.store.ingest(&payload(1), 1).await;
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
         h.moderation
             .block_for_test(blake3::hash(&doc()).to_hex().as_str());
         let r = put_catalog(&h.app, SUB, Some(&creator()), doc()).await;
@@ -645,7 +666,7 @@ mod tests {
     #[tokio::test]
     async fn every_payload_must_be_ingested() {
         let h = harness(true);
-        h.store.ingest(&payload(1), 1).await;
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
         let bytes = catalog(
             SUB,
             vec![
@@ -667,9 +688,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_payload_size_must_match_the_stored_blob() {
+        let h = harness(true);
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
+        h.store.ingest(&payload(2), PAYLOAD_SIZE - 1).await;
+        h.store.ingest(&payload(3), PAYLOAD_SIZE + 1).await;
+
+        // The first mismatching entry, in entry order, is reported.
+        let bytes = catalog(
+            SUB,
+            vec![
+                entry("rec-1", &payload(1)),
+                entry("rec-3", &payload(3)),
+                entry("rec-2", &payload(2)),
+            ],
+        );
+        let r = put_catalog(&h.app, SUB, Some(&creator()), bytes).await;
+        assert_eq!(
+            (r.status, r.error()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("payload {} size does not match", payload(3))
+            )
+        );
+        assert!(h.store.tags.lock().await.is_empty());
+        assert!(h.store.catalog_documents.lock().await.is_empty());
+
+        // Two entries naming one payload are each checked: the second is
+        // wrong although the first is right.
+        let mut wrong = entry("rec-1b", &payload(1));
+        wrong["payloadSize"] = serde_json::json!(PAYLOAD_SIZE + 1);
+        let bytes = catalog(SUB, vec![entry("rec-1", &payload(1)), wrong]);
+        let r = put_catalog(&h.app, SUB, Some(&creator()), bytes).await;
+        assert_eq!(
+            (r.status, r.error()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("payload {} size does not match", payload(1))
+            )
+        );
+
+        // An ingest failure is reported before any size mismatch.
+        let bytes = catalog(
+            SUB,
+            vec![entry("rec-3", &payload(3)), entry("rec-4", &payload(4))],
+        );
+        let r = put_catalog(&h.app, SUB, Some(&creator()), bytes).await;
+        assert_eq!(r.error(), format!("payload {} is not ingested", payload(4)));
+
+        // Sizes that match publish.
+        let r = put_catalog(&h.app, SUB, Some(&creator()), doc()).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        assert_eq!(h.store.tags.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn storage_failure_is_502() {
         let h = harness(true);
-        h.store.ingest(&payload(1), 1).await;
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
         h.store
             .down
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -698,7 +774,7 @@ mod tests {
             );
         }
 
-        h.store.ingest(&payload(1), 1).await;
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
         let r = put_catalog(&h.app, SUB, Some(&creator()), doc()).await;
         let hash = r.json()["hash"].as_str().unwrap().to_string();
         h.moderation.block_for_test(&hash);
@@ -712,7 +788,7 @@ mod tests {
     #[tokio::test]
     async fn blobs_confirm_ingest() {
         let h = harness(true);
-        h.store.ingest(&payload(1), 7_342_067).await;
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
         let r = get(&h.app, &format!("/blobs/{}", payload(1))).await;
         assert_eq!(r.status, StatusCode::OK);
         assert_eq!(
@@ -744,8 +820,8 @@ mod tests {
     #[tokio::test]
     async fn the_tag_route_rolls_back_to_a_published_catalog() {
         let h = harness(true);
-        h.store.ingest(&payload(1), 1).await;
-        h.store.ingest(&payload(2), 2).await;
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
+        h.store.ingest(&payload(2), PAYLOAD_SIZE).await;
         let first = put_catalog(&h.app, SUB, Some(&creator()), doc())
             .await
             .json()["hash"]

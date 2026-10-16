@@ -68,7 +68,7 @@ The document is UTF-8 JSON, at most **262 144 bytes**. The node stores the uploa
 | `contentID` | 1–256 bytes of `[A-Za-z0-9:._@-]`, not containing `..`. It is unique within the document and stays the same when the creator republishes a recording. |
 | `version` | An integer from 1 to 9007199254740991 (2⁵³−1). A republish with different bytes uses a larger version. |
 | `payloadHash` | 64 lowercase hex characters: the BLAKE3 hash of the TDF bytes. At upload, it must name a blob the node has ingested and not blocked. |
-| `payloadSize` | An integer from 1 to 4294967296 (4 GiB): the TDF's size in bytes. |
+| `payloadSize` | An integer from 1 to 4294967296 (4 GiB): the TDF's size in bytes. At upload, it must equal the size `GET /blobs/<payloadHash>` reports. |
 | `title` | Optional. A string of 1–512 UTF-8 bytes. |
 | `publishedAt` | RFC 3339 UTC to the second with a `Z` suffix (`YYYY-MM-DDTHH:MM:SSZ`). |
 | `attributeFQNs` | An array of 0–32 `https://` URLs, each at most 512 bytes: the data attributes in the TDF's policy, for display. They grant nothing. |
@@ -101,8 +101,9 @@ The node checks the following in order. Each failure returns its own status.
 3. **The body is at most 262 144 bytes.** Otherwise 413 `catalog too large`.
 4. **The body is a valid `arkavo.creator-catalog/1` document whose `owner` equals `{sub}`.** Otherwise 422 `invalid catalog: <reason>`.
 5. **No entry's `payloadHash` is blocked.** Otherwise 403 `content is blocked`.
-6. **Every `payloadHash` is an ingested blob.** Otherwise 422 `payload <hash> is not ingested`.
-7. **The node stores the bytes and moves the tag.**
+6. **Every `payloadHash` is an ingested blob.** Otherwise 422 `payload <hash> is not ingested`, naming the first missing payload in entry order.
+7. **Every entry's `payloadSize` equals the ingested blob's size.** Otherwise 422 `payload <hash> size does not match`, naming the first mismatching entry's payload in entry order. Each entry is checked, including entries that share a payload.
+8. **The node stores the bytes and moves the tag.**
    - It stores the bytes at `catalog-documents/<blake3>` and points the tag `catalog/<sub>` at that hash.
    - 200 `{"name":"catalog/<sub>","hash":"<blake3 hex>","size":<bytes>}`.
 
