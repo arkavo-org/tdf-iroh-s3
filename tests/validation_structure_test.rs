@@ -184,3 +184,76 @@ fn unsafe_payload_urls_are_rejected() {
         assert!(validate_tdf_structure(&bytes).is_err(), "{url}");
     }
 }
+
+fn error_chain(result: anyhow::Result<opentdf::TdfManifest>) -> String {
+    format!("{:#}", result.expect_err("refused"))
+}
+
+/// The payload is read to its end, so a corrupt one fails its CRC.
+#[test]
+fn a_corrupt_payload_is_rejected() {
+    let mut bytes = fairplay_layout(FAIRPLAY_MANIFEST, "0.payload");
+    let payload = [4u8; 44];
+    let at = bytes
+        .windows(payload.len())
+        .rposition(|w| w == payload)
+        .expect("stored payload bytes");
+    bytes[at + 10] ^= 0xff;
+    let error = error_chain(validate_tdf_structure(&bytes));
+    assert!(
+        error.contains("payload member \"0.payload\" is corrupt"),
+        "{error}"
+    );
+}
+
+/// An end record listing millions of members is refused before the ZIP
+/// reader reserves memory for them.
+#[test]
+fn a_zip64_end_record_listing_too_many_members_is_rejected() {
+    let mut bytes = fairplay_layout(FAIRPLAY_MANIFEST, "0.payload");
+    let eocd64_at = bytes.len() as u64;
+    // ZIP64 end record: 10 million members.
+    bytes.extend_from_slice(b"PK\x06\x06");
+    bytes.extend_from_slice(&44u64.to_le_bytes()); // record size
+    bytes.extend_from_slice(&45u16.to_le_bytes()); // version made by
+    bytes.extend_from_slice(&45u16.to_le_bytes()); // version needed
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // disk
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // disk with the directory
+    bytes.extend_from_slice(&10_000_000u64.to_le_bytes()); // on this disk
+    bytes.extend_from_slice(&10_000_000u64.to_le_bytes()); // in total
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // directory size
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // directory offset
+    // Its locator.
+    bytes.extend_from_slice(b"PK\x06\x07");
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&eocd64_at.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    // A ZIP32 end record deferring to it.
+    bytes.extend_from_slice(b"PK\x05\x06");
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+    bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+    bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+    bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+    bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    let error = error_chain(validate_tdf_structure(&bytes));
+    assert!(error.contains("lists 10000000 members"), "{error}");
+}
+
+/// The central directory read is bounded, so names cannot fill memory.
+#[test]
+fn a_central_directory_over_its_read_limit_is_rejected() {
+    use tdf_iroh_s3::validation::structure::MAX_CENTRAL_DIRECTORY_READ;
+    let long = "n".repeat(60_000);
+    let names: Vec<String> = (0..300).map(|i| format!("{i:03}{long}")).collect();
+    let mut members: Vec<(&str, &[u8])> = vec![("manifest.json", FAIRPLAY_MANIFEST.as_bytes())];
+    members.extend(names.iter().map(|n| (n.as_str(), &b""[..])));
+    members.push(("0.payload", &[4u8; 44]));
+    let bytes = zip_of(&members);
+    assert!(
+        (300 * 60_000) as u64 > MAX_CENTRAL_DIRECTORY_READ,
+        "the directory exceeds the limit"
+    );
+    let error = error_chain(validate_tdf_structure(&bytes));
+    assert!(error.contains("central directory exceeds"), "{error}");
+}
