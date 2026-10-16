@@ -442,10 +442,15 @@ mod tests {
         );
         assert!(reason(nested.as_bytes()).contains("duplicate key `version`"));
 
-        // An escaped spelling of the same key is the same key.
+        // An escaped spelling of the same key is the same key: `\u006fwner`
+        // is `owner`, at the top level and in an entry.
         let escaped =
-            br#"{"schema":"arkavo.creator-catalog/1","owner":"a","owner":"b","entries":[]}"#;
-        assert!(reason(escaped).contains("duplicate key"));
+            br#"{"schema":"arkavo.creator-catalog/1","owner":"a","\u006fwner":"b","entries":[]}"#;
+        assert!(reason(escaped).contains("duplicate key `owner`"));
+        let escaped_nested = format!(
+            r#"{{"schema":"arkavo.creator-catalog/1","owner":"a","entries":[{{"contentID":"x","\u0063ontentID":"y","version":1,"payloadHash":"{h}","payloadSize":1,"publishedAt":"2026-10-16T14:30:00Z","attributeFQNs":[]}}]}}"#
+        );
+        assert!(reason(escaped_nested.as_bytes()).contains("duplicate key `contentID`"));
     }
 
     #[test]
