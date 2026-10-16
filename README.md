@@ -7,11 +7,20 @@ and stores them in Amazon S3. Serves stored blobs back to any requesting peer.
 
 1. Peers send blobs over Iroh's P2P QUIC protocol
 2. Each blob is validated as a valid TDF (Trusted Data Format):
-   - ZIP structure with manifest.json and payload
+   - At most `[validation] max_blob_bytes` (default 4 GiB)
+   - A ZIP holding an OpenTDF manifest: `manifest.json` with the payload in
+     the member `payload.url` names (other members, such as HLS playlists
+     and fMP4 segments, are allowed), or the legacy `0.manifest.json` +
+     `0.payload`
    - Required attributes present in the policy
    - Optional assertion signature verification
 3. Valid blobs are stored in S3, keyed by BLAKE3 content hash
 4. Any peer can retrieve blobs by hash — the TDF encryption layer handles access control
+
+Creators publish a catalog of their recordings as a JSON document the node
+stores by hash, behind the tag `catalog/<sub>`. The contract between the
+node, the Creator app and the iOS viewer is
+[docs/creator-catalogs.md](docs/creator-catalogs.md).
 
 ## Build
 
@@ -26,26 +35,36 @@ Create a config file (TOML):
 ```toml
 [iroh]
 bind_port = 11204
+# Public ip:port addresses peers can dial directly, reported by GET /node
+# (the node cannot see its elastic IP itself). Default: none.
+public_addresses = ["3.91.18.97:11204"]
 
 [s3]
 bucket = "my-tdf-store"
 region = "us-east-1"
+# S3-compatible stores (LocalStack, MinIO). AWS_ENDPOINT_URL also works.
+# endpoint_url = "http://127.0.0.1:4566"
+# force_path_style = true
 
 [validation]
 required_attributes = [
     "https://example.com/attr/storage/value/permanent"
 ]
+# Larger pushes are refused. Ingest holds the blob in memory, so keep this
+# below the instance's free RAM. Default 4294967296 (4 GiB).
+max_blob_bytes = 4294967296
 
 [validation.assertion]
 enabled = false
 trusted_public_keys = []
 
-# Optional: HTTP tag API for catalog discovery. Tags are stable names
-# pointing at the latest blob hash (e.g. a creator's content catalog).
-# GET /tags/<name> is public; PUT /tags/<name> requires an Arkavo CWT
-# whose subject owns the tag (name must equal "<tag_prefix><sub>").
+# HTTP API: tags, creator catalogs, ingest confirmation, node identity.
+# GET routes are public; writes need an Arkavo CWT whose subject owns the
+# name ("<tag_prefix><sub>").
 [http]
 enabled = true
+# 127.0.0.1 behind a TLS proxy on the same host (default 0.0.0.0).
+bind_address = "127.0.0.1"
 bind_port = 8090
 cose_keys_url = "https://identity.arkavo.net/.well-known/cose-keys"
 expected_issuer = "https://identity.arkavo.net"
@@ -127,7 +146,9 @@ entity_mode = "claims"
 The IAM role needs the same S3 write permissions on `manifests/` and
 `catalog-index/` as on `blobs/` — derived-artifact writes are best-effort
 (a failure is logged and never masks a successful blob ingest; re-pushing
-the content repairs the index).
+the content repairs the index). Creator catalogs need `s3:PutObject` and
+`s3:GetObject` on `catalog-documents/`. See
+[docs/deploy-runbook.md](docs/deploy-runbook.md) for the full policy.
 
 ## Entitled catalog
 
@@ -162,24 +183,45 @@ Attribute definitions resolve as URLs: `GET /attributes` (the full set),
 the namespace host points at this node. See
 `attributes/patreon.arkavo.com.json` for the example artifact.
 
-## Tag API (catalog discovery)
+## HTTP API
 
-Content blobs are immutable, so consumers need a stable pointer to a
-creator's *latest* catalog. With `[http]` enabled:
+With `[http]` enabled the node serves the routes below. TLS terminates in
+the node when `[http.tls]` is set (below), or in a proxy in front of it.
+Every error body is `{"error":"<message>"}`. The creator catalog routes are
+specified in [docs/creator-catalogs.md](docs/creator-catalogs.md).
+
+| Route | Access | Purpose |
+|---|---|---|
+| `GET /healthz` | public | Liveness. |
+| `GET /node` | public | `{"endpointId","relayUrl","directAddresses"}`: the iroh endpoint publishers push to. |
+| `GET /blobs/{hash}` | public | `{"hash","size"}` once a pushed TDF is ingested; 404 until then, or if refused or blocked. |
+| `PUT /catalogs/{sub}` | publisher CWT | Publish a `arkavo.creator-catalog/1` document; moves `catalog/<sub>`. |
+| `GET /catalog-documents/{hash}` | public | A stored catalog document, byte for byte (immutable). |
+| `GET /tags/{name}` | public | Resolve a tag, e.g. `catalog/<sub>`. |
+| `PUT /tags/catalog/{sub}` | publisher CWT | Point the tag at an earlier catalog document of the same subject. |
+| `POST /publish/sessions` | publisher CWT | Gated nodes only; see below. |
 
 ```bash
-# Resolve a creator's catalog pointer (public)
-curl https://iroh.arkavo.net/tags/catalog/arkavo:<user-id>
-# -> {"name":"catalog/arkavo:<user-id>","hash":"<blake3-hex>"}
+# Resolve a creator's catalog, then read it (public)
+curl https://iroh.arkavo.net/tags/catalog/<sub>
+# -> {"name":"catalog/<sub>","hash":"<blake3-hex>"}
+curl https://iroh.arkavo.net/catalog-documents/<blake3-hex>
 
-# Move your own pointer (requires Arkavo CWT; hash must be an ingested blob)
-curl -X PUT https://iroh.arkavo.net/tags/catalog/arkavo:<user-id> \
+# Publish a catalog (the document's exact bytes)
+curl -X PUT https://iroh.arkavo.net/catalogs/<sub> \
   -H "Authorization: Bearer <cwt>" \
   -H "Content-Type: application/json" \
-  -d '{"hash":"<blake3-hex>"}'
+  --data-binary @catalog.json
+# -> {"name":"catalog/<sub>","hash":"<blake3-hex>","size":<bytes>}
 ```
 
-The blob itself is then fetched over the Iroh blobs protocol by hash.
+`<sub>` is the CWT's `sub` exactly as minted; the node never canonicalizes
+it. Recordings themselves are fetched over the Iroh blobs protocol by hash.
+
+On a node with `[publishing] required = false`, writes still need a token
+that verifies; the entitlement, service-token and suspension checks are
+skipped, and nothing is blocked.
+
 TLS terminates in the node when `[http.tls]` is set. The ACM certificate
 must be requested with `--options Export=ENABLED`, and the instance role
 needs `acm:ExportCertificate` on it. The systemd unit grants
@@ -189,7 +231,7 @@ needs `acm:ExportCertificate` on it. The systemd unit grants
 
 Publishing is gated by default (`[publishing] required = true`).
 
-- A tag write needs the Arkavo creator-publishing entitlement in the CWT.
+- A tag or catalog write needs the Arkavo creator-publishing entitlement in the CWT.
 - An iroh push is accepted only from an endpoint that first opened a publish session with `POST /publish/sessions`.
 - Operators suspend creators and block content hashes through `/moderation/*`.
 
@@ -201,20 +243,31 @@ See [docs/publishing-and-moderation.md](docs/publishing-and-moderation.md).
 ./target/release/tdf-iroh-s3 --config config.toml
 ```
 
-## Deploy (AMI)
+## Deploy
 
-Build the AMI with Packer:
-
-```bash
-cargo build --release
-cd packer
-packer build -var "binary_path=../target/release/tdf-iroh-s3" ami.pkr.hcl
-```
-
-Launch an EC2 instance from the AMI, passing config as user-data.
+See [docs/deploy-runbook.md](docs/deploy-runbook.md): building the arm64
+Linux binary, the Packer AMI, configuration, TLS for `iroh.arkavo.net`
+(with a stable, pinned leaf key), IAM and smoke checks.
 
 ## Test
 
 ```bash
 cargo test
 ```
+
+The test CLI drives a running node:
+
+```bash
+cargo run --bin tdf-iroh-s3-test -- --help
+# create-tdf, push, push-raw, fetch, publish-session, publish, put-catalog
+
+# Creator's flow against a node: session (if gated), push, wait for ingest
+cargo run --bin tdf-iroh-s3-test -- publish -n <endpointId> --addr <ip:port> \
+  --url http://127.0.0.1:8090 --token-file token.txt -d recording.tdf
+```
+
+`publish-session` and `push-raw` take `--secret-key-file` so both use the
+same endpoint key, which a gated node's publish session requires.
+`examples/mint_test_idp.rs` emits a local key set and creator token for
+running against a node with `cose_keys_url` pointed at it, and
+`[s3] endpoint_url` + `force_path_style` run the node against LocalStack.

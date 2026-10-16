@@ -44,9 +44,9 @@ The session lasts `[publishing] session_ttl_secs` (default 900).
 - The pusher's subject is recorded at `moderation/publishers/<hash>`.
 - Sessions are held in memory on the node. After a restart, open a new one.
 
-### 2. Point the catalog tag at the new catalog
+### 2. Publish the catalog
 
-Use `PUT /tags/catalog/<sub>` (see the README). It now also requires the entitlement, an unsuspended subject, and a hash that is not blocked.
+Use `PUT /catalogs/<sub>` ([creator-catalogs.md](creator-catalogs.md)), or `PUT /tags/catalog/<sub>` to point the tag back at an earlier catalog. Both require the entitlement, an unsuspended subject, and content that is not blocked.
 
 ### When a membership lapses
 
