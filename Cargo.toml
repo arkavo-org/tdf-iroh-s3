@@ -56,12 +56,15 @@ coset = "0.3"
 ciborium = "0.2"
 p256 = { version = "0.13", features = ["ecdsa"] }
 base64 = "0.22"
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std"] }
 
 [dev-dependencies]
 tempfile = "3"
 zip = "2.2"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+rcgen = "0.14.10"
 
 [[bin]]
 name = "tdf-iroh-s3-test"

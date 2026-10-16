@@ -12,4 +12,5 @@ pub mod ssm;
 pub mod store;
 pub mod tags_api;
 pub mod test_cli;
+pub mod tls;
 pub mod validation;

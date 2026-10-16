@@ -1,0 +1,12 @@
+[Unit]
+Description=Export the TDF-Iroh-S3 HTTPS certificate from ACM
+After=network-online.target tdf-iroh-s3.service
+Wants=network-online.target
+# Retry indefinitely: a failed first-boot export must not wait for the 12h timer.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tdf-iroh-s3-cert-sync
+Restart=on-failure
+RestartSec=60

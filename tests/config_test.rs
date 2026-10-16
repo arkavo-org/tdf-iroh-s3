@@ -138,3 +138,32 @@ session_ttl_secs = 60
     assert_eq!(config.publishing.operator_client_ids, vec!["moderation"]);
     assert_eq!(config.publishing.session_ttl_secs, 60);
 }
+
+#[test]
+fn test_config_http_tls_defaults() {
+    let toml_str = r#"
+[s3]
+bucket = "test-bucket"
+region = "us-east-1"
+
+[http.tls]
+cert_path = "/etc/tdf-iroh-s3/tls/fullchain.pem"
+key_path = "/etc/tdf-iroh-s3/tls/privkey.pem"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    let tls = config.http.tls.expect("tls section");
+    assert_eq!(tls.bind_port, 443);
+    assert_eq!(tls.reload_check_secs, 60);
+    assert!(tls.acm_certificate_arn.is_empty());
+}
+
+#[test]
+fn test_config_http_tls_absent_by_default() {
+    let toml_str = r#"
+[s3]
+bucket = "test-bucket"
+region = "us-east-1"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert!(config.http.tls.is_none());
+}

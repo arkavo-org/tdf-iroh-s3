@@ -18,6 +18,7 @@ use tdf_iroh_s3::node::TdfIrohNode;
 use tdf_iroh_s3::ssm;
 use tdf_iroh_s3::store::s3::S3Client;
 use tdf_iroh_s3::tags_api::{self, ApiState, TagPublishing};
+use tdf_iroh_s3::tls;
 
 #[derive(Parser)]
 #[command(
@@ -36,6 +37,10 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    // reqwest pulls in ring and axum-server pulls in aws-lc-rs; with both
+    // compiled in, rustls needs the process default chosen explicitly.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let cli = Cli::parse();
     let config = Config::from_file(&cli.config)?;
@@ -84,6 +89,7 @@ async fn main() -> Result<()> {
 
     // HTTP tag API (catalog discovery): GET resolution is public; PUT is
     // CWT-authenticated against the configured IdP key set.
+    let mut https = None;
     if node.config.http.enabled {
         let http_cfg = &node.config.http;
         anyhow::ensure!(
@@ -299,11 +305,31 @@ async fn main() -> Result<()> {
             );
         }
 
-        let listener = tokio::net::TcpListener::bind(("0.0.0.0", http_cfg.bind_port)).await?;
+        if let Some(tls_cfg) = &http_cfg.tls {
+            anyhow::ensure!(
+                tls_cfg.bind_port != http_cfg.bind_port,
+                "[http.tls] bind_port {} must differ from [http] bind_port",
+                tls_cfg.bind_port
+            );
+        }
+        // With TLS on, the plain listener stays for on-host checks only.
+        let plain_host = if http_cfg.tls.is_some() {
+            "127.0.0.1"
+        } else {
+            "0.0.0.0"
+        };
+        let listener = tokio::net::TcpListener::bind((plain_host, http_cfg.bind_port)).await?;
         info!(
-            "HTTP tag API listening on port {} (tag prefix {:?})",
-            http_cfg.bind_port, http_cfg.tag_prefix
+            "HTTP tag API listening on {}:{} (tag prefix {:?})",
+            plain_host, http_cfg.bind_port, http_cfg.tag_prefix
         );
+        if let Some(tls_cfg) = &http_cfg.tls {
+            let tls_router = router.clone();
+            let tls_cfg = tls_cfg.clone();
+            https = Some(tokio::spawn(async move {
+                tls::serve_https(&tls_cfg, tls_router).await
+            }));
+        }
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, router).await {
                 tracing::error!("HTTP tag API exited: {e}");
@@ -311,7 +337,24 @@ async fn main() -> Result<()> {
         });
     }
 
-    tokio::signal::ctrl_c().await?;
+    // With TLS on, HTTPS is the only externally reachable API: if it ends,
+    // exit non-zero so systemd restarts the node instead of leaving it dark.
+    if let Some(https) = https {
+        tokio::select! {
+            res = tokio::signal::ctrl_c() => res?,
+            res = https => {
+                let err = match res {
+                    Ok(Ok(())) => anyhow::anyhow!("HTTPS listener stopped"),
+                    Ok(Err(e)) => e,
+                    Err(e) => anyhow::Error::from(e).context("HTTPS task"),
+                };
+                node.shutdown().await?;
+                return Err(err);
+            }
+        }
+    } else {
+        tokio::signal::ctrl_c().await?;
+    }
     info!("Shutting down...");
     node.shutdown().await?;
     info!("Done.");

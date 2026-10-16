@@ -69,6 +69,21 @@ build {
     destination = "/tmp/bootstrap.sh"
   }
 
+  provisioner "file" {
+    source      = "files/cert-sync.sh"
+    destination = "/tmp/cert-sync.sh"
+  }
+
+  provisioner "file" {
+    source      = "files/tdf-iroh-s3-cert-sync.service"
+    destination = "/tmp/tdf-iroh-s3-cert-sync.service"
+  }
+
+  provisioner "file" {
+    source      = "files/tdf-iroh-s3-cert-sync.timer"
+    destination = "/tmp/tdf-iroh-s3-cert-sync.timer"
+  }
+
   provisioner "shell" {
     script          = "scripts/setup-user.sh"
     execute_command = "sudo bash '{{.Path}}'"

@@ -51,6 +51,16 @@ cose_keys_url = "https://identity.arkavo.net/.well-known/cose-keys"
 expected_issuer = "https://identity.arkavo.net"
 tag_prefix = "catalog/"
 
+# Optional: HTTPS terminated by the node itself (rustls). The plain
+# listener above then binds to 127.0.0.1 only. On EC2 the
+# tdf-iroh-s3-cert-sync timer exports the exportable ACM certificate into
+# these files every 12h, and the node reloads them when they change.
+[http.tls]
+bind_port = 443
+cert_path = "/etc/tdf-iroh-s3/tls/fullchain.pem"
+key_path = "/etc/tdf-iroh-s3/tls/privkey.pem"
+acm_certificate_arn = "arn:aws:acm:us-east-1:<account>:certificate/<id>"
+
 # Optional: ingest-time catalog index (see issue #5). Each ingested blob
 # gets a catalog-index/<group>/<hash> entry per value of the grouping
 # attribute in its TDF policy; the extracted manifest.json is stored at
@@ -170,7 +180,10 @@ curl -X PUT https://iroh.arkavo.net/tags/catalog/arkavo:<user-id> \
 ```
 
 The blob itself is then fetched over the Iroh blobs protocol by hash.
-TLS terminates in front of the listener (ALB / reverse proxy).
+TLS terminates in the node when `[http.tls]` is set. The ACM certificate
+must be requested with `--options Export=ENABLED`, and the instance role
+needs `acm:ExportCertificate` on it. The systemd unit grants
+`CAP_NET_BIND_SERVICE` so the service user can bind 443.
 
 ## Publishing and moderation
 
