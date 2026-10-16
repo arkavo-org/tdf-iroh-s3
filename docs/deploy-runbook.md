@@ -1,6 +1,6 @@
 # Deploy runbook: iroh.arkavo.net
 
-This covers deploying the node that serves creator catalogs ([creator-catalogs.md](creator-catalogs.md)) at `iroh.arkavo.net`. The host is an Amazon Linux 2023 arm64 `t4g.medium` with the elastic IP `3.91.18.97`. Iroh listens on UDP 11204, and the HTTP API listens on `127.0.0.1:8090` behind TLS.
+This covers deploying the release that serves creator catalogs ([creator-catalogs.md](creator-catalogs.md)) at `iroh.arkavo.net`. The host is an Amazon Linux 2023 arm64 `t4g.medium` launched from the `tdf-iroh-s3` launch template. Iroh listens on UDP 11204. The node terminates TLS itself on 443 with an ACM-exported certificate (`[http.tls]`, kept current by `cert-sync`; see the README), and its plain listener on 8090 is loopback-only.
 
 ## 1. Build the arm64 Linux binary
 
@@ -35,22 +35,22 @@ packer build ami.pkr.hcl
 
 You can roll the release out in either of two ways.
 
-- **New instance from the AMI.** Launch it with the config below as user-data. `bootstrap.sh` writes user-data to `/etc/tdf-iroh-s3/config.toml` only when that file does not exist. Then move the elastic IP `3.91.18.97` to the new instance.
+- **New instance from the AMI.** Point the launch template at the new AMI, add the configuration below to its user-data, and launch. `bootstrap.sh` writes user-data to `/etc/tdf-iroh-s3/config.toml` only when that file does not exist. Then move the `iroh.arkavo.net` CNAME to the new instance and stop the old one.
 - **In place.** Copy the binary to the running instance and restart the service:
 
   ```bash
-  scp /tmp/tdf-iroh-s3.gz ec2-user@3.91.18.97:/tmp/
-  ssh ec2-user@3.91.18.97 'gunzip -f /tmp/tdf-iroh-s3.gz &&
+  scp /tmp/tdf-iroh-s3.gz ec2-user@<instance>:/tmp/
+  ssh ec2-user@<instance> 'gunzip -f /tmp/tdf-iroh-s3.gz &&
     sudo install -m 755 /tmp/tdf-iroh-s3 /usr/local/bin/tdf-iroh-s3 &&
     sudo systemctl restart tdf-iroh-s3'
   ```
 
-  Edit `/etc/tdf-iroh-s3/config.toml` on the instance before the restart.
+  Edit `/etc/tdf-iroh-s3/config.toml` on the instance before the restart. SSH accepts only the allowlisted address in the security group.
 
   `systemctl stop` and `restart` send SIGTERM, which the node handles by shutting down cleanly. To confirm that the last stop was clean:
 
   ```bash
-  ssh ec2-user@3.91.18.97 'sudo journalctl -u tdf-iroh-s3 | grep -E "SIGTERM received|Done\." | tail -2'
+  ssh ec2-user@<instance> 'sudo journalctl -u tdf-iroh-s3 | grep -E "SIGTERM received|Done\." | tail -2'
   # ... SIGTERM received, shutting down...
   # ... Done.
   ```
@@ -69,165 +69,44 @@ Add these settings to `/etc/tdf-iroh-s3/config.toml`, or to the user-data for a 
 ```toml
 [iroh]
 bind_port = 11204
-# Reported by GET /node as directAddresses. The node cannot see its
-# elastic IP itself.
-public_addresses = ["3.91.18.97:11204"]
+# Reported by GET /node as directAddresses; the node cannot see its own
+# public IP. Use an address that survives a stop and start (an elastic IP).
+# Leave it out rather than list one that changes: publishers then reach the
+# node through its relay.
+public_addresses = ["<public ip>:11204"]
 
 [validation]
 # Larger pushes are refused. The default is 4 GiB (the largest payloadSize
 # a catalog may name).
-max_blob_bytes = 4294967296
+max_blob_bytes = 4294967295
 
 [http]
 enabled = true
-bind_address = "127.0.0.1"   # only the TLS proxy on this host reaches the API
-bind_port = 8090
+bind_port = 8090   # loopback-only while [http.tls] is set
 cose_keys_url = "https://identity.arkavo.net/.well-known/cose-keys"
 expected_issuer = "https://identity.arkavo.net"
 ```
 
 **Memory.** Ingest holds the whole blob in memory: it reads the blob from the iroh store, validates it, and uploads it to S3. A `t4g.medium` has 4 GiB of RAM, so a blob near the 4 GiB default will exhaust memory before it is refused for any other reason.
 
-- On this instance type, set `max_blob_bytes = 2147483648` (2 GiB), or move to an instance with more memory.
+- On this instance type, set `max_blob_bytes = 2147483648` (2 GiB), or move to an instance with more memory. `GET /node` reports the limit as `maxBlobBytes`, and Creator refuses a larger recording before uploading it.
 - The node refuses a blob over the limit before reading it, so a lower limit is safe.
 
 Keep the rest of the config as it is: `[s3]`, `[publishing]` (gated by default) and `[catalog]`.
 
 ## 4. TLS for iroh.arkavo.net
 
-The iOS viewer pins the **leaf certificate's SubjectPublicKeyInfo** (SHA-256, lowercase hex), on top of normal system trust. A renewal must keep the same private key. Otherwise every installed viewer stops connecting until it gets an app update.
+Nothing changes here: the node keeps terminating TLS with the ACM-exported certificate that `cert-sync` installs (`[http.tls]`, README). The security group needs TCP 443 and UDP 11204 open; keep 8090 closed.
 
-### Open the ports
-
-The security group opens only TCP 22 and UDP 11204. Add TCP 80, for the ACME HTTP-01 challenge and the HTTPS redirect, and TCP 443. Keep 8090 closed.
+The iOS viewer pins the **leaf certificate's SubjectPublicKeyInfo** (SHA-256, lowercase hex), on top of normal system trust. Compute the pin it must carry:
 
 ```bash
-SG=<security group id of the instance>
-for port in 80 443; do
-  aws ec2 authorize-security-group-ingress --group-id "$SG" \
-    --ip-permissions "IpProtocol=tcp,FromPort=$port,ToPort=$port,IpRanges=[{CidrIp=0.0.0.0/0}],Ipv6Ranges=[{CidrIpv6=::/0}]"
-done
-```
-
-`iroh.arkavo.net` must resolve to `3.91.18.97`.
-
-### nginx and certbot
-
-AL2023 has no certbot package. Install certbot into a virtualenv, as certbot's own instructions describe:
-
-```bash
-sudo dnf install -y nginx python3 augeas-libs
-sudo python3 -m venv /opt/certbot
-sudo /opt/certbot/bin/pip install --upgrade pip certbot certbot-nginx
-sudo ln -sf /opt/certbot/bin/certbot /usr/bin/certbot
-
-sudo tee /etc/nginx/conf.d/iroh.arkavo.net.conf >/dev/null <<'EOF'
-server {
-    listen 80;
-    listen [::]:80;
-    server_name iroh.arkavo.net;
-
-    # Catalogs are at most 256 KiB, and the node answers a larger one with its
-    # JSON 413. Bodies over 1 MiB get nginx's own 413 page instead.
-    client_max_body_size 1m;
-
-    location / {
-        proxy_pass http://127.0.0.1:8090;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-EOF
-sudo systemctl enable --now nginx
-```
-
-Issue the certificate with an ECDSA P-256 key, and set `--reuse-key` so that every renewal keeps that key:
-
-```bash
-sudo certbot --nginx -d iroh.arkavo.net \
-  --key-type ecdsa --elliptic-curve secp256r1 --reuse-key \
-  --redirect --agree-tos -m <ops email>
-
-# Renewals reuse the key while this says True:
-sudo grep reuse_key /etc/letsencrypt/renewal/iroh.arkavo.net.conf
-```
-
-A certbot installed with pip does not add a renewal timer, and AL2023 has no cron, so add a systemd timer:
-
-```bash
-sudo tee /etc/systemd/system/certbot-renew.service >/dev/null <<'EOF'
-[Unit]
-Description=Renew Let's Encrypt certificates
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/certbot renew --quiet --deploy-hook "systemctl reload nginx"
-EOF
-sudo tee /etc/systemd/system/certbot-renew.timer >/dev/null <<'EOF'
-[Unit]
-Description=Renew Let's Encrypt certificates twice a day
-
-[Timer]
-OnCalendar=*-*-* 00,12:00:00
-RandomizedDelaySec=3600
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-sudo systemctl daemon-reload
-sudo systemctl enable --now certbot-renew.timer
-sudo certbot renew --dry-run
-```
-
-Never pass `--new-key` to certbot, and never delete `/etc/letsencrypt` on this host. Either one replaces the pinned key.
-
-### Compute the pin
-
-Compute the pin from the live endpoint:
-
-```bash
-openssl s_client -connect iroh.arkavo.net:443 -servername iroh.arkavo.net </dev/null \
+echo | openssl s_client -connect iroh.arkavo.net:443 -servername iroh.arkavo.net 2>/dev/null \
   | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256
 # SHA2-256(stdin)= <64 lowercase hex>   <- the pin
 ```
 
-The same value comes from the key on the host:
-
-```bash
-sudo openssl pkey -in /etc/letsencrypt/live/iroh.arkavo.net/privkey.pem -pubout -outform der \
-  | openssl dgst -sha256
-```
-
-Run the first command again after the first renewal. The value must not change.
-
-### Backup pin
-
-Ship two pins in the iOS release configuration: the live key, and a backup key that is generated now and kept offline. If the live key is ever lost or compromised, the backup lets the server move to a new key without breaking installed viewers.
-
-```bash
-# Offline, on a trusted machine. Store iroh-backup.key in the secrets vault, not on the host.
-openssl ecparam -name prime256v1 -genkey -noout -out iroh-backup.key
-openssl pkey -in iroh-backup.key -pubout -outform der | openssl dgst -sha256   # backup pin
-```
-
-To switch to the backup key:
-
-1. Request a certificate for it with a CSR.
-2. Install the certificate in nginx.
-3. Ship a viewer release that pins the new key and a fresh backup.
-
-```bash
-openssl req -new -key iroh-backup.key -subj "/CN=iroh.arkavo.net" \
-  -addext "subjectAltName=DNS:iroh.arkavo.net" -out iroh-backup.csr
-sudo certbot certonly --nginx --csr iroh-backup.csr \
-  --cert-path /etc/nginx/iroh-backup-cert.pem --fullchain-path /etc/nginx/iroh-backup-fullchain.pem
-# Point ssl_certificate / ssl_certificate_key in the nginx server block at the
-# new fullchain and at iroh-backup.key, then: sudo systemctl reload nginx
-```
-
-certbot does not renew certificates issued from a CSR. Repeat the `certonly --csr` command before the certificate expires, which is every 90 days, until a viewer release moves the pins.
+**The pin changes when the key does.** ACM manages the key, and a renewal can come with a new one; then every installed viewer stops reaching the HTTPS routes until it gets an app update. Check the pin after each renewal. Before the iOS release ships pins, decide how renewals keep a pinned key (for example, a viewer release with the next key's pin ahead of each renewal, or a key the team controls). The certificate in use in October 2026 expires on 2027-05-01.
 
 ## 5. IAM
 
@@ -256,9 +135,9 @@ The NodeId (endpoint ID) is a 64-character lowercase hex string. Two places repo
 
 ```bash
 curl -s https://iroh.arkavo.net/node
-# {"endpointId":"<64 hex>","relayUrl":"https://...","directAddresses":["3.91.18.97:11204"]}
+# {"endpointId":"<64 hex>","relayUrl":"https://...","directAddresses":[...],"maxBlobBytes":<bytes>}
 
-ssh ec2-user@3.91.18.97 'sudo journalctl -u tdf-iroh-s3 | grep "Node ID:" | tail -1'
+ssh ec2-user@<instance> 'sudo journalctl -u tdf-iroh-s3 | grep "Node ID:" | tail -1'
 ```
 
 The endpoint ID must match the one in the iOS release configuration.
@@ -270,16 +149,13 @@ curl -fsS https://iroh.arkavo.net/healthz
 # ok
 
 curl -fsS https://iroh.arkavo.net/node
-# endpointId as above; directAddresses ["3.91.18.97:11204"]; relayUrl a URL or null
+# endpointId as above; directAddresses as configured; relayUrl a URL or null; maxBlobBytes
 
 curl -sS https://iroh.arkavo.net/blobs/0000000000000000000000000000000000000000000000000000000000000000
 # {"error":"blob not found"}  (a 502 here means the IAM ListBucket grant is missing)
 
 curl -sS https://iroh.arkavo.net/blobs/<hash of a published TDF>
 # {"hash":"<hash>","size":<bytes>}
-
-curl -sS http://iroh.arkavo.net/healthz -o /dev/null -w '%{http_code}\n'
-# 301 (redirect to https)
 ```
 
 Then compute the pin as in section 4 and compare it with the iOS release configuration.
@@ -288,8 +164,8 @@ Run an end-to-end push and fetch from outside the VPC with the test CLI. On a ga
 
 ```bash
 cargo run --release --bin tdf-iroh-s3-test -- publish \
-  -n <endpointId> --addr 3.91.18.97:11204 \
+  -n <endpointId> --addr <public ip>:11204 \
   --url https://iroh.arkavo.net --token-file token.txt -d recording.tdf
 cargo run --release --bin tdf-iroh-s3-test -- fetch \
-  -n <endpointId> --addr 3.91.18.97:11204 --hash <hash> -o /tmp/check.tdf
+  -n <endpointId> --addr <public ip>:11204 --hash <hash> -o /tmp/check.tdf
 ```

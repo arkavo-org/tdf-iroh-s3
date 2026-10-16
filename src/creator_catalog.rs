@@ -25,7 +25,7 @@ pub const MAX_CONTENT_ID_BYTES: usize = 256;
 /// 2^53 - 1, the largest integer every JSON reader represents exactly.
 pub const MAX_VERSION: u64 = 9_007_199_254_740_991;
 /// 4 GiB.
-pub const MAX_PAYLOAD_SIZE: u64 = 4_294_967_296;
+pub const MAX_PAYLOAD_SIZE: u64 = 4_294_967_295;
 pub const MAX_TITLE_BYTES: usize = 512;
 pub const MAX_ATTRIBUTE_FQNS: usize = 32;
 pub const MAX_ATTRIBUTE_FQN_BYTES: usize = 512;
@@ -147,9 +147,11 @@ fn validate_entry(e: &CreatorCatalogEntry) -> Result<(), String> {
     Ok(())
 }
 
-/// `owner` and `contentID`: `[A-Za-z0-9:._@-]{1,max}`, never containing `..`.
+/// `owner` and `contentID`: `[A-Za-z0-9:._@-]{1,max}`, never `.` and never
+/// containing `..`.
 pub fn valid_identifier(s: &str, max: usize) -> bool {
     (1..=max).contains(&s.len())
+        && s != "."
         && !s.contains("..")
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'.' | b'_' | b'@' | b'-'))
@@ -508,7 +510,12 @@ mod tests {
 
     #[test]
     fn payload_size_is_in_range() {
-        assert!(parse(&entry_with(|e| e["payloadSize"] = json!(4_294_967_296u64))).is_ok());
+        assert!(parse(&entry_with(|e| e["payloadSize"] = json!(4_294_967_295u64))).is_ok());
+        assert!(
+            reason(&entry_with(|e| e["payloadSize"] = json!(4_294_967_296u64)))
+                .contains("payloadSize")
+        );
+        assert!(reason(&entry_with(|e| e["contentID"] = json!("."))).contains("contentID"));
         assert!(parse(&entry_with(|e| e["payloadSize"] = json!(1))).is_ok());
         for v in [json!(0), json!(4_294_967_297u64), json!(-5), json!(2.5)] {
             assert!(

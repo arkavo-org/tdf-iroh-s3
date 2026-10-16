@@ -41,7 +41,7 @@ The document is UTF-8 JSON, at most **262 144 bytes**. The node stores the uploa
   "owner": "5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10",
   "entries": [
     {
-      "contentID": "rec-2b9c4f1e0d8a4c7f",
+      "contentID": "rec-2b9c4f1e0d8a4c7f9e1d3b5a6c8f0e2d",
       "version": 2,
       "payloadHash": "4f8a…64 lowercase hex…",
       "payloadSize": 7342067,
@@ -58,18 +58,18 @@ The document is UTF-8 JSON, at most **262 144 bytes**. The node stores the uploa
 | Field | Rule |
 |---|---|
 | `schema` | Exactly `"arkavo.creator-catalog/1"`. Readers reject any other value. |
-| `owner` | Must equal the tag's `<sub>`: 1–248 bytes of `[A-Za-z0-9:._@-]`, not containing `..`. |
+| `owner` | Must equal the tag's `<sub>`: 1–248 bytes of `[A-Za-z0-9:._@-]`, not `.` and not containing `..`. |
 | `entries` | An array of 0–1000 entries. An empty array is a valid catalog with nothing published. |
 
 **Entry fields**
 
 | Field | Rule |
 |---|---|
-| `contentID` | 1–256 bytes of `[A-Za-z0-9:._@-]`, not containing `..`. It is unique within the document and stays the same when the creator republishes a recording. |
+| `contentID` | 1–256 bytes of `[A-Za-z0-9:._@-]`, not `.` and not containing `..`. It is unique within the document and stays the same when the creator republishes a recording. |
 | `version` | An integer from 1 to 9007199254740991 (2⁵³−1). A republish with different bytes uses a larger version. |
 | `payloadHash` | 64 lowercase hex characters: the BLAKE3 hash of the TDF bytes. At upload, it must name a blob the node has ingested and not blocked. |
-| `payloadSize` | An integer from 1 to 4294967296 (4 GiB): the TDF's size in bytes. At upload, it must equal the size `GET /blobs/<payloadHash>` reports. |
-| `title` | Optional. A string of 1–512 UTF-8 bytes. |
+| `payloadSize` | An integer from 1 to 4294967295 (4 GiB − 1, the viewer's limit): the TDF's size in bytes. At upload, it must equal the size `GET /blobs/<payloadHash>` reports. |
+| `title` | Optional: leave the key out when there is no title (`null` is rejected). A string of 1–512 UTF-8 bytes. |
 | `publishedAt` | RFC 3339 UTC to the second with a `Z` suffix (`YYYY-MM-DDTHH:MM:SSZ`). |
 | `attributeFQNs` | An array of 0–32 URLs: the data attributes in the TDF's policy, for display. They grant nothing. Each URL starts with `https://` followed by a host, is at most 512 bytes, and uses only visible ASCII characters (0x21–0x7E), so it has no spaces or non-ASCII characters. |
 
@@ -197,4 +197,4 @@ A pushed blob is ingested only when it is a ZIP holding an OpenTDF manifest. Ing
 
 The manifest must parse as an OpenTDF manifest, with every required field present.
 
-Blobs larger than `[validation] max_blob_bytes` are refused. The default is 4 GiB.
+Blobs larger than `[validation] max_blob_bytes` are refused. The default is 4294967295 bytes (4 GiB − 1), the largest `payloadSize`.

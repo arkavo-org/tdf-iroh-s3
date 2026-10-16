@@ -51,8 +51,8 @@ required_attributes = [
     "https://example.com/attr/storage/value/permanent"
 ]
 # Larger pushes are refused. Ingest holds the blob in memory, so keep this
-# below the instance's free RAM. Default 4294967296 (4 GiB).
-max_blob_bytes = 4294967296
+# below the instance's free RAM. Default 4294967295 (4 GiB − 1, the viewer's limit).
+max_blob_bytes = 4294967295
 
 [validation.assertion]
 enabled = false
