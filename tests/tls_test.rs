@@ -6,11 +6,27 @@ use axum::routing::get;
 use tdf_iroh_s3::config::TlsConfig;
 use tdf_iroh_s3::tls::serve_https;
 
-fn write_self_signed(dir: &Path) -> String {
+fn install_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+/// Write via rename so the server never sees a half-written file.
+fn write_atomic(path: &Path, contents: &str) {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, contents).unwrap();
+    std::fs::rename(tmp, path).unwrap();
+}
+
+fn self_signed() -> (String, String) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    std::fs::write(dir.join("fullchain.pem"), cert.cert.pem()).unwrap();
-    std::fs::write(dir.join("privkey.pem"), cert.signing_key.serialize_pem()).unwrap();
-    cert.cert.pem()
+    (cert.cert.pem(), cert.signing_key.serialize_pem())
+}
+
+fn write_self_signed(dir: &Path) -> String {
+    let (cert, key) = self_signed();
+    write_atomic(&dir.join("privkey.pem"), &key);
+    write_atomic(&dir.join("fullchain.pem"), &cert);
+    cert
 }
 
 fn free_port() -> u16 {
@@ -52,6 +68,7 @@ where
 
 #[tokio::test]
 async fn https_serves_and_reloads_renewed_cert() {
+    install_provider();
     let dir = tempfile::tempdir().unwrap();
     let first = write_self_signed(dir.path());
     let port = free_port();
@@ -82,6 +99,7 @@ async fn https_serves_and_reloads_renewed_cert() {
 
 #[tokio::test]
 async fn https_waits_for_missing_cert() {
+    install_provider();
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
     let cfg = TlsConfig {
@@ -95,7 +113,10 @@ async fn https_waits_for_missing_cert() {
     let server = tokio::spawn(async move { serve_https(&cfg, router).await });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!server.is_finished(), "missing cert must not end the server");
+    assert!(
+        !server.is_finished(),
+        "missing cert must not end the server"
+    );
 
     let pem = write_self_signed(dir.path());
     let ok = tokio::time::timeout(Duration::from_secs(20), async {
@@ -108,4 +129,41 @@ async fn https_waits_for_missing_cert() {
     })
     .await;
     assert!(ok.is_ok(), "HTTPS never came up once the cert appeared");
+}
+
+#[tokio::test]
+async fn https_retries_a_mismatched_pair() {
+    install_provider();
+    let dir = tempfile::tempdir().unwrap();
+    // Key from one cert, chain from another: what an interrupted sync leaves.
+    let (_, stray_key) = self_signed();
+    let (cert, _) = self_signed();
+    write_atomic(&dir.path().join("privkey.pem"), &stray_key);
+    write_atomic(&dir.path().join("fullchain.pem"), &cert);
+
+    let port = free_port();
+    let cfg = TlsConfig {
+        bind_port: port,
+        cert_path: dir.path().join("fullchain.pem"),
+        key_path: dir.path().join("privkey.pem"),
+        acm_certificate_arn: String::new(),
+        reload_check_secs: 1,
+    };
+    let router = Router::new().route("/healthz", get(|| async { "ok" }));
+    let server = tokio::spawn(async move { serve_https(&cfg, router).await });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !server.is_finished(),
+        "an unloadable pair must not end the server"
+    );
+
+    let pem = write_self_signed(dir.path());
+    let ok = tokio::time::timeout(Duration::from_secs(20), async {
+        while get_healthz(port, &pem).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await;
+    assert!(ok.is_ok(), "HTTPS never came up once the pair was repaired");
 }

@@ -5,7 +5,7 @@
 //! a restart.
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
@@ -15,37 +15,17 @@ use tracing::{info, warn};
 
 use crate::config::TlsConfig;
 
+/// How often a missing or unloadable cert/key pair is retried at startup.
+const LOAD_RETRY: Duration = Duration::from_secs(10);
+
 /// Serve `router` over HTTPS on `cfg.bind_port` until the server fails.
 ///
-/// A cert or key that is not there yet (first boot, before cert-sync has run)
-/// is waited for rather than treated as fatal, so the iroh node keeps running.
+/// A cert/key pair that is missing or does not load yet (first boot before
+/// cert-sync has run, or a pair caught mid-write) is retried rather than
+/// treated as fatal, so the iroh node keeps running meanwhile. Only a failure
+/// of the listener itself is returned.
 pub async fn serve_https(cfg: &TlsConfig, router: Router) -> anyhow::Result<()> {
-    // reqwest pulls in ring and axum-server pulls in aws-lc-rs; with both
-    // compiled in, rustls needs the process default chosen explicitly.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-    let mut warned = false;
-    while !(cfg.cert_path.exists() && cfg.key_path.exists()) {
-        if !warned {
-            warn!(
-                "HTTPS waiting for {} and {}",
-                cfg.cert_path.display(),
-                cfg.key_path.display()
-            );
-            warned = true;
-        }
-        tokio::time::sleep(Duration::from_secs(10)).await;
-    }
-
-    let config = RustlsConfig::from_pem_file(&cfg.cert_path, &cfg.key_path)
-        .await
-        .with_context(|| {
-            format!(
-                "loading TLS cert {} / key {}",
-                cfg.cert_path.display(),
-                cfg.key_path.display()
-            )
-        })?;
+    let config = load_when_ready(&cfg.cert_path, &cfg.key_path).await;
 
     tokio::spawn(reload_on_change(
         config.clone(),
@@ -62,13 +42,40 @@ pub async fn serve_https(cfg: &TlsConfig, router: Router) -> anyhow::Result<()> 
         .with_context(|| format!("HTTPS listener on port {}", cfg.bind_port))
 }
 
+async fn load_when_ready(cert_path: &Path, key_path: &Path) -> RustlsConfig {
+    let mut last_err = String::new();
+    loop {
+        let res = if cert_path.exists() && key_path.exists() {
+            RustlsConfig::from_pem_file(cert_path, key_path)
+                .await
+                .map_err(|e| e.to_string())
+        } else {
+            Err("cert or key file missing".to_string())
+        };
+        match res {
+            Ok(config) => return config,
+            Err(e) => {
+                if e != last_err {
+                    warn!(
+                        "HTTPS waiting for a loadable cert {} / key {}: {e}",
+                        cert_path.display(),
+                        key_path.display()
+                    );
+                    last_err = e;
+                }
+            }
+        }
+        tokio::time::sleep(LOAD_RETRY).await;
+    }
+}
+
 /// Poll both files' mtimes and reload the pair when either changes. A pair
 /// that fails to load (say, caught halfway through a write) keeps the
 /// previous certificate in service and is retried on the next tick.
 async fn reload_on_change(
     config: RustlsConfig,
-    cert_path: std::path::PathBuf,
-    key_path: std::path::PathBuf,
+    cert_path: PathBuf,
+    key_path: PathBuf,
     every: Duration,
 ) {
     let mut loaded = mtimes(&cert_path, &key_path);

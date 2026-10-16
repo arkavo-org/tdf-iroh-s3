@@ -7,12 +7,21 @@ set -euo pipefail
 CONFIG_PATH="/etc/tdf-iroh-s3/config.toml"
 SERVICE_USER="tdf-iroh-s3"
 
-# Value of `key = "..."` inside the [http.tls] table of the config.
+# Value of `key = "..."` (or '...') inside the [http.tls] table. Only the
+# standard table form is understood; an inline `tls = { ... }` under [http]
+# is not, and is reported below rather than silently skipped.
 tls_value() {
     awk -v key="$1" '
-        /^\s*\[/ { in_tls = ($0 ~ /^\s*\[http\.tls\]\s*$/); next }
-        in_tls && $0 ~ "^\\s*" key "\\s*=" {
-            sub(/^[^=]*=\s*"/, ""); sub(/".*$/, ""); print; exit
+        /^[[:space:]]*\[/ {
+            in_tls = ($0 ~ /^[[:space:]]*\[http\.tls\][[:space:]]*(#.*)?$/); next
+        }
+        in_tls && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            v = $0
+            sub(/^[^=]*=[[:space:]]*/, "", v)
+            q = substr(v, 1, 1)
+            if (q == "\"" || q == "\047") { v = substr(v, 2); sub(q ".*$", "", v) }
+            else { sub(/[[:space:]]*(#.*)?$/, "", v) }
+            print v; exit
         }' "$CONFIG_PATH"
 }
 
@@ -22,6 +31,10 @@ CERT_ARN=$(tls_value acm_certificate_arn)
 CERT_PATH=$(tls_value cert_path)
 KEY_PATH=$(tls_value key_path)
 if [ -z "$CERT_ARN" ]; then
+    if grep -Eq '^[[:space:]]*tls[[:space:]]*=[[:space:]]*\{' "$CONFIG_PATH"; then
+        echo "ERROR: inline [http] tls = { ... } is not supported; use a [http.tls] table" >&2
+        exit 1
+    fi
     echo "[http.tls] acm_certificate_arn not set; nothing to sync"
     exit 0
 fi
@@ -56,12 +69,21 @@ PY
 
 openssl pkey -in "$WORK/key.enc.pem" -passin "file:$WORK/pass" -out "$WORK/privkey.pem"
 
-if [ -f "$CERT_PATH" ] && cmp -s "$WORK/fullchain.pem" "$CERT_PATH"; then
+# Up to date only if the chain is unchanged AND the key on disk still
+# belongs to it; a missing, corrupt or relocated key gets rewritten.
+pubkey_of_cert() { openssl x509 -in "$1" -noout -pubkey 2>/dev/null; }
+pubkey_of_key() { openssl pkey -in "$1" -pubout 2>/dev/null; }
+if [ -f "$CERT_PATH" ] && [ -f "$KEY_PATH" ] \
+    && cmp -s "$WORK/fullchain.pem" "$CERT_PATH" \
+    && [ "$(pubkey_of_cert "$CERT_PATH")" = "$(pubkey_of_key "$KEY_PATH")" ]; then
     echo "Certificate unchanged ($(openssl x509 -in "$CERT_PATH" -noout -enddate))"
     exit 0
 fi
 
-install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 750 "$(dirname "$CERT_PATH")" "$(dirname "$KEY_PATH")"
+# Create missing parent dirs only; never re-own or re-mode an existing one.
+for d in "$(dirname "$CERT_PATH")" "$(dirname "$KEY_PATH")"; do
+    [ -d "$d" ] || install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 750 "$d"
+done
 # Key first, then chain: the node reloads when either changes and a pair it
 # cannot load keeps the old certificate in service until the next check.
 install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 600 "$WORK/privkey.pem" "$KEY_PATH.tmp"
