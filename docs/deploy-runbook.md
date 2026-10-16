@@ -117,7 +117,9 @@ server {
     listen [::]:80;
     server_name iroh.arkavo.net;
 
-    client_max_body_size 1m;   # catalogs are at most 256 KiB; the node answers 413
+    # Catalogs are at most 256 KiB, and the node answers a larger one with its
+    # JSON 413. Bodies over 1 MiB get nginx's own 413 page instead.
+    client_max_body_size 1m;
 
     location / {
         proxy_pass http://127.0.0.1:8090;
