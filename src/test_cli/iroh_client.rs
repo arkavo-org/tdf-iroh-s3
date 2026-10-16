@@ -3,7 +3,8 @@ use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_base::TransportAddr;
 use iroh_blobs::BlobsProtocol;
-use iroh_blobs::protocol::{GetRequest, PushRequest};
+use iroh_blobs::api::blobs::Bitfield;
+use iroh_blobs::protocol::{GetManyRequest, GetRequest, ObserveRequest, PushRequest};
 use iroh_blobs::store::mem::MemStore;
 use iroh_blobs::{Hash, HashAndFormat};
 use std::collections::BTreeSet;
@@ -139,7 +140,9 @@ impl IrohTestClient {
         Ok(hash)
     }
 
-    /// Fetch a blob from a remote node by hash.
+    /// Fetch a blob from a remote node by hash. A blob already complete in
+    /// this client's store is returned without asking the node, so a client
+    /// that pushed a blob cannot use this to check the node has it.
     pub async fn fetch_from_node(
         &self,
         addr: impl Into<EndpointAddr>,
@@ -169,6 +172,61 @@ impl IrohTestClient {
             .context("Failed to read fetched blob from local store")?;
 
         Ok(data)
+    }
+
+    /// Fetch blobs from a remote node with one get-many request, returning
+    /// them in the order of `hashes`. Unlike [`Self::fetch_from_node`], this
+    /// asks the node even for blobs this client already holds.
+    pub async fn get_many_from_node(
+        &self,
+        addr: impl Into<EndpointAddr>,
+        hashes: &[Hash],
+    ) -> Result<Vec<bytes::Bytes>> {
+        let conn = self
+            .endpoint
+            .connect(addr, iroh_blobs::ALPN)
+            .await
+            .context("Failed to connect to remote node")?;
+        self.store
+            .remote()
+            .execute_get_many(conn, GetManyRequest::from_iter(hashes.iter().copied()))
+            .complete()
+            .await
+            .context("Failed to get blobs from remote node")?;
+        let mut blobs = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            blobs.push(
+                self.store
+                    .get_bytes(*hash)
+                    .await
+                    .context("Failed to read fetched blob from local store")?,
+            );
+        }
+        Ok(blobs)
+    }
+
+    /// The remote node's first answer to an observe request: which ranges of
+    /// the blob it holds. Observing a hash the node does not hold can create an
+    /// empty entry for it there.
+    pub async fn observe_on_node(
+        &self,
+        addr: impl Into<EndpointAddr>,
+        hash: Hash,
+    ) -> Result<Bitfield> {
+        use futures::StreamExt;
+
+        let conn = self
+            .endpoint
+            .connect(addr, iroh_blobs::ALPN)
+            .await
+            .context("Failed to connect to remote node")?;
+        let updates = self.store.remote().observe(conn, ObserveRequest::new(hash));
+        let mut updates = std::pin::pin!(updates);
+        updates
+            .next()
+            .await
+            .context("Observe stream ended without an answer")?
+            .context("Failed to observe blob on remote node")
     }
 
     /// Shut down the client endpoint.

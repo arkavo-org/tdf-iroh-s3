@@ -38,7 +38,7 @@ Iroh peer (QUIC) → Endpoint → FsStore (publish gate on push)
 
 ### Key Modules
 
-- **`node.rs`** — `TdfIrohNode`: Iroh endpoint lifecycle, binds QUIC port, registers BlobsProtocol, runs the ingest loop (push gate, blocked-fetch refusal). S3 client and config shared via `Arc`.
+- **`node.rs`** — `TdfIrohNode`: Iroh endpoint lifecycle, binds QUIC port, registers BlobsProtocol, runs the ingest loop: with a gate it intercepts push, get, get_many and observe (push gate, blocked-hash refusal); without one it only takes push notifications. Each request type follows its own `EventMask` field (iroh-blobs#270), and push is `Disabled` by default. S3 client and config shared via `Arc`.
 - **`ingest.rs`** — `ingest_from_store()` / `ingest_blob()`: size check → validate → hash → deduplicate → upload → derived artifacts.
 - **`validation/`** — `max_blob_bytes` check, then three stages: `structure.rs` (ZIP/manifest via `opentdf::TdfArchive`: spec layout `manifest.json` + the member `payload.url` names, or legacy `0.manifest.json` + `0.payload`), `attributes.rs` (required FQN lookup in policy), `assertion.rs` (policy binding hash + optional signature verification).
 - **`catalog.rs`** / **`catalog_api.rs`** — ingest-time index (`manifests/`, `catalog-index/<group>/`) and the entitled `GET /catalog/{group}` listing (AuthZEN decisions via `authz.rs`). Policies come in the spec form (`{"attribute": "<FQN>"}`) and opentdf-rs's structured form; both are read.

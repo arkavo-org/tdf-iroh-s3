@@ -1,14 +1,21 @@
-//! Integration test: push a TDF blob to a node, verify it arrives and is accessible.
+//! Integration tests: push blobs to a running node over iroh and check what
+//! it stores, ingests and serves.
 //!
-//! Note: This test does NOT verify S3 upload (requires LocalStack/MinIO).
-//! It verifies the network flow: push -> node stores blob -> blob fetchable.
+//! S3 is a loopback fake that records the keys the node writes. Ingest
+//! uploads `blobs/<hash>` only after the blob validates as a TDF, so that key
+//! shows a push reached ingest.
 //!
-//! The FsStore's direct `status()` API does not reflect blobs received via the
-//! iroh-blobs push protocol (they are stored internally by BlobsProtocol and
-//! served via the network protocol). We verify accessibility by fetching the
-//! blob back from the node over the iroh-blobs GET protocol.
+//! A check that the node holds a blob fetches it with a client that did not
+//! push it: `fetch_from_node` returns a blob the client already holds
+//! without asking the node.
 
-use std::sync::Arc;
+use axum::body::Bytes;
+use axum::http::{Method, StatusCode, Uri};
+use axum::response::IntoResponse;
+use iroh_blobs::Hash;
+use iroh_blobs::api::blobs::BlobStatus;
+use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tdf_iroh_s3::config::{
     CatalogConfig, Config, HttpConfig, IrohConfig, PublishingConfig, S3Config, ValidationConfig,
@@ -16,6 +23,9 @@ use tdf_iroh_s3::config::{
 use tdf_iroh_s3::moderation::{Moderation, PublishGate};
 use tdf_iroh_s3::node::TdfIrohNode;
 use tdf_iroh_s3::test_cli::iroh_client::IrohTestClient;
+
+const BUCKET: &str = "test-bucket";
+const INGEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn test_config(data_dir: &str) -> Config {
     Config {
@@ -26,7 +36,7 @@ fn test_config(data_dir: &str) -> Config {
             public_addresses: Vec::new(),
         },
         s3: S3Config {
-            bucket: "test-bucket".to_string(),
+            bucket: BUCKET.to_string(),
             region: "us-east-1".to_string(),
             prefix: String::new(),
             endpoint_url: String::new(),
@@ -39,136 +49,280 @@ fn test_config(data_dir: &str) -> Config {
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn test_push_blob_stored_in_node() {
-    // Set dummy AWS credentials so S3Client::new doesn't hang
-    // trying to reach the IMDS endpoint.
+/// Dummy credentials, so the AWS SDK neither fails nor queries IMDS.
+fn set_dummy_aws_credentials() {
     // SAFETY: current_thread runtime ensures no other threads read env vars concurrently.
     unsafe {
         std::env::set_var("AWS_ACCESS_KEY_ID", "test");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
     }
+}
 
-    let tmp_dir = tempfile::tempdir().unwrap();
-    let config = test_config(tmp_dir.path().to_str().unwrap());
+/// A loopback stand-in for S3. HEAD answers 404, so every blob is new. PUT
+/// succeeds and records its key.
+#[derive(Clone, Default)]
+struct FakeS3 {
+    puts: Arc<Mutex<Vec<String>>>,
+}
 
-    let node = TdfIrohNode::spawn(config).await.unwrap();
+impl FakeS3 {
+    /// Serve on a random loopback port and return the endpoint URL.
+    async fn start() -> (Self, String) {
+        let s3 = Self::default();
+        let puts = Arc::clone(&s3.puts);
+        let app = axum::Router::new().fallback(move |method: Method, uri: Uri, _body: Bytes| {
+            let puts = Arc::clone(&puts);
+            async move {
+                if method == Method::PUT {
+                    let path = uri.path();
+                    let key = path.strip_prefix(&format!("/{BUCKET}/")).unwrap_or(path);
+                    puts.lock().unwrap().push(key.to_string());
+                    (StatusCode::OK, [("etag", "\"fake\"")]).into_response()
+                } else {
+                    StatusCode::NOT_FOUND.into_response()
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        (s3, url)
+    }
+
+    fn has_put(&self, key: &str) -> bool {
+        self.puts.lock().unwrap().iter().any(|k| k == key)
+    }
+
+    /// Whether `key` is written within [`INGEST_TIMEOUT`].
+    async fn wait_for_put(&self, key: &str) -> bool {
+        let deadline = tokio::time::Instant::now() + INGEST_TIMEOUT;
+        while tokio::time::Instant::now() < deadline {
+            if self.has_put(key) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        self.has_put(key)
+    }
+}
+
+/// A node writing to a fresh [`FakeS3`], gated when `gate` is given.
+async fn spawn_node(gate: Option<Arc<PublishGate>>) -> (TdfIrohNode, FakeS3, tempfile::TempDir) {
+    set_dummy_aws_credentials();
+    let (s3, endpoint_url) = FakeS3::start().await;
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(data_dir.path().to_str().unwrap());
+    config.s3.endpoint_url = endpoint_url;
+    config.s3.force_path_style = true;
+    let node = TdfIrohNode::spawn_with_gate(config, gate).await.unwrap();
+    (node, s3, data_dir)
+}
+
+fn blob_key(hash: Hash) -> String {
+    format!("blobs/{}", hash.to_hex())
+}
+
+/// A refused push leaves nothing behind: the node's store does not have
+/// the blob, the node serves nothing for it, and ingest never uploads it.
+async fn assert_push_not_taken(node: &TdfIrohNode, s3: &FakeS3, hash: Hash) {
+    // push_to_node waited 500 ms after the transfer, time enough for a
+    // wrongly accepted push to land.
+    let status = node.store().status(hash).await.unwrap();
+    assert!(
+        matches!(status, BlobStatus::NotFound),
+        "a refused push must not be stored, status: {status:?}"
+    );
+    let probe = IrohTestClient::new().await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            probe.fetch_from_node(node.addr().id, hash)
+        )
+        .await
+        .is_ok_and(|r| r.is_err()),
+        "a refused push must not be served"
+    );
+    probe.shutdown().await.unwrap();
+    assert!(
+        !s3.has_put(&blob_key(hash)),
+        "a refused push must not be ingested"
+    );
+}
+
+/// iroh-blobs resets a request the event handler refused with
+/// ERR_PERMISSION (1). A request the handler left unanswered would be reset
+/// with ERR_INTERNAL (3).
+fn assert_refused_for_permission<T: std::fmt::Debug>(result: anyhow::Result<T>, request: &str) {
+    let error = format!("{:#}", result.expect_err(request));
+    assert!(
+        error.contains("reset by peer: error 1"),
+        "{request}: expected a permission refusal, got: {error}"
+    );
+}
+
+/// Without a gate, a push is accepted, ingested and served. Ingest runs only
+/// because the mask enables push events.
+#[tokio::test(flavor = "current_thread")]
+async fn test_ungated_push_is_ingested_and_served() {
+    let (node, s3, _data_dir) = spawn_node(None).await;
     let node_id = node.addr().id;
 
-    // Create a valid TDF blob
-    let tdf_bytes = create_test_tdf();
-
-    // Push it to the node
-    let client = IrohTestClient::new().await.unwrap();
-    let hash = client.push_to_node(node_id, &tdf_bytes).await.unwrap();
-
-    // Verify the blob is accessible by fetching it back from the node
-    // (fetch_from_node blocks until the blob is available over the protocol)
-    let fetched = client.fetch_from_node(node_id, hash).await.unwrap();
-    assert_eq!(
-        fetched.as_ref(),
-        tdf_bytes.as_slice(),
-        "Fetched blob should match the original TDF bytes"
+    let tdf = create_test_tdf();
+    let pusher = IrohTestClient::new().await.unwrap();
+    let hash = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    assert!(
+        s3.wait_for_put(&blob_key(hash)).await,
+        "an ungated push must be ingested"
     );
+    assert!(s3.has_put(&format!("manifests/{}", hash.to_hex())));
 
-    client.shutdown().await.unwrap();
+    let viewer = IrohTestClient::new().await.unwrap();
+    let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
+    assert_eq!(fetched.as_ref(), tdf.as_slice());
+
+    for c in [pusher, viewer] {
+        c.shutdown().await.unwrap();
+    }
     node.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_push_invalid_blob_does_not_crash_node() {
-    // SAFETY: current_thread runtime ensures no other threads read env vars concurrently.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
-    }
-
-    let tmp_dir = tempfile::tempdir().unwrap();
-    let config = test_config(tmp_dir.path().to_str().unwrap());
-
-    let node = TdfIrohNode::spawn(config).await.unwrap();
+    let (node, s3, _data_dir) = spawn_node(None).await;
     let node_id = node.addr().id;
 
-    // Push garbage (non-TDF) bytes to the node
+    // Garbage (non-TDF) bytes are stored and served, but not ingested.
     let garbage = vec![0xDEu8; 256];
-    let client = IrohTestClient::new().await.unwrap();
-    let hash = client.push_to_node(node_id, &garbage).await.unwrap();
-
-    // Give the ingest loop time to attempt (and reject) the blob
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    // The node should still be alive — verify by fetching the blob back
-    // (it's stored in FsStore even though ingest to S3 was rejected)
-    let fetched = client.fetch_from_node(node_id, hash).await.unwrap();
+    let pusher = IrohTestClient::new().await.unwrap();
+    let hash = pusher.push_to_node(node_id, &garbage).await.unwrap();
+    let viewer = IrohTestClient::new().await.unwrap();
+    let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
     assert_eq!(fetched.as_ref(), garbage.as_slice());
+    assert!(!s3.has_put(&blob_key(hash)));
 
-    client.shutdown().await.unwrap();
+    // The ingest loop survives the rejection: the next TDF is ingested.
+    let tdf = create_test_tdf();
+    let hash = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    assert!(s3.wait_for_put(&blob_key(hash)).await);
+
+    for c in [pusher, viewer] {
+        c.shutdown().await.unwrap();
+    }
     node.shutdown().await.unwrap();
 }
 
-/// A gated node (tdf-iroh-s3#17): pushes need a publish session for the
-/// pushing endpoint, and blocked hashes are not served.
+/// A gated node (tdf-iroh-s3#17) takes a push only from an endpoint with a
+/// publish session whose subject is not suspended.
 #[tokio::test(flavor = "current_thread")]
-async fn test_gated_node_needs_a_session_and_refuses_blocked_fetches() {
-    // SAFETY: current_thread runtime ensures no other threads read env vars concurrently.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
-    }
-
-    let tmp_dir = tempfile::tempdir().unwrap();
-    let config = test_config(tmp_dir.path().to_str().unwrap());
+async fn test_gated_push_needs_a_session() {
     let gate = Arc::new(PublishGate::new(Arc::new(Moderation::default())));
-    let node = TdfIrohNode::spawn_with_gate(config, Some(Arc::clone(&gate)))
-        .await
-        .unwrap();
+    let (node, s3, _data_dir) = spawn_node(Some(Arc::clone(&gate))).await;
     let node_id = node.addr().id;
 
     // No session: the push is refused and nothing is stored. (The pusher
     // may not see the refusal; the node simply never takes the blob.)
     let stranger = IrohTestClient::new().await.unwrap();
-    let refused = vec![0x11u8; 128];
+    let refused = create_test_tdf();
     let _ = stranger.push_to_node(node_id, &refused).await;
-    let hash = blake3_hash(&refused);
-    let probe = IrohTestClient::new().await.unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), probe.fetch_from_node(node_id, hash))
-            .await
-            .map_or(true, |r| r.is_err()),
-        "a refused push must not be stored"
-    );
-    probe.shutdown().await.unwrap();
+    assert_push_not_taken(&node, &s3, Hash::new(&refused)).await;
 
-    // A session for this endpoint: the push lands and is served.
+    // A session for this endpoint: the push is ingested, its publisher is
+    // recorded, and it is served.
     let creator = IrohTestClient::new().await.unwrap();
     gate.open_session(
         creator.endpoint_id(),
         "arkavo:creator-1",
         Duration::from_secs(60),
     );
-    let accepted = vec![0x22u8; 128];
+    let accepted = create_test_tdf();
     let hash = creator
         .push_to_node(node_id, &accepted)
         .await
         .map_err(|e| format!("{e:#}"))
         .unwrap();
+    assert!(
+        s3.wait_for_put(&blob_key(hash)).await,
+        "a push with a session must be ingested"
+    );
+    assert!(
+        s3.wait_for_put(&format!("moderation/publishers/{}", hash.to_hex()))
+            .await,
+        "the publisher of an ingested push must be recorded"
+    );
     let viewer = IrohTestClient::new().await.unwrap();
     let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
     assert_eq!(fetched.as_ref(), accepted.as_slice());
 
-    // Blocked: no longer served to anyone.
-    gate.moderation.block_for_test(&hash.to_hex());
-    let other = IrohTestClient::new().await.unwrap();
-    assert!(other.fetch_from_node(node_id, hash).await.is_err());
+    // A suspended subject: refused although the session is live.
+    gate.moderation.suspend_for_test("arkavo:creator-1", false);
+    let suspended = create_test_tdf();
+    let _ = creator.push_to_node(node_id, &suspended).await;
+    assert_push_not_taken(&node, &s3, Hash::new(&suspended)).await;
 
-    for c in [stranger, creator, viewer, other] {
+    for c in [stranger, creator, viewer] {
         c.shutdown().await.unwrap();
     }
     node.shutdown().await.unwrap();
 }
 
-fn blake3_hash(data: &[u8]) -> iroh_blobs::Hash {
-    iroh_blobs::Hash::new(data)
+/// A blocked hash is refused for get, get_many and observe, each with a
+/// permission error, while another hash is still served for each.
+#[tokio::test(flavor = "current_thread")]
+async fn test_gated_node_refuses_blocked_hashes() {
+    let gate = Arc::new(PublishGate::new(Arc::new(Moderation::default())));
+    let (node, _s3, _data_dir) = spawn_node(Some(Arc::clone(&gate))).await;
+    let node_id = node.addr().id;
+
+    let creator = IrohTestClient::new().await.unwrap();
+    gate.open_session(
+        creator.endpoint_id(),
+        "arkavo:creator-1",
+        Duration::from_secs(60),
+    );
+    let blocked_bytes = vec![0x22u8; 128];
+    let open_bytes = vec![0x33u8; 256];
+    let blocked = creator.push_to_node(node_id, &blocked_bytes).await.unwrap();
+    let open = creator.push_to_node(node_id, &open_bytes).await.unwrap();
+
+    // Served before the block.
+    let viewer = IrohTestClient::new().await.unwrap();
+    let fetched = viewer.fetch_from_node(node_id, blocked).await.unwrap();
+    assert_eq!(fetched.as_ref(), blocked_bytes.as_slice());
+
+    gate.moderation.block_for_test(&blocked.to_hex());
+
+    // get
+    let client = IrohTestClient::new().await.unwrap();
+    let fetched = client.fetch_from_node(node_id, open).await.unwrap();
+    assert_eq!(fetched.as_ref(), open_bytes.as_slice());
+    assert_refused_for_permission(client.fetch_from_node(node_id, blocked).await, "get");
+
+    // get_many: refused when any of its hashes is blocked.
+    let client = IrohTestClient::new().await.unwrap();
+    let fetched = client.get_many_from_node(node_id, &[open]).await.unwrap();
+    assert_eq!(fetched, vec![Bytes::from(open_bytes.clone())]);
+    assert_refused_for_permission(
+        client.get_many_from_node(node_id, &[blocked]).await,
+        "get_many",
+    );
+    assert_refused_for_permission(
+        client.get_many_from_node(node_id, &[open, blocked]).await,
+        "get_many with a blocked hash among others",
+    );
+
+    // observe
+    let client = IrohTestClient::new().await.unwrap();
+    let bitfield = client.observe_on_node(node_id, open).await.unwrap();
+    assert!(bitfield.is_complete());
+    assert_eq!(bitfield.size(), open_bytes.len() as u64);
+    assert_refused_for_permission(client.observe_on_node(node_id, blocked).await, "observe");
+
+    for c in [creator, viewer] {
+        c.shutdown().await.unwrap();
+    }
+    node.shutdown().await.unwrap();
 }
 
 fn create_test_tdf() -> Vec<u8> {
@@ -196,11 +350,7 @@ async fn test_node_route_reports_the_running_endpoint() {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    // SAFETY: current_thread runtime ensures no other threads read env vars concurrently.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
-    }
+    set_dummy_aws_credentials();
     let tmp_dir = tempfile::tempdir().unwrap();
     let mut config = test_config(tmp_dir.path().to_str().unwrap());
     config.iroh.public_addresses = vec!["203.0.113.7:11204".parse().unwrap()];

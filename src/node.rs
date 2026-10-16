@@ -4,7 +4,8 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::BlobsProtocol;
 use iroh_blobs::provider::events::{
-    AbortReason, ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
+    AbortReason, ConnectMode, EventMask, EventSender, ObserveMode, ProviderMessage, RequestMode,
+    RequestUpdate,
 };
 use iroh_blobs::store::fs::FsStore;
 use std::net::Ipv4Addr;
@@ -71,23 +72,34 @@ impl TdfIrohNode {
 
         let cancel = CancellationToken::new();
 
-        // iroh-blobs 0.103's EventSender::request() reads only `mask.get`, for
-        // every request type (get, get_many, push, observe). With a gate,
-        // Intercept lets the loop refuse a request. In both Intercept and
-        // Notify the update stream carries no events and closes when the
-        // transfer ends, which `wait_and_ingest` waits for. (InterceptLog
-        // would reset any request whose update stream the loop stopped
-        // reading.) `connected: Intercept` reports each connection's
-        // authenticated endpoint ID: the pusher.
+        // Each request type follows its own field of the mask. A field left
+        // at `EventMask::DEFAULT` sends no events; for push, DEFAULT is
+        // `Disabled`, which refuses every push. Ingest starts from push
+        // events, so both masks enable push.
+        //
+        // With a gate, every request type is intercepted and
+        // `run_ingest_loop` answers each one. A push needs a publish
+        // session. A blocked hash is refused for get, get_many and observe.
+        // `connected: Intercept` reports each connection's authenticated
+        // endpoint ID, which identifies the pusher. Without a gate, push
+        // events only notify, and no other request type sends events.
+        //
+        // In both Intercept and Notify the update stream carries no events.
+        // It closes when the transfer ends, and `wait_and_ingest` waits for
+        // that. InterceptLog would reset any request whose update stream
+        // the loop stopped reading.
         let mask = if gate.is_some() {
             EventMask {
                 connected: ConnectMode::Intercept,
                 get: RequestMode::Intercept,
+                get_many: RequestMode::Intercept,
+                push: RequestMode::Intercept,
+                observe: ObserveMode::Intercept,
                 ..EventMask::DEFAULT
             }
         } else {
             EventMask {
-                get: RequestMode::Notify,
+                push: RequestMode::Notify,
                 ..EventMask::DEFAULT
             }
         };
@@ -170,6 +182,11 @@ async fn run_ingest_loop(
                 if let Some(ref m) = msg {
                     info!("Received provider message: {:?}", m);
                 }
+                // Every message with a `tx` holds its request until it is
+                // answered, so each arm answers. A dropped `tx` refuses the
+                // request (iroh-blobs resets it with an internal error); it
+                // never approves it. The match lists every variant, so a new
+                // one is a compile error rather than an unanswered request.
                 match msg {
                     Some(ProviderMessage::PushRequestReceivedNotify(msg)) => {
                         let hash = msg.inner.request.hash;
@@ -207,9 +224,6 @@ async fn run_ingest_loop(
                             }
                         });
                     }
-                    Some(ProviderMessage::GetRequestReceivedNotify(_)) => {
-                        debug!("Get request received (notify)");
-                    }
                     Some(ProviderMessage::GetRequestReceived(msg)) => {
                         let hash = msg.inner.request.hash;
                         if blocked(&hash) {
@@ -228,12 +242,13 @@ async fn run_ingest_loop(
                         }
                     }
                     Some(ProviderMessage::ObserveRequestReceived(msg)) => {
-                        let result = if blocked(&msg.inner.request.hash) {
-                            Err(AbortReason::Permission)
+                        let hash = msg.inner.request.hash;
+                        if blocked(&hash) {
+                            info!(%hash, "Observe of blocked content refused");
+                            msg.tx.send(Err(AbortReason::Permission)).await.ok();
                         } else {
-                            Ok(())
-                        };
-                        msg.tx.send(result).await.ok();
+                            msg.tx.send(Ok(())).await.ok();
+                        }
                     }
                     Some(ProviderMessage::ClientConnected(msg)) => {
                         if let Some(g) = &gate {
@@ -246,8 +261,18 @@ async fn run_ingest_loop(
                             g.closed(msg.inner.connection_id);
                         }
                     }
-                    Some(other) => {
-                        debug!("Other event received: {:?}", std::mem::discriminant(&other));
+                    // Throttling is off (`ThrottleMode::None`); answer anyway.
+                    Some(ProviderMessage::Throttle(msg)) => {
+                        msg.tx.send(Ok(())).await.ok();
+                    }
+                    // Neither mask enables these notifications.
+                    Some(
+                        ProviderMessage::ClientConnectedNotify(_)
+                        | ProviderMessage::GetRequestReceivedNotify(_)
+                        | ProviderMessage::GetManyRequestReceivedNotify(_)
+                        | ProviderMessage::ObserveRequestReceivedNotify(_),
+                    ) => {
+                        debug!("Unrequested provider notification ignored");
                     }
                     None => {
                         info!("Event channel closed, ingest loop exiting");
