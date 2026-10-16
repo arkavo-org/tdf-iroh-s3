@@ -91,7 +91,7 @@ expected_issuer = "https://identity.arkavo.net"
 
 **Memory.** Ingest does not hold a blob in memory.
 - It exports the pushed blob from the iroh store to a scratch file under `<data_dir>/ingest`.
-- It validates the blob from that file, reading only the ZIP central directory and the manifest (at most 4 MiB).
+- It validates the blob from that file. It reads the ZIP central directory (at most 65,535 members, and at most 16 MiB read to open it), the manifest (at most 4 MiB), and the payload member, streamed to check its CRC. In Creator's FairPlay archives the payload is the small key envelope; in the legacy layout it is most of the archive, so validation then reads the whole blob once more.
 - It uploads the blob to S3 streaming from the file.
 
 So memory no longer limits `max_blob_bytes`, and the 4294967295 default stays, also on a `t4g.medium`. The earlier advice to lower it to 2147483648 there was about RAM and no longer applies. Lower it only to limit how much disk one push can take. `GET /node` reports the limit as `maxBlobBytes`, and Creator refuses a larger recording before uploading it.
@@ -101,6 +101,8 @@ So memory no longer limits `max_blob_bytes`, and the 4294967295 default stays, a
 - **Pushes in flight,** each up to `max_blob_bytes`. A push that declares a larger size is stopped after its first few hundred KiB. Nothing limits how many pushes run at once, and on a node with `[publishing] required = false` anyone can push. So size the free space for the bursts you expect, and watch it.
 - **One scratch copy per ingest in progress**, `max_concurrent_ingests` × `max_blob_bytes` at most. With a reflink-capable filesystem the copy shares the blob's blocks and takes no space: XFS shows `reflink=1` in `xfs_info /var/lib/tdf-iroh-s3`.
 - **Refused blobs,** until the store's garbage collector deletes them. A blob that is not a valid TDF, or a push that stops early, is never served, and is deleted within about `[iroh] gc_interval_secs` (default 60).
+
+**First start on an existing store.** The node serves a blob only when it validated it, or S3 holds `blobs/<hash>`. After a restart, and for everything earlier builds stored, the first fetch of each blob asks S3 once (a HEAD of `blobs/<hash>`) and the node remembers the answer. Expect one HEAD per distinct blob fetched after each start. A stored blob that S3 lacks never validated; earlier builds kept such blobs and served them. The first fetch of one is refused, and the collector then deletes it. A blob in transit when the node stopped is handled the same way.
 
 As a rule, beyond the stored blobs, keep free at least (pushes you expect at once + `max_concurrent_ingests`) × `max_blob_bytes`. With the defaults and one push at a time, that is 8 GiB, or 4 GiB with reflinks.
 

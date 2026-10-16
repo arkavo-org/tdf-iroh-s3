@@ -31,20 +31,23 @@ cargo run --bin tdf-iroh-s3-test -- <subcommand>
 ### Data Flow
 
 ```
-Iroh peer (QUIC) → Endpoint → FsStore (publish gate on push; pending, withheld;
-  a push whose declared size exceeds max_blob_bytes has its connection closed)
+Iroh peer (QUIC) → Endpoint → FsStore (single-blob pushes only; publish gate on
+  push; pending, withheld; a push whose declared size exceeds max_blob_bytes has
+  its connection closed)
   → export to <data_dir>/ingest scratch file → size check
   → validation from the file in spawn_blocking (structure → attributes → assertion)
   → S3 existence check → S3 upload streamed from the file → manifest + catalog index
   (refused → withheld, deleted by the store's GC via quarantine.rs)
+Served (get/get_many/observe, single blobs only): validated by this process, or
+  ingested (S3 HEAD blobs/<hash>, asked once per hash); else refused
 ```
 
 ### Key Modules
 
-- **`node.rs`** — `TdfIrohNode`: Iroh endpoint lifecycle, binds QUIC port, registers BlobsProtocol (wrapped to keep open connections by `stable_id`, so an oversize push's connection can be closed), loads the FsStore with the quarantine's GC config, runs the ingest loop: it intercepts push, get, get_many and observe gated or not (withheld hashes refused; with a gate also the push session check and blocked-hash refusal). Each request type follows its own `EventMask` field (iroh-blobs#270), and push is `Disabled` by default. S3 client and config shared via `Arc`.
+- **`node.rs`** — `TdfIrohNode`: Iroh endpoint lifecycle, binds QUIC port, registers BlobsProtocol (wrapped to keep open connections by `stable_id`, so an oversize push's connection can be closed), loads the FsStore with the quarantine's GC config, runs the ingest loop: it intercepts push, get, get_many and observe gated or not (hash-sequence requests refused; only blobs known valid are served; with a gate also the push session check and blocked-hash refusal). The loop answers from memory; a push, or a fetch that needs the store or S3, is answered from its own task. Each request type follows its own `EventMask` field (iroh-blobs#270), and push is `Disabled` by default. S3 client and config shared via `Arc`.
 - **`ingest.rs`** — `validate_from_store()` (export to a scratch file, validate it off the runtime) then `upload()` (stream to S3, derived artifacts); `IngestError::Refused` vs `Failed`. The BLAKE3 hash is the push's; it is not recomputed.
-- **`quarantine.rs`** — pending (tracked, not yet validated) and refused pushes; both withheld from get/get_many/observe. Refused blobs are deleted by the FsStore garbage collector (the only deletion iroh-blobs exposes) through its protect callback; persisted in `<data_dir>/refused-blobs`. A push of a hash the node already holds is not tracked, a validated hash is never refused, and S3-ingested hashes are never deleted.
-- **`validation/`** — `max_blob_bytes` check, then three stages: `structure.rs` (ZIP central directory + manifest via the `zip` crate from any `Read + Seek`, manifest bounded to 4 MiB, payload member must exist; spec layout `manifest.json` + the member `payload.url` names, or legacy `0.manifest.json` + `0.payload`), `attributes.rs` (required FQN lookup in policy), `assertion.rs` (policy binding hash + optional signature verification).
+- **`quarantine.rs`** — which blobs are served: only those validated by this process or ingested in S3 (asked once per hash, the answer kept). Pending (tracked, not yet validated) and refused pushes are withheld, as is any stored blob not known valid (after a restart, or written by older builds); a stored blob S3 lacks is refused. Refused blobs are deleted by the FsStore garbage collector (the only deletion iroh-blobs exposes) through its protect callback, which keeps pending and validated hashes; persisted in `<data_dir>/refused-blobs`. A push of a hash the node already holds (validated or ingested) is not tracked, a validated hash is never refused, and S3-ingested hashes are never deleted.
+- **`validation/`** — `max_blob_bytes` check, then three stages: `structure.rs` (ZIP central directory + manifest via the `zip` crate from any `Read + Seek`: at most 65,535 members, checked on every ZIP64 end record before the reader reserves, and at most 16 MiB read while opening; manifest bounded to 4 MiB; payload member read to its end so its CRC is checked, and refused if it would inflate past the archive; spec layout `manifest.json` + the member `payload.url` names, or legacy `0.manifest.json` + `0.payload`), `attributes.rs` (required FQN lookup in policy), `assertion.rs` (policy binding hash + optional signature verification).
 - **`catalog.rs`** / **`catalog_api.rs`** — ingest-time index (`manifests/`, `catalog-index/<group>/`) and the entitled `GET /catalog/{group}` listing (AuthZEN decisions via `authz.rs`). Policies come in the spec form (`{"attribute": "<FQN>"}`) and opentdf-rs's structured form; both are read.
 - **`creator_catalog.rs`** — pure parser/validator for creator catalog documents (strict: unknown and duplicate keys rejected, exact timestamps, limits).
 - **`catalogs_api.rs`** — `PUT /catalogs/{sub}`, `GET /catalog-documents/{hash}`, `GET /blobs/{hash}`; shares `ApiState` and the `TagStore` trait with `tags_api.rs`.

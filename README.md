@@ -18,8 +18,10 @@ and stores them in Amazon S3. Serves stored blobs back to any requesting peer.
 3. Valid blobs are stored in S3, keyed by BLAKE3 content hash. Ingest reads
    the blob from a file and streams it to S3; it never holds it in memory.
 4. Any peer can retrieve blobs by hash — the TDF encryption layer handles access control.
-   A pushed blob is served only once it validates; a refused one is never
-   served, and the store's garbage collector deletes it.
+   A blob is served only once it is known valid: validated by this node, or
+   ingested in S3. A refused one is never served, and the store's garbage
+   collector deletes it. Only single blobs are pushed or fetched; hash
+   sequences are refused.
 
 Creators publish a catalog of their recordings as a JSON document the node
 stores by hash, behind the tag `catalog/<sub>`. The contract between the

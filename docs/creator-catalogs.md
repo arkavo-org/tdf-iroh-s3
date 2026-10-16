@@ -128,7 +128,7 @@ This route is public and existed before this contract.
 - **200:** `{"name":"catalog/<sub>","hash":"<hex>"}`.
 - **404:** `tag not found`. There is no catalog, the creator is suspended with `hideCatalog`, the catalog is blocked, or the tag does not name a stored catalog document.
 
-The tag `catalog/<sub>` existed before catalog documents, and an older tag may name a TDF blob instead of a catalog. The node answers such a tag with 404, as if there were no catalog. Creator then starts a new catalog, and a viewer shows that the creator has none, rather than both failing on `GET /catalog-documents`.
+The tag `catalog/<sub>` existed before catalog documents, and an older tag may name a TDF blob instead of a catalog. The node answers such a tag with 404, as if there were no catalog. Creator then starts a new catalog, and a viewer shows that the creator has none, rather than both failing on `GET /catalog-documents`. The node checks each hash once and remembers the answer. When storage cannot answer, it returns the tag unchecked, and `GET /catalog-documents` answers for the document.
 
 ### `PUT /tags/catalog/{sub}`: point the tag at an earlier catalog
 
@@ -172,6 +172,7 @@ Creator reads the node to push to from this route. The iOS viewer does not. The 
    - Only step 4 confirms that the node has the TDF.
    - A push larger than `maxBlobBytes` is stopped while it transfers: the node closes the connection with the reason `blob exceeds max_blob_bytes`.
    - The node serves a pushed blob over iroh only once it validates. A blob it refuses is never served and is deleted.
+   - Push and fetch single blobs (`GetRequest::blob`). The node refuses hash-sequence requests.
 4. **Confirm ingest.** Poll `GET /blobs/<hash>` until it returns 200 with the expected size.
    - Wait at most 120 s.
    - A 404 after that means the node refused the push or the archive.
@@ -206,6 +207,6 @@ A pushed blob is ingested only when it is a ZIP holding an OpenTDF manifest. Ing
   - extra members, such as fMP4 playlists, init segments and media segments, are allowed.
 - **The legacy layout:** `0.manifest.json` with `0.payload`.
 
-The manifest must parse as an OpenTDF manifest, with every required field present, and be at most 4 MiB. The payload member must exist; ingest does not read its bytes.
+The manifest must parse as an OpenTDF manifest, with every required field present, and be at most 4 MiB. The payload member must exist and read back intact: ingest reads it to its end, checking its CRC. The archive may list at most 65,535 members.
 
 Blobs larger than `[validation] max_blob_bytes` are refused. The default is 4294967295 bytes (4 GiB − 1), the largest `payloadSize`.
