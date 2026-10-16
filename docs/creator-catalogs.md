@@ -71,7 +71,7 @@ The document is UTF-8 JSON, at most **262 144 bytes**. The node stores the uploa
 | `payloadSize` | An integer from 1 to 4294967296 (4 GiB): the TDF's size in bytes. At upload, it must equal the size `GET /blobs/<payloadHash>` reports. |
 | `title` | Optional. A string of 1–512 UTF-8 bytes. |
 | `publishedAt` | RFC 3339 UTC to the second with a `Z` suffix (`YYYY-MM-DDTHH:MM:SSZ`). |
-| `attributeFQNs` | An array of 0–32 `https://` URLs, each at most 512 bytes: the data attributes in the TDF's policy, for display. They grant nothing. |
+| `attributeFQNs` | An array of 0–32 URLs: the data attributes in the TDF's policy, for display. They grant nothing. Each URL starts with `https://` followed by a host, is at most 512 bytes, and uses only visible ASCII characters (0x21–0x7E), so it has no spaces or non-ASCII characters. |
 
 **Rules for keys**
 
@@ -81,7 +81,7 @@ The document is UTF-8 JSON, at most **262 144 bytes**. The node stores the uploa
 
 ## HTTP routes
 
-TLS terminates in front of the node. Every error body is `{"error":"<message>"}`.
+TLS terminates in front of the node. Every error body is `{"error":"<message>"}`, with one exception: on an ungated node `POST /publish/sessions` answers 404 with an empty body (see [Publishing a recording](#publishing-a-recording-creator)).
 
 ### `PUT /catalogs/{sub}`: publish a catalog
 
@@ -98,12 +98,13 @@ The node checks the following in order. Each failure returns its own status.
    - 403 for an entitlement, service-token or suspension failure.
    - On a node with `[publishing] required = false`, the token still has to verify. The publishing checks are skipped.
 2. **`{sub}` equals the token's `sub`.** Otherwise 403 `catalog does not match token subject`.
-3. **The body is at most 262 144 bytes.** Otherwise 413 `catalog too large`.
-4. **The body is a valid `arkavo.creator-catalog/1` document whose `owner` equals `{sub}`.** Otherwise 422 `invalid catalog: <reason>`.
-5. **No entry's `payloadHash` is blocked.** Otherwise 403 `content is blocked`.
-6. **Every `payloadHash` is an ingested blob.** Otherwise 422 `payload <hash> is not ingested`, naming the first missing payload in entry order.
-7. **Every entry's `payloadSize` equals the ingested blob's size.** Otherwise 422 `payload <hash> size does not match`, naming the first mismatching entry's payload in entry order. Each entry is checked, including entries that share a payload.
-8. **The node stores the bytes and moves the tag.**
+3. **The `Content-Type` is `application/json`.** Otherwise, including when the header is missing, 415 `content type must be application/json`. The media type is matched without regard to case, and parameters such as `; charset=utf-8` are allowed.
+4. **The body is at most 262 144 bytes.** Otherwise 413 `catalog too large`.
+5. **The body is a valid `arkavo.creator-catalog/1` document whose `owner` equals `{sub}`.** Otherwise 422 `invalid catalog: <reason>`.
+6. **Nothing is blocked:** no entry's `payloadHash`, and not the document's own BLAKE3 hash. Otherwise 403 `content is blocked`.
+7. **Every `payloadHash` is an ingested blob.** Otherwise 422 `payload <hash> is not ingested`, naming the first missing payload in entry order.
+8. **Every entry's `payloadSize` equals the ingested blob's size.** Otherwise 422 `payload <hash> size does not match`, naming the first mismatching entry's payload in entry order. Each entry is checked, including entries that share a payload.
+9. **The node stores the bytes and moves the tag.**
    - It stores the bytes at `catalog-documents/<blake3>` and points the tag `catalog/<sub>` at that hash.
    - 200 `{"name":"catalog/<sub>","hash":"<blake3 hex>","size":<bytes>}`.
 
@@ -115,7 +116,7 @@ This route is public.
 
 - **200:** the stored bytes, with `Content-Type: application/json` and `Cache-Control: public, max-age=31536000, immutable`.
 - **400:** `invalid hash`. The hash must be 64 lowercase hex characters.
-- **404:** `catalog not found`.
+- **404:** `catalog not found`, including when the document's hash is blocked.
 
 ### `GET /tags/catalog/{sub}`: find a creator's current catalog
 
@@ -129,9 +130,8 @@ This route is public and existed before this contract.
 This route needs the same token checks as `PUT /catalogs/{sub}`.
 
 - The body is `{"hash":"<hex>"}`.
-- For a name under the catalog tag prefix, the hash must be a stored catalog document whose `owner` equals `{sub}`. Otherwise 422 `hash does not reference a catalog document of this subject`.
+- The hash must be a stored catalog document whose `owner` equals `{sub}`. Otherwise 422 `hash does not reference a catalog document of this subject`.
 - Success returns **204**.
-- Tags outside the prefix keep the earlier rule: the hash must be an ingested blob.
 
 ### `GET /blobs/{hash}`: confirm ingest
 
@@ -156,10 +156,13 @@ Creator reads the node to push to from this route. The iOS viewer does not. The 
 2. **Open a publish session.**
    - Creator calls `POST /publish/sessions` with its iroh endpoint ID, and signs with its endpoint key (see [publishing-and-moderation.md](publishing-and-moderation.md)).
    - A 404 means the node is ungated (`required = false`). Continue without a session.
+   - That 404 has an empty body, not `{"error":…}`. Check only the status.
 3. **Push the TDF** to the node over iroh. The push returns the BLAKE3 hash.
+   - The push's result does not say whether the node accepted it. A gated node that refuses a push, for example one from an endpoint without a session, does not report the refusal to the pusher, and the push appears to succeed.
+   - Only step 4 confirms that the node has the TDF.
 4. **Confirm ingest.** Poll `GET /blobs/<hash>` until it returns 200 with the expected size.
    - Wait at most 120 s.
-   - A 404 after that means the node refused the archive.
+   - A 404 after that means the node refused the push or the archive.
 5. **Read the current catalog.**
    - `GET /tags/catalog/<sub>`, then `GET /catalog-documents/<hash>`.
    - A 404 on the tag means there is no catalog yet.

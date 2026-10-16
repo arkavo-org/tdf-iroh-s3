@@ -187,7 +187,8 @@ the namespace host points at this node. See
 
 With `[http]` enabled the node serves the routes below. TLS terminates in
 the node when `[http.tls]` is set (below), or in a proxy in front of it.
-Every error body is `{"error":"<message>"}`. The creator catalog routes are
+Every error body is `{"error":"<message>"}`, except that an ungated node
+answers `POST /publish/sessions` with 404 and an empty body. The creator catalog routes are
 specified in [docs/creator-catalogs.md](docs/creator-catalogs.md).
 
 | Route | Access | Purpose |
@@ -199,7 +200,7 @@ specified in [docs/creator-catalogs.md](docs/creator-catalogs.md).
 | `GET /catalog-documents/{hash}` | public | A stored catalog document, byte for byte (immutable). |
 | `GET /tags/{name}` | public | Resolve a tag, e.g. `catalog/<sub>`. |
 | `PUT /tags/catalog/{sub}` | publisher CWT | Point the tag at an earlier catalog document of the same subject. |
-| `POST /publish/sessions` | publisher CWT | Gated nodes only; see below. |
+| `POST /publish/sessions` | publisher CWT | Gated nodes only (404, empty body, when ungated); see below. |
 
 ```bash
 # Resolve a creator's catalog, then read it (public)
