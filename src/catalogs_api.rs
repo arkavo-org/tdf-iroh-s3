@@ -580,6 +580,17 @@ mod tests {
         )
         .await;
         assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+
+        // Beyond axum's 2 MB default body limit the handler still answers,
+        // with the contract's JSON error, after the token checks.
+        let huge = vec![b' '; 3 * 1024 * 1024];
+        let r = put_catalog(&h.app, SUB, Some(&creator()), huge.clone()).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::PAYLOAD_TOO_LARGE, "catalog too large")
+        );
+        let r = put_catalog(&h.app, SUB, None, huge).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
