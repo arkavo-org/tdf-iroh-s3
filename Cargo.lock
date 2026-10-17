@@ -5206,6 +5206,7 @@ dependencies = [
  "aws-sdk-ssm",
  "axum",
  "axum-server",
+ "bao-tree",
  "base64 0.22.1",
  "blake3",
  "bytes",

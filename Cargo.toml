@@ -49,6 +49,8 @@ iroh-base = "1.3.0"
 axum = "0.8"
 http-body-util = "0.1"
 futures = "0.3"
+# Same version iroh-blobs uses: outboards and BAO encoding for serving from S3.
+bao-tree = { version = "0.16", features = ["tokio_fsm", "validate"] }
 serde_json = "1"
 url = "2.5"
 # Reading TDF archives from a file at ingest (the version opentdf uses)
