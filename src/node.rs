@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
+use crate::dht::{self, DhtOptions};
 use crate::ingest::{self, IngestError};
 use crate::moderation::{BlobOwner, PublishGate, now_secs};
 use crate::s3_serve::{Refusal, S3Server};
@@ -49,6 +50,16 @@ impl TdfIrohNode {
     /// With a gate, pushes are accepted only from endpoints holding a
     /// publish session, and blocked hashes are neither accepted nor served.
     pub async fn spawn_with_gate(config: Config, gate: Option<Arc<PublishGate>>) -> Result<Self> {
+        Self::spawn_with_dht(config, gate, DhtOptions::default()).await
+    }
+
+    /// [`Self::spawn_with_gate`], with `dht` deciding what `[iroh]
+    /// publish_dht` publishes (tests use it to publish local addresses).
+    pub async fn spawn_with_dht(
+        config: Config,
+        gate: Option<Arc<PublishGate>>,
+        dht: DhtOptions,
+    ) -> Result<Self> {
         let config = Arc::new(config);
 
         let s3_client = Arc::new(
@@ -92,6 +103,15 @@ impl TdfIrohNode {
                     .context("Failed to load or create node secret key")?;
             builder = builder.secret_key(secret_key);
         }
+        if config.iroh.publish_dht {
+            // The DHT record is signed with the endpoint's key and carries
+            // its direct addresses. `public_addresses` are advertised as
+            // external addresses so the record can include them.
+            builder = builder.address_lookup(dht::publisher(&config.iroh.dht_bootstrap, dht));
+            for addr in &config.iroh.public_addresses {
+                builder = builder.external_addr(*addr);
+            }
+        }
 
         let endpoint = builder
             .bind_addr((Ipv4Addr::UNSPECIFIED, config.iroh.bind_port))
@@ -101,6 +121,13 @@ impl TdfIrohNode {
             .context("Failed to bind Iroh endpoint")?;
 
         info!("Iroh endpoint bound on port {}", config.iroh.bind_port);
+        if config.iroh.publish_dht {
+            info!(
+                "Publishing the endpoint address to the Mainline DHT (publish_dht): endpoint ID {} (pkarr key {})",
+                endpoint.id(),
+                endpoint.id().to_z32()
+            );
+        }
         endpoint.online().await;
         info!("Iroh endpoint online");
 

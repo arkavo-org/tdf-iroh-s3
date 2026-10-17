@@ -80,6 +80,10 @@ push_stall_secs = 120
 # is done with. This is the default.
 gc_interval_secs = 60
 
+# Publish the node's address to the Mainline DHT, so a viewer finds the node by
+# endpoint ID alone. Off by default. See "Publishing the address to the DHT".
+publish_dht = true
+
 [s3]
 bucket = "arkavo-iroh-content"
 # No prefix: keys are blobs/<hash>, outboards/<hash>, and so on.
@@ -99,6 +103,25 @@ bind_port = 8090   # loopback-only while [http.tls] is set
 cose_keys_url = "https://identity.arkavo.net/.well-known/cose-keys"
 expected_issuer = "https://identity.arkavo.net"
 ```
+
+**Publishing the address to the DHT.** With `[iroh] publish_dht = true` the node writes a pkarr record to the BitTorrent Mainline DHT. The record is signed with the node's key and stored under the endpoint ID. A viewer built with a DHT address lookup (iroh-swift's, for iOS) can then connect knowing only the endpoint ID: it needs no relay and no configured address. The n0 DNS publishing of the relay URL, which the `N0` preset does, is unchanged and keeps running.
+
+What the record holds:
+- **The home relay URL** (for example `https://use1-1.relay.n0.iroh.link./`).
+- **The node's globally routable direct IP addresses.** These come from two places:
+  - Addresses the relays report for the node (QUIC address discovery). Behind EC2's 1:1 NAT the node should learn `<public ip>:11204` this way, with no help from the config. This is expected, not verified on EC2 here; check it as below. On a developer machine behind a home router the same mechanism published the router's address, with a different port.
+  - `[iroh] public_addresses`, if set. With `publish_dht` they are handed to the endpoint as external addresses, which `publish_dht = false` does not do (then they only appear in `GET /node`).
+- **Nothing private.** The instance's own `172.31.x.x` address, loopback, link-local, carrier-grade NAT, ULA and other reserved addresses are dropped, from `public_addresses` too. Global IPv6 addresses of the node's interfaces are published, with the iroh port, when it has any.
+
+The record is published once the addresses are known, again whenever they or the relay change, and every hour. The DHT forgets a record nobody refreshes, so a stopped node disappears from it after a while.
+
+**Should you set `public_addresses` alongside `publish_dht`?** Not for the DHT's sake. The node discovers its public address itself, and an address you write down can only go stale. Set it only for the reason it already has, `GET /node`, and only with an address that survives a stop and start (an elastic IP). The instance IP changes on a redeploy, when the `iroh.arkavo.net` CNAME is moved to the new instance. A hard-coded address does not follow it. Update `public_addresses` in the new instance's config in the same step as the CNAME, or the DHT record carries the old IP next to the discovered current one (and `GET /node` reports only the old one). A viewer then wastes one dial on a dead address, or on an address that now belongs to someone else, and still gets through on the right one or the relay. If the check below shows the node did not discover its public address, set `public_addresses` to the elastic IP and nothing else.
+
+Other points:
+- The DHT client needs outbound UDP to arbitrary ports. The default security group allows it.
+- The record is public and readable by anyone with the endpoint ID. The public IP is already in DNS, so this adds nothing about the node.
+- A pkarr packet is limited to 1000 bytes. A host with very many IPv6 addresses can exceed it; the node then logs `failed to create signed packet` and publishes nothing.
+- `[iroh] dht_bootstrap` points the node at a private DHT instead of Mainline. Leave it empty in production.
 
 **Memory.** Ingest does not hold a blob in memory.
 - It exports the pushed blob from the iroh store to a scratch file under `<data_dir>/ingest`.
@@ -181,6 +204,16 @@ ssh ec2-user@<instance> 'sudo journalctl -u tdf-iroh-s3 | grep "Node ID:" | tail
 The endpoint ID must match the one in the iOS release configuration.
 
 ## 7. Post-deploy smoke checks
+
+With `publish_dht = true`, check the DHT publish first:
+
+```bash
+ssh ec2-user@<instance> 'sudo journalctl -u tdf-iroh-s3 | grep "Publishing the endpoint address" | tail -1'
+# ... Publishing the endpoint address to the Mainline DHT (publish_dht): endpoint ID <64 hex> (pkarr key <z32>)
+```
+
+Open `https://app.pkarr.org/?pk=<z32>` with the pkarr key from that line. The record should list the relay URL and `<public ip>:11204`, and no `172.31.x.x` address. The DHT takes up to a minute after start to hold the record. To see each publish in the node's log, run it with `RUST_LOG=info,iroh_blobs::store::gc=warn,iroh_mainline_address_lookup=debug`; the lines read `publishing EndpointData {...}` and `pkarr publish success. published under <z32>`.
+
 
 ```bash
 curl -fsS https://iroh.arkavo.net/healthz

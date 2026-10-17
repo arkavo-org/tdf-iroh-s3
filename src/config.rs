@@ -241,8 +241,12 @@ pub struct IrohConfig {
     pub data_dir: String,
     /// Public `ip:port` addresses peers can dial directly, reported by
     /// `GET /node` as `directAddresses` (for example the instance's elastic
-    /// IP and the iroh port). The node cannot discover these itself behind
-    /// NAT. Empty by default.
+    /// IP and the iroh port). Empty by default.
+    ///
+    /// They are not advertised by the endpoint itself, which finds its public
+    /// address through the relays. With `publish_dht` they are also added to
+    /// the endpoint's direct addresses, so the DHT record carries them; a
+    /// private or loopback address is dropped from the record.
     #[serde(default)]
     pub public_addresses: Vec<SocketAddr>,
     /// How often the store's garbage collector deletes staged pushes that
@@ -255,6 +259,23 @@ pub struct IrohConfig {
     /// that stops sending does not hold the push open. Default 120.
     #[serde(default = "default_push_stall_secs")]
     pub push_stall_secs: u64,
+    /// Publish the node's address to the BitTorrent Mainline DHT, as a pkarr
+    /// record signed by the node's key and stored under its endpoint ID, so a
+    /// viewer that knows only the endpoint ID can find the node without a
+    /// relay or a configured address. The record holds the home relay URL and
+    /// the node's globally routable direct IP addresses: those the relays
+    /// report for it (QUIC address discovery) and `public_addresses`. Private,
+    /// loopback and link-local addresses are left out. It is published when
+    /// the addresses are known, when they change, and every hour. Needs
+    /// outbound UDP. Default false; the existing n0 DNS publishing of the
+    /// relay URL is unchanged either way.
+    #[serde(default)]
+    pub publish_dht: bool,
+    /// Bootstrap nodes (`host:port`) for the DHT `publish_dht` uses, instead
+    /// of the public Mainline ones. For a private DHT; empty (the default)
+    /// uses Mainline.
+    #[serde(default)]
+    pub dht_bootstrap: Vec<String>,
 }
 
 fn default_gc_interval_secs() -> u64 {
@@ -274,6 +295,8 @@ impl Default for IrohConfig {
             public_addresses: Vec::new(),
             gc_interval_secs: default_gc_interval_secs(),
             push_stall_secs: default_push_stall_secs(),
+            publish_dht: false,
+            dht_bootstrap: Vec::new(),
         }
     }
 }

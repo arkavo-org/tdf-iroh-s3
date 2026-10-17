@@ -91,6 +91,15 @@ impl IrohTestClient {
         Ok(Self { endpoint, store })
     }
 
+    /// A client on a prebuilt `endpoint`, for tests that choose how it finds
+    /// addresses (for example only through the DHT).
+    pub fn with_endpoint(endpoint: Endpoint) -> Self {
+        Self {
+            endpoint,
+            store: MemStore::new(),
+        }
+    }
+
     /// This client's endpoint ID, which a publish session names.
     pub fn endpoint_id(&self) -> EndpointId {
         self.endpoint.id()

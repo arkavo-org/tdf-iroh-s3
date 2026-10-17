@@ -36,6 +36,8 @@ fn test_config(data_dir: &str) -> Config {
             public_addresses: Vec::new(),
             gc_interval_secs: 1,
             push_stall_secs: 120,
+            publish_dht: false,
+            dht_bootstrap: Vec::new(),
         },
         s3: S3Config {
             bucket: BUCKET.to_string(),
@@ -1384,4 +1386,225 @@ async fn test_a_node_uploaded_blob_is_stored_byte_for_byte() {
 
     pusher.shutdown().await.unwrap();
     node.shutdown().await.unwrap();
+}
+
+// --- `[iroh] publish_dht` (BitTorrent Mainline DHT) ---
+//
+// The DHT is a local testnet (`n0_mainline::Testnet`, nodes on loopback);
+// `dht_bootstrap` points the node and the resolvers at it, so nothing
+// touches the public DHT. (The node itself still reaches the n0 relays and
+// n0 DNS as in every test here.)
+
+use iroh::address_lookup::AddressLookup;
+use iroh::endpoint::presets;
+use iroh::{Endpoint, RelayMode};
+use iroh_mainline_address_lookup::DhtAddressLookup;
+use n0_mainline::{DhtBuilder, Testnet};
+use tdf_iroh_s3::dht::{DhtOptions, is_global};
+
+fn testnet_builder(testnet: &Testnet) -> DhtBuilder {
+    let mut dht = DhtBuilder::default();
+    dht.bootstrap(&testnet.bootstrap);
+    dht
+}
+
+/// A read-only DHT lookup on `testnet`; it does not publish.
+fn dht_resolver(testnet: &Testnet) -> DhtAddressLookup {
+    DhtAddressLookup::builder()
+        .dht_builder(testnet_builder(testnet))
+        .no_publish()
+        .build()
+        .unwrap()
+}
+
+/// What the DHT holds for `id`, once it holds a record with both a relay and a
+/// direct address (a publish happens when addresses are known and again
+/// when they change, so the first record can be partial) or `want` is met.
+async fn resolve_record(
+    lookup: &DhtAddressLookup,
+    id: iroh::EndpointId,
+    want: impl Fn(&iroh::address_lookup::EndpointData) -> bool,
+) -> iroh::address_lookup::EndpointData {
+    use futures::StreamExt;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(stream) = lookup.resolve(id) {
+            let items: Vec<_> = stream.collect().await;
+            for item in items.into_iter().flatten() {
+                if want(&item) {
+                    return (*item).clone();
+                }
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no matching record for {id} on the DHT in time"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// A node with `publish_dht` on `testnet` publishes its relay and direct
+/// addresses, signed by its key. A viewer that has only the endpoint ID and
+/// a DHT lookup (no relay, no n0 DNS, no address) connects and fetches.
+#[tokio::test(flavor = "current_thread")]
+async fn test_publish_dht_makes_the_node_resolvable_by_endpoint_id() {
+    let testnet = Testnet::new(3).await.unwrap();
+    let bootstrap = testnet.bootstrap.clone();
+    let (s3, endpoint_url) = FakeS3::start().await;
+    let (node, s3, _data_dir) = spawn_node_on_dht(
+        s3,
+        endpoint_url,
+        |c| {
+            c.iroh.publish_dht = true;
+            c.iroh.dht_bootstrap = bootstrap;
+        },
+        // Loopback and LAN addresses are the only ones a test can dial.
+        DhtOptions {
+            include_non_global_addrs: true,
+        },
+    )
+    .await;
+    let node_id = node.addr().id;
+    let relay = node.addr().relay_urls().next().cloned();
+    let relay = relay.expect("the node is online, so it has a home relay");
+
+    // The record: the relay URL and the node's direct addresses, found with
+    // only the endpoint ID. The id is the signing key, so a record under it
+    // could only be signed by the node.
+    let resolver = dht_resolver(&testnet);
+    let record = resolve_record(&resolver, node_id, |d| {
+        d.relay_urls().any(|u| *u == relay) && d.ip_addrs().next().is_some()
+    })
+    .await;
+    let node_port = node
+        .endpoint()
+        .bound_sockets()
+        .iter()
+        .map(|a| a.port())
+        .collect::<Vec<_>>();
+    assert!(
+        record.ip_addrs().all(|a| node_port.contains(&a.port())),
+        "direct addresses carry the iroh port: {record:?} vs {node_port:?}"
+    );
+
+    // Push a TDF the usual way, then fetch it with a viewer that can only
+    // use the DHT.
+    let tdf = create_test_tdf();
+    let pusher = IrohTestClient::new().await.unwrap();
+    let hash = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    assert!(s3.wait_for_put(&blob_key(hash)).await);
+
+    let viewer = Endpoint::builder(presets::Minimal)
+        .relay_mode(RelayMode::Disabled)
+        .address_lookup(
+            DhtAddressLookup::builder()
+                .dht_builder(testnet_builder(&testnet))
+                .no_publish(),
+        )
+        .bind()
+        .await
+        .unwrap();
+    let viewer = IrohTestClient::with_endpoint(viewer);
+    let fetched = tokio::time::timeout(
+        Duration::from_secs(60),
+        // A bare endpoint ID: no relay URL, no IP address.
+        viewer.fetch_from_node(node_id, hash),
+    )
+    .await
+    .expect("fetch by endpoint ID over the DHT")
+    .unwrap();
+    assert_eq!(fetched.as_ref(), tdf.as_slice());
+
+    for c in [pusher, viewer] {
+        c.shutdown().await.unwrap();
+    }
+    node.shutdown().await.unwrap();
+}
+
+/// With the default options the record holds the relay and `public_addresses`
+/// only as far as they are globally routable: the node's private, loopback and
+/// link-local interface addresses never reach the DHT.
+#[tokio::test(flavor = "current_thread")]
+async fn test_publish_dht_leaves_out_non_global_addresses() {
+    let testnet = Testnet::new(3).await.unwrap();
+    let bootstrap = testnet.bootstrap.clone();
+    let (s3, endpoint_url) = FakeS3::start().await;
+    // 8.8.4.4 stands in for the elastic IP; 10.1.2.3 is a misconfiguration.
+    let public: std::net::SocketAddr = "8.8.4.4:11204".parse().unwrap();
+    let private: std::net::SocketAddr = "10.1.2.3:11204".parse().unwrap();
+    let (node, _s3, _data_dir) = spawn_node_on_dht(
+        s3,
+        endpoint_url,
+        |c| {
+            c.iroh.publish_dht = true;
+            c.iroh.dht_bootstrap = bootstrap;
+            c.iroh.public_addresses = vec![public, private];
+        },
+        DhtOptions::default(),
+    )
+    .await;
+    let node_id = node.addr().id;
+    let relay = node.addr().relay_urls().next().cloned().unwrap();
+
+    let resolver = dht_resolver(&testnet);
+    let record = resolve_record(&resolver, node_id, |d| {
+        d.relay_urls().any(|u| *u == relay) && d.ip_addrs().any(|a| *a == public)
+    })
+    .await;
+    assert!(
+        record.ip_addrs().all(|a| is_global(a.ip())),
+        "only global addresses are published: {record:?}"
+    );
+    assert!(!record.ip_addrs().any(|a| *a == private));
+    node.shutdown().await.unwrap();
+}
+
+/// Off by default: a node that does not set `publish_dht` writes nothing to
+/// the DHT.
+#[tokio::test(flavor = "current_thread")]
+async fn test_dht_is_not_published_unless_enabled() {
+    let testnet = Testnet::new(3).await.unwrap();
+    let bootstrap = testnet.bootstrap.clone();
+    let (s3, endpoint_url) = FakeS3::start().await;
+    let (node, _s3, _data_dir) = spawn_node_on_dht(
+        s3,
+        endpoint_url,
+        // `dht_bootstrap` alone does nothing.
+        |c| c.iroh.dht_bootstrap = bootstrap,
+        DhtOptions {
+            include_non_global_addrs: true,
+        },
+    )
+    .await;
+    let node_id = node.addr().id;
+    // Time enough for a publish to land if there were one.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let resolver = dht_resolver(&testnet);
+    use futures::StreamExt;
+    let items: Vec<_> = resolver.resolve(node_id).unwrap().collect().await;
+    assert!(
+        items.into_iter().flatten().next().is_none(),
+        "nothing is published without publish_dht"
+    );
+    node.shutdown().await.unwrap();
+}
+
+/// [`spawn_node_on`] with the DHT options.
+async fn spawn_node_on_dht(
+    s3: FakeS3,
+    endpoint_url: String,
+    edit: impl FnOnce(&mut Config),
+    dht: DhtOptions,
+) -> (TdfIrohNode, FakeS3, tempfile::TempDir) {
+    set_dummy_aws_credentials();
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(data_dir.path().to_str().unwrap());
+    edit(&mut config);
+    config.s3.endpoint_url = endpoint_url;
+    config.s3.force_path_style = true;
+    let node = TdfIrohNode::spawn_with_dht(config, None, dht)
+        .await
+        .unwrap();
+    (node, s3, data_dir)
 }

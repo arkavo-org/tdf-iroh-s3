@@ -67,6 +67,7 @@ BlobsHandler → S3Server: blocked? → HEAD blobs/<hash> and outboards/<hash>
 - **`creator_catalog.rs`** — pure parser/validator for creator catalog documents (strict: unknown and duplicate keys rejected, exact timestamps, limits).
 - **`catalogs_api.rs`** — `PUT /catalogs/{sub}`, `GET /catalog-documents/{hash}`, `GET /blobs/{hash}`; shares `ApiState` and the `TagStore` trait with `tags_api.rs`.
 - **`tags_api.rs`** — `GET/PUT /tags/{name}`, `/healthz`, and `authorize_publisher` (gated: `PublishPolicy::publisher`; ungated: token verification only). A catalog tag may only point at a stored catalog document of its subject.
+- **`dht.rs`** — `[iroh] publish_dht`: the `DhtAddressLookup` (iroh-mainline-address-lookup) added to the endpoint, signed by the node key, and its `AddrFilter` (home relay + globally routable IPs only; the crate's default is relay only). `public_addresses` are passed to the endpoint as external addresses only when `publish_dht` is on. `dht_bootstrap` swaps Mainline for a private DHT; tests use a local `n0_mainline::Testnet` (`TdfIrohNode::spawn_with_dht`, `DhtOptions`).
 - **`node_api.rs`** — `GET /node`: endpoint ID and relay from the running endpoint, `directAddresses` from `[iroh] public_addresses`.
 - **`moderation.rs`** — publishing gate, publish sessions (`POST /publish/sessions`, signed by the endpoint key), suspensions, blocks, audit records.
 - **`auth.rs`** — CWT (COSE_Sign1 ES256) verification against the IdP's COSE key set.
