@@ -122,3 +122,36 @@ async fn test_catalog_document_owner_metadata_round_trips() {
     let head = client.head_catalog_document(&hash).await.unwrap();
     assert_eq!(head, Some(Some("arkavo:creator-1".to_string())));
 }
+
+/// An outboard is stored and sized by HEAD; a blob of 16 KiB or less has an
+/// empty one, which is a zero-length object, not a missing one.
+#[tokio::test(flavor = "current_thread")]
+async fn test_outboard_put_and_size_including_empty() {
+    use bytes::Bytes;
+    use tdf_iroh_s3::config::S3Config;
+    use tdf_iroh_s3::store::s3::S3Client;
+
+    // SAFETY: current_thread runtime ensures no other threads read env vars concurrently.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+    }
+    let s3 = S3Client::from_config(&S3Config {
+        bucket: "test-bucket".into(),
+        region: "us-east-1".into(),
+        prefix: String::new(),
+        endpoint_url: metadata_s3().await,
+        force_path_style: true,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(s3.outboard_size("aa").await.unwrap(), None);
+    s3.put_outboard("aa", Bytes::new()).await.unwrap();
+    assert_eq!(s3.outboard_size("aa").await.unwrap(), Some(0));
+    assert!(s3.get_outboard("aa").await.unwrap().is_empty());
+    s3.put_outboard("bb", Bytes::from(vec![1u8; 128]))
+        .await
+        .unwrap();
+    assert_eq!(s3.outboard_size("bb").await.unwrap(), Some(128));
+}

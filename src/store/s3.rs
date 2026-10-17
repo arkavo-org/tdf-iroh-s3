@@ -322,6 +322,35 @@ impl S3Client {
         }
     }
 
+    /// The stored size of a blob's outboard, or `None` when there is no
+    /// such outboard. An empty outboard (a blob of 16 KiB or less) is
+    /// `Some(0)`.
+    pub async fn outboard_size(&self, hash_hex: &str) -> Result<Option<u64>> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(self.outboard_key(hash_hex))
+            .send()
+            .await
+        {
+            Ok(head) => {
+                let size = head
+                    .content_length()
+                    .and_then(|n| u64::try_from(n).ok())
+                    .context("S3 HEAD of an outboard returned no content length")?;
+                Ok(Some(size))
+            }
+            Err(e) => {
+                if e.as_service_error().is_some_and(|se| se.is_not_found()) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!("Failed to HEAD outboard in S3: {}", e))
+                }
+            }
+        }
+    }
+
     /// Store a creator catalog document under `catalog-documents/<hash>`,
     /// byte for byte, with its owner as object metadata (`x-amz-meta-owner`)
     /// so a read can apply the owner's suspension without parsing it.
