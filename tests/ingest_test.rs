@@ -254,7 +254,7 @@ async fn ingest_from_store_streams_a_valid_blob_to_s3() {
         std::env::set_var("AWS_ACCESS_KEY_ID", "test");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
     }
-    let (endpoint_url, puts) = recording_s3().await;
+    let (endpoint_url, puts_log) = recording_s3().await;
     let s3 = S3Client::from_config(&S3Config {
         bucket: "test-bucket".into(),
         region: "us-east-1".into(),
@@ -300,7 +300,7 @@ async fn ingest_from_store_streams_a_valid_blob_to_s3() {
     assert_eq!(result.hash_hex, hash.to_hex().to_string());
     assert_eq!(result.size, tdf.len() as u64);
 
-    let puts = puts.lock().unwrap().clone();
+    let puts = puts_log.lock().unwrap().clone();
     let (_, uploaded, chunked) = puts
         .iter()
         .find(|(key, _, _)| *key == format!("blobs/{}", hash.to_hex()))
@@ -314,6 +314,57 @@ async fn ingest_from_store_streams_a_valid_blob_to_s3() {
         puts.iter()
             .any(|(key, _, _)| *key == format!("manifests/{}", hash.to_hex()))
     );
+
+    // The outboard is uploaded too, before the blob (so a blob that exists
+    // in S3 always has one), and is the BAO tree of the blob at iroh's
+    // block size.
+    let position = |key: String| puts.iter().position(|(k, _, _)| *k == key);
+    let outboard_at =
+        position(format!("outboards/{}", hash.to_hex())).expect("the outboard is uploaded");
+    let blob_at = position(format!("blobs/{}", hash.to_hex())).unwrap();
+    assert!(outboard_at < blob_at, "outboards/ is written before blobs/");
+    let expected = {
+        use bao_tree::io::outboard::PreOrderOutboard;
+        use bao_tree::io::sync::CreateOutboard;
+        PreOrderOutboard::<Vec<u8>>::create_sized(
+            &tdf[..],
+            tdf.len() as u64,
+            iroh_blobs::store::IROH_BLOCK_SIZE,
+        )
+        .unwrap()
+    };
+    assert_eq!(blake3::Hash::from(hash), expected.root);
+    assert!(!expected.data.is_empty());
+    assert!(puts[outboard_at].1 == expected.data, "the outboard's bytes");
+    assert_scratch_empty(&scratch).await;
+
+    // A blob of one chunk group (16 KiB) or less has an empty outboard,
+    // still uploaded, as a zero-length object.
+    let small = create_tdf_with_attribute("https://example.com/attr/storage/value/permanent");
+    assert!(small.len() <= 16 * 1024);
+    let small_hash = store.add_slice(&small).await.unwrap().hash;
+    ingest_from_store(
+        small_hash,
+        &store,
+        &ValidationConfig::default(),
+        &CatalogConfig::default(),
+        &s3,
+        &scratch,
+    )
+    .await
+    .unwrap()
+    .expect("a complete blob is ingested");
+    let puts = puts_log.lock().unwrap().clone();
+    let outboard_at = puts
+        .iter()
+        .position(|(k, _, _)| *k == format!("outboards/{}", small_hash.to_hex()))
+        .expect("an empty outboard is still uploaded");
+    let blob_at = puts
+        .iter()
+        .position(|(k, _, _)| *k == format!("blobs/{}", small_hash.to_hex()))
+        .unwrap();
+    assert!(outboard_at < blob_at);
+    assert!(puts[outboard_at].1.is_empty());
     assert_scratch_empty(&scratch).await;
 
     // Garbage is refused from its file, and its copy removed too.

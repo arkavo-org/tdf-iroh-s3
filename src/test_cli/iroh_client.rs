@@ -4,7 +4,9 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_base::TransportAddr;
 use iroh_blobs::BlobsProtocol;
 use iroh_blobs::api::blobs::Bitfield;
-use iroh_blobs::protocol::{GetManyRequest, GetRequest, ObserveRequest, PushRequest};
+use iroh_blobs::protocol::{
+    ChunkRanges, ChunkRangesSeq, GetManyRequest, GetRequest, ObserveRequest, PushRequest,
+};
 use iroh_blobs::store::mem::MemStore;
 use iroh_blobs::{Hash, HashAndFormat};
 use std::collections::BTreeSet;
@@ -279,6 +281,34 @@ impl IrohTestClient {
             .context("Failed to read fetched blob from local store")?;
 
         Ok(data)
+    }
+
+    /// Get only the 1 KiB chunks `chunks` of `hash` from a remote node, then
+    /// read `bytes` of it from this client's store. The client verifies every
+    /// chunk group it receives against the hash.
+    pub async fn get_ranges_from_node(
+        &self,
+        addr: impl Into<EndpointAddr>,
+        hash: Hash,
+        chunks: ChunkRanges,
+        bytes: std::ops::Range<u64>,
+    ) -> Result<Vec<u8>> {
+        let conn = self
+            .endpoint
+            .connect(addr, iroh_blobs::ALPN)
+            .await
+            .context("Failed to connect to remote node")?;
+        let request = GetRequest::new(hash, ChunkRangesSeq::from_ranges([chunks]));
+        self.store
+            .remote()
+            .execute_get(conn, request)
+            .await
+            .context("Failed to get ranges from remote node")?;
+        self.store
+            .export_ranges(hash, bytes)
+            .concatenate()
+            .await
+            .context("Failed to read fetched ranges from local store")
     }
 
     /// Fetch blobs from a remote node with one get-many request, returning

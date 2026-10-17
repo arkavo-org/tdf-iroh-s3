@@ -277,6 +277,32 @@ impl S3Client {
         Ok(data.into_bytes())
     }
 
+    /// Open a GET of the object at `key` from byte `start` to its end,
+    /// streamed. `None` when there is no such object. The body is read as
+    /// it arrives; the caller bounds how long it waits.
+    pub async fn get_object_from(
+        &self,
+        key: &str,
+        start: u64,
+    ) -> Result<Option<std::pin::Pin<Box<dyn tokio::io::AsyncBufRead + Send>>>> {
+        let mut request = self.client.get_object().bucket(&self.bucket).key(key);
+        // A range on a zero-length object is invalid in S3; from 0, ask for
+        // all of it.
+        if start > 0 {
+            request = request.range(format!("bytes={start}-"));
+        }
+        match request.send().await {
+            Ok(resp) => Ok(Some(Box::pin(resp.body.into_async_read()))),
+            Err(e) => {
+                if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!("Failed to GET {key} from S3: {e}"))
+                }
+            }
+        }
+    }
+
     pub async fn get_outboard(&self, hash_hex: &str) -> Result<Bytes> {
         let resp = self
             .client
@@ -317,6 +343,35 @@ impl S3Client {
                     Ok(None)
                 } else {
                     Err(anyhow::anyhow!("Failed to HEAD blob in S3: {}", e))
+                }
+            }
+        }
+    }
+
+    /// The stored size of a blob's outboard, or `None` when there is no
+    /// such outboard. An empty outboard (a blob of 16 KiB or less) is
+    /// `Some(0)`.
+    pub async fn outboard_size(&self, hash_hex: &str) -> Result<Option<u64>> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(self.outboard_key(hash_hex))
+            .send()
+            .await
+        {
+            Ok(head) => {
+                let size = head
+                    .content_length()
+                    .and_then(|n| u64::try_from(n).ok())
+                    .context("S3 HEAD of an outboard returned no content length")?;
+                Ok(Some(size))
+            }
+            Err(e) => {
+                if e.as_service_error().is_some_and(|se| se.is_not_found()) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!("Failed to HEAD outboard in S3: {}", e))
                 }
             }
         }
