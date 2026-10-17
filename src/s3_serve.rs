@@ -161,7 +161,9 @@ impl S3Server {
         tokio::spawn(async move {
             match server.compute_outboard(hash, size).await {
                 Ok(()) => info!(%hash, size, "Outboard computed from S3 and stored"),
-                Err(e) => warn!(%hash, error = format!("{e:#}"), "Computing the outboard failed; a later fetch tries again"),
+                Err(e) => {
+                    warn!(%hash, error = format!("{e:#}"), "Computing the outboard failed; a later fetch tries again")
+                }
             }
             lock(&server.backfilling).remove(&hash);
             drop(permit);
@@ -225,7 +227,10 @@ impl S3Reader {
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "S3 GET got no response"))?
                 .map_err(io::Error::other)?
                 .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, format!("{} is not in S3", self.key))
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("{} is not in S3", self.key),
+                    )
                 })?;
             self.open = Some(OpenGet { pos: offset, body });
         }
@@ -267,7 +272,10 @@ impl AsyncSliceReader for S3Reader {
 }
 
 /// Fill `buf` from `body`, failing if no bytes arrive for [`S3_STALL`].
-async fn read_exact(body: &mut Pin<Box<dyn AsyncBufRead + Send>>, buf: &mut [u8]) -> io::Result<()> {
+async fn read_exact(
+    body: &mut Pin<Box<dyn AsyncBufRead + Send>>,
+    buf: &mut [u8],
+) -> io::Result<()> {
     let mut filled = 0;
     while filled < buf.len() {
         let n = tokio::time::timeout(S3_STALL, body.read(&mut buf[filled..]))

@@ -153,9 +153,10 @@ pub async fn validate_from_store(
 
 /// Upload a validated blob to S3, streaming from its scratch file, and
 /// write the derived artifacts (extracted manifest + catalog index
-/// entries). The scratch file is removed either way.
+/// entries). It can be retried; the scratch file goes when `validated` is
+/// dropped.
 pub async fn upload(
-    validated: Validated,
+    validated: &Validated,
     catalog_config: &CatalogConfig,
     s3_client: &S3Client,
 ) -> Result<IngestResult, IngestError> {
@@ -166,13 +167,14 @@ pub async fn upload(
         outboard,
         file,
     } = validated;
+    let size = *size;
     let hash_hex = hash.to_hex().to_string();
 
     // The outboard goes first, always (it is small, and a re-push repairs a
     // missing one), so a blob that exists in S3 always has its outboard.
     // An empty outboard (a blob of 16 KiB or less) is a zero-length object.
     s3_client
-        .put_outboard(&hash_hex, Bytes::from(outboard))
+        .put_outboard(&hash_hex, Bytes::copy_from_slice(outboard))
         .await
         .context("Failed to upload outboard to S3")
         .map_err(IngestError::Failed)?;
@@ -194,15 +196,13 @@ pub async fn upload(
             .context("Failed to upload blob to S3")
             .map_err(IngestError::Failed)?;
     }
-    file.remove().await;
-
     // Derived artifacts (extracted manifest + catalog index entries).
     // Best-effort: the content blob is already durably stored, so a
     // manifest/index write failure must not mask a successful ingest — it
     // is loudly logged, and re-pushing the same content rewrites the
     // artifacts (self-repair). Note: the index prefixes (`manifests/`,
     // `catalog-index/`) need the same S3 write permissions as `blobs/`.
-    match catalog::derive_artifacts(&manifest, &hash_hex, size, unix_now(), catalog_config) {
+    match catalog::derive_artifacts(manifest, &hash_hex, size, unix_now(), catalog_config) {
         Ok(derived) => {
             if let Err(e) = s3_client
                 .put_manifest(&hash_hex, Bytes::from(derived.manifest_json))
@@ -245,7 +245,9 @@ pub async fn ingest_from_store(
     scratch_dir: &Path,
 ) -> Result<Option<IngestResult>, IngestError> {
     match validate_from_store(hash, store, validation_config, scratch_dir).await? {
-        Some(validated) => upload(validated, catalog_config, s3_client).await.map(Some),
+        Some(validated) => upload(&validated, catalog_config, s3_client)
+            .await
+            .map(Some),
         None => Ok(None),
     }
 }
@@ -294,11 +296,6 @@ impl ScratchFile {
         &self.path
     }
 
-    /// Remove now, waiting for it.
-    async fn remove(mut self) {
-        let path = std::mem::take(&mut self.path);
-        remove_quietly(path).await;
-    }
 }
 
 impl Drop for ScratchFile {
