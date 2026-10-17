@@ -111,7 +111,8 @@ What the record holds:
 - **The node's globally routable direct IP addresses.** These come from two places:
   - Addresses the relays report for the node (QUIC address discovery). Behind EC2's 1:1 NAT the node should learn `<public ip>:11204` this way, with no help from the config. This is expected, not verified on EC2 here; check it as below. On a developer machine behind a home router the same mechanism published the router's address, with a different port.
   - `[iroh] public_addresses`, if set. With `publish_dht` they are handed to the endpoint as external addresses, which `publish_dht = false` does not do (then they only appear in `GET /node`).
-- **Nothing private.** The instance's own `172.31.x.x` address, loopback, link-local, carrier-grade NAT, ULA and other reserved addresses are dropped, from `public_addresses` too. Global IPv6 addresses of the node's interfaces are published, with the iroh port, when it has any.
+- **Nothing private.** The instance's own `172.31.x.x` address, loopback, link-local, carrier-grade NAT, ULA and other reserved addresses are dropped, from `public_addresses` too. Only global unicast IPv6 (`2000::/3`) counts as global; documentation, 6to4, Teredo and other special blocks are dropped. Global IPv6 addresses of the node's interfaces are published, with the iroh port, when it has any.
+- **At most 8 direct addresses,** IPv4 first, then IPv6, and one relay URL. A pkarr packet holds 1000 bytes and the crate rejects a whole update that exceeds it, so the node bounds the record rather than risk publishing nothing.
 
 The record is published once the addresses are known, again whenever they or the relay change, and every hour. The DHT forgets a record nobody refreshes, so a stopped node disappears from it after a while.
 
@@ -120,7 +121,6 @@ The record is published once the addresses are known, again whenever they or the
 Other points:
 - The DHT client needs outbound UDP to arbitrary ports. The default security group allows it.
 - The record is public and readable by anyone with the endpoint ID. The public IP is already in DNS, so this adds nothing about the node.
-- A pkarr packet is limited to 1000 bytes. A host with very many IPv6 addresses can exceed it; the node then logs `failed to create signed packet` and publishes nothing.
 - `[iroh] dht_bootstrap` points the node at a private DHT instead of Mainline. Leave it empty in production.
 
 **Memory.** Ingest does not hold a blob in memory.

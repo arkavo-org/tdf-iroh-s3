@@ -16,6 +16,16 @@ use n0_mainline::DhtBuilder;
 use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// Most direct addresses one record carries. A pkarr packet holds at most 1000
+/// bytes of DNS data, and the crate refuses a whole update that exceeds it
+/// (no truncation, no relay-only fallback), which would leave the node with
+/// no record or a stale one. iroh-dns writes one TXT record per address
+/// (`addr=<socket address>`, up to 47 characters for a full IPv6 address and
+/// port, plus DNS framing). Measured with full-length IPv6 addresses, 13 fit
+/// beside a 20-character relay host, 12 beside 100 and 10 beside 200; eight
+/// leave room in every case (`a_full_record_fits_a_pkarr_packet`).
+pub const MAX_DIRECT_ADDRS: usize = 8;
+
 /// How the node publishes. The default is what production uses.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DhtOptions {
@@ -40,22 +50,34 @@ pub fn publisher(bootstrap: &[String], options: DhtOptions) -> Builder {
         .addr_filter(addr_filter(options.include_non_global_addrs))
 }
 
-/// Keeps the relay URL and, unless `include_non_global`, only the direct IP
-/// addresses that are globally routable. The crate's own default is relay
-/// only, which would leave the record without any direct address.
+/// Keeps the home relay URL and, unless `include_non_global`, only the direct
+/// IP addresses that are globally routable, at most [`MAX_DIRECT_ADDRS`] of
+/// them: IPv4 first, then IPv6, each in the order given. The crate's own
+/// default is relay only, which would leave the record without any direct
+/// address.
 pub fn addr_filter(include_non_global: bool) -> AddrFilter {
     AddrFilter::new(move |addrs| {
-        Cow::Owned(
-            addrs
-                .iter()
-                .filter(|addr| match addr {
-                    TransportAddr::Relay(_) => true,
-                    TransportAddr::Ip(sock) => include_non_global || is_global(sock.ip()),
-                    _ => false,
-                })
-                .cloned()
-                .collect(),
-        )
+        let mut kept: Vec<TransportAddr> = addrs
+            .iter()
+            .find(|a| a.is_relay())
+            .cloned()
+            .into_iter()
+            .collect();
+        let direct = |v4: bool| {
+            addrs.iter().filter(move |addr| match addr {
+                TransportAddr::Ip(sock) => {
+                    sock.is_ipv4() == v4 && (include_non_global || is_global(sock.ip()))
+                }
+                _ => false,
+            })
+        };
+        kept.extend(
+            direct(true)
+                .chain(direct(false))
+                .take(MAX_DIRECT_ADDRS)
+                .cloned(),
+        );
+        Cow::Owned(kept)
     })
 }
 
@@ -85,17 +107,17 @@ fn is_global_v4(ip: Ipv4Addr) -> bool {
         || a >= 240) // 240.0.0.0/4, reserved
 }
 
+/// Global unicast `2000::/3` only, minus the blocks inside it that are not
+/// routable on the public internet. Everything outside `2000::/3` (unspecified,
+/// loopback, IPv4-mapped, NAT64, ULA, link-local, site-local, multicast, ...)
+/// is excluded by the allowlist itself.
 fn is_global_v6(ip: Ipv6Addr) -> bool {
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return is_global_v4(v4);
-    }
-    let segments = ip.segments();
-    !(ip.is_unspecified()
-        || ip.is_loopback()
-        || ip.is_multicast()
-        || ip.is_unique_local()
-        || ip.is_unicast_link_local()
-        || (segments[0] == 0x2001 && segments[1] == 0x0db8)) // 2001:db8::/32, documentation
+    let s = ip.segments();
+    (s[0] & 0xe000) == 0x2000 // 2000::/3
+        && !(s[0] == 0x2001 && s[1] < 0x0200) // 2001::/23, IETF protocol assignments (Teredo, ORCHID, ...)
+        && !(s[0] == 0x2001 && s[1] == 0x0db8) // 2001:db8::/32, documentation
+        && s[0] != 0x2002 // 2002::/16, 6to4
+        && !(s[0] == 0x3fff && s[1] < 0x1000) // 3fff::/20, documentation
 }
 
 #[cfg(test)]
@@ -110,13 +132,23 @@ mod tests {
 
     #[test]
     fn public_addresses_are_global() {
-        for s in ["3.91.18.97", "8.8.8.8", "2600:1f18::1", "2a00:1450::1"] {
+        for s in [
+            "3.91.18.97",
+            "8.8.8.8",
+            "2606:4700::1111",
+            "2600:1f18::1",
+            "2a00:1450::1",
+            "2001:4860:4860::8888",
+            "2001:200::1", // just past 2001::/23
+            "3ffe::1",     // outside 3fff::/20
+            "3fff:1000::1",
+        ] {
             assert!(is_global(ip(s)), "{s}");
         }
     }
 
     #[test]
-    fn private_and_reserved_addresses_are_not_global() {
+    fn private_and_reserved_ipv4_addresses_are_not_global() {
         for s in [
             "0.0.0.0",
             "10.0.0.5",
@@ -134,14 +166,6 @@ mod tests {
             "224.0.0.1",
             "255.255.255.255",
             "240.0.0.1",
-            "::",
-            "::1",
-            "fe80::1",
-            "fd00::1",
-            "fc00::1",
-            "ff02::1",
-            "2001:db8::1",
-            "::ffff:10.0.0.1",
         ] {
             assert!(!is_global(ip(s)), "{s}");
         }
@@ -154,7 +178,36 @@ mod tests {
         ] {
             assert!(is_global(ip(s)), "{s}");
         }
-        assert!(is_global(ip("::ffff:3.91.18.97")));
+    }
+
+    #[test]
+    fn non_global_ipv6_blocks_are_not_global() {
+        for (what, s) in [
+            ("unspecified ::/128", "::"),
+            ("loopback ::1", "::1"),
+            ("IPv4-mapped ::ffff:0:0/96", "::ffff:3.91.18.97"),
+            ("IPv4-mapped, private", "::ffff:10.0.0.1"),
+            ("NAT64 64:ff9b::/96", "64:ff9b::808:808"),
+            ("local-use NAT64 64:ff9b:1::/48", "64:ff9b:1::1"),
+            ("discard 100::/64", "100::1"),
+            ("IETF protocol assignments 2001::/23 (Teredo)", "2001::1"),
+            ("IETF protocol assignments 2001::/23 (ORCHID)", "2001:10::1"),
+            (
+                "IETF protocol assignments 2001::/23, last",
+                "2001:1ff:ffff::1",
+            ),
+            ("documentation 2001:db8::/32", "2001:db8::1"),
+            ("documentation 3fff::/20", "3fff::1"),
+            ("documentation 3fff::/20, last", "3fff:fff:ffff::1"),
+            ("6to4 2002::/16", "2002:5bcc:18fd::1"),
+            ("ULA fc00::/7", "fc00::1"),
+            ("ULA fd00::/8", "fd12:3456::1"),
+            ("link-local fe80::/10", "fe80::1"),
+            ("site-local fec0::/10", "fec0::1"),
+            ("multicast ff00::/8", "ff02::1"),
+        ] {
+            assert!(!is_global(ip(s)), "{what}: {s}");
+        }
     }
 
     fn sample() -> Vec<TransportAddr> {
@@ -179,5 +232,73 @@ mod tests {
     #[test]
     fn filter_can_keep_everything() {
         assert_eq!(addr_filter(true).apply(&sample()).into_owned(), sample());
+    }
+
+    /// 30 global IPv6 addresses, the longest form (eight groups and a port),
+    /// plus a few global IPv4 ones and the relay.
+    fn crowded() -> Vec<TransportAddr> {
+        let mut addrs = vec![TransportAddr::Relay(
+            "https://use1-1.relay.n0.iroh.link./"
+                .parse::<RelayUrl>()
+                .unwrap(),
+        )];
+        for i in 0..30u16 {
+            let a = format!("[2601:147:c182:6fa0:ca6:3b5b:a281:{:x}]:56799", 0xcda0 + i);
+            addrs.push(TransportAddr::Ip(a.parse().unwrap()));
+        }
+        for i in 1..=3u8 {
+            addrs.push(TransportAddr::Ip(
+                format!("98.204.36.{i}:54571").parse().unwrap(),
+            ));
+        }
+        addrs
+    }
+
+    #[test]
+    fn filter_bounds_the_direct_addresses_and_puts_ipv4_first() {
+        let kept = addr_filter(false).apply(&crowded()).into_owned();
+        assert!(kept[0].is_relay());
+        assert_eq!(kept.len(), 1 + MAX_DIRECT_ADDRS);
+        let direct: Vec<_> = kept[1..]
+            .iter()
+            .map(|a| match a {
+                TransportAddr::Ip(s) => *s,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert!(direct[..3].iter().all(|a| a.is_ipv4()), "{direct:?}");
+        assert!(direct[3..].iter().all(|a| a.is_ipv6()), "{direct:?}");
+    }
+
+    /// The filtered record is encoded by the same path the publisher uses
+    /// (`EndpointInfo::to_pkarr_signed_packet`), which refuses a DNS packet
+    /// over 1000 bytes. Unbounded, 30 addresses do not fit.
+    #[test]
+    fn a_full_record_fits_a_pkarr_packet() {
+        use iroh::address_lookup::EndpointData;
+        use iroh::endpoint_info::EndpointInfo;
+
+        let key = iroh::SecretKey::generate();
+        let encode = |addrs: Vec<TransportAddr>| {
+            let info = EndpointInfo::from_parts(key.public(), EndpointData::from_iter(addrs));
+            info.to_pkarr_signed_packet(&key, 30)
+        };
+        assert!(
+            encode(crowded()).is_err(),
+            "the unfiltered record is too big"
+        );
+
+        let kept = addr_filter(false).apply(&crowded()).into_owned();
+        encode(kept).expect("the filtered record fits");
+
+        // Also with a much longer relay URL than n0's.
+        let mut long = crowded();
+        long[0] = TransportAddr::Relay(
+            format!("https://{}.example.com./", "r".repeat(100))
+                .parse::<RelayUrl>()
+                .unwrap(),
+        );
+        let kept = addr_filter(false).apply(&long).into_owned();
+        encode(kept).expect("the filtered record fits a long relay URL");
     }
 }

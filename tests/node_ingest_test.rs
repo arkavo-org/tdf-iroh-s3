@@ -1473,20 +1473,13 @@ async fn test_publish_dht_makes_the_node_resolvable_by_endpoint_id() {
     // only the endpoint ID. The id is the signing key, so a record under it
     // could only be signed by the node.
     let resolver = dht_resolver(&testnet);
-    let record = resolve_record(&resolver, node_id, |d| {
+    // (The ports of discovered addresses depend on the runner's NAT, so
+    // they are not asserted; the fetch below proves a published address
+    // works.)
+    resolve_record(&resolver, node_id, |d| {
         d.relay_urls().any(|u| *u == relay) && d.ip_addrs().next().is_some()
     })
     .await;
-    let node_port = node
-        .endpoint()
-        .bound_sockets()
-        .iter()
-        .map(|a| a.port())
-        .collect::<Vec<_>>();
-    assert!(
-        record.ip_addrs().all(|a| node_port.contains(&a.port())),
-        "direct addresses carry the iroh port: {record:?} vs {node_port:?}"
-    );
 
     // Push a TDF the usual way, then fetch it with a viewer that can only
     // use the DHT.
