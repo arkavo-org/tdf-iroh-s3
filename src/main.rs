@@ -360,21 +360,28 @@ async fn main() -> Result<()> {
 
     // With TLS on, HTTPS is the only externally reachable API: if it ends,
     // exit non-zero so systemd restarts the node instead of leaving it dark.
-    let signal = if let Some(https) = https {
-        tokio::select! {
-            signal = shutdown_signal() => signal?,
-            res = https => {
-                let err = match res {
-                    Ok(Ok(())) => anyhow::anyhow!("HTTPS listener stopped"),
-                    Ok(Err(e)) => e,
-                    Err(e) => anyhow::Error::from(e).context("HTTPS task"),
-                };
-                node.shutdown().await?;
-                return Err(err);
-            }
+    // The same goes for the store's garbage collector, the only cleanup of
+    // staged pushes: a restart starts a fresh one.
+    let https = async {
+        match https {
+            Some(https) => match https.await {
+                Ok(Ok(())) => anyhow::anyhow!("HTTPS listener stopped"),
+                Ok(Err(e)) => e,
+                Err(e) => anyhow::Error::from(e).context("HTTPS task"),
+            },
+            None => std::future::pending().await,
         }
-    } else {
-        shutdown_signal().await?
+    };
+    let signal = tokio::select! {
+        signal = shutdown_signal() => signal?,
+        err = https => {
+            node.shutdown().await?;
+            return Err(err);
+        }
+        () = node.collector_stopped() => {
+            node.shutdown().await?;
+            anyhow::bail!("The store's garbage collector stopped; restarting for a fresh one");
+        }
     };
     info!("{signal} received, shutting down...");
     node.shutdown().await?;
