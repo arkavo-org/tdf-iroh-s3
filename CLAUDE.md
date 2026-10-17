@@ -40,8 +40,8 @@ Iroh peer (QUIC) → Endpoint → FsStore (single-blob pushes only; publish gate
   (refused → withheld, deleted by the store's GC via quarantine.rs)
 Served (get/get_many/observe, single blobs only): validated = known valid and
   complete in the store (validated by this process, or complete + S3 HEAD
-  blobs/<hash>, kept in a bounded cache); an absent hash is left to iroh-blobs;
-  a stored blob S3 lacks is ingested again on its first fetch; else refused
+  blobs/<hash>, kept in a bounded cache); a stored blob S3 lacks is ingested
+  again on its first fetch; anything else, including an absent hash, refused
 ```
 
 ### Key Modules

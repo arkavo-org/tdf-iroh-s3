@@ -766,14 +766,11 @@ async fn test_a_push_of_an_ingested_hash_the_store_lacks_is_tracked() {
     node.shutdown().await.unwrap();
 }
 
-/// A single get of a hash the node does not hold is not refused by the
-/// node: it approves the request and iroh-blobs answers "not found". A
-/// get_many or observe naming one is refused: a get_many reads its blobs in
-/// turn, so a hash absent at approval could be pushed, unvalidated, before
-/// the request reaches it (and iroh-blobs ends a get_many at a missing blob
-/// anyway); an observe could create an entry for it.
+/// A fetch naming a hash the node does not hold is refused. The node
+/// decides once, before iroh-blobs reads the store, so approving an absent
+/// hash would let a push landing meanwhile be served unvalidated.
 #[tokio::test(flavor = "current_thread")]
-async fn test_only_a_single_get_may_name_a_missing_hash() {
+async fn test_a_fetch_naming_a_missing_hash_is_refused() {
     let (node, s3, _data_dir) = spawn_node(None).await;
     let node_id = node.addr().id;
     let tdf = create_test_tdf();
@@ -783,22 +780,11 @@ async fn test_only_a_single_get_may_name_a_missing_hash() {
 
     let viewer = IrohTestClient::new().await.unwrap();
     let missing = Hash::new(b"not on the node");
-    let error = format!(
-        "{:#}",
-        viewer
-            .fetch_from_node(node_id, missing)
-            .await
-            .expect_err("not found")
-    );
-    assert!(
-        !error.contains("reset by peer: error 1"),
-        "get refused for permission: {error}"
-    );
+    assert_refused_for_permission(viewer.fetch_from_node(node_id, missing).await, "get");
     assert_refused_for_permission(
         viewer.get_many_from_node(node_id, &[held, missing]).await,
         "get_many",
     );
-    // An observe could create an entry for the hash; it is refused.
     assert_refused_for_permission(viewer.observe_on_node(node_id, missing).await, "observe");
     // The held blob alone is served.
     let fetched = viewer.fetch_from_node(node_id, held).await.unwrap();

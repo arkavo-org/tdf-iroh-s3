@@ -393,15 +393,8 @@ impl Fetch {
             return self.send(Err(AbortReason::RateLimited)).await;
         };
         let ingester = Arc::clone(ingester);
-        // Only a single get is approved for a hash the store lacks: its
-        // export starts at once and finds nothing. A get_many reads its
-        // blobs one after another, so a hash absent at approval could be
-        // pushed, unvalidated, before the request reaches it (iroh-blobs
-        // ends a get_many at a missing blob anyway); and an observe of an
-        // absent hash can create an entry for it in the store.
-        let absent_ok = self.request == "get";
         tokio::spawn(async move {
-            let answer = check_fetch(&ingester, &self.hashes, absent_ok).await;
+            let answer = check_fetch(&ingester, &self.hashes).await;
             self.send(answer).await;
             drop(permit);
         });
@@ -422,15 +415,16 @@ impl Fetch {
 }
 
 /// Check each hash against the store and S3, at most [`S3_LOOKUPS`] at
-/// once. Served when every hash is validated, or absent when `absent_ok`
-/// (iroh-blobs then reports it as not found). At most [`RECOVERIES`] stored
-/// blobs are recovered at once. A stored blob not known valid is refused
+/// once. Served only when every hash is validated. A hash the store lacks
+/// is refused too: approval is decided once, before iroh-blobs reads the
+/// store, so approving an absent hash would let a push landing meanwhile be
+/// served unvalidated (and iroh-blobs ends a get_many at a missing blob
+/// anyway). At most [`RECOVERIES`] stored blobs are recovered at once. A stored blob not known valid is refused
 /// for now, and ingested again in the background: a good one is served
 /// once that validates it.
 async fn check_fetch(
     ingester: &Arc<Ingester>,
     hashes: &[iroh_blobs::Hash],
-    absent_ok: bool,
 ) -> Result<(), AbortReason> {
     // Every check runs to its end: a recovery dropped unstarted would
     // refuse its blob.
@@ -444,7 +438,6 @@ async fn check_fetch(
     while let Some((hash, stored)) = checks.next().await {
         match stored {
             Stored::Serve => {}
-            Stored::Absent if absent_ok => {}
             Stored::Absent | Stored::Withheld | Stored::Unknown => {
                 answer = Err(AbortReason::Permission)
             }
@@ -624,7 +617,9 @@ async fn ingest_stored(hash: iroh_blobs::Hash, pending: PendingPush, ingester: &
             }
         }
         Ok(None) => {
-            error!(%hash, "Blob incomplete at validation");
+            // It was complete a moment ago: the store could not answer.
+            error!(%hash, "Store lookup failed at validation; the blob stays withheld");
+            pending.release();
             false
         }
         Err(IngestError::Refused(e)) => {

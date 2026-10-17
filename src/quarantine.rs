@@ -25,8 +25,9 @@
 //! never refused afterwards (validation lifts an earlier refusal). A push
 //! that fails for the node's own reasons (it could not read the store,
 //! export or read the blob, or the node is shutting down) is released
-//! without refusing it; a fetch recovers a released blob again only after
-//! [`RECOVERY_COOLDOWN`].
+//! without refusing it, and an earlier refusal of the hash is lifted (the
+//! blob is undecided again); a fetch recovers a released blob again only
+//! after [`RECOVERY_COOLDOWN`].
 //!
 //! iroh-blobs deletes blobs only through its garbage collector (its
 //! `delete` is crate-private), which removes every blob that nothing
@@ -138,6 +139,9 @@ struct Validated {
     /// While the collector runs, the hashes validated or released since it
     /// started: it may not have listed them.
     during_collection: Option<HashSet<Hash>>,
+    /// More than [`VALIDATED_CAPACITY`] hashes were validated or released
+    /// during the run: it is skipped rather than remember them all.
+    collection_overflowed: bool,
 }
 
 impl Validated {
@@ -160,7 +164,11 @@ impl Validated {
     /// Keep `hash` from the running collection, if one runs.
     fn protect(&mut self, hash: Hash) {
         if let Some(during) = &mut self.during_collection {
-            during.insert(hash);
+            if during.len() < VALIDATED_CAPACITY {
+                during.insert(hash);
+            } else {
+                self.collection_overflowed = true;
+            }
         }
     }
 
@@ -327,15 +335,29 @@ impl Quarantine {
         }
     }
 
+    /// Start `hash`'s cooldown. At capacity, expired cooldowns are dropped,
+    /// then the oldest, so recent ones stay in force.
     fn note_released(&self, hash: Hash) {
         let mut released = lock(&self.released);
         if released.len() >= RELEASED_CAPACITY {
             released.retain(|_, at| at.elapsed() < RECOVERY_COOLDOWN);
-            if released.len() >= RELEASED_CAPACITY {
-                released.clear();
+            if released.len() >= RELEASED_CAPACITY
+                && let Some(oldest) = released.iter().min_by_key(|(_, at)| **at).map(|(h, _)| *h)
+            {
+                released.remove(&oldest);
             }
         }
         released.insert(hash, std::time::Instant::now());
+    }
+
+    /// A released push leaves the blob undecided: an earlier refusal of it
+    /// (say, of a partial push this one completed) no longer stands, so the
+    /// collector keeps it until a push or recovery decides.
+    fn lift_refusal(self: &Arc<Self>, hash: Hash) {
+        if lock(&self.refused).remove(&hash) {
+            info!(%hash, "Refusal lifted: the blob is undecided");
+            self.spawn_persist();
+        }
     }
 
     /// The node is shutting down: a push ended from here on is released,
@@ -474,15 +496,24 @@ impl Quarantine {
         if lock(&self.refused).is_empty() {
             return None;
         }
-        lock(&self.validated).during_collection = Some(HashSet::new());
+        {
+            let mut validated = lock(&self.validated);
+            validated.during_collection = Some(HashSet::new());
+            validated.collection_overflowed = false;
+        }
         let plan = self.plan_collection().await;
         // Pending pushes before validations: a push that validates after
         // this read is recorded as validated during the run.
         let pending: Vec<Hash> = lock(&self.pending).keys().copied().collect();
-        let during = lock(&self.validated)
-            .during_collection
-            .take()
-            .unwrap_or_default();
+        let (during, overflowed) = {
+            let mut validated = lock(&self.validated);
+            let during = validated.during_collection.take().unwrap_or_default();
+            (during, std::mem::take(&mut validated.collection_overflowed))
+        };
+        if overflowed {
+            warn!("Garbage collection skipped: too many blobs validated during the run");
+            return None;
+        }
         let (stored, mut doomed, mut keep) = plan?;
         keep.extend(pending);
         keep.extend(during);
@@ -654,6 +685,7 @@ impl PendingPush {
             // Kept from a running collection, which may not have listed it.
             lock(&self.quarantine.validated).protect(self.hash);
             self.quarantine.note_released(self.hash);
+            self.quarantine.lift_refusal(self.hash);
             self.quarantine.settle(self.hash);
         }
     }
@@ -1012,6 +1044,55 @@ mod tests {
         assert!(matches!(q.check_stored(blob).await, Stored::Withheld));
         assert!(!q.is_refused(&blob));
         store.shutdown().await.unwrap();
+    }
+
+    /// A released push lifts an earlier refusal: the push may have
+    /// completed what a refused partial push left, so the blob is undecided
+    /// rather than condemned.
+    #[tokio::test]
+    async fn a_released_push_lifts_an_earlier_refusal() {
+        let (q, store, _s3, _dir) = attached().await;
+        drop(q.track(hash(16)).await);
+        assert!(q.is_refused(&hash(16)));
+        q.track(hash(16)).await.release();
+        assert!(!q.is_refused(&hash(16)));
+        assert_eq!(q.serve(&hash(16)), Serve::Ask);
+        store.shutdown().await.unwrap();
+    }
+
+    /// At capacity, cooldowns make room by dropping the oldest, not all.
+    #[tokio::test]
+    async fn cooldowns_at_capacity_drop_only_the_oldest() {
+        let (q, store, _s3, _dir) = attached().await;
+        let h = |i: usize| Hash::new(i.to_le_bytes());
+        for i in 0..RELEASED_CAPACITY {
+            q.note_released(h(i));
+        }
+        q.note_released(h(RELEASED_CAPACITY));
+        assert_eq!(lock(&q.released).len(), RELEASED_CAPACITY);
+        assert!(!q.recently_released(&h(0)), "the oldest made room");
+        for i in [1, RELEASED_CAPACITY / 2, RELEASED_CAPACITY] {
+            assert!(q.recently_released(&h(i)), "{i} still cooling down");
+        }
+        store.shutdown().await.unwrap();
+    }
+
+    /// A collection remembers at most VALIDATED_CAPACITY hashes validated
+    /// during its run; past that it is marked to be skipped.
+    #[test]
+    fn a_collection_with_too_many_validations_is_skipped() {
+        let mut v = Validated {
+            during_collection: Some(HashSet::new()),
+            ..Default::default()
+        };
+        for i in 0..=VALIDATED_CAPACITY {
+            v.protect(Hash::new(i.to_le_bytes()));
+        }
+        assert_eq!(
+            v.during_collection.as_ref().unwrap().len(),
+            VALIDATED_CAPACITY
+        );
+        assert!(v.collection_overflowed);
     }
 
     /// The validated set keeps at most VALIDATED_CAPACITY hashes, dropping
