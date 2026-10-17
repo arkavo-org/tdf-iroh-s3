@@ -15,13 +15,10 @@
 //! pushed. A good TDF whose upload failed is uploaded then, and served; one
 //! that does not validate, or an incomplete leftover, is refused.
 //!
-//! A blob the store lacks, or holds only in part, that S3 holds is
-//! *restored*: downloaded from S3 and imported into the store, then served.
-//! That is how a node whose store was lost (a replaced instance) serves
-//! what was published before. A fetch answer is final only when neither
-//! the store nor S3 holds the hash as valid content ([`Stored::Gone`]);
-//! anything a stalled transfer, a busy node or an S3 hiccup could cause is
-//! "try again" ([`Stored::Busy`]).
+//! A fetch answer is final only when the node cannot serve the hash: its
+//! store does not hold it as valid content ([`Stored::Gone`]). Anything a
+//! stalled transfer, a busy node or an S3 hiccup could cause is "try
+//! again" ([`Stored::Busy`]).
 //!
 //! A push of a hash the node does not hold (validated, or complete in the
 //! store and in S3) is *tracked*, as is a recovery: *pending* from the
@@ -89,11 +86,6 @@ pub const NOT_INGESTED_TTL: Duration = Duration::from_secs(60);
 /// Most "not ingested" answers remembered.
 const NOT_INGESTED_CAPACITY: usize = 10_000;
 
-/// How long a hash whose S3 object cannot be restored (larger than
-/// `max_blob_bytes`, or bytes that do not match its key) is answered as
-/// gone before a fetch tries the restore again.
-pub const UNRESTORABLE_TTL: Duration = Duration::from_secs(3600);
-
 /// The longest an S3 lookup may take; past it the lookup counts as failed
 /// (the fetch is told to try again), so a hung request cannot hold a
 /// lookup slot.
@@ -118,18 +110,11 @@ pub enum Stored {
     /// cools down, or the store or S3 could not answer. The fetcher should
     /// try again.
     Busy,
-    /// Neither the store nor S3 holds it as valid content: refused for
-    /// good.
+    /// The store does not hold it as valid content: refused for good.
     Gone,
-    /// A restore of it from S3 is under way: worth waiting for.
-    Restoring,
     /// Stored, but not known valid. The caller ingests it with this tracked
     /// push: served once it validates, refused if it does not.
     Recover(PendingPush),
-    /// S3 holds it (this many bytes) but the store does not hold it whole,
-    /// as after the node's store was lost. The caller restores it from S3
-    /// with this tracked push.
-    Restore(PendingPush, u64),
 }
 
 /// Hashes remembered for a while, at most `capacity` of them; at capacity
@@ -197,10 +182,6 @@ pub struct Quarantine {
     /// Hashes S3 recently answered it does not hold ([`NOT_INGESTED_TTL`]),
     /// so a repeated fetch of one does not ask again.
     not_ingested: Mutex<Expiring>,
-    /// Hashes being restored from S3.
-    restoring: Mutex<HashSet<Hash>>,
-    /// Hashes whose S3 object could not be restored ([`UNRESTORABLE_TTL`]).
-    unrestorable: Mutex<Expiring>,
     /// Set once the node shuts down: a push ended by the shutdown is
     /// released, not refused.
     closing: std::sync::atomic::AtomicBool,
@@ -290,8 +271,6 @@ impl Quarantine {
             lookups: Semaphore::new(S3_LOOKUPS),
             released: Mutex::new(Expiring::new(RECOVERY_COOLDOWN, RELEASED_CAPACITY)),
             not_ingested: Mutex::new(Expiring::new(NOT_INGESTED_TTL, NOT_INGESTED_CAPACITY)),
-            restoring: Mutex::default(),
-            unrestorable: Mutex::new(Expiring::new(UNRESTORABLE_TTL, NOT_INGESTED_CAPACITY)),
             closing: std::sync::atomic::AtomicBool::new(false),
             file,
             write_lock: tokio::sync::Mutex::new(()),
@@ -357,8 +336,8 @@ impl Quarantine {
     }
 
     /// Whether the node may serve `hash`, from memory alone. A hash with a
-    /// push pending is left to [`Self::check_stored`] too: S3 may hold it,
-    /// and a push that stalls must not keep published content away.
+    /// push pending is left to [`Self::check_stored`] too, which may find
+    /// it complete and ingested.
     pub fn serve(&self, hash: &Hash) -> Serve {
         if self.is_validated(hash) {
             Serve::Yes
@@ -369,31 +348,24 @@ impl Quarantine {
         }
     }
 
-    /// Decide `hash` from the store and S3:
+    /// Decide `hash` from the store, and from S3 when the store holds it
+    /// complete:
     ///
     /// | Store | S3 | Verdict |
     /// |---|---|---|
     /// | complete | holds it | served (it becomes validated) |
     /// | complete | lacks it | recovered (ingested again), or gone if refused |
-    /// | part or none | holds it | restored from S3 |
-    /// | part | lacks it | recovered (and so refused), or gone if refused |
-    /// | none | lacks it | gone |
+    /// | part | — | recovered (and so refused), or gone if refused |
+    /// | none | — | gone |
     ///
     /// A store or S3 error, a push or recovery under way, or a cooldown is
     /// busy: worth another try. Only gone is final, and it is checked again
-    /// against pushes and validations that began while S3 answered. A
-    /// pending push of the hash never stops a restore: the push may stall.
+    /// against pushes, validations and releases that happened meanwhile.
     pub async fn check_stored(self: &Arc<Self>, hash: Hash) -> Stored {
         match self.serve(&hash) {
             Serve::Yes => return Stored::Serve,
             Serve::Busy => return Stored::Busy,
             Serve::Ask => {}
-        }
-        if self.is_restoring(&hash) {
-            return Stored::Restoring;
-        }
-        if lock(&self.unrestorable).contains(&hash) {
-            return self.gone(hash);
         }
         let Some((store, _)) = self.attached.get() else {
             return Stored::Busy;
@@ -407,39 +379,27 @@ impl Quarantine {
         };
         let complete = bitfield.is_complete();
         let partial = !complete && !bitfield.ranges.is_empty();
-        let ingested = if lock(&self.not_ingested).contains(&hash) {
-            None
-        } else {
+        if complete && !lock(&self.not_ingested).contains(&hash) {
             match self.lookup(hash).await {
-                Ok(Some(size)) => Some(size),
-                Ok(None) => {
-                    lock(&self.not_ingested).insert(hash);
-                    None
+                Ok(Some(_)) => {
+                    self.mark_validated(hash);
+                    return Stored::Serve;
                 }
+                Ok(None) => lock(&self.not_ingested).insert(hash),
                 Err(e) => {
                     warn!(%hash, error = %e, "Ingest lookup failed");
                     return Stored::Busy;
                 }
             }
-        };
-        let refused = self.is_refused(&hash);
-        let pending = lock(&self.pending).contains_key(&hash);
-        match (complete, ingested) {
-            (true, Some(_)) => {
-                self.mark_validated(hash);
-                Stored::Serve
-            }
-            (false, Some(size)) => match self.track_restore(hash) {
-                Some(restore) => Stored::Restore(restore, size),
-                None => Stored::Restoring,
-            },
-            // S3 lacks it: a pending push decides.
-            (_, None) if pending => Stored::Busy,
-            (true, None) | (false, None) if refused => self.gone(hash),
-            (true, None) => self.recover(hash),
-            (false, None) if partial => self.recover(hash),
-            (false, None) => self.gone(hash),
         }
+        if lock(&self.pending).contains_key(&hash) {
+            // A pending push decides.
+            return Stored::Busy;
+        }
+        if self.is_refused(&hash) || !(complete || partial) {
+            return self.gone(hash);
+        }
+        self.recover(hash)
     }
 
     /// Gone, unless a push, validation or release of `hash` happened
@@ -454,12 +414,6 @@ impl Quarantine {
         }
     }
 
-    /// `hash`'s S3 object cannot be restored: answer it as gone for
-    /// [`UNRESTORABLE_TTL`] rather than download it again and again.
-    pub fn mark_unrestorable(&self, hash: Hash) {
-        lock(&self.unrestorable).insert(hash);
-    }
-
     fn recover(self: &Arc<Self>, hash: Hash) -> Stored {
         if self.recently_released(&hash) {
             return Stored::Busy;
@@ -468,11 +422,6 @@ impl Quarantine {
             Some(recovery) => Stored::Recover(recovery),
             None => Stored::Busy,
         }
-    }
-
-    /// Whether a restore of `hash` from S3 is under way.
-    pub fn is_restoring(&self, hash: &Hash) -> bool {
-        lock(&self.restoring).contains(hash)
     }
 
     fn recently_released(&self, hash: &Hash) -> bool {
@@ -548,21 +497,6 @@ impl Quarantine {
         }
         pending.insert(hash, 1);
         Some(PendingPush::new(self, hash, true))
-    }
-
-    /// A tracked push of `hash` for a restore from S3, unless a restore of
-    /// it runs already. A pending push does not stop it: the restore writes
-    /// the same verified content, and the push may never finish. Fetches of
-    /// the hash may wait for it ([`Stored::Restoring`]).
-    fn track_restore(self: &Arc<Self>, hash: Hash) -> Option<PendingPush> {
-        let mut pending = lock(&self.pending);
-        if !lock(&self.restoring).insert(hash) {
-            return None;
-        }
-        *pending.entry(hash).or_default() += 1;
-        let mut push = PendingPush::new(self, hash, true);
-        push.restoring = true;
-        Some(push)
     }
 
     /// Whether `hash` is refused and waiting for deletion.
@@ -809,8 +743,6 @@ pub struct PendingPush {
     hash: Hash,
     tracked: bool,
     settled: bool,
-    /// A restore from S3 ([`Quarantine::track_restore`]).
-    restoring: bool,
 }
 
 impl PendingPush {
@@ -820,21 +752,12 @@ impl PendingPush {
             hash,
             tracked,
             settled: false,
-            restoring: false,
         }
     }
 
     /// The hash this push is for.
     pub fn hash(&self) -> Hash {
         self.hash
-    }
-
-    /// Clear this restore's marker, once: a later restore of the hash has a
-    /// marker of its own.
-    fn end_restore(&mut self) {
-        if std::mem::take(&mut self.restoring) {
-            lock(&self.quarantine.restoring).remove(&self.hash);
-        }
     }
 
     /// Whether this push decides the blob's fate (the node did not hold it).
@@ -846,7 +769,6 @@ impl PendingPush {
     pub fn validated(mut self) {
         self.settled = true;
         self.quarantine.mark_validated(self.hash);
-        self.end_restore();
         if self.tracked {
             self.quarantine.settle(self.hash);
         }
@@ -858,7 +780,6 @@ impl PendingPush {
     /// [`RECOVERY_COOLDOWN`], checks it again.
     pub fn release(mut self) {
         self.settled = true;
-        self.end_restore();
         if self.tracked {
             // Kept from a running collection, which may not have listed it.
             lock(&self.quarantine.validated).protect(self.hash);
@@ -870,12 +791,11 @@ impl PendingPush {
 }
 
 impl PendingPush {
-    /// The node had no room to start this recovery or restore now: end it
+    /// The node had no room to start this recovery now: end it
     /// with no effect at all (no refusal, no cooldown), so a later fetch
     /// tries again.
     pub fn cancel(mut self) {
         self.settled = true;
-        self.end_restore();
         if self.tracked {
             self.quarantine.settle(self.hash);
         }
@@ -884,7 +804,6 @@ impl PendingPush {
 
 impl Drop for PendingPush {
     fn drop(&mut self) {
-        self.end_restore();
         if self.tracked && !self.settled {
             self.quarantine.end_unvalidated(self.hash);
         }
@@ -1159,50 +1078,22 @@ mod tests {
         // Refused and not ingested: gone.
         assert!(matches!(q.check_stored(never).await, Stored::Gone));
 
-        // Not stored, ingested: restored; fetches meanwhile may wait.
-        let Stored::Restore(restore, _) = q.check_stored(lost).await else {
-            panic!("a blob only S3 holds is restored");
-        };
-        assert!(q.is_restoring(&lost));
-        assert_eq!(q.serve(&lost), Serve::Ask);
-        assert!(matches!(q.check_stored(lost).await, Stored::Restoring));
-        restore.cancel();
-        assert!(!q.is_restoring(&lost));
-        assert!(!q.is_refused(&lost), "a cancelled restore refuses nothing");
-
-        // Not stored, not ingested: gone, and S3 is asked once.
+        // Not stored: gone, whatever S3 holds, and S3 is not asked.
         let heads = s3.heads.load(SeqCst);
+        assert!(matches!(q.check_stored(lost).await, Stored::Gone));
         assert!(matches!(q.check_stored(absent).await, Stored::Gone));
-        assert!(matches!(q.check_stored(absent).await, Stored::Gone));
-        assert_eq!(s3.heads.load(SeqCst), heads + 1, "the answer is reused");
-        assert!(!q.is_refused(&absent));
-        store.shutdown().await.unwrap();
-    }
-
-    /// A restore that fails for the node's own reasons (S3, disk) releases
-    /// the hash; one that ends by validating serves it.
-    #[tokio::test]
-    async fn a_restore_ends_served_or_released() {
-        let (q, store, s3, _dir) = attached().await;
-        s3.ingest(hash(18));
-        let Stored::Restore(restore, _) = q.check_stored(hash(18)).await else {
-            panic!("restored");
-        };
-        restore.release();
-        assert!(!q.is_restoring(&hash(18)));
-        assert!(!q.is_refused(&hash(18)));
-        assert!(
-            matches!(q.check_stored(hash(18)).await, Stored::Busy),
-            "cooling down"
+        assert_eq!(
+            s3.heads.load(SeqCst),
+            heads,
+            "no lookup for a hash not stored"
         );
 
-        s3.ingest(hash(19));
-        let Stored::Restore(restore, _) = q.check_stored(hash(19)).await else {
-            panic!("restored");
-        };
-        restore.validated();
-        assert!(!q.is_restoring(&hash(19)));
-        assert_eq!(q.serve(&hash(19)), Serve::Yes);
+        // Complete but not ingested, asked again after the recovery: the
+        // "not ingested" answer is reused.
+        let heads = s3.heads.load(SeqCst);
+        assert!(matches!(q.check_stored(never).await, Stored::Gone));
+        assert_eq!(s3.heads.load(SeqCst), heads, "the answer is reused");
+        assert!(!q.is_refused(&absent));
         store.shutdown().await.unwrap();
     }
 

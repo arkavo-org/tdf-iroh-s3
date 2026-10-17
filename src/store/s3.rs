@@ -277,53 +277,6 @@ impl S3Client {
         Ok(data.into_bytes())
     }
 
-    /// Download `blobs/<hash>` to `path`, streaming: the blob is never held
-    /// in memory. Refuses more than `max_bytes`. Returns the bytes written.
-    ///
-    /// A download that gets no response within `stall`, or no bytes for
-    /// `stall` once it has started, fails: a hung request never holds its
-    /// caller.
-    pub async fn get_blob_to_file(
-        &self,
-        hash_hex: &str,
-        path: &Path,
-        max_bytes: u64,
-        stall: std::time::Duration,
-    ) -> Result<u64> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let request = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(self.blob_key(hash_hex))
-            .send();
-        let resp = tokio::time::timeout(stall, request)
-            .await
-            .context("S3 GET of a blob got no response")?
-            .context("Failed to GET blob from S3")?;
-        let mut file = tokio::fs::File::create(path)
-            .await
-            .with_context(|| format!("Failed to create {}", path.display()))?;
-        let mut body = resp.body.into_async_read();
-        let mut buf = vec![0u8; 256 * 1024];
-        let mut written = 0u64;
-        loop {
-            let n = tokio::time::timeout(stall, body.read(&mut buf))
-                .await
-                .context("S3 download of a blob stalled")?
-                .context("Failed to download blob from S3")?;
-            if n == 0 {
-                break;
-            }
-            written += n as u64;
-            anyhow::ensure!(written <= max_bytes, "blob in S3 exceeds {max_bytes} bytes");
-            file.write_all(&buf[..n]).await?;
-        }
-        file.flush().await?;
-        file.sync_all().await.ok();
-        Ok(written)
-    }
-
     pub async fn get_outboard(&self, hash_hex: &str) -> Result<Bytes> {
         let resp = self
             .client

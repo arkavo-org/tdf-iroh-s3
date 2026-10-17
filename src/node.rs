@@ -159,7 +159,6 @@ impl TdfIrohNode {
                     config.validation.max_concurrent_ingests.get(),
                 )),
                 recoveries: Arc::new(Semaphore::new(RECOVERIES)),
-                restores: Arc::new(Semaphore::new(RESTORES)),
             });
             let cancel = cancel.clone();
             tokio::spawn(async move {
@@ -224,8 +223,6 @@ struct Ingester {
     permits: Arc<Semaphore>,
     /// Bounds recoveries ([`RECOVERIES`]).
     recoveries: Arc<Semaphore>,
-    /// Bounds restores from S3 ([`RESTORES`]).
-    restores: Arc<Semaphore>,
 }
 
 async fn run_ingest_loop(
@@ -358,14 +355,6 @@ const FETCH_CHECKS: usize = 256;
 /// ingest permit or holding one.
 const RECOVERIES: usize = 64;
 
-/// Blobs restored from S3 at once. Each holds a download and a copy into
-/// the store on disk while it runs.
-const RESTORES: usize = 2;
-
-/// An S3 download that gets no response, or no bytes, for this long fails
-/// (the restore is released and tried again later).
-const S3_STALL: Duration = Duration::from_secs(30);
-
 /// Most hashes one get_many may name. Creator and the viewer fetch one blob
 /// at a time; a request naming more is refused before any lookup, so it
 /// cannot make the node send S3 a lookup per hash.
@@ -401,20 +390,11 @@ async fn hold_tag(ingester: &Ingester, hash: iroh_blobs::Hash) {
     }
 }
 
-/// How long a fetch waits for a restore from S3 before answering "try
-/// again" (`RateLimited`). The restore goes on either way: it belongs to the
-/// node, not to the request, so a fetcher that gives up, drops its
-/// connection or comes back on another path finds the blob served once it
-/// is done. Held requests stay well within iroh's path idle timeouts (15 s
-/// direct, 30 s relayed), which its heartbeats keep from firing anyway.
-const RESTORE_WAIT: Duration = Duration::from_secs(10);
-
 /// A get, get_many or observe waiting for its answer.
 ///
 /// The answer tells the fetcher whether to try again. `Permission` is final:
-/// the hash is blocked, or neither the store nor S3 holds it as valid
-/// content. `RateLimited` means not now: it is being pushed, checked or
-/// restored, the node is busy, or the store or S3 did not answer. On an
+/// the hash is blocked, or the node does not hold it as valid content. `RateLimited` means not now: it is being pushed, checked or
+/// recovered, the node is busy, or the store or S3 did not answer. On an
 /// iroh P2P network, transfers stall and drop, so anything that a transfer
 /// or a dependency's hiccup could cause is `RateLimited`, never final.
 struct Fetch {
@@ -486,15 +466,13 @@ impl Fetch {
 /// otherwise. A hash the store lacks is never approved on the strength of
 /// arriving later: approval is decided once, before iroh-blobs reads the
 /// store. A stored blob not known valid is ingested again in the
-/// background (at most [`RECOVERIES`]); one the store lacks but S3 holds is
-/// restored from S3 (at most [`RESTORES`]), and the fetch waits up to
-/// [`RESTORE_WAIT`] for it.
+/// background (at most [`RECOVERIES`]).
 async fn check_fetch(
     ingester: &Arc<Ingester>,
     hashes: &[iroh_blobs::Hash],
 ) -> Result<(), AbortReason> {
-    // Every check started runs to its end: a recovery or restore dropped
-    // unstarted would refuse its blob. Once a hash is gone the answer is
+    // Every check started runs to its end: a recovery dropped unstarted
+    // would refuse its blob. Once a hash is gone the answer is
     // final, so no further checks start.
     let stop = std::sync::atomic::AtomicBool::new(false);
     let mut checks = futures::stream::iter(hashes.iter().copied())
@@ -505,7 +483,6 @@ async fn check_fetch(
         })
         .buffer_unordered(S3_LOOKUPS);
     let (mut gone, mut busy) = (false, false);
-    let mut waits = Vec::new();
     while let Some((hash, stored)) = checks.next().await {
         match stored {
             Stored::Serve => {}
@@ -514,7 +491,6 @@ async fn check_fetch(
                 stop.store(true, std::sync::atomic::Ordering::SeqCst);
             }
             Stored::Busy => busy = true,
-            Stored::Restoring => waits.push(hash),
             Stored::Recover(recovery) => {
                 match Arc::clone(&ingester.recoveries).try_acquire_owned() {
                     Ok(permit) => {
@@ -530,116 +506,15 @@ async fn check_fetch(
                 }
                 busy = true;
             }
-            Stored::Restore(restore, size) => {
-                match Arc::clone(&ingester.restores).try_acquire_owned() {
-                    Ok(permit) => {
-                        let ingester = Arc::clone(ingester);
-                        tokio::spawn(async move {
-                            restore_from_s3(restore, size, &ingester).await;
-                            drop(permit);
-                        });
-                        waits.push(hash);
-                    }
-                    Err(_) => {
-                        restore.cancel();
-                        busy = true;
-                    }
-                }
-            }
         }
     }
     if gone {
         return Err(AbortReason::Permission);
     }
-    if !busy && !waits.is_empty() {
-        let deadline = tokio::time::Instant::now() + RESTORE_WAIT;
-        for hash in waits {
-            if !wait_restored(&ingester.quarantine, hash, deadline).await {
-                busy = true;
-                break;
-            }
-        }
-    }
     if busy {
         Err(AbortReason::RateLimited)
     } else {
         Ok(())
-    }
-}
-
-/// Wait until `hash` is validated (restored), its restore ends without
-/// that, or `deadline` passes. `true` when it was restored.
-async fn wait_restored(
-    quarantine: &Quarantine,
-    hash: iroh_blobs::Hash,
-    deadline: tokio::time::Instant,
-) -> bool {
-    loop {
-        if quarantine.is_validated(&hash) {
-            return true;
-        }
-        if !quarantine.is_restoring(&hash) || tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// Restore a blob the store lacks from S3's `blobs/<hash>`: download it to
-/// a scratch file (streamed, never in memory), import it into the store,
-/// and check the store computed the expected hash. S3 holds only blobs
-/// that validated at ingest, so a match is served. A download or import
-/// failure releases the hash (the content is still in S3; a later fetch
-/// tries again); an S3 object whose content does not match its key is
-/// logged, and what it imported is refused for the collector to delete.
-async fn restore_from_s3(restore: PendingPush, size: u64, ingester: &Ingester) {
-    let hash = restore.hash();
-    let max = ingester.config.validation.max_blob_bytes;
-    if size > max {
-        error!(%hash, size, max, "Blob in S3 exceeds max_blob_bytes; not restored");
-        ingester.quarantine.mark_unrestorable(hash);
-        return restore.cancel();
-    }
-    info!(%hash, size, "Restoring blob from S3");
-    let path = ingester
-        .scratch_dir
-        .join(format!("restore-{}", hash.to_hex()));
-    let result = async {
-        let written = ingester
-            .s3_client
-            .get_blob_to_file(&hash.to_hex(), &path, max, S3_STALL)
-            .await?;
-        let tag = ingester
-            .store
-            .add_path(&path)
-            .temp_tag()
-            .await
-            .context("Failed to import the downloaded blob")?;
-        anyhow::Ok((written, tag))
-    }
-    .await;
-    let _ = tokio::fs::remove_file(&path).await;
-    match result {
-        Ok((written, tag)) if tag.hash() == hash => {
-            // The import's tag outlives any collector run that might have
-            // started before the restore finished.
-            restore.validated();
-            hold(tag, ingester);
-            info!(%hash, size = written, "Blob restored from S3");
-        }
-        Ok((_, tag)) => {
-            let imported = tag.hash();
-            error!(%hash, %imported, "S3 object does not match its key; not restored");
-            ingester.quarantine.mark_unrestorable(hash);
-            ingester.quarantine.condemn(imported);
-            drop(tag);
-            // Final for UNRESTORABLE_TTL: no cooldown, no retry meanwhile.
-            restore.cancel();
-        }
-        Err(e) => {
-            warn!(%hash, error = format!("{e:#}"), "Restore from S3 failed; a later fetch tries again");
-            restore.release();
-        }
     }
 }
 
