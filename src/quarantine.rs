@@ -433,15 +433,6 @@ impl Quarantine {
         lock(&self.released).insert(hash);
     }
 
-    /// A blob the store holds under `hash` that nothing should have put
-    /// there (an S3 object whose content did not match its key): refused,
-    /// for the collector to delete, unless a push of it is pending.
-    pub fn condemn(self: &Arc<Self>, hash: Hash) {
-        if let Some(push) = self.track_if_idle(hash) {
-            drop(push);
-        }
-    }
-
     /// A released push leaves the blob undecided: an earlier refusal of it
     /// (say, of a partial push this one completed) no longer stands, so the
     /// collector keeps it until a push or recovery decides.
@@ -753,11 +744,6 @@ impl PendingPush {
             tracked,
             settled: false,
         }
-    }
-
-    /// The hash this push is for.
-    pub fn hash(&self) -> Hash {
-        self.hash
     }
 
     /// Whether this push decides the blob's fate (the node did not hold it).
