@@ -7,6 +7,7 @@ fn test_valid_tdf_passes_full_pipeline() {
     let config = ValidationConfig {
         required_attributes: vec!["https://example.com/attr/storage/value/permanent".to_string()],
         assertion: Default::default(),
+        ..Default::default()
     };
     let result = validate_blob(&tdf_bytes, &config);
     assert!(result.is_ok(), "Valid TDF should pass: {:?}", result.err());
@@ -26,6 +27,7 @@ fn test_missing_attribute_fails_pipeline() {
     let config = ValidationConfig {
         required_attributes: vec!["https://example.com/attr/storage/value/permanent".to_string()],
         assertion: Default::default(),
+        ..Default::default()
     };
     let result = validate_blob(&tdf_bytes, &config);
     assert!(result.is_err(), "Missing attribute should fail");

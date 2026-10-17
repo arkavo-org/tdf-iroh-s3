@@ -1,4 +1,6 @@
 use serde::Deserialize;
+use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
@@ -237,6 +239,20 @@ pub struct IrohConfig {
     pub secret_key_param: String,
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
+    /// Public `ip:port` addresses peers can dial directly, reported by
+    /// `GET /node` as `directAddresses` (for example the instance's elastic
+    /// IP and the iroh port). The node cannot discover these itself behind
+    /// NAT. Empty by default.
+    #[serde(default)]
+    pub public_addresses: Vec<SocketAddr>,
+    /// How often the store's garbage collector checks for refused blobs to
+    /// delete (it runs only while some are waiting). Seconds; default 60.
+    #[serde(default = "default_gc_interval_secs")]
+    pub gc_interval_secs: u64,
+}
+
+fn default_gc_interval_secs() -> u64 {
+    60
 }
 
 impl Default for IrohConfig {
@@ -245,6 +261,8 @@ impl Default for IrohConfig {
             bind_port: default_bind_port(),
             secret_key_param: default_secret_key_param(),
             data_dir: default_data_dir(),
+            public_addresses: Vec::new(),
+            gc_interval_secs: default_gc_interval_secs(),
         }
     }
 }
@@ -267,17 +285,58 @@ pub struct S3Config {
     pub region: String,
     #[serde(default)]
     pub prefix: String,
+    /// An S3-compatible endpoint such as LocalStack or MinIO
+    /// (`http://127.0.0.1:4566`). Empty uses AWS, or `AWS_ENDPOINT_URL_S3` /
+    /// `AWS_ENDPOINT_URL` when set.
+    #[serde(default)]
+    pub endpoint_url: String,
+    /// Put the bucket in the request path instead of the host name. Most
+    /// S3-compatible endpoints need this; AWS does not.
+    #[serde(default)]
+    pub force_path_style: bool,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ValidationConfig {
     #[serde(default)]
     pub required_attributes: Vec<String>,
     #[serde(default)]
     pub assertion: AssertionConfig,
+    /// Pushed blobs larger than this many bytes are refused. Ingest reads
+    /// the blob from a file, so memory does not bound this; disk does (see
+    /// `docs/deploy-runbook.md`).
+    #[serde(default = "default_max_blob_bytes")]
+    pub max_blob_bytes: u64,
+    /// How many pushed blobs are validated and uploaded at once. Each one in
+    /// progress holds a copy of the blob on disk (none when the filesystem
+    /// supports reflinks). At least 1; default 1.
+    #[serde(default = "default_max_concurrent_ingests")]
+    pub max_concurrent_ingests: NonZeroUsize,
 }
 
-#[derive(Debug, Default, Deserialize)]
+impl Default for ValidationConfig {
+    fn default() -> Self {
+        Self {
+            required_attributes: Vec::new(),
+            assertion: AssertionConfig::default(),
+            max_blob_bytes: default_max_blob_bytes(),
+            max_concurrent_ingests: default_max_concurrent_ingests(),
+        }
+    }
+}
+
+fn default_max_concurrent_ingests() -> NonZeroUsize {
+    NonZeroUsize::MIN
+}
+
+/// The largest `payloadSize` a creator catalog may name.
+pub const DEFAULT_MAX_BLOB_BYTES: u64 = crate::creator_catalog::MAX_PAYLOAD_SIZE;
+
+fn default_max_blob_bytes() -> u64 {
+    DEFAULT_MAX_BLOB_BYTES
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct AssertionConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -292,6 +351,12 @@ pub struct AssertionConfig {
 pub struct HttpConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Listen address of the plain listener without `[http.tls]`:
+    /// `127.0.0.1` when a TLS proxy on the same host fronts the API; the
+    /// default `0.0.0.0` listens on every interface. With `[http.tls]` the
+    /// plain listener is always `127.0.0.1`.
+    #[serde(default = "default_http_bind_address")]
+    pub bind_address: IpAddr,
     #[serde(default = "default_http_bind_port")]
     pub bind_port: u16,
     #[serde(default)]
@@ -338,6 +403,7 @@ impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            bind_address: default_http_bind_address(),
             bind_port: default_http_bind_port(),
             cose_keys_url: String::new(),
             expected_issuer: String::new(),
@@ -345,6 +411,10 @@ impl Default for HttpConfig {
             tls: None,
         }
     }
+}
+
+fn default_http_bind_address() -> IpAddr {
+    IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
 }
 
 fn default_http_bind_port() -> u16 {

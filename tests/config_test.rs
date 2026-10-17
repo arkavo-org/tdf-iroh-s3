@@ -38,6 +38,26 @@ region = "us-east-1"
     assert_eq!(config.iroh.bind_port, 11204);
     assert!(config.validation.required_attributes.is_empty());
     assert!(!config.validation.assertion.enabled);
+    assert_eq!(
+        config.validation.max_blob_bytes,
+        tdf_iroh_s3::config::DEFAULT_MAX_BLOB_BYTES
+    );
+    assert_eq!(tdf_iroh_s3::config::DEFAULT_MAX_BLOB_BYTES, 4_294_967_295);
+}
+
+#[test]
+fn test_max_blob_bytes_is_configurable() {
+    let toml_str = r#"
+[s3]
+bucket = "test-bucket"
+region = "us-east-1"
+
+[validation]
+max_blob_bytes = 1048576
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.validation.max_blob_bytes, 1_048_576);
+    assert!(config.validation.required_attributes.is_empty());
 }
 
 #[test]
@@ -166,4 +186,71 @@ region = "us-east-1"
 "#;
     let config: Config = toml::from_str(toml_str).unwrap();
     assert!(config.http.tls.is_none());
+}
+
+#[test]
+fn test_s3_compatible_endpoint() {
+    let toml_str = r#"
+[s3]
+bucket = "test-bucket"
+region = "us-east-1"
+endpoint_url = "http://127.0.0.1:4566"
+force_path_style = true
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.s3.endpoint_url, "http://127.0.0.1:4566");
+    assert!(config.s3.force_path_style);
+
+    let config: Config = toml::from_str("[s3]\nbucket = \"b\"\nregion = \"r\"\n").unwrap();
+    assert!(config.s3.endpoint_url.is_empty());
+    assert!(!config.s3.force_path_style);
+}
+
+#[test]
+fn test_public_addresses_and_http_bind_address() {
+    let toml_str = r#"
+[iroh]
+public_addresses = ["3.91.18.97:11204", "[2001:db8::1]:11204"]
+
+[s3]
+bucket = "test-bucket"
+region = "us-east-1"
+
+[http]
+enabled = true
+bind_address = "127.0.0.1"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    let addrs: Vec<String> = config
+        .iroh
+        .public_addresses
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+    assert_eq!(addrs, ["3.91.18.97:11204", "[2001:db8::1]:11204"]);
+    assert_eq!(config.http.bind_address.to_string(), "127.0.0.1");
+
+    let config: Config = toml::from_str("[s3]\nbucket = \"b\"\nregion = \"r\"\n").unwrap();
+    assert!(config.iroh.public_addresses.is_empty());
+    assert_eq!(config.http.bind_address.to_string(), "0.0.0.0");
+
+    // An address without a port is refused at load.
+    let bad = "[iroh]\npublic_addresses = [\"3.91.18.97\"]\n[s3]\nbucket = \"b\"\nregion = \"r\"\n";
+    assert!(toml::from_str::<Config>(bad).is_err());
+}
+
+#[test]
+fn test_max_concurrent_ingests_defaults_to_one_and_refuses_zero() {
+    let base = "[s3]\nbucket = \"b\"\nregion = \"r\"\n";
+    let config: Config = toml::from_str(base).unwrap();
+    assert_eq!(config.validation.max_concurrent_ingests.get(), 1);
+
+    let config: Config =
+        toml::from_str(&format!("{base}[validation]\nmax_concurrent_ingests = 3\n")).unwrap();
+    assert_eq!(config.validation.max_concurrent_ingests.get(), 3);
+
+    assert!(
+        toml::from_str::<Config>(&format!("{base}[validation]\nmax_concurrent_ingests = 0\n"))
+            .is_err()
+    );
 }

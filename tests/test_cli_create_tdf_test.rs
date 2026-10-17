@@ -12,6 +12,7 @@ fn test_create_tdf_with_attribute() {
     let config = ValidationConfig {
         required_attributes: vec![attr.to_string()],
         assertion: Default::default(),
+        ..Default::default()
     };
     let result = validate_blob(&tdf_bytes, &config);
     assert!(

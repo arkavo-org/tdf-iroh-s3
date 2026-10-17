@@ -1,0 +1,48 @@
+{
+  "encryptionInformation": {
+    "integrityInformation": {
+      "encryptedSegmentSizeDefault": 2097180,
+      "rootSignature": {
+        "alg": "HS256",
+        "sig": "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY="
+      },
+      "segmentHashAlg": "GMAC",
+      "segmentSizeDefault": 2097152,
+      "segments": [
+        {
+          "encryptedSegmentSize": 44,
+          "hash": "BwcHBwcHBwcHBwcHBwcHBw==",
+          "segmentSize": 16
+        }
+      ]
+    },
+    "keyAccess": [
+      {
+        "kid": "00000000000000000000000000000000",
+        "policyBinding": {
+          "alg": "HS256",
+          "hash": "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg="
+        },
+        "protocol": "kas",
+        "type": "wrapped",
+        "url": "https://kas.example.com",
+        "wrappedKey": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQ=="
+      }
+    ],
+    "method": {
+      "algorithm": "AES-256-GCM",
+      "isStreamable": true,
+      "iv": ""
+    },
+    "policy": "eyJhcmthdm86Y2xhc3NpZmljYXRpb24iOnsiZmlsdGVyIjoicGFzc2VkIiwiZmxhZ2dlZCI6W10sInYiOjF9LCJhcmthdm86Y29tcG9uZW50cyI6W3siaWQiOiJ2aWRlbyIsImtleUJpbmRpbmciOiJBUUVCQVFFQkFRRUJBUUVCQVFFQkFRRUJBUUVCQVFFQkFRRUJBUUVCQVFFPSIsImtpbmQiOiJ2aWRlbyJ9LHsiaWQiOiJhdWRpbyIsImtleUJpbmRpbmciOiJBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJPSIsImtpbmQiOiJhdWRpbyJ9XSwiYXJrYXZvOmZwc1Byb2ZpbGUiOiJ1cm46YXJrYXZvOmZhaXJwbGF5OmtleS1lbnZlbG9wZToxIiwiYXJrYXZvOm1lZGlhIjpbeyJuYW1lIjoidmlkZW8tc2VnbWVudDAubTRzIiwic2hhMjU2IjoiQXdNREF3TURBd01EQXdNREF3TURBd01EQXdNREF3TURBd01EQXdNREF3TT0ifV0sImFya2F2bzptZWRpYUlWcyI6eyJhdWRpbyI6IkJBUUVCQVFFQkFRRUJBUUVCQVFFQkE9PSIsInZpZGVvIjoiQlFVRkJRVUZCUVVGQlFVRkJRVUZCUT09In0sImJvZHkiOnsiZGF0YUF0dHJpYnV0ZXMiOlt7ImF0dHJpYnV0ZSI6Imh0dHBzOi8vcGF0cmVvbi5hcmthdm8uY29tL2F0dHIvY2FtcGFpZ24vdmFsdWUvMTIzNDU2NzgifSx7ImF0dHJpYnV0ZSI6Imh0dHBzOi8vcGF0cmVvbi5hcmthdm8uY29tL2F0dHIvY2FtcGFpZ24tdGllci92YWx1ZS8xMjM0NTY3OF9zdXBwb3J0ZXIifV0sImRpc3NlbSI6W119LCJ1dWlkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn0=",
+    "type": "split"
+  },
+  "payload": {
+    "isEncrypted": true,
+    "mimeType": "application/json",
+    "protocol": "zip",
+    "type": "reference",
+    "url": "0.payload"
+  },
+  "schemaVersion": "4.3.0"
+}

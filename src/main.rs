@@ -12,9 +12,11 @@ use tdf_iroh_s3::authz::{
     AuthZenClient, AuthzProtocol, ConnectAuthzClient, DecisionProvider, DenyAll,
 };
 use tdf_iroh_s3::catalog_api::{self, CatalogApiState, CatalogCache};
+use tdf_iroh_s3::catalogs_api;
 use tdf_iroh_s3::config::Config;
 use tdf_iroh_s3::moderation::{self, Moderation, ModerationApi, PublishGate, PublishPolicy};
 use tdf_iroh_s3::node::TdfIrohNode;
+use tdf_iroh_s3::node_api;
 use tdf_iroh_s3::ssm;
 use tdf_iroh_s3::store::s3::S3Client;
 use tdf_iroh_s3::tags_api::{self, ApiState, TagPublishing};
@@ -34,7 +36,11 @@ struct Cli {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            // The store's garbage collector logs at info each time it skips
+            // a run, which it does every interval while no refused blob is
+            // waiting for deletion.
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,iroh_blobs::store::gc=warn")),
         )
         .init();
 
@@ -56,7 +62,7 @@ async fn main() -> Result<()> {
     // before the node accepts anything, and startup fails if they cannot be:
     // a node that forgot its suspensions must not come up.
     let gate = if config.publishing.required {
-        let store = S3Client::new(&config.s3.bucket, &config.s3.region, &config.s3.prefix).await?;
+        let store = S3Client::from_config(&config.s3).await?;
         let view = Arc::new(Moderation::default());
         view.reload(&store)
             .await
@@ -86,6 +92,10 @@ async fn main() -> Result<()> {
     let node = TdfIrohNode::spawn_with_gate(config, gate.clone()).await?;
     let addr = node.addr();
     info!("Node running at {}", addr.id);
+    info!(
+        "Public addresses for GET /node: {:?}",
+        node.config.iroh.public_addresses
+    );
 
     // HTTP tag API (catalog discovery): GET resolution is public; PUT is
     // CWT-authenticated against the configured IdP key set.
@@ -119,12 +129,22 @@ async fn main() -> Result<()> {
             store: Arc::clone(&node.s3_client),
             verifier: Arc::clone(&verifier),
             tag_prefix: http_cfg.tag_prefix.clone(),
+            catalog_documents: Default::default(),
             publishing: gate.as_ref().map(|g| TagPublishing {
                 policy: Arc::clone(&policy),
                 moderation: Arc::clone(&g.moderation),
             }),
         });
-        let mut router = tags_api::router(state);
+        // Tags and the creator catalog routes exist whenever HTTP does; on
+        // an ungated node they still verify tokens but skip the publishing
+        // checks.
+        let mut router = tags_api::router(Arc::clone(&state))
+            .merge(catalogs_api::router(state))
+            .merge(node_api::router(node_api::live(
+                node.endpoint().clone(),
+                &node.config.iroh.public_addresses,
+                node.config.validation.max_blob_bytes,
+            )));
         if let Some(g) = &gate {
             if policy.operator_client_ids.is_empty() {
                 tracing::warn!(
@@ -314,14 +334,15 @@ async fn main() -> Result<()> {
         }
         // With TLS on, the plain listener stays for on-host checks only.
         let plain_host = if http_cfg.tls.is_some() {
-            "127.0.0.1"
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
         } else {
-            "0.0.0.0"
+            http_cfg.bind_address
         };
         let listener = tokio::net::TcpListener::bind((plain_host, http_cfg.bind_port)).await?;
         info!(
-            "HTTP tag API listening on {}:{} (tag prefix {:?})",
-            plain_host, http_cfg.bind_port, http_cfg.tag_prefix
+            "HTTP API listening on {} (tag prefix {:?})",
+            listener.local_addr()?,
+            http_cfg.tag_prefix
         );
         if let Some(tls_cfg) = &http_cfg.tls {
             let tls_router = router.clone();
@@ -339,9 +360,9 @@ async fn main() -> Result<()> {
 
     // With TLS on, HTTPS is the only externally reachable API: if it ends,
     // exit non-zero so systemd restarts the node instead of leaving it dark.
-    if let Some(https) = https {
+    let signal = if let Some(https) = https {
         tokio::select! {
-            res = tokio::signal::ctrl_c() => res?,
+            signal = shutdown_signal() => signal?,
             res = https => {
                 let err = match res {
                     Ok(Ok(())) => anyhow::anyhow!("HTTPS listener stopped"),
@@ -353,13 +374,37 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        tokio::signal::ctrl_c().await?;
-    }
-    info!("Shutting down...");
+        shutdown_signal().await?
+    };
+    info!("{signal} received, shutting down...");
     node.shutdown().await?;
     info!("Done.");
 
     Ok(())
+}
+
+/// Wait for Ctrl-C (SIGINT) or, on Unix, SIGTERM, which is what systemd
+/// sends on `systemctl stop`. Returns the signal's name.
+async fn shutdown_signal() -> Result<&'static str> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).context("Installing SIGTERM handler")?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => {
+                r.context("Waiting for Ctrl-C")?;
+                Ok("SIGINT")
+            }
+            _ = term.recv() => Ok("SIGTERM"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("Waiting for Ctrl-C")?;
+        Ok("Ctrl-C")
+    }
 }
 
 fn catalog_router<D: DecisionProvider>(

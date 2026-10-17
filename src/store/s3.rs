@@ -1,6 +1,15 @@
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
+use aws_sdk_s3::config::RequestChecksumCalculation;
+use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
+use std::path::Path;
+
+use crate::config::S3Config;
+
+/// User metadata key holding a catalog document's owner
+/// (`x-amz-meta-owner`).
+pub const CATALOG_OWNER_METADATA: &str = "owner";
 
 pub struct S3Client {
     client: Client,
@@ -11,15 +20,33 @@ pub struct S3Client {
 impl S3Client {
     /// Create a new S3 client using the default AWS credential chain (IAM role on EC2).
     pub async fn new(bucket: &str, region: &str, prefix: &str) -> Result<Self> {
-        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(aws_sdk_s3::config::Region::new(region.to_string()))
+        Self::from_config(&S3Config {
+            bucket: bucket.to_string(),
+            region: region.to_string(),
+            prefix: prefix.to_string(),
+            endpoint_url: String::new(),
+            force_path_style: false,
+        })
+        .await
+    }
+
+    /// Create a client from the `[s3]` section: the default AWS credential
+    /// chain, plus the endpoint and addressing overrides an S3-compatible
+    /// store (LocalStack, MinIO) needs.
+    pub async fn from_config(config: &S3Config) -> Result<Self> {
+        let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new(config.region.clone()))
             .load()
             .await;
-        let client = Client::new(&config);
+        let mut builder = aws_sdk_s3::config::Builder::from(&sdk_config)
+            .force_path_style(config.force_path_style);
+        if !config.endpoint_url.is_empty() {
+            builder = builder.endpoint_url(&config.endpoint_url);
+        }
         Ok(Self {
-            client,
-            bucket: bucket.to_string(),
-            prefix: prefix.to_string(),
+            client: Client::from_conf(builder.build()),
+            bucket: config.bucket.clone(),
+            prefix: config.prefix.clone(),
         })
     }
 
@@ -34,6 +61,26 @@ impl S3Client {
             client,
             bucket: bucket.to_string(),
             prefix: prefix.to_string(),
+        }
+    }
+
+    /// A client for a loopback S3 stand-in at `endpoint_url`, with static
+    /// credentials, for tests.
+    #[cfg(test)]
+    pub fn for_endpoint(bucket: &str, endpoint_url: &str) -> Self {
+        let config = aws_sdk_s3::config::Builder::new()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test", "test", None, None, "test",
+            ))
+            .endpoint_url(endpoint_url)
+            .force_path_style(true)
+            .build();
+        Self {
+            client: Client::from_conf(config),
+            bucket: bucket.to_string(),
+            prefix: String::new(),
         }
     }
 
@@ -57,12 +104,49 @@ impl S3Client {
         format!("{}catalog-index/{}/{}", self.prefix, group, hash_hex)
     }
 
+    pub fn catalog_document_key(&self, hash_hex: &str) -> String {
+        format!("{}catalog-documents/{}", self.prefix, hash_hex)
+    }
+
     pub async fn put_blob(&self, hash_hex: &str, data: Bytes) -> Result<()> {
         self.client
             .put_object()
             .bucket(&self.bucket)
             .key(self.blob_key(hash_hex))
             .body(data.into())
+            .send()
+            .await
+            .context("Failed to PUT blob to S3")?;
+        Ok(())
+    }
+
+    /// Upload a blob from a file of `size` bytes, streaming it: the body is
+    /// read from disk as it is sent, never held in memory.
+    ///
+    /// The SDK's default CRC32 checksum is off for this request. With it, a
+    /// streamed body is sent `aws-chunked`, and aws-runtime 1.7.1 (the
+    /// newest that builds on this crate's Rust 1.91) sends the body as one
+    /// chunk while declaring a Content-Length for 64 KiB chunks, so the
+    /// request never completes. Without it the body is sent as is, with its
+    /// exact length; TLS protects it in transit.
+    pub async fn put_blob_file(&self, hash_hex: &str, path: &Path, size: u64) -> Result<()> {
+        let body = ByteStream::read_from()
+            .path(path)
+            .length(aws_sdk_s3::primitives::Length::Exact(size))
+            .build()
+            .await
+            .with_context(|| format!("Failed to open {} for upload", path.display()))?;
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.blob_key(hash_hex))
+            .content_length(i64::try_from(size).context("blob too large for S3")?)
+            .body(body)
+            .customize()
+            .config_override(
+                aws_sdk_s3::config::Builder::default()
+                    .request_checksum_calculation(RequestChecksumCalculation::WhenRequired),
+            )
             .send()
             .await
             .context("Failed to PUT blob to S3")?;
@@ -210,7 +294,9 @@ impl S3Client {
         Ok(data.into_bytes())
     }
 
-    pub async fn has_blob(&self, hash_hex: &str) -> Result<bool> {
+    /// The stored size of an ingested blob, or `None` when there is no
+    /// such blob.
+    pub async fn blob_size(&self, hash_hex: &str) -> Result<Option<u64>> {
         match self
             .client
             .head_object()
@@ -219,12 +305,104 @@ impl S3Client {
             .send()
             .await
         {
-            Ok(_) => Ok(true),
+            Ok(head) => {
+                let size = head
+                    .content_length()
+                    .and_then(|n| u64::try_from(n).ok())
+                    .context("S3 HEAD of a blob returned no content length")?;
+                Ok(Some(size))
+            }
             Err(e) => {
                 if e.as_service_error().is_some_and(|se| se.is_not_found()) {
-                    Ok(false)
+                    Ok(None)
                 } else {
                     Err(anyhow::anyhow!("Failed to HEAD blob in S3: {}", e))
+                }
+            }
+        }
+    }
+
+    /// Store a creator catalog document under `catalog-documents/<hash>`,
+    /// byte for byte, with its owner as object metadata (`x-amz-meta-owner`)
+    /// so a read can apply the owner's suspension without parsing it.
+    pub async fn put_catalog_document(
+        &self,
+        hash_hex: &str,
+        body: Bytes,
+        owner: &str,
+    ) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_document_key(hash_hex))
+            .content_type("application/json")
+            .metadata(CATALOG_OWNER_METADATA, owner)
+            .body(body.into())
+            .send()
+            .await
+            .context("Failed to PUT catalog document to S3")?;
+        Ok(())
+    }
+
+    /// A stored catalog document and its `owner` metadata (`None` for a
+    /// document stored without it).
+    pub async fn get_catalog_document(
+        &self,
+        hash_hex: &str,
+    ) -> Result<Option<(Bytes, Option<String>)>> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_document_key(hash_hex))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let owner = resp
+                    .metadata()
+                    .and_then(|m| m.get(CATALOG_OWNER_METADATA))
+                    .cloned();
+                let data = resp.body.collect().await?;
+                Ok(Some((data.into_bytes(), owner)))
+            }
+            Err(e) => {
+                if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Failed to GET catalog document from S3: {}",
+                        e
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Whether a catalog document is stored, and its `owner` metadata, from
+    /// a HEAD (no body).
+    pub async fn head_catalog_document(&self, hash_hex: &str) -> Result<Option<Option<String>>> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_document_key(hash_hex))
+            .send()
+            .await
+        {
+            Ok(head) => Ok(Some(
+                head.metadata()
+                    .and_then(|m| m.get(CATALOG_OWNER_METADATA))
+                    .cloned(),
+            )),
+            Err(e) => {
+                if e.as_service_error().is_some_and(|se| se.is_not_found()) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Failed to HEAD catalog document in S3: {}",
+                        e
+                    ))
                 }
             }
         }

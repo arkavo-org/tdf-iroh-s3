@@ -13,6 +13,7 @@ fn test_e2e_valid_tdf_full_pipeline() {
     let config = ValidationConfig {
         required_attributes: vec!["https://example.com/attr/storage/value/permanent".to_string()],
         assertion: Default::default(),
+        ..Default::default()
     };
 
     let result = validate_blob(&tdf_bytes, &config);
@@ -32,6 +33,7 @@ fn test_e2e_reject_non_tdf() {
     let config = ValidationConfig {
         required_attributes: vec![],
         assertion: Default::default(),
+        ..Default::default()
     };
     let result = validate_blob(&garbage, &config);
     assert!(result.is_err());
@@ -43,6 +45,7 @@ fn test_e2e_reject_wrong_attribute() {
     let config = ValidationConfig {
         required_attributes: vec!["https://example.com/attr/storage/value/permanent".to_string()],
         assertion: Default::default(),
+        ..Default::default()
     };
     let result = validate_blob(&tdf_bytes, &config);
     assert!(result.is_err());

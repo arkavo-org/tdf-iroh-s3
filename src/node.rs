@@ -1,20 +1,29 @@
 use anyhow::{Context, Result};
+use futures::StreamExt;
 use iroh::endpoint::presets;
-use iroh::protocol::Router;
+use iroh::endpoint::{Connection, VarInt};
+use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::BlobsProtocol;
 use iroh_blobs::provider::events::{
-    AbortReason, ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
+    AbortReason, ConnectMode, EventMask, EventSender, ObserveMode, ProviderMessage, RequestMode,
+    RequestUpdate,
 };
 use iroh_blobs::store::fs::FsStore;
+use iroh_blobs::store::fs::options::Options;
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
-use crate::ingest::ingest_from_store;
+use crate::ingest::{self, IngestError};
 use crate::moderation::{BlobOwner, PublishGate, now_secs};
+use crate::quarantine::{PendingPush, Quarantine, S3_LOOKUPS, Serve, Stored};
 use crate::secret_key;
 use crate::store::s3::S3Client;
 
@@ -24,6 +33,7 @@ pub struct TdfIrohNode {
     endpoint: Endpoint,
     pub s3_client: Arc<S3Client>,
     pub config: Arc<Config>,
+    quarantine: Arc<Quarantine>,
     cancel: CancellationToken,
 }
 
@@ -40,14 +50,29 @@ impl TdfIrohNode {
         let config = Arc::new(config);
 
         let s3_client = Arc::new(
-            S3Client::new(&config.s3.bucket, &config.s3.region, &config.s3.prefix)
+            S3Client::from_config(&config.s3)
                 .await
                 .context("Failed to create S3 client")?,
         );
 
-        let store = FsStore::load(&config.iroh.data_dir)
+        // The store's garbage collector deletes refused blobs (and nothing
+        // else): see `quarantine`.
+        let quarantine = Quarantine::load(Path::new(&config.iroh.data_dir))
             .await
-            .context("Failed to load FsStore")?;
+            .context("Failed to load refused blobs")?;
+        let store = {
+            let root = Path::new(&config.iroh.data_dir);
+            let options = Options {
+                gc: Some(
+                    quarantine.gc_config(Duration::from_secs(config.iroh.gc_interval_secs.max(1))),
+                ),
+                ..Options::new(root)
+            };
+            FsStore::load_with_opts(root.join("blobs.db"), options)
+                .await
+                .context("Failed to load FsStore")?
+        };
+        quarantine.attach(store.clone().into(), Arc::clone(&s3_client));
 
         let mut builder = Endpoint::builder(presets::N0);
         if !config.iroh.secret_key_param.is_empty() {
@@ -71,28 +96,48 @@ impl TdfIrohNode {
 
         let cancel = CancellationToken::new();
 
-        // iroh-blobs 0.103's EventSender::request() reads only `mask.get`, for
-        // every request type (get, get_many, push, observe). With a gate,
-        // Intercept lets the loop refuse a request; its update stream then
-        // just closes when the transfer ends, which `wait_and_ingest`
-        // handles. (InterceptLog would reset any request whose update
-        // stream the loop stopped reading.) `connected: Intercept` reports
-        // each connection's authenticated endpoint ID: the pusher.
-        let mask = if gate.is_some() {
-            EventMask {
-                connected: ConnectMode::Intercept,
-                get: RequestMode::Intercept,
-                ..EventMask::DEFAULT
-            }
-        } else {
-            EventMask {
-                get: RequestMode::Notify,
-                ..EventMask::DEFAULT
-            }
+        // Each request type follows its own field of the mask. A field left
+        // at `EventMask::DEFAULT` sends no events; for push, DEFAULT is
+        // `Disabled`, which refuses every push.
+        //
+        // Push, get, get_many and observe are intercepted, gated or not, and
+        // `run_ingest_loop` answers each one. Only single-blob requests are
+        // allowed: a hash-sequence push would import child blobs no
+        // validation sees, and a hash-sequence get would serve children
+        // without their own check. A push is recorded as pending before it
+        // is answered, so the blob is withheld (and protected from the
+        // garbage collector) from its first byte. get, get_many and observe
+        // are answered only for a blob known to be valid (`quarantine`), and
+        // on a gated node never for a blocked hash. With a gate, a push also
+        // needs a publish session, and `connected: Intercept` reports each
+        // connection's authenticated endpoint ID, which identifies the
+        // pusher. The loop answers from memory; anything that waits (on the
+        // store or S3) runs in a task of its own, so one slow request never
+        // holds up the others.
+        //
+        // The update stream of an intercepted request carries no events. It
+        // closes when the transfer ends, and `wait_and_ingest` waits for
+        // that. InterceptLog would reset any request whose update stream the
+        // loop stopped reading.
+        let mask = EventMask {
+            connected: if gate.is_some() {
+                ConnectMode::Intercept
+            } else {
+                EventMask::DEFAULT.connected
+            },
+            get: RequestMode::Intercept,
+            get_many: RequestMode::Intercept,
+            push: RequestMode::Intercept,
+            observe: ObserveMode::Intercept,
+            ..EventMask::DEFAULT
         };
         let (event_sender, event_rx) = EventSender::channel(64, mask);
 
-        let blobs = BlobsProtocol::new(&store, Some(event_sender));
+        let connections = Arc::new(Connections::default());
+        let blobs = TrackedBlobs {
+            inner: BlobsProtocol::new(&store, Some(event_sender)),
+            connections: Arc::clone(&connections),
+        };
 
         let router = Router::builder(endpoint.clone())
             .accept(iroh_blobs::ALPN, blobs)
@@ -103,12 +148,21 @@ impl TdfIrohNode {
 
         // Spawn the ingest background task
         {
-            let store = store.clone();
-            let s3_client = Arc::clone(&s3_client);
-            let config = Arc::clone(&config);
+            let ingester = Arc::new(Ingester {
+                connections,
+                quarantine: Arc::clone(&quarantine),
+                store: store.clone(),
+                s3_client: Arc::clone(&s3_client),
+                config: Arc::clone(&config),
+                scratch_dir: ingest::prepare_scratch_dir(&config.iroh.data_dir).await?,
+                permits: Arc::new(Semaphore::new(
+                    config.validation.max_concurrent_ingests.get(),
+                )),
+                recoveries: Arc::new(Semaphore::new(RECOVERIES)),
+            });
             let cancel = cancel.clone();
             tokio::spawn(async move {
-                run_ingest_loop(event_rx, store, s3_client, config, gate, cancel).await;
+                run_ingest_loop(event_rx, ingester, gate, cancel).await;
             });
         }
 
@@ -118,6 +172,7 @@ impl TdfIrohNode {
             endpoint,
             s3_client,
             config,
+            quarantine,
             cancel,
         })
     }
@@ -126,11 +181,24 @@ impl TdfIrohNode {
         self.endpoint.addr()
     }
 
+    /// The running endpoint (`GET /node` reads its identity and relay).
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
     pub fn store(&self) -> &FsStore {
         &self.store
     }
 
+    /// Pushed blobs withheld from serving, and refused ones awaiting
+    /// deletion.
+    pub fn quarantine(&self) -> &Arc<Quarantine> {
+        &self.quarantine
+    }
+
     pub async fn shutdown(self) -> Result<()> {
+        // Pushes and recoveries the shutdown ends are released, not refused.
+        self.quarantine.close();
         self.cancel.cancel();
         self.router
             .shutdown()
@@ -141,11 +209,25 @@ impl TdfIrohNode {
     }
 }
 
-async fn run_ingest_loop(
-    mut rx: tokio::sync::mpsc::Receiver<ProviderMessage>,
+/// What ingesting a pushed blob needs.
+struct Ingester {
+    /// Open connections, so an oversize push's can be closed.
+    connections: Arc<Connections>,
+    quarantine: Arc<Quarantine>,
     store: FsStore,
     s3_client: Arc<S3Client>,
     config: Arc<Config>,
+    /// `<data_dir>/ingest`, where blobs are exported for validation.
+    scratch_dir: PathBuf,
+    /// `[validation] max_concurrent_ingests` permits.
+    permits: Arc<Semaphore>,
+    /// Bounds recoveries ([`RECOVERIES`]).
+    recoveries: Arc<Semaphore>,
+}
+
+async fn run_ingest_loop(
+    mut rx: tokio::sync::mpsc::Receiver<ProviderMessage>,
+    ingester: Arc<Ingester>,
     gate: Option<Arc<PublishGate>>,
     cancel: CancellationToken,
 ) {
@@ -154,6 +236,9 @@ async fn run_ingest_loop(
         gate.as_ref()
             .is_some_and(|g| g.moderation.is_blocked(&hash.to_hex()))
     };
+    // Fetches checked against the store and S3 at once; more are refused
+    // as rate limited until some finish.
+    let checks = Arc::new(Semaphore::new(FETCH_CHECKS));
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -162,21 +247,23 @@ async fn run_ingest_loop(
             }
             msg = rx.recv() => {
                 if let Some(ref m) = msg {
-                    info!("Received provider message: {:?}", m);
+                    debug!("Received provider message: {:?}", m);
                 }
+                // Every message with a `tx` holds its request until it is
+                // answered, so each arm answers, here or in a task it
+                // spawns. A dropped `tx` refuses the request (iroh-blobs
+                // resets it with an internal error); it never approves it.
+                // The match lists every variant, so a new one is a compile
+                // error rather than an unanswered request.
                 match msg {
-                    Some(ProviderMessage::PushRequestReceivedNotify(msg)) => {
-                        let hash = msg.inner.request.hash;
-                        info!(%hash, "Push request received (notify)");
-                        let store = store.clone();
-                        let s3_client = Arc::clone(&s3_client);
-                        let config = Arc::clone(&config);
-                        tokio::spawn(async move {
-                            wait_and_ingest(hash, msg.rx, &store, &s3_client, &config).await;
-                        });
-                    }
                     Some(ProviderMessage::PushRequestReceived(msg)) => {
                         let hash = msg.inner.request.hash;
+                        let connection_id = msg.inner.connection_id;
+                        if !msg.inner.request.ranges.is_blob() {
+                            warn!(%hash, "Push of a hash sequence refused");
+                            msg.tx.send(Err(AbortReason::Permission)).await.ok();
+                            continue;
+                        }
                         let owner = match &gate {
                             None => None,
                             Some(g) => match g.authorize_push(msg.inner.connection_id, &hash.to_hex()) {
@@ -189,45 +276,41 @@ async fn run_ingest_loop(
                             },
                         };
                         info!(%hash, subject = ?owner.as_ref().map(|o| &o.0), "Push accepted");
-                        msg.tx.send(Ok(())).await.ok();
-                        let store = store.clone();
-                        let s3_client = Arc::clone(&s3_client);
-                        let config = Arc::clone(&config);
+                        let ingester = Arc::clone(&ingester);
                         tokio::spawn(async move {
-                            if wait_and_ingest(hash, msg.rx, &store, &s3_client, &config).await
+                            let pending = ingester.quarantine.track(hash).await;
+                            msg.tx.send(Ok(())).await.ok();
+                            // Recorded once the blob validates (it is served
+                            // from then on), whether or not its upload works.
+                            if wait_and_ingest(hash, msg.rx, connection_id, pending, &ingester).await
                                 && let Some((subject, endpoint)) = owner
                             {
-                                record_owner(&s3_client, hash, subject, endpoint).await;
+                                record_owner(&ingester.s3_client, hash, subject, endpoint).await;
                             }
                         });
                     }
-                    Some(ProviderMessage::GetRequestReceivedNotify(_)) => {
-                        debug!("Get request received (notify)");
-                    }
                     Some(ProviderMessage::GetRequestReceived(msg)) => {
                         let hash = msg.inner.request.hash;
-                        if blocked(&hash) {
-                            info!(%hash, "Fetch of blocked content refused");
+                        if !msg.inner.request.ranges.is_blob() {
+                            info!(%hash, "Fetch of a hash sequence refused");
                             msg.tx.send(Err(AbortReason::Permission)).await.ok();
-                        } else {
-                            msg.tx.send(Ok(())).await.ok();
+                            continue;
                         }
+                        let fetch = Fetch { request: "get", hashes: vec![hash], tx: msg.tx };
+                        fetch.answer(&ingester, &blocked, &checks).await;
                     }
                     Some(ProviderMessage::GetManyRequestReceived(msg)) => {
-                        if msg.inner.request.hashes.iter().any(&blocked) {
-                            info!("Fetch of blocked content refused (get_many)");
-                            msg.tx.send(Err(AbortReason::Permission)).await.ok();
-                        } else {
-                            msg.tx.send(Ok(())).await.ok();
-                        }
+                        let hashes = msg.inner.request.hashes.clone();
+                        let fetch = Fetch { request: "get_many", hashes, tx: msg.tx };
+                        fetch.answer(&ingester, &blocked, &checks).await;
                     }
                     Some(ProviderMessage::ObserveRequestReceived(msg)) => {
-                        let result = if blocked(&msg.inner.request.hash) {
-                            Err(AbortReason::Permission)
-                        } else {
-                            Ok(())
+                        let fetch = Fetch {
+                            request: "observe",
+                            hashes: vec![msg.inner.request.hash],
+                            tx: msg.tx,
                         };
-                        msg.tx.send(result).await.ok();
+                        fetch.answer(&ingester, &blocked, &checks).await;
                     }
                     Some(ProviderMessage::ClientConnected(msg)) => {
                         if let Some(g) = &gate {
@@ -240,8 +323,19 @@ async fn run_ingest_loop(
                             g.closed(msg.inner.connection_id);
                         }
                     }
-                    Some(other) => {
-                        debug!("Other event received: {:?}", std::mem::discriminant(&other));
+                    // Throttling is off (`ThrottleMode::None`); answer anyway.
+                    Some(ProviderMessage::Throttle(msg)) => {
+                        msg.tx.send(Ok(())).await.ok();
+                    }
+                    // Neither mask enables these notifications.
+                    Some(
+                        ProviderMessage::ClientConnectedNotify(_)
+                        | ProviderMessage::PushRequestReceivedNotify(_)
+                        | ProviderMessage::GetRequestReceivedNotify(_)
+                        | ProviderMessage::GetManyRequestReceivedNotify(_)
+                        | ProviderMessage::ObserveRequestReceivedNotify(_),
+                    ) => {
+                        debug!("Unrequested provider notification ignored");
                     }
                     None => {
                         info!("Event channel closed, ingest loop exiting");
@@ -251,6 +345,120 @@ async fn run_ingest_loop(
             }
         }
     }
+}
+
+/// Fetches (get, get_many, observe) checked against the store and S3 at
+/// once.
+const FETCH_CHECKS: usize = 256;
+
+/// Stored blobs being ingested again (recovered) at once, waiting for an
+/// ingest permit or holding one.
+const RECOVERIES: usize = 64;
+
+/// A get, get_many or observe waiting for its answer.
+struct Fetch {
+    request: &'static str,
+    hashes: Vec<iroh_blobs::Hash>,
+    tx: irpc::channel::oneshot::Sender<Result<(), AbortReason>>,
+}
+
+impl Fetch {
+    /// Answer from memory when it decides every hash: served when each is
+    /// validated, refused when any is blocked or withheld. Otherwise check
+    /// the hashes against the store and S3 in a task of its own, one of at
+    /// most [`FETCH_CHECKS`].
+    async fn answer(
+        self,
+        ingester: &Arc<Ingester>,
+        blocked: &impl Fn(&iroh_blobs::Hash) -> bool,
+        checks: &Arc<Semaphore>,
+    ) {
+        let mut ask = false;
+        for hash in &self.hashes {
+            let serve = if blocked(hash) {
+                Serve::No
+            } else {
+                ingester.quarantine.serve(hash)
+            };
+            match serve {
+                Serve::Yes => {}
+                Serve::No => return self.send(Err(AbortReason::Permission)).await,
+                Serve::Ask => ask = true,
+            }
+        }
+        if !ask {
+            return self.send(Ok(())).await;
+        }
+        let Ok(permit) = Arc::clone(checks).try_acquire_owned() else {
+            return self.send(Err(AbortReason::RateLimited)).await;
+        };
+        let ingester = Arc::clone(ingester);
+        tokio::spawn(async move {
+            let answer = check_fetch(&ingester, &self.hashes).await;
+            self.send(answer).await;
+            drop(permit);
+        });
+    }
+
+    async fn send(self, answer: Result<(), AbortReason>) {
+        if let Err(reason) = &answer {
+            info!(
+                request = self.request,
+                hash = ?self.hashes.first(),
+                count = self.hashes.len(),
+                ?reason,
+                "Fetch refused: content not known valid, blocked, or too many checks"
+            );
+        }
+        self.tx.send(answer).await.ok();
+    }
+}
+
+/// Check each hash against the store and S3, at most [`S3_LOOKUPS`] at
+/// once. Served only when every hash is validated. A hash the store lacks
+/// is refused too: approval is decided once, before iroh-blobs reads the
+/// store, so approving an absent hash would let a push landing meanwhile be
+/// served unvalidated (and iroh-blobs ends a get_many at a missing blob
+/// anyway). At most [`RECOVERIES`] stored blobs are recovered at once. A stored blob not known valid is refused
+/// for now, and ingested again in the background: a good one is served
+/// once that validates it.
+async fn check_fetch(
+    ingester: &Arc<Ingester>,
+    hashes: &[iroh_blobs::Hash],
+) -> Result<(), AbortReason> {
+    // Every check runs to its end: a recovery dropped unstarted would
+    // refuse its blob.
+    let mut checks = futures::stream::iter(hashes.iter().copied())
+        .map(|hash| {
+            let quarantine = Arc::clone(&ingester.quarantine);
+            async move { (hash, quarantine.check_stored(hash).await) }
+        })
+        .buffer_unordered(S3_LOOKUPS);
+    let mut answer = Ok(());
+    while let Some((hash, stored)) = checks.next().await {
+        match stored {
+            Stored::Serve => {}
+            Stored::Absent | Stored::Withheld | Stored::Unknown => {
+                answer = Err(AbortReason::Permission)
+            }
+            Stored::Recover(recovery) => {
+                match Arc::clone(&ingester.recoveries).try_acquire_owned() {
+                    Ok(permit) => {
+                        info!(%hash, "Stored blob not known valid; ingesting it again");
+                        let ingester = Arc::clone(ingester);
+                        tokio::spawn(async move {
+                            ingest_stored(hash, recovery, &ingester).await;
+                            drop(permit);
+                        });
+                    }
+                    // Enough recoveries wait already; a later fetch retries.
+                    Err(_) => recovery.release(),
+                }
+                answer = Err(AbortReason::Permission);
+            }
+        }
+    }
+    answer
 }
 
 /// Record who pushed a blob, so a suspension can be traced to content.
@@ -275,17 +483,45 @@ async fn record_owner(
     }
 }
 
-/// Wait for a push to land and ingest it. `true` when the blob was ingested.
+/// Wait for a push to land and ingest it. `true` when the blob validated
+/// (it is served from then on, whether or not its upload worked).
+/// A transfer that aborts is still checked: the store may hold the whole
+/// blob already.
 async fn wait_and_ingest(
     hash: iroh_blobs::Hash,
     mut rx: irpc::channel::mpsc::Receiver<RequestUpdate>,
-    store: &FsStore,
-    s3_client: &S3Client,
-    config: &Config,
+    connection_id: u64,
+    pending: PendingPush,
+    ingester: &Ingester,
 ) -> bool {
+    // A push carries its size in its first 8 bytes, and the store records
+    // it with the first chunks written. When it exceeds max_blob_bytes, the
+    // connection is closed then, so the push stops long before it can fill
+    // the disk. Only a push of a hash the node does not hold is watched.
+    let max = ingester.config.validation.max_blob_bytes;
+    let watched = pending.is_tracked();
+    let mut oversize = Box::pin(async {
+        if watched {
+            oversize_push(&ingester.store, hash, max).await
+        } else {
+            std::future::pending().await
+        }
+    });
+
     // Wait for the push transfer to complete
     let mut completed = false;
-    while let Ok(Some(update)) = rx.recv().await {
+    loop {
+        let update = tokio::select! {
+            update = rx.recv() => update,
+            size = &mut oversize => {
+                warn!(%hash, size, max, "Push exceeds max_blob_bytes; closing its connection");
+                ingester.connections.close(connection_id, b"blob exceeds max_blob_bytes");
+                return false;
+            }
+        };
+        let Ok(Some(update)) = update else {
+            break;
+        };
         match update {
             RequestUpdate::Started(s) => {
                 info!(%hash, size = s.size, "Push transfer started");
@@ -297,38 +533,161 @@ async fn wait_and_ingest(
                 break;
             }
             RequestUpdate::Aborted(_) => {
+                // Check the store anyway: the blob may be complete already.
                 warn!(%hash, "Push transfer aborted");
-                return false;
+                break;
             }
         }
     }
+    // The transfer is over; stop watching its size.
+    drop(oversize);
     if !completed {
-        // Notify mode doesn't provide RequestUpdate events — the stream closes
-        // immediately. The blob should already be in the store by this point.
-        info!(%hash, "Push notification received, checking store");
+        // In Notify and Intercept modes the stream carries no events.
+        // iroh-blobs holds its sender until the push handler returns, after
+        // the data is written (or the transfer fails), so the stream closes
+        // when the transfer ends, never at the notification.
+        info!(%hash, "Push transfer ended, checking store");
     }
 
-    // Blob is written — ingest with small retry for FsStore async DB propagation
+    ingest_stored(hash, pending, ingester).await
+}
+
+/// Ingest the blob the store holds for `hash` once it is complete:
+/// validate, then upload. `true` when it validated. Dropping `pending`
+/// unvalidated ends it as refused (see `quarantine`), so every path that
+/// finds the blob incomplete or invalid refuses it; a failure of the node's
+/// own (the store cannot answer, export fails) releases it instead.
+async fn ingest_stored(hash: iroh_blobs::Hash, pending: PendingPush, ingester: &Ingester) -> bool {
+    // Retry briefly for FsStore's async DB propagation; an aborted transfer
+    // leaves the blob incomplete. This waits without an ingest permit, so
+    // an abandoned push holds up no one.
+    let mut complete = false;
     for attempt in 0..10 {
-        match ingest_from_store(hash, store, &config.validation, &config.catalog, s3_client).await {
-            Ok(Some(result)) => {
-                info!(
-                    hash = %result.hash_hex,
-                    size = result.size,
-                    "Blob ingested successfully"
-                );
-                return true;
+        match ingester.store.observe(hash).await {
+            Ok(bitfield) if bitfield.is_complete() => {
+                complete = true;
+                break;
             }
-            Ok(None) => {
-                debug!(%hash, attempt, "Blob not yet readable, retrying");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
+            Ok(_) => {}
             Err(e) => {
-                error!(%hash, error = %e, "Ingest failed");
+                error!(%hash, error = %e, "Store lookup failed; the blob stays withheld");
+                pending.release();
                 return false;
             }
         }
+        debug!(%hash, attempt, "Blob not yet complete, retrying");
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    error!(%hash, "Blob not readable after transfer completed");
-    false
+    if !complete {
+        warn!(%hash, "Blob incomplete after the push ended");
+        return false;
+    }
+
+    // At most `max_concurrent_ingests` blobs are exported, validated and
+    // uploaded at once; each holds a scratch copy on disk meanwhile.
+    let Ok(_permit) = ingester.permits.acquire().await else {
+        pending.release();
+        return false;
+    };
+    let config = &ingester.config;
+    let result = ingest::validate_from_store(
+        hash,
+        &ingester.store,
+        &config.validation,
+        &ingester.scratch_dir,
+    )
+    .await;
+    match result {
+        Ok(Some(validated)) => {
+            // Servable from here on, whatever the upload does.
+            pending.validated();
+            match ingest::upload(validated, &config.catalog, &ingester.s3_client).await {
+                Ok(result) => {
+                    info!(
+                        hash = %result.hash_hex,
+                        size = result.size,
+                        "Blob ingested successfully"
+                    );
+                    true
+                }
+                Err(e) => {
+                    error!(%hash, error = %e, "Upload failed; the blob is served from this node only");
+                    true
+                }
+            }
+        }
+        Ok(None) => {
+            // It was complete a moment ago: the store could not answer.
+            error!(%hash, "Store lookup failed at validation; the blob stays withheld");
+            pending.release();
+            false
+        }
+        Err(IngestError::Refused(e)) => {
+            warn!(%hash, error = format!("{e:#}"), "Ingest refused the blob");
+            false
+        }
+        Err(IngestError::Failed(e)) => {
+            error!(%hash, error = format!("{e:#}"), "Ingest failed; the blob stays withheld");
+            pending.release();
+            false
+        }
+    }
+}
+
+/// Resolves with the size `hash`'s push declared once that exceeds `max`;
+/// otherwise never. The size is fixed by the hash, so once a size within
+/// `max` is known there is nothing left to watch.
+async fn oversize_push(store: &FsStore, hash: iroh_blobs::Hash, max: u64) -> u64 {
+    if let Ok(updates) = store.observe(hash).stream().await {
+        tokio::pin!(updates);
+        while let Some(bitfield) = updates.next().await {
+            match bitfield.size() {
+                0 => continue,
+                size if size > max => return size,
+                _ => break,
+            }
+        }
+    }
+    std::future::pending().await
+}
+
+/// Open connections of the blobs protocol, by the id iroh-blobs reports in
+/// its events (`Connection::stable_id`).
+#[derive(Debug, Default)]
+struct Connections(std::sync::Mutex<HashMap<u64, Connection>>);
+
+impl Connections {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Connection>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Close connection `id`, if it is still open, with application error
+    /// code 1 and `reason`.
+    fn close(&self, id: u64, reason: &[u8]) {
+        if let Some(conn) = self.lock().get(&id) {
+            conn.close(VarInt::from_u32(1), reason);
+        }
+    }
+}
+
+/// The blobs protocol, keeping each open connection in [`Connections`] so
+/// the ingest loop can close the one carrying an oversize push.
+#[derive(Debug, Clone)]
+struct TrackedBlobs {
+    inner: BlobsProtocol,
+    connections: Arc<Connections>,
+}
+
+impl ProtocolHandler for TrackedBlobs {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        let id = conn.stable_id() as u64;
+        self.connections.lock().insert(id, conn.clone());
+        let result = self.inner.accept(conn).await;
+        self.connections.lock().remove(&id);
+        result
+    }
+
+    async fn shutdown(&self) {
+        self.inner.shutdown().await
+    }
 }

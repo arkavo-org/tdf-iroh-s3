@@ -44,9 +44,9 @@ The session lasts `[publishing] session_ttl_secs` (default 900).
 - The pusher's subject is recorded at `moderation/publishers/<hash>`.
 - Sessions are held in memory on the node. After a restart, open a new one.
 
-### 2. Point the catalog tag at the new catalog
+### 2. Publish the catalog
 
-Use `PUT /tags/catalog/<sub>` (see the README). It now also requires the entitlement, an unsuspended subject, and a hash that is not blocked.
+Use `PUT /catalogs/<sub>` ([creator-catalogs.md](creator-catalogs.md)), or `PUT /tags/catalog/<sub>` to point the tag back at an earlier catalog. Both require the entitlement, an unsuspended subject, and content that is not blocked.
 
 ### When a membership lapses
 
@@ -69,9 +69,9 @@ The authnz-rs `client_credentials` grant mints such tokens. If the list is empty
 
 | Route | Effect |
 |---|---|
-| `PUT /moderation/suspensions/{subject}` `{"reason","reportId"?,"hideCatalog"?}` | Refuses the subject's sessions, pushes and tag writes. With `hideCatalog`, `GET /tags/catalog/{subject}` returns 404. |
+| `PUT /moderation/suspensions/{subject}` `{"reason","reportId"?,"hideCatalog"?}` | Refuses the subject's sessions, pushes and tag writes. With `hideCatalog`, `GET /tags/catalog/{subject}` and `GET /catalog-documents/{hash}` for the subject's documents return 404. |
 | `DELETE /moderation/suspensions/{subject}` | Lifts the suspension. |
-| `PUT /moderation/blocks/{hash}` `{"reason","reportId"?}` | Takedown: iroh fetches of the hash are refused, it is left out of `/catalog/{group}` listings, no tag may point at it, and a tag already pointing at it returns 404. |
+| `PUT /moderation/blocks/{hash}` `{"reason","reportId"?}` | Takedown: iroh pushes of the hash are refused, and so are iroh get, get-many and observe requests for it (a get-many that names it among other hashes is refused whole). It is left out of `/catalog/{group}` listings, no tag may point at it, and a tag already pointing at it returns 404. |
 | `DELETE /moderation/blocks/{hash}` | Lifts the block. |
 | `GET /moderation/suspensions`, `GET /moderation/blocks` | Active records. |
 
