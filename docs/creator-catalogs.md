@@ -12,7 +12,7 @@ It covers four things: how a creator's recordings are published, how a viewer fi
 
 - **A recording is one TDF archive, addressed by the BLAKE3 hash of its bytes.**
   - The creator pushes it to the node over iroh.
-  - The node validates it as a TDF, stores it, and serves it to any peer by hash.
+  - The node validates it as a TDF, stores it in S3, and serves it to any peer by hash, straight from S3.
   - Whether a viewer may play it is decided by the TDF's key access, not by the node.
 - **A creator's catalog is one JSON document listing their published recordings.**
   - The node stores each version by the BLAKE3 hash of its exact bytes.
@@ -146,7 +146,7 @@ This route needs the same token checks as `PUT /catalogs/{sub}`.
 
 This route is public. It is how a publisher confirms ingest before naming a hash in a catalog.
 
-- **200:** `{"hash":"<hex>","size":<bytes>}`, when the hash is an ingested TDF that is not blocked.
+- **200:** `{"hash":"<hex>","size":<bytes>}`, when the hash is an ingested TDF that is not blocked. The node stores the blob's outboard before the blob, so a 200 means the blob can be fetched.
 - **404:** `blob not found`. The hash was never pushed, is still being ingested, failed validation, or is blocked.
 - **400:** `invalid hash`.
 
@@ -172,8 +172,9 @@ Creator reads the node to push to from this route. The iOS viewer does not. The 
    - Only step 4 confirms that the node has the TDF.
    - A push larger than `maxBlobBytes` is stopped while it transfers: the node closes the connection with the reason `blob exceeds max_blob_bytes`.
    - A push that stops sending for `push_stall_secs`, default 120 s, is closed; push again.
-   - The node serves a pushed blob over iroh only once it validates. A blob it refuses is never served and is deleted.
-   - Push and fetch single blobs (`GetRequest::blob`). The node refuses hash-sequence requests.
+   - The node serves a blob over iroh only from S3, and only once it has validated, so a refused blob is never served. The node's local store only stages the push and is cleaned up afterwards.
+   - If the upload to S3 fails, the node retries it twice (after 1 s and 5 s) and then gives up; the blob stays unservable and `GET /blobs/<hash>` stays 404. Push again.
+   - Push and fetch single blobs (`GetRequest::blob`). The node refuses hash-sequence requests, observe requests and a `get_many` naming more than 64 hashes.
 4. **Confirm ingest.** Poll `GET /blobs/<hash>` until it returns 200 with the expected size.
    - Wait at most 120 s.
    - A 404 after that means the node refused the push or the archive.
@@ -199,8 +200,10 @@ To remove a recording, Creator uploads the catalog without its entry. The TDF st
    - Verify the BLAKE3 hash before using the file.
    - Expect the transfer to fail now and then: iroh connections stall, drop and change paths. A failed transfer is worth another attempt; the node keeps nothing from it.
 4. **Read the node's refusal.** The node approves or refuses each request before it sends a byte. A refused request is reset with an iroh-blobs error code:
-   - `ERR_PERMISSION` (1) is final. The hash is blocked, or the node does not hold it as valid content. Do not retry. A `get_many` naming more than 64 hashes gets this answer before any lookup, so fetch one blob at a time.
-   - `ERR_LIMIT` (2) means try again. The blob is being pushed or checked, or the node is busy or could not reach its storage. Retry with a backoff.
+   - `ERR_PERMISSION` (1) is final. The hash is blocked, or S3 has no such blob. Do not retry. Hash-sequence requests, observe requests and a `get_many` naming more than 64 hashes get this answer before any lookup, so fetch one blob at a time.
+   - `ERR_LIMIT` (2) means try again. S3 did not answer in time (a HEAD over 10 s, or a GET that sends nothing for 30 s), the blob's outboard is being computed, or the node is serving 256 fetches at once. Retry with a backoff.
+   - A blob ingested before outboards were stored has none. Its first fetch is answered `ERR_LIMIT` while the node computes the outboard by streaming the blob from S3 once; the retry is served.
+   - A transfer that S3 breaks off part-way is reset with `ERR_LIMIT` too. Fetch the blob again.
    - The Arkavo iOS viewer already maps these (ADR-0057 §5): iroh-swift reports `ERR_PERMISSION` as "permission denied", which the viewer treats as not found, and `ERR_LIMIT` as a failure it retries.
 
 ## Archive layout accepted at ingest

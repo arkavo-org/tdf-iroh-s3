@@ -1,7 +1,8 @@
 # tdf-iroh-s3
 
 A persistent Iroh peer node that validates incoming blobs as OpenTDF files
-and stores them in Amazon S3. Serves stored blobs back to any requesting peer.
+and stores them in Amazon S3. Serves stored blobs back to any requesting
+peer, straight from S3.
 
 ## How It Works
 
@@ -17,11 +18,34 @@ and stores them in Amazon S3. Serves stored blobs back to any requesting peer.
    - Optional assertion signature verification
 3. Valid blobs are stored in S3, keyed by BLAKE3 content hash. Ingest reads
    the blob from a file and streams it to S3; it never holds it in memory.
+   It also computes the blob's BAO outboard (the hash tree that lets a peer
+   verify each chunk group of a ranged read) and uploads it to
+   `outboards/<hash>` before the blob. So `GET /blobs/<hash>` answering 200
+   means the blob can be served. An upload that fails is retried twice (after
+   1 s and 5 s) before the publish fails; the publisher pushes again.
 4. Any peer can retrieve blobs by hash — the TDF encryption layer handles access control.
-   A blob is served only once it is known valid: validated by this node, or
-   ingested in S3. A refused one is never served, and the store's garbage
-   collector deletes it. Only single blobs are pushed or fetched; hash
-   sequences are refused.
+   A fetch (get or get_many) is answered straight from S3: the node writes
+   the blob's size, then the BAO encoding of the requested ranges, read from
+   `blobs/<hash>` and `outboards/<hash>` through range GETs. The node keeps
+   no copy of what it serves, and the peer verifies every chunk group
+   against the hash. Only single blobs are pushed or fetched; hash sequences
+   are refused, and so are observe requests and a get_many over 64 hashes.
+5. The local iroh store only stages pushes. A push is pending until ingest
+   is done with it, and the store's garbage collector (every `[iroh]
+   gc_interval_secs`, default 60) deletes every stored blob no pending push
+   needs. Nothing local is ever served.
+
+A fetch is refused with an iroh-blobs error code:
+
+- `ERR_PERMISSION` (1) is final: the hash is blocked, or S3 has no such blob.
+- `ERR_LIMIT` (2) means try again: S3 did not answer (a HEAD takes over 10 s,
+  or a GET sends nothing for 30 s), the blob's outboard is being computed, or
+  256 fetches are running. A transfer S3 breaks off part-way is reset with
+  `ERR_LIMIT` too.
+
+A blob ingested before outboards were stored has none. The first fetch of it
+is answered `ERR_LIMIT` while the node computes the outboard by streaming the
+blob from S3 once and stores it; the next fetch is served.
 
 Creators publish a catalog of their recordings as a JSON document the node
 stores by hash, behind the tag `catalog/<sub>`. The contract between the
@@ -45,8 +69,12 @@ bind_port = 11204
 # (the node cannot see its elastic IP itself). Default: none.
 public_addresses = ["3.91.18.97:11204"]
 # A push whose connection receives less than 64 KiB in this many seconds is
-# closed and its partial data refused: a peer can stop sending without closing.
+# closed, then checked like an aborted transfer: a peer can stop sending
+# without closing.
 push_stall_secs = 120
+# How often the store's garbage collector deletes staged pushes that ingest
+# is done with. Default 60.
+# gc_interval_secs = 60
 
 [s3]
 bucket = "my-tdf-store"
@@ -155,8 +183,9 @@ environment_region = "us-east-1"
 entity_mode = "claims"
 ```
 
-The IAM role needs the same S3 write permissions on `manifests/` and
-`catalog-index/` as on `blobs/` — derived-artifact writes are best-effort
+The IAM role needs read and write on `blobs/` and `outboards/` (fetches
+read both; ingest writes both). It needs the same S3 write permissions on
+`manifests/` and `catalog-index/` as on `blobs/` — derived-artifact writes are best-effort
 (a failure is logged and never masks a successful blob ingest; re-pushing
 the content repairs the index). Creator catalogs need `s3:PutObject` and
 `s3:GetObject` on `catalog-documents/`. See
@@ -207,7 +236,7 @@ specified in [docs/creator-catalogs.md](docs/creator-catalogs.md).
 |---|---|---|
 | `GET /healthz` | public | Liveness. |
 | `GET /node` | public | `{"endpointId","relayUrl","directAddresses","maxBlobBytes"}`: the iroh endpoint publishers push to, and the largest archive ingest accepts. |
-| `GET /blobs/{hash}` | public | `{"hash","size"}` once a pushed TDF is ingested; 404 until then, or if refused or blocked. |
+| `GET /blobs/{hash}` | public | `{"hash","size"}` once a pushed TDF is ingested and servable; 404 until then, or if refused or blocked. |
 | `PUT /catalogs/{sub}` | publisher CWT | Publish a `arkavo.creator-catalog/1` document; moves `catalog/<sub>`. |
 | `GET /catalog-documents/{hash}` | public | A stored catalog document, byte for byte (`ETag`, cached 5 minutes, `If-None-Match` → 304). |
 | `GET /tags/{name}` | public | Resolve a tag, e.g. `catalog/<sub>`. A catalog tag that names no stored catalog document (an older tag naming a TDF blob) is 404. |

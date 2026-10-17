@@ -71,7 +71,7 @@ The authnz-rs `client_credentials` grant mints such tokens. If the list is empty
 |---|---|
 | `PUT /moderation/suspensions/{subject}` `{"reason","reportId"?,"hideCatalog"?}` | Refuses the subject's sessions, pushes and tag writes. With `hideCatalog`, `GET /tags/catalog/{subject}` and `GET /catalog-documents/{hash}` for the subject's documents return 404. |
 | `DELETE /moderation/suspensions/{subject}` | Lifts the suspension. |
-| `PUT /moderation/blocks/{hash}` `{"reason","reportId"?}` | Takedown: iroh pushes of the hash are refused, and so are iroh get, get-many and observe requests for it (a get-many that names it among other hashes is refused whole). It is left out of `/catalog/{group}` listings, no tag may point at it, and a tag already pointing at it returns 404. |
+| `PUT /moderation/blocks/{hash}` `{"reason","reportId"?}` | Takedown: iroh pushes of the hash are refused, and so are iroh get and get-many requests for it (a get-many that names it among other hashes is refused whole). Observe requests are always refused. It is left out of `/catalog/{group}` listings, no tag may point at it, and a tag already pointing at it returns 404. |
 | `DELETE /moderation/blocks/{hash}` | Lifts the block. |
 | `GET /moderation/suspensions`, `GET /moderation/blocks` | Active records. |
 
@@ -99,7 +99,7 @@ Each suspension or block is stored as a JSON object under `moderation/suspension
 
 ### Not included
 
-- **Deleting stored bytes.** A block stops distribution, but it does not remove the blob from the node's store or from S3.
+- **Deleting stored bytes.** A block stops distribution, but it does not remove the blob or its outboard from S3.
 - **Resolving a report's `contentId` to hashes.** That waits for the frozen catalog schema, so a takedown names payload hashes.
 - **Consuming arkavo-rs's NATS `moderation.actions.*` events.** That NATS is not reachable from EC2. arkavo-rs or a moderator calls this API.
 

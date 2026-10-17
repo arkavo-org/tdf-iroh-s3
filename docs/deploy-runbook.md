@@ -1,6 +1,6 @@
 # Deploy runbook: iroh.arkavo.net
 
-This covers deploying the release that serves creator catalogs ([creator-catalogs.md](creator-catalogs.md)) at `iroh.arkavo.net`. The host is an Amazon Linux 2023 arm64 `t4g.medium` launched from the `tdf-iroh-s3` launch template. Iroh listens on UDP 11204. The node terminates TLS itself on 443 with an ACM-exported certificate (`[http.tls]`, kept current by `cert-sync`; see the README), and its plain listener on 8090 is loopback-only.
+This covers deploying the release that serves creator catalogs ([creator-catalogs.md](creator-catalogs.md)) at `iroh.arkavo.net`. The node keeps its content in S3 and serves every fetch from there; its disk only stages pushes. The host is an Amazon Linux 2023 arm64 `t4g.medium` launched from the `tdf-iroh-s3` launch template. Iroh listens on UDP 11204. The node terminates TLS itself on 443 with an ACM-exported certificate (`[http.tls]`, kept current by `cert-sync`; see the README), and its plain listener on 8090 is loopback-only.
 
 ## 1. Build the arm64 Linux binary
 
@@ -76,6 +76,15 @@ bind_port = 11204
 public_addresses = ["<public ip>:11204"]
 # A push that receives less than 64 KiB in this many seconds is closed as stalled.
 push_stall_secs = 120
+# How often the store's garbage collector deletes staged pushes that ingest
+# is done with. This is the default.
+gc_interval_secs = 60
+
+[s3]
+bucket = "arkavo-iroh-content"
+# No prefix: keys are blobs/<hash>, outboards/<hash>, and so on.
+prefix = ""
+# region as deployed
 
 [validation]
 # Larger pushes are refused, and stopped while they transfer. The default is
@@ -94,23 +103,23 @@ expected_issuer = "https://identity.arkavo.net"
 **Memory.** Ingest does not hold a blob in memory.
 - It exports the pushed blob from the iroh store to a scratch file under `<data_dir>/ingest`.
 - It validates the blob from that file. It reads the ZIP central directory (at most 65,535 members, and at most 16 MiB read to open it), the manifest (at most 4 MiB), and the payload member, streamed to check its CRC. In Creator's FairPlay archives the payload is the small key envelope; in the legacy layout it is most of the archive, so validation then reads the whole blob once more.
-- It uploads the blob to S3 streaming from the file.
+- It computes the blob's BAO outboard from the same file, in one streaming pass, and checks its root against the hash. Memory holds the outboard, about 64 bytes per 16 KiB of blob. A blob of 16 KiB or less has a zero-length outboard.
+- It uploads `outboards/<hash>`, then streams the blob to `blobs/<hash>` from the file. The outboard goes first, so `GET /blobs/<hash>` answering 200 means the blob can be served. An upload that fails is retried twice, after 1 s and after 5 s, before the publish fails; the publisher then pushes again.
+
+Fetches use no scratch file and no store. The node reads the blob and its outboard from S3 through range GETs and sends the BAO encoding of the ranges the peer asked for, so a fetch holds a few buffers in memory whatever the blob's size.
 
 So memory no longer limits `max_blob_bytes`, and the 4294967295 default stays, also on a `t4g.medium`. The earlier advice to lower it to 2147483648 there was about RAM and no longer applies. Lower it only to limit how much disk one push can take. `GET /node` reports the limit as `maxBlobBytes`, and Creator refuses a larger recording before uploading it.
 
-**Disk.** The data volume (`[iroh] data_dir`) holds:
-- **Every blob the node serves.** The iroh store keeps each ingested TDF; it is the copy viewers download. S3 holds a copy of each, which the node does not read back.
-- **Pushes in flight,** each up to `max_blob_bytes`. A push that declares a larger size is stopped after its first few hundred KiB. Nothing limits how many pushes run at once, and on a node with `[publishing] required = false` anyone can push. So size the free space for the bursts you expect, and watch it.
+**Disk.** The data volume (`[iroh] data_dir`) only stages pushes. Everything the node serves lives in S3, so the volume holds no content. It holds:
+- **Pushes in flight,** each up to `max_blob_bytes`. A push that declares a larger size is stopped after its first few hundred KiB. A push that receives less than 64 KiB in `[iroh] push_stall_secs` is closed. Nothing limits how many pushes run at once, and on a node with `[publishing] required = false` anyone can push. So size the free space for the bursts you expect, and watch it.
+- **Staged copies of pushes already ingested,** for up to one collector interval. The store's garbage collector runs every `[iroh] gc_interval_secs` (default 60) and deletes every stored blob that no pending push needs. A push is pending until ingest is done with it, whatever the outcome.
 - **One scratch copy per ingest in progress**, `max_concurrent_ingests` × `max_blob_bytes` at most. With a reflink-capable filesystem the copy shares the blob's blocks and takes no space: XFS shows `reflink=1` in `xfs_info /var/lib/tdf-iroh-s3`.
-- **Refused blobs,** until the store's garbage collector deletes them. A blob that is not a valid TDF, or a push that stops early, is never served, and is deleted within about `[iroh] gc_interval_secs` (default 60).
 
-**First start on an existing store.** The node serves a blob only when it is known valid and complete in its store: it validated it, or S3 holds `blobs/<hash>`. After a restart, and for everything earlier builds stored, the first fetch of each blob asks S3 once (a HEAD of `blobs/<hash>`), and the node remembers the answer for the most recently used 200,000 hashes. Expect one HEAD per distinct blob fetched after each start. A stored blob that S3 lacks is ingested again on its first fetch, which is refused meanwhile: a valid TDF whose upload had failed is uploaded and served from then on; anything else (earlier builds kept and served such blobs) is refused, and the collector deletes it. A blob in transit when the node stopped is handled the same way.
+As a rule, keep free at least (pushes you expect at once + `max_concurrent_ingests`) × `max_blob_bytes`. With the defaults and one push at a time, that is 8 GiB, or 4 GiB with reflinks. The volume does not grow with the amount of content the node serves.
 
-**Replacing the instance.** The store lives on the instance's root volume, and the node serves only what its store holds, so a new instance starts with nothing to serve until content is pushed to it again. Keep the data volume across replacements until fetches are served from S3.
+**First fetches, legacy blobs and replacing the instance.** The first fetch of each blob after a start costs two S3 HEADs (the blob and its outboard); the node remembers the answer. A blob ingested before outboards were stored has none: its first fetch is answered "try again" (`ERR_LIMIT`) while the node computes the outboard by streaming the blob from S3 once and stores it, and the next fetch is served. Replacing the instance is safe and loses nothing, because everything served lives in S3. Several nodes can serve one bucket.
 
-As a rule, beyond the stored blobs, keep free at least (pushes you expect at once + `max_concurrent_ingests`) × `max_blob_bytes`. With the defaults and one push at a time, that is 8 GiB, or 4 GiB with reflinks.
-
-Keep the rest of the config as deployed: `[s3]`, `[publishing]` and `[catalog]`. Production runs `[publishing] required = false`; keep that. Creator works either way: on an ungated node `POST /publish/sessions` answers 404, and Creator pushes without a session.
+Keep the rest of the config as deployed: the `[s3]` region, `[publishing]` and `[catalog]`. Production runs `[publishing] required = false`; keep that. Creator works either way: on an ungated node `POST /publish/sessions` answers 404, and Creator pushes without a session.
 
 ## 4. TLS for iroh.arkavo.net
 
@@ -128,9 +137,16 @@ echo | openssl s_client -connect iroh.arkavo.net:443 -servername iroh.arkavo.net
 
 ## 5. IAM
 
-The instance role already has access to `<prefix>blobs/*`, `manifests/*`, `catalog-index/*`, `tags/*` and `moderation/*`. Creator catalogs add read and write access to `catalog-documents/*`:
+The node's content is in the bucket `arkavo-iroh-content`, with no prefix. In the policies below, `<bucket>` is that bucket and `<prefix>` is empty.
+
+The instance role already has access to `<prefix>blobs/*`, `manifests/*`, `catalog-index/*`, `tags/*` and `moderation/*`. Serving fetches from S3 adds read and write access to `outboards/*`: ingest writes an outboard for every blob, a fetch reads it, and the node writes one for a blob that lacks it. Creator catalogs add read and write access to `catalog-documents/*`:
 
 ```json
+{
+  "Effect": "Allow",
+  "Action": ["s3:GetObject", "s3:PutObject"],
+  "Resource": "arn:aws:s3:::<bucket>/<prefix>outboards/*"
+},
 {
   "Effect": "Allow",
   "Action": ["s3:GetObject", "s3:PutObject"],
@@ -143,9 +159,9 @@ The instance role already has access to `<prefix>blobs/*`, `manifests/*`, `catal
 }
 ```
 
-The role needs `s3:ListBucket` on the bucket itself, without a prefix condition. Without it, S3 answers a request for a missing key with 403 instead of 404. The node then reports `GET /blobs/{hash}` and `GET /catalog-documents/{hash}` for unknown hashes as 502 `storage unavailable` instead of 404.
+The role needs `s3:ListBucket` on the bucket itself, without a prefix condition. Without it, S3 answers a request for a missing key with 403 instead of 404. The node then reports `GET /blobs/{hash}` and `GET /catalog-documents/{hash}` for unknown hashes as 502 `storage unavailable` instead of 404, and answers a fetch of an unknown hash "try again" (`ERR_LIMIT`) instead of "not found" (`ERR_PERMISSION`).
 
-`GET /blobs/{hash}` is an S3 `HeadObject` on `blobs/<hash>`, which the existing `s3:GetObject` on `blobs/*` covers.
+`GET /blobs/{hash}` is an S3 `HeadObject` on `blobs/<hash>`, which the existing `s3:GetObject` on `blobs/*` covers. A fetch HEADs `blobs/<hash>` and `outboards/<hash>`, then reads both with range GETs.
 
 ## 6. Read the NodeId
 
@@ -187,3 +203,9 @@ cargo run --release --bin tdf-iroh-s3-test -- publish \
 cargo run --release --bin tdf-iroh-s3-test -- fetch \
   -n <endpointId> --addr <public ip>:11204 --hash <hash> -o /tmp/check.tdf
 ```
+
+The fetch is served from S3. A fetch of a blob ingested before outboards were stored fails once with "try again" while the node computes its outboard; run it again.
+
+## 8. Follow-ups
+
+- **Startup S3 self-check (suggested, not implemented).** The node could HEAD the bucket at startup and fail loudly when it cannot reach it. That would have caught the months of publishes that never reached S3.
