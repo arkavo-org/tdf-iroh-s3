@@ -35,6 +35,7 @@ fn test_config(data_dir: &str) -> Config {
             data_dir: data_dir.to_string(),
             public_addresses: Vec::new(),
             gc_interval_secs: 1,
+            push_stall_secs: 120,
         },
         s3: S3Config {
             bucket: BUCKET.to_string(),
@@ -66,6 +67,10 @@ struct FakeS3 {
     puts: Arc<Mutex<Vec<String>>>,
     /// Keys HEAD finds, with their sizes: blobs ingested before the test.
     present: Arc<Mutex<std::collections::HashMap<String, u64>>>,
+    /// Bodies GET returns, for keys in `present`.
+    bodies: Arc<Mutex<std::collections::HashMap<String, Bytes>>>,
+    /// How long GET waits before answering: a slow S3.
+    get_delay: Arc<Mutex<Duration>>,
 }
 
 impl FakeS3 {
@@ -74,13 +79,25 @@ impl FakeS3 {
         let s3 = Self::default();
         let puts = Arc::clone(&s3.puts);
         let present = Arc::clone(&s3.present);
+        let bodies = Arc::clone(&s3.bodies);
+        let get_delay = Arc::clone(&s3.get_delay);
         let app = axum::Router::new()
             .fallback(move |method: Method, uri: Uri, _body: Bytes| {
                 let puts = Arc::clone(&puts);
                 let present = Arc::clone(&present);
+                let bodies = Arc::clone(&bodies);
+                let get_delay = Arc::clone(&get_delay);
                 async move {
                     let path = uri.path();
                     let key = path.strip_prefix(&format!("/{BUCKET}/")).unwrap_or(path);
+                    let body = bodies.lock().unwrap().get(key).cloned();
+                    if method == Method::GET
+                        && let Some(body) = body
+                    {
+                        let delay = *get_delay.lock().unwrap();
+                        tokio::time::sleep(delay).await;
+                        return (StatusCode::OK, body).into_response();
+                    }
                     if method == Method::PUT {
                         puts.lock().unwrap().push(key.to_string());
                         (StatusCode::OK, [("etag", "\"fake\"")]).into_response()
@@ -106,6 +123,15 @@ impl FakeS3 {
     /// Answer HEAD of `blobs/<hash>` as an ingested blob of `size` bytes.
     fn ingested(&self, hash: Hash, size: u64) {
         self.present.lock().unwrap().insert(blob_key(hash), size);
+    }
+
+    /// Hold `body` as `blobs/<hash>`: HEAD finds it and GET returns it.
+    fn holds(&self, hash: Hash, body: &[u8]) {
+        self.ingested(hash, body.len() as u64);
+        self.bodies
+            .lock()
+            .unwrap()
+            .insert(blob_key(hash), Bytes::copy_from_slice(body));
     }
 
     fn has_put(&self, key: &str) -> bool {
@@ -184,6 +210,16 @@ async fn assert_push_not_taken(node: &TdfIrohNode, s3: &FakeS3, hash: Hash) {
     assert!(
         !s3.has_put(&blob_key(hash)),
         "a refused push must not be ingested"
+    );
+}
+
+/// iroh-blobs resets a request the event handler answered "try again"
+/// (`RateLimited`) with ERR_LIMIT (2).
+fn assert_refused_as_rate_limited<T: std::fmt::Debug>(result: anyhow::Result<T>, request: &str) {
+    let error = format!("{:#}", result.expect_err(request));
+    assert!(
+        error.contains("reset by peer: error 2"),
+        "{request}: expected a try-again refusal, got: {error}"
     );
 }
 
@@ -684,7 +720,8 @@ async fn test_a_stored_blob_is_served_only_once_known_valid() {
     assert!(q.is_validated(&ingested));
 
     // Never validated: refused, then deleted by the collector.
-    assert_refused_for_permission(viewer.fetch_from_node(node_id, never).await, "get");
+    // Being checked: try again.
+    assert_refused_as_rate_limited(viewer.fetch_from_node(node_id, never).await, "get");
     wait_until("the unvalidated blob is refused", || async {
         q.is_refused(&never)
     })
@@ -695,7 +732,7 @@ async fn test_a_stored_blob_is_served_only_once_known_valid() {
     .await;
 
     // Valid but never uploaded: refused at first, uploaded, then served.
-    assert_refused_for_permission(viewer.fetch_from_node(node_id, unuploaded).await, "get");
+    assert_refused_as_rate_limited(viewer.fetch_from_node(node_id, unuploaded).await, "get");
     assert!(
         s3.wait_for_put(&blob_key(unuploaded)).await,
         "uploaded on recovery"
@@ -793,5 +830,307 @@ async fn test_a_fetch_naming_a_missing_hash_is_refused() {
     for c in [pusher, viewer] {
         c.shutdown().await.unwrap();
     }
+    node.shutdown().await.unwrap();
+}
+
+/// A node whose store was lost (a replaced instance) restores a blob from
+/// S3 on its first fetch, and serves it on that same fetch.
+#[tokio::test(flavor = "current_thread")]
+async fn test_a_lost_store_is_restored_from_s3() {
+    let (s3, endpoint_url) = FakeS3::start().await;
+    let tdf = create_large_test_tdf(8 * 1024 * 1024);
+    let hash = Hash::new(&tdf);
+    s3.holds(hash, &tdf);
+    let (node, _s3, _data_dir) =
+        spawn_node_on(tempfile::tempdir().unwrap(), s3, endpoint_url, None, |_| {}).await;
+    let node_id = node.addr().id;
+
+    let viewer = IrohTestClient::new().await.unwrap();
+    let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
+    assert!(
+        fetched.as_ref() == tdf.as_slice(),
+        "served on the first fetch"
+    );
+    assert!(node.quarantine().is_validated(&hash));
+    node.store().sync_db().await.unwrap();
+    assert!(node.store().observe(hash).await.unwrap().is_complete());
+
+    viewer.shutdown().await.unwrap();
+    node.shutdown().await.unwrap();
+}
+
+/// A slow S3 holds the first fetch for a while; a restore longer than the
+/// wait answers "try again", and goes on, so a later fetch is served.
+/// Neither the slow download nor the fetcher giving up condemns the blob.
+#[tokio::test(flavor = "current_thread")]
+async fn test_a_slow_restore_is_waited_for_then_retried() {
+    let (s3, endpoint_url) = FakeS3::start().await;
+    let tdf = create_test_tdf();
+    let hash = Hash::new(&tdf);
+    s3.holds(hash, &tdf);
+    *s3.get_delay.lock().unwrap() = Duration::from_secs(3);
+    let (node, s3, _data_dir) =
+        spawn_node_on(tempfile::tempdir().unwrap(), s3, endpoint_url, None, |_| {}).await;
+    let node_id = node.addr().id;
+
+    // Held for the 3 s download, then served.
+    let viewer = IrohTestClient::new().await.unwrap();
+    let started = tokio::time::Instant::now();
+    let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
+    assert_eq!(fetched.as_ref(), tdf.as_slice());
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "waited for the restore"
+    );
+    viewer.shutdown().await.unwrap();
+
+    // Longer than the wait: "try again"; the restore finishes regardless.
+    let (s3_slow, url) = FakeS3::start().await;
+    drop(s3);
+    let other = create_test_tdf();
+    let other_hash = Hash::new(&other);
+    s3_slow.holds(other_hash, &other);
+    *s3_slow.get_delay.lock().unwrap() = Duration::from_secs(14);
+    node.shutdown().await.unwrap();
+    let (node, _s3, _data_dir) =
+        spawn_node_on(tempfile::tempdir().unwrap(), s3_slow, url, None, |_| {}).await;
+    let node_id = node.addr().id;
+    let viewer = IrohTestClient::new().await.unwrap();
+    assert_refused_as_rate_limited(viewer.fetch_from_node(node_id, other_hash).await, "get");
+    wait_until("the restore finishes after the fetcher gave up", || async {
+        node.quarantine().is_validated(&other_hash)
+    })
+    .await;
+    let fetched = viewer.fetch_from_node(node_id, other_hash).await.unwrap();
+    assert_eq!(fetched.as_ref(), other.as_slice());
+    assert!(!node.quarantine().is_refused(&other_hash));
+
+    viewer.shutdown().await.unwrap();
+    node.shutdown().await.unwrap();
+}
+
+/// A fetcher that drops its connection mid-restore, as a phone on a
+/// flaky link does, cancels nothing: the restore completes and the next
+/// fetch, from a fresh connection, is served.
+#[tokio::test(flavor = "current_thread")]
+async fn test_a_fetcher_dropping_mid_restore_cancels_nothing() {
+    let (s3, endpoint_url) = FakeS3::start().await;
+    let tdf = create_test_tdf();
+    let hash = Hash::new(&tdf);
+    s3.holds(hash, &tdf);
+    *s3.get_delay.lock().unwrap() = Duration::from_secs(2);
+    let (node, _s3, _data_dir) =
+        spawn_node_on(tempfile::tempdir().unwrap(), s3, endpoint_url, None, |_| {}).await;
+    let node_id = node.addr().id;
+
+    let flaky = IrohTestClient::new().await.unwrap();
+    let gave_up = tokio::time::timeout(
+        Duration::from_millis(500),
+        flaky.fetch_from_node(node_id, hash),
+    )
+    .await;
+    assert!(
+        gave_up.is_err(),
+        "the fetcher gave up while the node restored"
+    );
+    flaky.shutdown().await.unwrap();
+
+    wait_until("the restore completes without its fetcher", || async {
+        node.quarantine().is_validated(&hash)
+    })
+    .await;
+    let viewer = IrohTestClient::new().await.unwrap();
+    let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
+    assert_eq!(fetched.as_ref(), tdf.as_slice());
+
+    viewer.shutdown().await.unwrap();
+    node.shutdown().await.unwrap();
+}
+
+/// A fetcher that drops mid-transfer of a served blob changes nothing on
+/// the node: nothing is refused, and the blob is served again.
+#[tokio::test(flavor = "current_thread")]
+async fn test_a_fetcher_dropping_mid_transfer_changes_nothing() {
+    let (node, s3, _data_dir) = spawn_node(None).await;
+    let node_id = node.addr().id;
+    let tdf = create_large_test_tdf(20 * 1024 * 1024);
+    let pusher = IrohTestClient::new().await.unwrap();
+    let hash = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    assert!(s3.wait_for_put(&blob_key(hash)).await);
+
+    for _ in 0..3 {
+        let flaky = IrohTestClient::new().await.unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(30),
+            flaky.fetch_from_node(node_id, hash),
+        )
+        .await;
+        flaky.shutdown().await.unwrap();
+    }
+    assert!(!node.quarantine().is_refused(&hash));
+    assert!(node.quarantine().is_validated(&hash));
+    let viewer = IrohTestClient::new().await.unwrap();
+    let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
+    assert!(fetched.as_ref() == tdf.as_slice());
+
+    for c in [pusher, viewer] {
+        c.shutdown().await.unwrap();
+    }
+    node.shutdown().await.unwrap();
+}
+
+/// An S3 object whose bytes do not match its key is not served. The first
+/// fetch is answered "try again" while the node looks; once the object is
+/// found bad, fetches are refused for good (for an hour) instead of
+/// downloading it again, and what it imported is refused and deleted.
+#[tokio::test(flavor = "current_thread")]
+async fn test_a_corrupt_s3_object_is_not_restored() {
+    let (s3, endpoint_url) = FakeS3::start().await;
+    let tdf = create_test_tdf();
+    let hash = Hash::new(&tdf);
+    let mut corrupt = tdf.clone();
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 0xff;
+    s3.holds(hash, &corrupt);
+    let imported = Hash::new(&corrupt);
+    let (node, _s3, _data_dir) =
+        spawn_node_on(tempfile::tempdir().unwrap(), s3, endpoint_url, None, |_| {}).await;
+    let node_id = node.addr().id;
+    let q = node.quarantine();
+
+    let viewer = IrohTestClient::new().await.unwrap();
+    assert_refused_as_rate_limited(viewer.fetch_from_node(node_id, hash).await, "get");
+    assert!(!q.is_validated(&hash));
+    wait_until("the mismatched import is refused", || async {
+        q.is_refused(&imported)
+    })
+    .await;
+    wait_until("the mismatched import is deleted", || async {
+        !q.is_refused(&imported) && node.store().observe(imported).await.unwrap().size() == 0
+    })
+    .await;
+    // The same object would fail the same way: final, not downloaded again.
+    assert_refused_for_permission(viewer.fetch_from_node(node_id, hash).await, "get");
+
+    viewer.shutdown().await.unwrap();
+    node.shutdown().await.unwrap();
+}
+
+/// A push that stops sending without closing, as on a dead link, is
+/// closed once its connection stalls, and its partial data refused.
+#[tokio::test(flavor = "current_thread")]
+async fn test_a_stalled_push_is_closed() {
+    let (node, _s3, _data_dir) = spawn_node_with(None, |c| c.iroh.push_stall_secs = 2).await;
+    let node_id = node.addr().id;
+    let tdf = create_large_test_tdf(20 * 1024 * 1024);
+    let pusher = IrohTestClient::new().await.unwrap();
+    let (hash, stalled) = pusher
+        .push_to_node_stalled(node_id, &tdf, Duration::from_millis(150))
+        .await
+        .unwrap();
+    wait_until("the stalled push is refused", || async {
+        node.quarantine().is_refused(&hash)
+    })
+    .await;
+    drop(stalled);
+    pusher.shutdown().await.unwrap();
+    node.shutdown().await.unwrap();
+}
+
+/// A stalled push of a hash S3 holds does not keep it from viewers: the
+/// node restores it from S3 regardless and serves it.
+#[tokio::test(flavor = "current_thread")]
+async fn test_a_stalled_push_does_not_block_a_restore() {
+    let (s3, endpoint_url) = FakeS3::start().await;
+    let tdf = create_large_test_tdf(20 * 1024 * 1024);
+    let hash = Hash::new(&tdf);
+    s3.holds(hash, &tdf);
+    let (node, _s3, _data_dir) =
+        spawn_node_on(tempfile::tempdir().unwrap(), s3, endpoint_url, None, |_| {}).await;
+    let node_id = node.addr().id;
+
+    let pusher = IrohTestClient::new().await.unwrap();
+    let (pushed, stalled) = pusher
+        .push_to_node_stalled(node_id, &tdf, Duration::from_millis(150))
+        .await
+        .unwrap();
+    assert_eq!(pushed, hash);
+    let viewer = IrohTestClient::new().await.unwrap();
+    let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
+    assert!(
+        fetched.as_ref() == tdf.as_slice(),
+        "restored despite the stalled push"
+    );
+    assert!(node.quarantine().is_validated(&hash));
+
+    drop(stalled);
+    for c in [pusher, viewer] {
+        c.shutdown().await.unwrap();
+    }
+    node.shutdown().await.unwrap();
+}
+
+/// A get_many naming more hashes than Creator or the viewer ever do is
+/// refused before any lookup.
+#[tokio::test(flavor = "current_thread")]
+async fn test_a_huge_get_many_is_refused() {
+    let (node, _s3, _data_dir) = spawn_node(None).await;
+    let node_id = node.addr().id;
+    let viewer = IrohTestClient::new().await.unwrap();
+    let hashes: Vec<Hash> = (0u32..65).map(|i| Hash::new(i.to_le_bytes())).collect();
+    assert_refused_for_permission(
+        viewer.get_many_from_node(node_id, &hashes).await,
+        "get_many",
+    );
+    viewer.shutdown().await.unwrap();
+    node.shutdown().await.unwrap();
+}
+
+/// A stalled re-push of a blob the store holds whole (a valid TDF whose
+/// upload failed before a restart) does not condemn it: once the stalled
+/// push is closed, the node checks the store, validates the blob and
+/// uploads it.
+#[tokio::test(flavor = "current_thread")]
+async fn test_a_stalled_re_push_of_a_whole_blob_validates_it() {
+    use iroh_blobs::store::fs::FsStore;
+    use iroh_blobs::store::fs::options::Options;
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let tdf = create_large_test_tdf(20 * 1024 * 1024);
+    let hash = {
+        let root = data_dir.path();
+        let store = FsStore::load_with_opts(root.join("blobs.db"), Options::new(root))
+            .await
+            .unwrap();
+        let hash = store.add_slice(&tdf).temp_tag().await.unwrap().hash();
+        store.sync_db().await.unwrap();
+        store.shutdown().await.unwrap();
+        hash
+    };
+    let (s3, endpoint_url) = FakeS3::start().await;
+    let (node, s3, _data_dir) = spawn_node_on(data_dir, s3, endpoint_url, None, |c| {
+        c.iroh.push_stall_secs = 2
+    })
+    .await;
+    let node_id = node.addr().id;
+
+    let pusher = IrohTestClient::new().await.unwrap();
+    let (pushed, stalled) = pusher
+        .push_to_node_stalled(node_id, &tdf, Duration::from_millis(150))
+        .await
+        .unwrap();
+    assert_eq!(pushed, hash);
+    assert!(
+        s3.wait_for_put(&blob_key(hash)).await,
+        "validated and uploaded"
+    );
+    wait_until("the blob validates", || async {
+        node.quarantine().is_validated(&hash)
+    })
+    .await;
+    assert!(!node.quarantine().is_refused(&hash));
+
+    drop(stalled);
+    pusher.shutdown().await.unwrap();
     node.shutdown().await.unwrap();
 }
