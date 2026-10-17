@@ -214,6 +214,39 @@ impl IrohTestClient {
         Ok(())
     }
 
+    /// Start pushing `data`, then stop sending without closing anything, as
+    /// a peer on a dead link does: the push is polled for `run_for`, then
+    /// held unpolled with its connection open until the returned guard is
+    /// dropped.
+    pub async fn push_to_node_stalled(
+        &self,
+        addr: impl Into<EndpointAddr>,
+        data: &[u8],
+        run_for: std::time::Duration,
+    ) -> Result<(Hash, StalledPush)> {
+        let hash = self.add_bytes(data).await?;
+        let conn = self
+            .endpoint
+            .connect(addr, iroh_blobs::ALPN)
+            .await
+            .context("Failed to connect to remote node")?;
+        let request = PushRequest::from(GetRequest::blob(hash));
+        let mut push: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = {
+            let push = self.store.remote().execute_push(conn.clone(), request);
+            Box::pin(async move {
+                let _ = push.await;
+            })
+        };
+        let _ = tokio::time::timeout(run_for, &mut push).await;
+        Ok((
+            hash,
+            StalledPush {
+                _push: push,
+                _conn: conn,
+            },
+        ))
+    }
+
     /// Fetch a blob from a remote node by hash. A blob already complete in
     /// this client's store is returned without asking the node, so a client
     /// that pushed a blob cannot use this to check the node has it.
@@ -308,4 +341,11 @@ impl IrohTestClient {
         self.endpoint.close().await;
         Ok(())
     }
+}
+
+/// A push that stopped sending; dropping it lets the push and its
+/// connection go.
+pub struct StalledPush {
+    _push: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    _conn: iroh::endpoint::Connection,
 }

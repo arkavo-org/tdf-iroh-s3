@@ -249,10 +249,19 @@ pub struct IrohConfig {
     /// delete (it runs only while some are waiting). Seconds; default 60.
     #[serde(default = "default_gc_interval_secs")]
     pub gc_interval_secs: u64,
+    /// A push whose connection receives less than 64 KiB in this many
+    /// seconds is stalled: the node closes it, so a dead link or a peer
+    /// that stops sending does not hold the push open. Default 120.
+    #[serde(default = "default_push_stall_secs")]
+    pub push_stall_secs: u64,
 }
 
 fn default_gc_interval_secs() -> u64 {
     60
+}
+
+fn default_push_stall_secs() -> u64 {
+    120
 }
 
 impl Default for IrohConfig {
@@ -263,6 +272,7 @@ impl Default for IrohConfig {
             data_dir: default_data_dir(),
             public_addresses: Vec::new(),
             gc_interval_secs: default_gc_interval_secs(),
+            push_stall_secs: default_push_stall_secs(),
         }
     }
 }

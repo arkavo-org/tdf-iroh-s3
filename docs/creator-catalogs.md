@@ -171,6 +171,7 @@ Creator reads the node to push to from this route. The iOS viewer does not. The 
    - The push's result does not say whether the node accepted it. A gated node refuses a push from an endpoint without a session by aborting the request, but the pusher may see no error: the iroh-blobs client in this repository's test CLI reports such a push as successful.
    - Only step 4 confirms that the node has the TDF.
    - A push larger than `maxBlobBytes` is stopped while it transfers: the node closes the connection with the reason `blob exceeds max_blob_bytes`.
+   - A push that stops sending for `push_stall_secs`, default 120 s, is closed; push again.
    - The node serves a pushed blob over iroh only once it validates. A blob it refuses is never served and is deleted.
    - Push and fetch single blobs (`GetRequest::blob`). The node refuses hash-sequence requests.
 4. **Confirm ingest.** Poll `GET /blobs/<hash>` until it returns 200 with the expected size.
@@ -196,6 +197,11 @@ To remove a recording, Creator uploads the catalog without its entry. The TDF st
 3. **Download a recording.** Fetch `payloadHash` over iroh, from the endpoint ID compiled into the viewer.
    - Reject the download if it is larger than `payloadSize`.
    - Verify the BLAKE3 hash before using the file.
+   - Expect the transfer to fail now and then: iroh connections stall, drop and change paths. A failed transfer is worth another attempt; the node keeps nothing from it.
+4. **Read the node's refusal.** The node approves or refuses each request before it sends a byte. A refused request is reset with an iroh-blobs error code:
+   - `ERR_PERMISSION` (1) is final. The hash is blocked, or the node does not hold it as valid content. Do not retry. A `get_many` naming more than 64 hashes gets this answer before any lookup, so fetch one blob at a time.
+   - `ERR_LIMIT` (2) means try again. The blob is being pushed or checked, or the node is busy or could not reach its storage. Retry with a backoff.
+   - The Arkavo iOS viewer already maps these (ADR-0057 §5): iroh-swift reports `ERR_PERMISSION` as "permission denied", which the viewer treats as not found, and `ERR_LIMIT` as a failure it retries.
 
 ## Archive layout accepted at ingest
 

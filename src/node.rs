@@ -355,7 +355,48 @@ const FETCH_CHECKS: usize = 256;
 /// ingest permit or holding one.
 const RECOVERIES: usize = 64;
 
+/// Most hashes one get_many may name. Creator and the viewer fetch one blob
+/// at a time; a request naming more is refused before any lookup, so it
+/// cannot make the node send S3 a lookup per hash.
+const MAX_FETCH_HASHES: usize = 64;
+
+/// How long a blob that just validated keeps a temporary tag. A collector
+/// run that read the pending pushes before the blob arrived, and lists tags
+/// after it validated, would otherwise find it unprotected; the tag covers
+/// any run that could have started meanwhile.
+fn tag_hold(ingester: &Ingester) -> Duration {
+    Duration::from_secs(ingester.config.iroh.gc_interval_secs.max(1) * 2 + 10)
+}
+
+/// Keep `tag` for [`tag_hold`], then let it go.
+fn hold(tag: iroh_blobs::api::TempTag, ingester: &Ingester) {
+    let hold = tag_hold(ingester);
+    tokio::spawn(async move {
+        tokio::time::sleep(hold).await;
+        drop(tag);
+    });
+}
+
+/// Tag `hash` for [`tag_hold`]; logged and skipped if the store refuses.
+async fn hold_tag(ingester: &Ingester, hash: iroh_blobs::Hash) {
+    match ingester
+        .store
+        .tags()
+        .temp_tag(iroh_blobs::HashAndFormat::raw(hash))
+        .await
+    {
+        Ok(tag) => hold(tag, ingester),
+        Err(e) => warn!(%hash, error = %e, "Could not tag a validated blob"),
+    }
+}
+
 /// A get, get_many or observe waiting for its answer.
+///
+/// The answer tells the fetcher whether to try again. `Permission` is final:
+/// the hash is blocked, or the node does not hold it as valid content. `RateLimited` means not now: it is being pushed, checked or
+/// recovered, the node is busy, or the store or S3 did not answer. On an
+/// iroh P2P network, transfers stall and drop, so anything that a transfer
+/// or a dependency's hiccup could cause is `RateLimited`, never final.
 struct Fetch {
     request: &'static str,
     hashes: Vec<iroh_blobs::Hash>,
@@ -363,28 +404,32 @@ struct Fetch {
 }
 
 impl Fetch {
-    /// Answer from memory when it decides every hash: served when each is
-    /// validated, refused when any is blocked or withheld. Otherwise check
-    /// the hashes against the store and S3 in a task of its own, one of at
-    /// most [`FETCH_CHECKS`].
+    /// Answer from memory when it decides: refused for good when a hash is
+    /// blocked, "try again" when one is busy, served when each is
+    /// validated. Otherwise check the hashes against the store and S3 in a
+    /// task of its own, one of at most [`FETCH_CHECKS`].
     async fn answer(
         self,
         ingester: &Arc<Ingester>,
         blocked: &impl Fn(&iroh_blobs::Hash) -> bool,
         checks: &Arc<Semaphore>,
     ) {
-        let mut ask = false;
+        if self.hashes.len() > MAX_FETCH_HASHES {
+            return self.send(Err(AbortReason::Permission)).await;
+        }
+        let (mut busy, mut ask) = (false, false);
         for hash in &self.hashes {
-            let serve = if blocked(hash) {
-                Serve::No
-            } else {
-                ingester.quarantine.serve(hash)
-            };
-            match serve {
+            if blocked(hash) {
+                return self.send(Err(AbortReason::Permission)).await;
+            }
+            match ingester.quarantine.serve(hash) {
                 Serve::Yes => {}
-                Serve::No => return self.send(Err(AbortReason::Permission)).await,
+                Serve::Busy => busy = true,
                 Serve::Ask => ask = true,
             }
+        }
+        if busy {
+            return self.send(Err(AbortReason::RateLimited)).await;
         }
         if !ask {
             return self.send(Ok(())).await;
@@ -407,40 +452,45 @@ impl Fetch {
                 hash = ?self.hashes.first(),
                 count = self.hashes.len(),
                 ?reason,
-                "Fetch refused: content not known valid, blocked, or too many checks"
+                "Fetch refused (Permission: final; RateLimited: try again)"
             );
         }
+        // The fetcher may be gone by now; that is fine.
         self.tx.send(answer).await.ok();
     }
 }
 
 /// Check each hash against the store and S3, at most [`S3_LOOKUPS`] at
-/// once. Served only when every hash is validated. A hash the store lacks
-/// is refused too: approval is decided once, before iroh-blobs reads the
-/// store, so approving an absent hash would let a push landing meanwhile be
-/// served unvalidated (and iroh-blobs ends a get_many at a missing blob
-/// anyway). At most [`RECOVERIES`] stored blobs are recovered at once. A stored blob not known valid is refused
-/// for now, and ingested again in the background: a good one is served
-/// once that validates it.
+/// once (see [`Quarantine::check_stored`]), and answer for all of them:
+/// `Permission` if any is gone, `RateLimited` if any is not ready, served
+/// otherwise. A hash the store lacks is never approved on the strength of
+/// arriving later: approval is decided once, before iroh-blobs reads the
+/// store. A stored blob not known valid is ingested again in the
+/// background (at most [`RECOVERIES`]).
 async fn check_fetch(
     ingester: &Arc<Ingester>,
     hashes: &[iroh_blobs::Hash],
 ) -> Result<(), AbortReason> {
-    // Every check runs to its end: a recovery dropped unstarted would
-    // refuse its blob.
+    // Every check started runs to its end: a recovery dropped unstarted
+    // would refuse its blob. Once a hash is gone the answer is
+    // final, so no further checks start.
+    let stop = std::sync::atomic::AtomicBool::new(false);
     let mut checks = futures::stream::iter(hashes.iter().copied())
+        .take_while(|_| std::future::ready(!stop.load(std::sync::atomic::Ordering::SeqCst)))
         .map(|hash| {
             let quarantine = Arc::clone(&ingester.quarantine);
             async move { (hash, quarantine.check_stored(hash).await) }
         })
         .buffer_unordered(S3_LOOKUPS);
-    let mut answer = Ok(());
+    let (mut gone, mut busy) = (false, false);
     while let Some((hash, stored)) = checks.next().await {
         match stored {
             Stored::Serve => {}
-            Stored::Absent | Stored::Withheld | Stored::Unknown => {
-                answer = Err(AbortReason::Permission)
+            Stored::Gone => {
+                gone = true;
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
             }
+            Stored::Busy => busy = true,
             Stored::Recover(recovery) => {
                 match Arc::clone(&ingester.recoveries).try_acquire_owned() {
                     Ok(permit) => {
@@ -452,13 +502,20 @@ async fn check_fetch(
                         });
                     }
                     // Enough recoveries wait already; a later fetch retries.
-                    Err(_) => recovery.release(),
+                    Err(_) => recovery.cancel(),
                 }
-                answer = Err(AbortReason::Permission);
+                busy = true;
             }
         }
     }
-    answer
+    if gone {
+        return Err(AbortReason::Permission);
+    }
+    if busy {
+        Err(AbortReason::RateLimited)
+    } else {
+        Ok(())
+    }
 }
 
 /// Record who pushed a blob, so a suspension can be traced to content.
@@ -498,11 +555,15 @@ async fn wait_and_ingest(
     // it with the first chunks written. When it exceeds max_blob_bytes, the
     // connection is closed then, so the push stops long before it can fill
     // the disk. Only a push of a hash the node does not hold is watched.
+    // The connection is also watched for a stall: on a P2P network a peer
+    // can stop sending without closing, and the push would hold its hash
+    // pending for as long as the connection lives.
     let max = ingester.config.validation.max_blob_bytes;
+    let stall = Duration::from_secs(ingester.config.iroh.push_stall_secs.max(1));
     let watched = pending.is_tracked();
-    let mut oversize = Box::pin(async {
+    let mut trouble = Box::pin(async {
         if watched {
-            oversize_push(&ingester.store, hash, max).await
+            watch_push(ingester, connection_id, hash, max, stall).await
         } else {
             std::future::pending().await
         }
@@ -513,9 +574,20 @@ async fn wait_and_ingest(
     loop {
         let update = tokio::select! {
             update = rx.recv() => update,
-            size = &mut oversize => {
-                warn!(%hash, size, max, "Push exceeds max_blob_bytes; closing its connection");
-                ingester.connections.close(connection_id, b"blob exceeds max_blob_bytes");
+            trouble = &mut trouble => {
+                match trouble {
+                    PushTrouble::Oversize(size) => {
+                        warn!(%hash, size, max, "Push exceeds max_blob_bytes; closing its connection");
+                        ingester.connections.close(connection_id, b"blob exceeds max_blob_bytes");
+                    }
+                    PushTrouble::Stalled => {
+                        // Closed, then checked like an aborted transfer: the
+                        // store may hold the whole blob already.
+                        warn!(%hash, ?stall, "Push stalled; closing its connection");
+                        ingester.connections.close(connection_id, b"push stalled");
+                        break;
+                    }
+                }
                 return false;
             }
         };
@@ -539,8 +611,8 @@ async fn wait_and_ingest(
             }
         }
     }
-    // The transfer is over; stop watching its size.
-    drop(oversize);
+    // The transfer is over; stop watching it.
+    drop(trouble);
     if !completed {
         // In Notify and Intercept modes the stream carries no events.
         // iroh-blobs holds its sender until the push handler returns, after
@@ -599,7 +671,9 @@ async fn ingest_stored(hash: iroh_blobs::Hash, pending: PendingPush, ingester: &
     .await;
     match result {
         Ok(Some(validated)) => {
-            // Servable from here on, whatever the upload does.
+            // Servable from here on, whatever the upload does. Tagged first,
+            // so no collector run can delete it after this.
+            hold_tag(ingester, hash).await;
             pending.validated();
             match ingest::upload(validated, &config.catalog, &ingester.s3_client).await {
                 Ok(result) => {
@@ -634,6 +708,53 @@ async fn ingest_stored(hash: iroh_blobs::Hash, pending: PendingPush, ingester: &
     }
 }
 
+/// Why a push is stopped before its transfer ends.
+enum PushTrouble {
+    /// It declared more than max_blob_bytes.
+    Oversize(u64),
+    /// Its connection received less than [`PUSH_STALL_MIN_BYTES`] in the
+    /// stall window.
+    Stalled,
+}
+
+/// Bytes a push's connection must receive per stall window
+/// (`[iroh] push_stall_secs`) to count as moving. QUIC keep-alives alone
+/// stay far below it. Counted on the connection, not the store: a push
+/// over data the store already holds writes nothing new while it moves.
+const PUSH_STALL_MIN_BYTES: u64 = 64 * 1024;
+
+/// Resolves when `hash`'s push declares a size over `max`, or its
+/// connection stalls; otherwise never. A connection that closes ends the
+/// transfer by itself.
+async fn watch_push(
+    ingester: &Ingester,
+    connection_id: u64,
+    hash: iroh_blobs::Hash,
+    max: u64,
+    stall: Duration,
+) -> PushTrouble {
+    let stalled = async {
+        let mut last = ingester.connections.rx_bytes(connection_id);
+        loop {
+            tokio::time::sleep(stall).await;
+            let now = ingester.connections.rx_bytes(connection_id);
+            match (last, now) {
+                (Some(before), Some(after))
+                    if after.saturating_sub(before) < PUSH_STALL_MIN_BYTES =>
+                {
+                    return;
+                }
+                (_, None) => std::future::pending::<()>().await,
+                _ => last = now,
+            }
+        }
+    };
+    tokio::select! {
+        size = oversize_push(&ingester.store, hash, max) => PushTrouble::Oversize(size),
+        () = stalled => PushTrouble::Stalled,
+    }
+}
+
 /// Resolves with the size `hash`'s push declared once that exceeds `max`;
 /// otherwise never. The size is fixed by the hash, so once a size within
 /// `max` is known there is nothing left to watch.
@@ -659,6 +780,11 @@ struct Connections(std::sync::Mutex<HashMap<u64, Connection>>);
 impl Connections {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Connection>> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Bytes connection `id` has received so far, while it is open.
+    fn rx_bytes(&self, id: u64) -> Option<u64> {
+        self.lock().get(&id).map(|conn| conn.stats().udp_rx.bytes)
     }
 
     /// Close connection `id`, if it is still open, with application error
