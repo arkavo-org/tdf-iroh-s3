@@ -44,6 +44,9 @@ bind_port = 11204
 # Public ip:port addresses peers can dial directly, reported by GET /node
 # (the node cannot see its elastic IP itself). Default: none.
 public_addresses = ["3.91.18.97:11204"]
+# A push whose connection receives less than 64 KiB in this many seconds is
+# closed and its partial data refused: a peer can stop sending without closing.
+push_stall_secs = 120
 
 [s3]
 bucket = "my-tdf-store"

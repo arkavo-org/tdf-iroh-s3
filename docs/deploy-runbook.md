@@ -74,6 +74,8 @@ bind_port = 11204
 # Leave it out rather than list one that changes: publishers then reach the
 # node through its relay.
 public_addresses = ["<public ip>:11204"]
+# A push that receives less than 64 KiB in this many seconds is closed as stalled.
+push_stall_secs = 120
 
 [validation]
 # Larger pushes are refused, and stopped while they transfer. The default is
@@ -97,12 +99,15 @@ expected_issuer = "https://identity.arkavo.net"
 So memory no longer limits `max_blob_bytes`, and the 4294967295 default stays, also on a `t4g.medium`. The earlier advice to lower it to 2147483648 there was about RAM and no longer applies. Lower it only to limit how much disk one push can take. `GET /node` reports the limit as `maxBlobBytes`, and Creator refuses a larger recording before uploading it.
 
 **Disk.** The data volume (`[iroh] data_dir`) holds:
-- **Every blob the node serves.** The iroh store keeps each ingested TDF; it is the copy viewers download. S3 holds a second copy, which the node does not read back.
+- **Every blob the node serves.** The iroh store keeps each ingested TDF; it is the copy viewers download. S3 holds a copy of each, and the node restores a blob from it when the store lacks one (below).
 - **Pushes in flight,** each up to `max_blob_bytes`. A push that declares a larger size is stopped after its first few hundred KiB. Nothing limits how many pushes run at once, and on a node with `[publishing] required = false` anyone can push. So size the free space for the bursts you expect, and watch it.
 - **One scratch copy per ingest in progress**, `max_concurrent_ingests` × `max_blob_bytes` at most. With a reflink-capable filesystem the copy shares the blob's blocks and takes no space: XFS shows `reflink=1` in `xfs_info /var/lib/tdf-iroh-s3`.
+- **Restores from S3 in progress,** at most 2 at once, each holding a download and its copy into the store (2 × the blob, briefly).
 - **Refused blobs,** until the store's garbage collector deletes them. A blob that is not a valid TDF, or a push that stops early, is never served, and is deleted within about `[iroh] gc_interval_secs` (default 60).
 
 **First start on an existing store.** The node serves a blob only when it is known valid and complete in its store: it validated it, or S3 holds `blobs/<hash>`. After a restart, and for everything earlier builds stored, the first fetch of each blob asks S3 once (a HEAD of `blobs/<hash>`), and the node remembers the answer for the most recently used 200,000 hashes. Expect one HEAD per distinct blob fetched after each start. A stored blob that S3 lacks is ingested again on its first fetch, which is refused meanwhile: a valid TDF whose upload had failed is uploaded and served from then on; anything else (earlier builds kept and served such blobs) is refused, and the collector deletes it. A blob in transit when the node stopped is handled the same way.
+
+**Replacing the instance.** The store lives on the instance's root volume, so a new instance starts with an empty store. That is safe: the first fetch of a blob the store lacks restores it from S3 (`blobs/<hash>`, a streamed download imported into the store and checked against its hash), holding the fetch up to 10 seconds and answering "try again" (`ERR_LIMIT`) if it takes longer, while the restore continues. Expect the first fetch of each recording after a replacement to be slower, one S3 GET per recording, and size the root volume for every blob viewers fetch from this node. A blob S3 holds whose bytes do not match its key is not served, and fetches of it are refused for an hour rather than downloaded again. A restore that gets no response or no bytes from S3 for 30 seconds fails and is tried again on a later fetch. A push of the same hash that is under way, or stalled, does not hold a restore back.
 
 As a rule, beyond the stored blobs, keep free at least (pushes you expect at once + `max_concurrent_ingests`) × `max_blob_bytes`. With the defaults and one push at a time, that is 8 GiB, or 4 GiB with reflinks.
 
