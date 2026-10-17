@@ -6,6 +6,7 @@ pub mod catalog_api;
 pub mod catalogs_api;
 pub mod config;
 pub mod creator_catalog;
+pub mod dht;
 pub mod ingest;
 pub mod moderation;
 pub mod node;

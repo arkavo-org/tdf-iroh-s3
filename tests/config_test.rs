@@ -254,3 +254,22 @@ fn test_max_concurrent_ingests_defaults_to_one_and_refuses_zero() {
             .is_err()
     );
 }
+
+#[test]
+fn test_publish_dht_is_off_by_default_and_configurable() {
+    let base = "[s3]\nbucket = \"b\"\nregion = \"r\"\n";
+    let config: Config = toml::from_str(base).unwrap();
+    assert!(!config.iroh.publish_dht);
+    assert!(config.iroh.dht_bootstrap.is_empty());
+    assert!(!tdf_iroh_s3::config::IrohConfig::default().publish_dht);
+
+    let config: Config = toml::from_str(&format!(
+        "[iroh]\npublish_dht = true\ndht_bootstrap = [\"127.0.0.1:6881\"]\n{base}"
+    ))
+    .unwrap();
+    assert!(config.iroh.publish_dht);
+    assert_eq!(config.iroh.dht_bootstrap, ["127.0.0.1:6881"]);
+
+    // A non-boolean is refused at load.
+    assert!(toml::from_str::<Config>(&format!("[iroh]\npublish_dht = \"yes\"\n{base}")).is_err());
+}

@@ -76,6 +76,16 @@ push_stall_secs = 120
 # How often the store's garbage collector deletes staged pushes that ingest
 # is done with. Default 60.
 # gc_interval_secs = 60
+# Publish the node's address to the BitTorrent Mainline DHT (pkarr record
+# signed by the node's key, stored under the endpoint ID). A viewer that knows
+# only the endpoint ID then finds the node without a relay or a configured
+# address. Published: the home relay URL and the globally routable direct IP
+# addresses (the ones the relays report for the node, plus public_addresses);
+# private, loopback and link-local addresses are left out. Needs outbound UDP.
+# Default false. See docs/deploy-runbook.md.
+publish_dht = false
+# Bootstrap nodes for a private DHT (host:port); default: the public Mainline ones.
+# dht_bootstrap = []
 
 [s3]
 bucket = "my-tdf-store"
