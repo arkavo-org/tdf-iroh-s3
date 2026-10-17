@@ -15,6 +15,12 @@
 //! already ingested. A push that starts and writes all its data between
 //! the last read and the collector's start can lose it; its ingest then
 //! finds the blob incomplete, and the publisher pushes again.
+//!
+//! The collector is the only cleanup, and iroh-blobs ends its loop for good
+//! after a run fails. Each run starts with the protect callback, so
+//! [`Staging::collector_stopped`] notices when the callback stops being
+//! called; the node then restarts (once no push is pending) to get a fresh
+//! collector, rather than letting staged pushes fill the disk.
 
 use iroh_blobs::Hash;
 use iroh_blobs::api::Store;
@@ -22,7 +28,7 @@ use iroh_blobs::store::{GcConfig, ProtectOutcome};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 pub struct Staging {
     /// Pushes not yet ingested, with how many of each are in flight.
@@ -32,7 +38,13 @@ pub struct Staging {
     /// The node's runtime: the collector runs on the store's own runtime,
     /// so its store requests run here instead.
     runtime: tokio::runtime::Handle,
+    /// When the collector last started a run (called the protect callback).
+    last_run: Mutex<tokio::time::Instant>,
 }
+
+/// How long [`Staging::collector_stopped`] waits for pending pushes to end
+/// before it reports anyway.
+const DRAIN_LIMIT: Duration = Duration::from_secs(15 * 60);
 
 impl Staging {
     pub fn new() -> Arc<Self> {
@@ -40,6 +52,7 @@ impl Staging {
             pending: Mutex::default(),
             store: OnceLock::new(),
             runtime: tokio::runtime::Handle::current(),
+            last_run: Mutex::new(tokio::time::Instant::now()),
         })
     }
 
@@ -56,6 +69,7 @@ impl Staging {
             interval,
             add_protected: Some(Arc::new(move |live: &mut HashSet<Hash>| {
                 let staging = Arc::clone(&staging);
+                *lock(&staging.last_run) = tokio::time::Instant::now();
                 Box::pin(async move {
                     // The callback's future must be Sync; store requests are
                     // not, so they run in a task of their own.
@@ -73,6 +87,23 @@ impl Staging {
                     }
                 })
             })),
+        }
+    }
+
+    /// Resolves once the collector has not started a run for `dead_after`,
+    /// checking every `poll`, and then no push is pending (or
+    /// [`DRAIN_LIMIT`] passed), so a restart cuts off no push.
+    pub async fn collector_stopped(&self, dead_after: Duration, poll: Duration) {
+        while lock(&self.last_run).elapsed() < dead_after {
+            tokio::time::sleep(poll).await;
+        }
+        error!(
+            ?dead_after,
+            "The store's garbage collector stopped; staged pushes are no longer deleted"
+        );
+        let deadline = tokio::time::Instant::now() + DRAIN_LIMIT;
+        while !lock(&self.pending).is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(poll).await;
         }
     }
 
@@ -178,6 +209,42 @@ mod tests {
         assert!(!staging.is_pending(&pushed));
         let keep = staging.keep_set().await.expect("both collected");
         assert!(keep.is_empty());
+        store.shutdown().await.unwrap();
+    }
+
+    /// Each collector run calls the protect callback, which counts as a
+    /// sign of life; without one for `dead_after`, the collector is
+    /// reported stopped, but only once no push is pending.
+    #[tokio::test]
+    async fn a_silent_collector_is_reported_once_pushes_end() {
+        let (staging, store, _dir) = staged().await;
+        let (dead_after, poll) = (Duration::from_millis(300), Duration::from_millis(10));
+        let protect = staging
+            .gc_config(Duration::from_secs(60))
+            .add_protected
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        let watch = staging.collector_stopped(dead_after, poll);
+        tokio::pin!(watch);
+        // Runs keep it alive.
+        for _ in 0..5 {
+            tokio::select! {
+                () = &mut watch => panic!("reported while the collector runs"),
+                () = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+            protect(&mut HashSet::new()).await;
+        }
+        // Then silence, with a push pending: not reported until it ends.
+        let push = staging.track(Hash::new(b"in flight"));
+        tokio::select! {
+            () = &mut watch => panic!("reported while a push is pending"),
+            () = tokio::time::sleep(dead_after * 2) => {}
+        }
+        drop(push);
+        tokio::time::timeout(Duration::from_secs(5), watch)
+            .await
+            .expect("reported once the push ended");
+        assert!(start.elapsed() >= Duration::from_millis(500) + dead_after);
         store.shutdown().await.unwrap();
     }
 

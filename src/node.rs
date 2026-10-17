@@ -197,6 +197,17 @@ impl TdfIrohNode {
         &self.staging
     }
 
+    /// Resolves when the store's garbage collector has started no run for
+    /// five intervals plus a minute (iroh-blobs ends it for good after a
+    /// failed run) and no push is pending. Nothing else deletes staged
+    /// pushes, so the caller restarts the node to get a fresh collector.
+    pub async fn collector_stopped(&self) {
+        let interval = Duration::from_secs(self.config.iroh.gc_interval_secs.max(1));
+        self.staging
+            .collector_stopped(interval * 5 + Duration::from_secs(60), interval)
+            .await
+    }
+
     pub async fn shutdown(self) -> Result<()> {
         self.cancel.cancel();
         self.router
