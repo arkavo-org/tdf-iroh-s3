@@ -277,6 +277,32 @@ impl S3Client {
         Ok(data.into_bytes())
     }
 
+    /// Open a GET of the object at `key` from byte `start` to its end,
+    /// streamed. `None` when there is no such object. The body is read as
+    /// it arrives; the caller bounds how long it waits.
+    pub async fn get_object_from(
+        &self,
+        key: &str,
+        start: u64,
+    ) -> Result<Option<std::pin::Pin<Box<dyn tokio::io::AsyncBufRead + Send>>>> {
+        let mut request = self.client.get_object().bucket(&self.bucket).key(key);
+        // A range on a zero-length object is invalid in S3; from 0, ask for
+        // all of it.
+        if start > 0 {
+            request = request.range(format!("bytes={start}-"));
+        }
+        match request.send().await {
+            Ok(resp) => Ok(Some(Box::pin(resp.body.into_async_read()))),
+            Err(e) => {
+                if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!("Failed to GET {key} from S3: {e}"))
+                }
+            }
+        }
+    }
+
     pub async fn get_outboard(&self, hash_hex: &str) -> Result<Bytes> {
         let resp = self
             .client

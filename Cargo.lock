@@ -5219,6 +5219,7 @@ dependencies = [
  "iroh",
  "iroh-base",
  "iroh-blobs",
+ "iroh-io",
  "irpc",
  "opentdf",
  "p256 0.13.2",
