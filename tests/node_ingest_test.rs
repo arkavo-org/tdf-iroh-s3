@@ -1071,7 +1071,8 @@ async fn test_a_blob_deleted_from_s3_is_refused_for_good() {
 
 /// An S3 object whose bytes no longer match its hash is never sent: the
 /// node checks each chunk group against the hash before sending it, and
-/// resets the fetch at the first that fails.
+/// resets the fetch at the first that fails. From then on the hash is
+/// refused for good: a re-push would not repair the object.
 #[tokio::test(flavor = "current_thread")]
 async fn test_a_corrupt_s3_object_is_not_served() {
     let (node, s3, _data_dir) = spawn_node(None).await;
@@ -1087,6 +1088,7 @@ async fn test_a_corrupt_s3_object_is_not_served() {
     let viewer = IrohTestClient::new().await.unwrap();
     // Reset by the node (ERR_LIMIT), not caught by the client's own check.
     assert_refused_as_rate_limited(viewer.fetch_from_node(node_id, hash).await, "get");
+    assert_refused_for_permission(viewer.fetch_from_node(node_id, hash).await, "get");
 
     for c in [pusher, viewer] {
         c.shutdown().await.unwrap();

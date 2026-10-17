@@ -37,11 +37,12 @@ peer, straight from S3.
 
 A fetch is refused with an iroh-blobs error code:
 
-- `ERR_PERMISSION` (1) is final: the hash is blocked, or S3 has no such blob.
+- `ERR_PERMISSION` (1) is final: the hash is blocked, S3 has no such blob, or
+  its S3 object turned out not to match the hash.
 - `ERR_LIMIT` (2) means try again: S3 did not answer (a HEAD takes over 10 s,
   or a GET sends nothing for 30 s), the blob's outboard is being computed, or
   256 fetches are running. A transfer S3 breaks off part-way is reset with
-  `ERR_LIMIT` too.
+  `ERR_LIMIT` too, and so is one whose fetcher stops reading for 60 s.
 
 A blob ingested before outboards were stored has none. The first fetch of it
 is answered `ERR_LIMIT` while the node computes the outboard by streaming the

@@ -200,10 +200,10 @@ To remove a recording, Creator uploads the catalog without its entry. The TDF st
    - Verify the BLAKE3 hash before using the file.
    - Expect the transfer to fail now and then: iroh connections stall, drop and change paths. A failed transfer is worth another attempt; the node keeps nothing from it.
 4. **Read the node's refusal.** The node approves or refuses each request before it sends a byte. A refused request is reset with an iroh-blobs error code:
-   - `ERR_PERMISSION` (1) is final. The hash is blocked, or S3 has no such blob. Do not retry. Hash-sequence requests, observe requests and a `get_many` naming more than 64 hashes get this answer before any lookup, so fetch one blob at a time.
+   - `ERR_PERMISSION` (1) is final. The hash is blocked, S3 has no such blob, or its S3 object turned out not to match the hash. Do not retry. Hash-sequence requests, observe requests and a `get_many` naming more than 64 hashes get this answer before any lookup, so fetch one blob at a time.
    - `ERR_LIMIT` (2) means try again. S3 did not answer in time (a HEAD over 10 s, or a GET that sends nothing for 30 s), the blob's outboard is being computed, or the node is serving 256 fetches at once. Retry with a backoff.
    - A blob ingested before outboards were stored has none. Its first fetch is answered `ERR_LIMIT` while the node computes the outboard by streaming the blob from S3 once; the retry is served.
-   - A transfer that S3 breaks off part-way is reset with `ERR_LIMIT` too. Fetch the blob again.
+   - A transfer that S3 breaks off part-way is reset with `ERR_LIMIT` too. Fetch the blob again. If the blob was deleted from S3 meanwhile, the next fetch gets `ERR_PERMISSION`.
    - The Arkavo iOS viewer already maps these (ADR-0057 §5): iroh-swift reports `ERR_PERMISSION` as "permission denied", which the viewer treats as not found, and `ERR_LIMIT` as a failure it retries.
 
 ## Archive layout accepted at ingest

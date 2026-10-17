@@ -378,20 +378,36 @@ async fn wait_and_ingest(
         let update = tokio::select! {
             update = rx.recv() => update,
             trouble = &mut trouble => {
-                match trouble {
+                let oversize = match trouble {
                     PushTrouble::Oversize(size) => {
                         warn!(%hash, size, max, "Push exceeds max_blob_bytes; closing its connection");
                         ingester.connections.close(connection_id, b"blob exceeds max_blob_bytes");
+                        true
                     }
                     PushTrouble::Stalled => {
-                        // Closed, then checked like an aborted transfer: the
-                        // store may hold the whole blob already.
                         warn!(%hash, ?stall, "Push stalled; closing its connection");
                         ingester.connections.close(connection_id, b"push stalled");
-                        break;
+                        false
                     }
+                };
+                // The push stays pending until its import has stopped
+                // writing: the collector must not delete the entry while
+                // the import still holds it, or the import's last write
+                // leaves a file the store no longer lists.
+                if tokio::time::timeout(TRANSFER_END_WAIT, async {
+                    while let Ok(Some(_)) = rx.recv().await {}
+                })
+                .await
+                .is_err()
+                {
+                    warn!(%hash, "Push transfer still running after its connection closed");
                 }
-                return false;
+                if oversize {
+                    return false;
+                }
+                // Checked like an aborted transfer: the store may hold the
+                // whole blob already.
+                break;
             }
         };
         let Ok(Some(update)) = update else {
@@ -426,6 +442,9 @@ async fn wait_and_ingest(
 
     ingest_stored(hash, pending, ingester).await
 }
+
+/// How long a push whose connection the node closed may take to stop.
+const TRANSFER_END_WAIT: Duration = Duration::from_secs(30);
 
 /// Upload attempts for a blob that validated, with this pause before
 /// each retry: an S3 hiccup should not fail a publish.

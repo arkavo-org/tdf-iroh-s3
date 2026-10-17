@@ -117,7 +117,11 @@ So memory no longer limits `max_blob_bytes`, and the 4294967295 default stays, a
 
 As a rule, keep free at least (pushes you expect at once + `max_concurrent_ingests`) × `max_blob_bytes`. With the defaults and one push at a time, that is 8 GiB, or 4 GiB with reflinks. The volume does not grow with the amount of content the node serves.
 
-**First fetches, legacy blobs and replacing the instance.** The first fetch of each blob after a start costs two S3 HEADs (the blob and its outboard); the node remembers the answer. A blob ingested before outboards were stored has none: its first fetch is answered "try again" (`ERR_LIMIT`) while the node computes the outboard by streaming the blob from S3 once and stores it, and the next fetch is served. Replacing the instance is safe and loses nothing, because everything served lives in S3. Several nodes can serve one bucket.
+**First fetches and legacy blobs.** The first fetch of each blob after a start costs two S3 HEADs (the blob and its outboard); the node remembers the answer. A blob ingested before outboards were stored has none: its first fetch is answered "try again" (`ERR_LIMIT`) while the node computes the outboard by streaming the blob from S3 once and stores it, and the next fetch is served. If that computation fails, fetches of the blob are answered "try again" for 10 minutes before the node tries once more.
+
+**Corrupt objects.** The node checks every chunk group it sends against the hash and never sends one that fails. An S3 object that does not match its hash is logged as `S3 object does not match its hash` (level ERROR) and refused for good until the node restarts. A re-push does not repair it, because ingest keeps an existing `blobs/<hash>`: delete `blobs/<hash>` and `outboards/<hash>`, then have the publisher push again.
+
+**Replacing the instance.** It is safe and loses nothing, because everything served lives in S3. Several nodes can serve one bucket.
 
 Keep the rest of the config as deployed: the `[s3]` region, `[publishing]` and `[catalog]`. Production runs `[publishing] required = false`; keep that. Creator works either way: on an ungated node `POST /publish/sessions` answers 404, and Creator pushes without a session.
 

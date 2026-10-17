@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bao_tree::io::EncodeError;
 use bao_tree::io::fsm::{AsyncSliceReader, CreateOutboard, encode_ranges_validated};
@@ -27,6 +27,7 @@ use bao_tree::{BaoTree, ChunkRanges};
 use bytes::{Bytes, BytesMut};
 use iroh_blobs::Hash;
 use iroh_blobs::store::IROH_BLOCK_SIZE;
+use iroh_io::AsyncStreamWriter;
 use tokio::io::{AsyncBufRead, AsyncReadExt};
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
@@ -36,6 +37,19 @@ use crate::store::s3::S3Client;
 /// An S3 GET that sends nothing for this long fails (the fetch is told to
 /// try again).
 pub const S3_STALL: Duration = Duration::from_secs(30);
+
+/// A write to the fetcher that makes no progress for this long fails: a
+/// peer that keeps its connection open but stops reading would otherwise
+/// hold a serve slot, and two open S3 GETs, for as long as it likes.
+pub const PEER_STALL: Duration = Duration::from_secs(60);
+
+/// After a failed outboard computation, how long fetches of the blob are
+/// told to try again without starting another (each streams the whole blob
+/// from S3).
+const BACKFILL_COOLDOWN: Duration = Duration::from_secs(600);
+
+/// Most hashes remembered as corrupt, or as failed backfills.
+const BAD_CAPACITY: usize = 10_000;
 
 /// The longest an S3 HEAD may take.
 const S3_HEAD_TIMEOUT: Duration = Duration::from_secs(10);
@@ -52,7 +66,7 @@ const SIZES_CAPACITY: usize = 100_000;
 /// Why a hash is not served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// Final: S3 holds no such blob.
+    /// Final: S3 holds no such blob, or its object does not match the hash.
     Gone,
     /// Try again: S3 did not answer, or the outboard is being computed.
     Busy,
@@ -66,6 +80,14 @@ pub struct S3Server {
     /// Hashes whose outboard is being computed.
     backfilling: Mutex<HashSet<Hash>>,
     backfills: Arc<Semaphore>,
+    /// Hashes whose S3 object does not match them, found while serving or
+    /// computing an outboard. Refused for good until the node restarts; a
+    /// push of the blob does not repair it (ingest keeps an existing
+    /// object), so an operator deletes the object and the publisher pushes
+    /// again.
+    corrupt: Mutex<HashSet<Hash>>,
+    /// When each recent outboard computation failed ([`BACKFILL_COOLDOWN`]).
+    backfill_failed: Mutex<HashMap<Hash, Instant>>,
 }
 
 impl S3Server {
@@ -75,6 +97,8 @@ impl S3Server {
             servable: Mutex::default(),
             backfilling: Mutex::default(),
             backfills: Arc::new(Semaphore::new(BACKFILLS)),
+            corrupt: Mutex::default(),
+            backfill_failed: Mutex::default(),
         })
     }
 
@@ -82,6 +106,9 @@ impl S3Server {
     /// both there. A blob without an outboard gets one computed in the
     /// background, and is refused as busy meanwhile.
     pub async fn check(self: &Arc<Self>, hash: Hash) -> Result<u64, Refusal> {
+        if lock(&self.corrupt).contains(&hash) {
+            return Err(Refusal::Gone);
+        }
         if let Some(size) = lock(&self.servable).get(&hash) {
             return Ok(*size);
         }
@@ -140,23 +167,31 @@ impl S3Server {
                 tree.outboard_size(),
             ),
         };
-        writer
-            .write_all(&size.to_le_bytes())
-            .await
-            .map_err(io::Error::other)?;
-        encode_ranges_validated(data, outboard, ranges, QuicWriter(writer))
+        let mut writer = QuicWriter(writer);
+        writer.write(&size.to_le_bytes()).await?;
+        encode_ranges_validated(data, outboard, ranges, writer)
             .await
             .map_err(|e| {
                 if matches!(
                     e,
                     EncodeError::LeafHashMismatch(_) | EncodeError::ParentHashMismatch(_)
                 ) {
-                    // Nothing that fails the check is sent, but the object
-                    // will not serve until someone pushes the blob again.
-                    error!(%hash, error = ?e, "S3 object does not match its hash");
+                    // Nothing that fails the check is sent.
+                    self.mark_corrupt(hash, &format!("{e:?}"));
                 }
                 io::Error::other(e)
             })
+    }
+
+    /// Refuse `hash` for good: its S3 object does not match it.
+    fn mark_corrupt(&self, hash: Hash, why: &str) {
+        error!(%hash, why, "S3 object does not match its hash; refused until restart. Delete blobs/<hash> and outboards/<hash> so the publisher can push it again");
+        let mut corrupt = lock(&self.corrupt);
+        if corrupt.len() >= BAD_CAPACITY {
+            corrupt.clear();
+        }
+        corrupt.insert(hash);
+        lock(&self.servable).remove(&hash);
     }
 
     /// Drop what is remembered of `hash`, so the next fetch asks S3 again.
@@ -167,6 +202,12 @@ impl S3Server {
     /// Compute and store the outboard of a blob that lacks one, unless that
     /// runs already or [`BACKFILLS`] run.
     fn backfill(self: &Arc<Self>, hash: Hash, size: u64) {
+        let cooling = lock(&self.backfill_failed)
+            .get(&hash)
+            .is_some_and(|at| at.elapsed() < BACKFILL_COOLDOWN);
+        if cooling {
+            return;
+        }
         let Ok(permit) = Arc::clone(&self.backfills).try_acquire_owned() else {
             return;
         };
@@ -176,9 +217,17 @@ impl S3Server {
         let server = Arc::clone(self);
         tokio::spawn(async move {
             match server.compute_outboard(hash, size).await {
-                Ok(()) => info!(%hash, size, "Outboard computed from S3 and stored"),
+                Ok(None) => info!(%hash, size, "Outboard computed from S3 and stored"),
+                Ok(Some(actual)) => {
+                    server.mark_corrupt(hash, &format!("the blob in S3 hashes to {actual}"));
+                }
                 Err(e) => {
-                    warn!(%hash, error = format!("{e:#}"), "Computing the outboard failed; a later fetch tries again")
+                    warn!(%hash, error = format!("{e:#}"), ?BACKFILL_COOLDOWN, "Computing the outboard failed; tried again after the cooldown");
+                    let mut failed = lock(&server.backfill_failed);
+                    if failed.len() >= BAD_CAPACITY {
+                        failed.retain(|_, at| at.elapsed() < BACKFILL_COOLDOWN);
+                    }
+                    failed.insert(hash, Instant::now());
                 }
             }
             lock(&server.backfilling).remove(&hash);
@@ -186,16 +235,20 @@ impl S3Server {
         });
     }
 
-    async fn compute_outboard(&self, hash: Hash, size: u64) -> anyhow::Result<()> {
+    /// Store the outboard of `hash`'s blob, computed from S3. `Some` (and
+    /// nothing stored) when the blob hashes to something else.
+    async fn compute_outboard(&self, hash: Hash, size: u64) -> anyhow::Result<Option<Hash>> {
         let hex = hash.to_hex();
         let data = S3Reader::new(Arc::clone(&self.s3), self.s3.blob_key(&hex), size);
         let outboard = PreOrderOutboard::<Vec<u8>>::create(data, IROH_BLOCK_SIZE).await?;
-        anyhow::ensure!(
-            Hash::from(outboard.root) == hash,
-            "blob in S3 hashes to {}, not its key",
-            Hash::from(outboard.root)
-        );
-        self.s3.put_outboard(&hex, Bytes::from(outboard.data)).await
+        let actual = Hash::from(outboard.root);
+        if actual != hash {
+            return Ok(Some(actual));
+        }
+        self.s3
+            .put_outboard(&hex, Bytes::from(outboard.data))
+            .await?;
+        Ok(None)
     }
 }
 
@@ -305,16 +358,27 @@ async fn read_exact(
     Ok(())
 }
 
+/// A write to the fetcher, failing if it makes no progress for
+/// [`PEER_STALL`].
+async fn peer_write<E: std::error::Error + Send + Sync + 'static>(
+    write: impl Future<Output = Result<(), E>>,
+) -> io::Result<()> {
+    tokio::time::timeout(PEER_STALL, write)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "fetcher stopped reading"))?
+        .map_err(io::Error::other)
+}
+
 /// The BAO encoder's writer over an iroh QUIC stream.
 struct QuicWriter<'a>(&'a mut iroh::endpoint::SendStream);
 
-impl iroh_io::AsyncStreamWriter for QuicWriter<'_> {
+impl AsyncStreamWriter for QuicWriter<'_> {
     async fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        self.0.write_all(data).await.map_err(io::Error::other)
+        peer_write(self.0.write_all(data)).await
     }
 
     async fn write_bytes(&mut self, data: Bytes) -> io::Result<()> {
-        self.0.write_chunk(data).await.map_err(io::Error::other)
+        peer_write(self.0.write_chunk(data)).await
     }
 
     async fn sync(&mut self) -> io::Result<()> {
