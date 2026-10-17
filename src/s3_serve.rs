@@ -20,6 +20,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bao_tree::io::EncodeError;
 use bao_tree::io::fsm::{AsyncSliceReader, CreateOutboard, encode_ranges_validated};
 use bao_tree::io::outboard::PreOrderOutboard;
 use bao_tree::{BaoTree, ChunkRanges};
@@ -28,7 +29,7 @@ use iroh_blobs::Hash;
 use iroh_blobs::store::IROH_BLOCK_SIZE;
 use tokio::io::{AsyncBufRead, AsyncReadExt};
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::store::s3::S3Client;
 
@@ -145,7 +146,22 @@ impl S3Server {
             .map_err(io::Error::other)?;
         encode_ranges_validated(data, outboard, ranges, QuicWriter(writer))
             .await
-            .map_err(io::Error::other)
+            .map_err(|e| {
+                if matches!(
+                    e,
+                    EncodeError::LeafHashMismatch(_) | EncodeError::ParentHashMismatch(_)
+                ) {
+                    // Nothing that fails the check is sent, but the object
+                    // will not serve until someone pushes the blob again.
+                    error!(%hash, error = ?e, "S3 object does not match its hash");
+                }
+                io::Error::other(e)
+            })
+    }
+
+    /// Drop what is remembered of `hash`, so the next fetch asks S3 again.
+    pub fn forget(&self, hash: &Hash) {
+        lock(&self.servable).remove(hash);
     }
 
     /// Compute and store the outboard of a blob that lacks one, unless that

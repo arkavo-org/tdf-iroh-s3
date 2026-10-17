@@ -137,7 +137,7 @@ echo | openssl s_client -connect iroh.arkavo.net:443 -servername iroh.arkavo.net
 
 ## 5. IAM
 
-The node's content is in the bucket `arkavo-iroh-content`, with no prefix. In the policies below, `<bucket>` is that bucket and `<prefix>` is empty.
+The node's content is in the bucket `arkavo-iroh-content`, with no prefix. In the policies below, `<bucket>` is that bucket and `<prefix>` is empty. Production's role `tdf-iroh-s3-node` grants `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on `arkavo-iroh-content/*` (inline policy `s3-iroh-content`), which covers every key below; the statements are for a role scoped per prefix.
 
 The instance role already has access to `<prefix>blobs/*`, `manifests/*`, `catalog-index/*`, `tags/*` and `moderation/*`. Serving fetches from S3 adds read and write access to `outboards/*`: ingest writes an outboard for every blob, a fetch reads it, and the node writes one for a blob that lacks it. Creator catalogs add read and write access to `catalog-documents/*`:
 

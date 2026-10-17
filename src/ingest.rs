@@ -295,7 +295,6 @@ impl ScratchFile {
     fn path(&self) -> &Path {
         &self.path
     }
-
 }
 
 impl Drop for ScratchFile {
