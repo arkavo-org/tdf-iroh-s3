@@ -89,7 +89,7 @@ required_attributes = [
     "https://example.com/attr/storage/value/permanent"
 ]
 # Larger pushes are refused, and stopped while they transfer. Memory does
-# not bound this; disk does (docs/deploy-runbook.md). Default 4294967295
+# not bound this; disk does (see Deploy). Default 4294967295
 # (4 GiB − 1, the viewer's limit).
 max_blob_bytes = 4294967295
 # Pushes validated and uploaded at once, each with a scratch copy on disk.
@@ -189,8 +189,11 @@ read both; ingest writes both). It needs the same S3 write permissions on
 `manifests/` and `catalog-index/` as on `blobs/` — derived-artifact writes are best-effort
 (a failure is logged and never masks a successful blob ingest; re-pushing
 the content repairs the index). Creator catalogs need `s3:PutObject` and
-`s3:GetObject` on `catalog-documents/`. See
-[docs/deploy-runbook.md](docs/deploy-runbook.md) for the full policy.
+`s3:GetObject` on `catalog-documents/`, and `s3:PutObject`, `s3:GetObject`
+on `moderation/` when the publishing gate is on. It also needs
+`s3:ListBucket` on the bucket itself, without a prefix condition: without
+it S3 answers a missing key with 403, and the node reports unknown hashes
+as 502 `storage unavailable` instead of 404.
 
 ## Entitled catalog
 
@@ -288,9 +291,21 @@ See [docs/publishing-and-moderation.md](docs/publishing-and-moderation.md).
 
 ## Deploy
 
-See [docs/deploy-runbook.md](docs/deploy-runbook.md): building the arm64
-Linux binary, the Packer AMI, configuration, TLS for `iroh.arkavo.net`
-(with a stable, pinned leaf key), IAM and smoke checks.
+`packer/ami.pkr.hcl` builds an Amazon Linux 2023 arm64 AMI around a
+prebuilt binary. A systemd unit runs it with
+`--config /etc/tdf-iroh-s3/config.toml`; on first boot the bootstrap
+script writes that file from EC2 user-data when it does not exist.
+
+Everything the node serves lives in S3, so replacing an instance loses
+nothing, and several nodes can serve one bucket. The data volume only
+stages pushes: keep at least (pushes expected at once +
+`max_concurrent_ingests`) × `max_blob_bytes` free (half that on a
+reflink-capable filesystem such as XFS with `reflink=1`). The endpoint ID
+comes from `[iroh] secret_key_param`, not the instance; keep it stable if
+clients pin it.
+
+Operator runbooks for a particular deployment live outside this
+repository (`production/` is gitignored).
 
 ## Test
 
