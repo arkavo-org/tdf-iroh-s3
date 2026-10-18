@@ -301,8 +301,9 @@ script writes that file from EC2 user-data when it does not exist.
 Everything the node serves lives in S3, so replacing an instance loses
 nothing, and several nodes can serve one bucket. The data volume only
 stages pushes: keep at least (pushes expected at once +
-`max_concurrent_ingests`) × `max_blob_bytes` free (half that on a
-reflink-capable filesystem such as XFS with `reflink=1`). The endpoint ID
+`max_concurrent_ingests`) × `max_blob_bytes` free. On a reflink-capable
+filesystem (XFS with `reflink=1`) the ingest scratch copies take no space,
+so drop the `max_concurrent_ingests` term. The endpoint ID
 comes from `[iroh] secret_key_param`, not the instance; keep it stable if
 clients pin it.
 
