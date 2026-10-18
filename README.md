@@ -292,7 +292,9 @@ See [docs/publishing-and-moderation.md](docs/publishing-and-moderation.md).
 ## Deploy
 
 `packer/ami.pkr.hcl` builds an Amazon Linux 2023 arm64 AMI around a
-prebuilt binary. A systemd unit runs it with
+prebuilt binary. It requires `binary_s3_uri` (the gzipped binary in S3)
+and `iam_instance_profile` (a build-instance profile that can read it),
+for example from a `-var-file`. A systemd unit runs it with
 `--config /etc/tdf-iroh-s3/config.toml`; on first boot the bootstrap
 script writes that file from EC2 user-data when it does not exist.
 
