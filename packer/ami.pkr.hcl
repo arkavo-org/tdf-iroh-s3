@@ -15,7 +15,11 @@ variable "aws_region" {
 variable "binary_s3_uri" {
   type        = string
   description = "S3 URI of the gzipped tdf-iroh-s3 binary (e.g. s3://bucket/path/tdf-iroh-s3.gz)"
-  default     = "s3://arkavo-report/packer/tdf-iroh-s3.gz"
+}
+
+variable "iam_instance_profile" {
+  type        = string
+  description = "Instance profile for the build instance; it needs s3:GetObject on binary_s3_uri"
 }
 
 variable "ami_name_prefix" {
@@ -41,7 +45,7 @@ source "amazon-ebs" "al2023" {
   ssh_username = "ec2-user"
   ssh_timeout  = "5m"
 
-  iam_instance_profile = "packer-s3-read"
+  iam_instance_profile = var.iam_instance_profile
 
   tags = {
     Name    = "${var.ami_name_prefix}"
