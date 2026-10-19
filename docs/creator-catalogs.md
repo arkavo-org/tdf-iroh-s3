@@ -206,6 +206,125 @@ To remove a recording, Creator uploads the catalog without its entry. The TDF st
    - A transfer that S3 breaks off part-way is reset with `ERR_LIMIT` too. Fetch the blob again. If the blob was deleted from S3 meanwhile, the next fetch gets `ERR_PERMISSION`.
    - The Arkavo iOS viewer already maps these (ADR-0057 §5): iroh-swift reports `ERR_PERMISSION` as "permission denied", which the viewer treats as not found, and `ERR_LIMIT` as a failure it retries.
 
+## Catalog v2: passkey-signed catalogs over iroh
+
+Catalog v2 ([tdf-iroh-s3#27](https://github.com/arkavo-org/tdf-iroh-s3/issues/27)) changes how a creator's current catalog is named and proved. The document format above is unchanged.
+
+- **The document travels over iroh.** A reader fetches it by BLAKE3 hash from the pinned node, the same way it fetches recordings.
+- **The creator signs a pointer with their passkey.** The pointer names the document's hash and size and carries a sequence number.
+- **The IdP attests the passkey.** identity.arkavo.net signs which passkey credential belongs to which subject ([authnz-rs#104](https://github.com/arkavo-org/authnz-rs/issues/104), `docs/passkey-credential-attestation.md` there).
+
+A reader checks the whole chain itself. So neither the node nor its storage can forge a creator's catalog, or roll back a reader that has already seen a newer `seq`. They can still withhold a catalog, or show an older signed one to a reader that has never seen a newer `seq`.
+
+v1 (`PUT /catalogs`, `GET /tags/catalog`, `GET /catalog-documents`) stays until Creator and the iOS viewer both ship v2.
+
+**Encoding.** Every binary value in v2 is base64url **without padding** (RFC 4648 §5, no `=`). The node refuses padded values and the standard alphabet's `+` and `/`.
+
+### The pointer
+
+The exact UTF-8 bytes of one JSON object. It is carried base64url-encoded and is never re-serialized, so the signed bytes are the bytes everyone reads.
+
+```json
+{"schema":"arkavo.catalog-pointer/1","owner":"<sub>","seq":7,"catalogHash":"<64 lowercase hex>","catalogSize":1234,"issuedAt":"2026-10-19T01:02:03Z"}
+```
+
+| Field | Rule |
+|---|---|
+| `schema` | `arkavo.catalog-pointer/1` |
+| `owner` | the publisher's `sub`, byte for byte (the same rules as a catalog's `owner`) |
+| `seq` | integer, 1 to 9 007 199 254 740 991 |
+| `catalogHash` | BLAKE3 of the document's bytes, 64 lowercase hex characters |
+| `catalogSize` | the document's length in bytes, 1 to 262 144 |
+| `issuedAt` | `YYYY-MM-DDTHH:MM:SSZ` |
+
+The object holds exactly these keys, with no key repeated and nothing after it, and is at most 1024 bytes.
+
+### The signed bundle
+
+```json
+{
+  "pointer": "<base64url pointer bytes>",
+  "assertion": {
+    "credentialId": "<base64url>",
+    "authenticatorData": "<base64url>",
+    "clientDataJSON": "<base64url>",
+    "signature": "<base64url DER ECDSA signature>"
+  },
+  "credential": "<base64url COSE_Sign1 attestation from the IdP>"
+}
+```
+
+Exactly these keys. `assertion` is the WebAuthn assertion as the platform returns it.
+
+### Verification
+
+The node checks this on publish and readers check it on read. The rules are the same:
+
+1. **The attestation** is a COSE_Sign1, tagged 18 or untagged:
+   - signed ES256 by a `kid` in `https://identity.arkavo.net/.well-known/cose-keys`;
+   - protected header content type (label 3) `application/arkavo-passkey-credential+cbor`;
+   - its payload is a CBOR map with exactly the text keys `typ` (`arkavo-passkey-credential`), `iss` (`https://identity.arkavo.net`), `sub`, `credentialId` (byte string), `publicKey` (COSE_Key: EC2, P-256), `rpId` (`identity.arkavo.net`) and `iat` (at most 60 s in the future);
+   - `sub` equals the pointer's `owner`, and `credentialId` equals the assertion's.
+2. **The assertion,** against the attested `publicKey`:
+   - `clientDataJSON.type` is `webauthn.get`;
+   - `clientDataJSON.challenge`, decoded, equals SHA-256 of the pointer bytes;
+   - `clientDataJSON.origin` is `https://identity.arkavo.net`, and `crossOrigin` is not `true`;
+   - `authenticatorData` is at least 37 bytes, starts with SHA-256(`identity.arkavo.net`), and has the UP (0x01) and UV (0x04) flags set;
+   - `signature` (ASN.1 DER) verifies with ES256 over `authenticatorData || SHA-256(clientDataJSON)`.
+   - The signature counter is ignored: synced passkeys report 0.
+3. **The pointer** follows the rules above, and its `owner` is the subject asked for.
+4. **The document** hashes to `catalogHash`, is `catalogSize` bytes long, is a valid `arkavo.creator-catalog/1`, and its `owner` is the pointer's `owner`.
+5. **Rollback.** The node refuses a `seq` that is not greater than the stored one. A reader refuses a `seq` lower than the highest it has seen for that creator.
+
+### `PUT /v2/catalogs/{sub}`: publish
+
+The request needs `Authorization: Bearer <Arkavo CWT>` and `Content-Type: application/json`. Its body is `{"document": "<base64url document bytes>", "bundle": {…}}`, at most 512 KiB.
+
+The node checks the following in order:
+
+| Check | Failure |
+|---|---|
+| The token passes the publishing checks (as `PUT /catalogs`) | 401 / 403 |
+| `{sub}` equals the token's `sub` | 403 `catalog does not match token subject` |
+| `Content-Type` is `application/json` | 415 |
+| The body is at most 512 KiB | 413 `request too large` |
+| The body has exactly `document` and `bundle` | 400 `invalid request: <reason>` |
+| `document` is 1–262 144 bytes of unpadded base64url | 422 `invalid request: …` |
+| Verification steps 1–3 | 422 `invalid bundle: <reason>`; 502 `key set unavailable` |
+| The pointer names this document | 422 `invalid bundle: catalogHash or catalogSize does not match the document` |
+| A valid catalog whose `owner` is `{sub}` | 422 `invalid catalog: <reason>` |
+| Nothing blocked, every payload ingested at its size (as `PUT /catalogs`, steps 6–8) | 403 / 422 |
+| The passkey credential is still the subject's, according to the IdP's status route | 403 `passkey credential unknown`, `… revoked` or `… belongs to another subject`; 502 `credential status unavailable` |
+| `seq` is greater than the stored one | 409 `seq must be greater than <n>` |
+
+The node then stores the document at `catalog-documents/<blake3>` with its BAO outboard at `catalog-outboards/<blake3>`, and then the bundle at `catalog-pointers/<sub>`. The pointer is written only if no other publish replaced it in the meantime; otherwise 409 `seq must be greater than the stored seq: another publish won`. Read the pointer again and retry.
+
+200: `{"owner":"<sub>","seq":<n>,"hash":"<blake3 hex>","size":<bytes>}`.
+
+### `GET /v2/catalogs/{sub}`: read the pointer
+
+This route is public.
+
+- **200:** the stored bundle JSON, with `Cache-Control: public, max-age=300`.
+- **400:** `invalid subject`.
+- **404:** `catalog not found`. There is no catalog, or the creator is suspended with `hideCatalog`, or the catalog's hash is blocked. Only this 404 means "no catalog".
+
+### Fetching the document over iroh
+
+Fetch `catalogHash` from the pinned node, with a size limit of `catalogSize`. The node serves catalog documents from `catalog-documents/` and `catalog-outboards/`. These are kept apart from `blobs/`, so a catalog document is never taken for a recording. Refusals follow [Reading a catalog and downloading](#reading-a-catalog-and-downloading-viewer):
+
+- `ERR_PERMISSION` when the hash is blocked or its creator is hidden;
+- `ERR_LIMIT` while the node computes a missing outboard.
+
+### Publishing (Creator)
+
+1. Build the document as for v1.
+2. Read the stored pointer (`GET /v2/catalogs/<sub>`) and set `seq` to one more than the higher of its `seq` and the highest this device has used.
+3. Write the pointer bytes and keep them exactly.
+4. Get a passkey assertion for RP `identity.arkavo.net`, with challenge SHA-256(pointer bytes) and user verification required. Allow only the signed-in account's credentials.
+5. Get the attestation for the assertion's credential: `POST https://identity.arkavo.net/passkeys/credential-attestation`.
+6. `PUT /v2/catalogs/<sub>`. On a 409, read the pointer again and retry once.
+
 ## Archive layout accepted at ingest
 
 A pushed blob is ingested only when it is a ZIP holding an OpenTDF manifest. Ingest accepts either of two layouts:
