@@ -84,7 +84,7 @@ BlobsHandler → S3Server: blocked? → HEAD blobs/<hash> and outboards/<hash>
 
 ## Deployment
 
-Packer AMI build (`packer/ami.pkr.hcl`) for Amazon Linux 2023 arm64; it pulls the gzipped binary from `s3://arkavo-report/packer/tdf-iroh-s3.gz`. Systemd service runs the binary with `--config /etc/tdf-iroh-s3/config.toml`. Bootstrap script fetches config from EC2 user-data (IMDSv2) if no config file exists. Full procedure, TLS and smoke checks: `docs/deploy-runbook.md`.
+Packer AMI build (`packer/ami.pkr.hcl`) for Amazon Linux 2023 arm64; it pulls the gzipped binary from `binary_s3_uri` using `iam_instance_profile`, both required variables (Arkavo's values: `production/ami.pkrvars.hcl`, gitignored). Systemd service runs the binary with `--config /etc/tdf-iroh-s3/config.toml`. Bootstrap script fetches config from EC2 user-data (IMDSv2) if no config file exists. Full procedure, TLS and smoke checks: `production/deploy-runbook.md` (Arkavo-specific, gitignored: local only, never commit it; the repo is public).
 
 ## Rust Toolchain
 

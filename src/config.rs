@@ -315,7 +315,7 @@ pub struct ValidationConfig {
     pub assertion: AssertionConfig,
     /// Pushed blobs larger than this many bytes are refused. Ingest reads
     /// the blob from a file, so memory does not bound this; disk does (see
-    /// `docs/deploy-runbook.md`).
+    /// Deploy in the README).
     #[serde(default = "default_max_blob_bytes")]
     pub max_blob_bytes: u64,
     /// How many pushed blobs are validated and uploaded at once. Each one in
