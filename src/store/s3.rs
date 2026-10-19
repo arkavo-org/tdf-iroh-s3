@@ -108,6 +108,17 @@ impl S3Client {
         format!("{}catalog-documents/{}", self.prefix, hash_hex)
     }
 
+    /// The BAO outboard of a catalog document (catalog v2), kept apart from
+    /// `outboards/` as the document is kept apart from `blobs/`.
+    pub fn catalog_outboard_key(&self, hash_hex: &str) -> String {
+        format!("{}catalog-outboards/{}", self.prefix, hash_hex)
+    }
+
+    /// A creator's signed catalog pointer bundle (catalog v2).
+    pub fn catalog_pointer_key(&self, sub: &str) -> String {
+        format!("{}catalog-pointers/{}", self.prefix, sub)
+    }
+
     pub async fn put_blob(&self, hash_hex: &str, data: Bytes) -> Result<()> {
         self.client
             .put_object()
@@ -460,6 +471,144 @@ impl S3Client {
                     ))
                 }
             }
+        }
+    }
+
+    /// A stored catalog document's size and `owner` metadata, from a HEAD.
+    pub async fn catalog_document_size(
+        &self,
+        hash_hex: &str,
+    ) -> Result<Option<(u64, Option<String>)>> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_document_key(hash_hex))
+            .send()
+            .await
+        {
+            Ok(head) => {
+                let size = head
+                    .content_length()
+                    .and_then(|n| u64::try_from(n).ok())
+                    .context("S3 HEAD of a catalog document returned no content length")?;
+                let owner = head
+                    .metadata()
+                    .and_then(|m| m.get(CATALOG_OWNER_METADATA))
+                    .cloned();
+                Ok(Some((size, owner)))
+            }
+            Err(e) => {
+                if e.as_service_error().is_some_and(|se| se.is_not_found()) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Failed to HEAD catalog document in S3: {}",
+                        e
+                    ))
+                }
+            }
+        }
+    }
+
+    pub async fn put_catalog_outboard(&self, hash_hex: &str, data: Bytes) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_outboard_key(hash_hex))
+            .body(data.into())
+            .send()
+            .await
+            .context("Failed to PUT catalog outboard to S3")?;
+        Ok(())
+    }
+
+    /// The stored size of a catalog document's outboard, or `None`.
+    pub async fn catalog_outboard_size(&self, hash_hex: &str) -> Result<Option<u64>> {
+        self.object_size(&self.catalog_outboard_key(hash_hex), "catalog outboard")
+            .await
+    }
+
+    async fn object_size(&self, key: &str, what: &str) -> Result<Option<u64>> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(head) => Ok(Some(
+                head.content_length()
+                    .and_then(|n| u64::try_from(n).ok())
+                    .with_context(|| format!("S3 HEAD of a {what} returned no content length"))?,
+            )),
+            Err(e) => {
+                if e.as_service_error().is_some_and(|se| se.is_not_found()) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!("Failed to HEAD {what} in S3: {}", e))
+                }
+            }
+        }
+    }
+
+    /// A creator's stored pointer bundle and its ETag.
+    pub async fn get_catalog_pointer(&self, sub: &str) -> Result<Option<(Bytes, String)>> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_pointer_key(sub))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let etag = resp
+                    .e_tag()
+                    .context("S3 GET of a catalog pointer returned no ETag")?
+                    .to_string();
+                let data = resp.body.collect().await?;
+                Ok(Some((data.into_bytes(), etag)))
+            }
+            Err(e) => {
+                if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!("Failed to GET catalog pointer from S3: {}", e))
+                }
+            }
+        }
+    }
+
+    /// Store a creator's pointer bundle only if the stored one is still
+    /// `expected` (its ETag), or, with `None`, only if there is none.
+    /// `false` when another write got there first.
+    pub async fn put_catalog_pointer(
+        &self,
+        sub: &str,
+        body: Bytes,
+        expected: Option<&str>,
+    ) -> Result<bool> {
+        let put = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_pointer_key(sub))
+            .content_type("application/json")
+            .body(body.into());
+        let put = match expected {
+            Some(etag) => put.if_match(etag),
+            None => put.if_none_match("*"),
+        };
+        match put.send().await {
+            Ok(_) => Ok(true),
+            // 412: the condition failed; 409: a concurrent conditional
+            // write to the same key is in progress.
+            Err(e) if e.raw_response().is_some_and(|r| matches!(r.status().as_u16(), 409 | 412)) => {
+                Ok(false)
+            }
+            Err(e) => Err(anyhow::anyhow!("Failed to PUT catalog pointer to S3: {}", e)),
         }
     }
 

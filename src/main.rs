@@ -13,6 +13,7 @@ use tdf_iroh_s3::authz::{
 };
 use tdf_iroh_s3::catalog_api::{self, CatalogApiState, CatalogCache};
 use tdf_iroh_s3::catalogs_api;
+use tdf_iroh_s3::catalogs_v2_api;
 use tdf_iroh_s3::config::Config;
 use tdf_iroh_s3::moderation::{self, Moderation, ModerationApi, PublishGate, PublishPolicy};
 use tdf_iroh_s3::node::TdfIrohNode;
@@ -138,8 +139,14 @@ async fn main() -> Result<()> {
         // Tags and the creator catalog routes exist whenever HTTP does; on
         // an ungated node they still verify tokens but skip the publishing
         // checks.
+        let v2 = catalogs_v2_api::state(
+            Arc::clone(&state),
+            &http_cfg.passkey_rp_id,
+            &http_cfg.passkey_status_url,
+        );
         let mut router = tags_api::router(Arc::clone(&state))
             .merge(catalogs_api::router(state))
+            .merge(catalogs_v2_api::router(v2))
             .merge(node_api::router(node_api::live(
                 node.endpoint().clone(),
                 &node.config.iroh.public_addresses,

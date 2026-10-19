@@ -220,7 +220,7 @@ pub(crate) async fn check_payloads<S: TagStore>(
 }
 
 /// `application/json`, with or without parameters such as `charset`.
-fn is_json(headers: &HeaderMap) -> bool {
+pub(crate) fn is_json(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -300,7 +300,7 @@ async fn get_catalog_document<S: TagStore>(
 
 /// True when the document's owner is suspended with `hideCatalog` on this
 /// (gated) node.
-fn owner_hidden<S: TagStore>(state: &ApiState<S>, owner: Option<&str>) -> bool {
+pub(crate) fn owner_hidden<S: TagStore>(state: &ApiState<S>, owner: Option<&str>) -> bool {
     state.publishing.as_ref().is_some_and(|p| {
         owner
             .and_then(|o| p.moderation.suspension(o))

@@ -215,7 +215,7 @@ fn is_https_url(s: &str) -> bool {
 }
 
 /// Deserializes any JSON value, failing on an object that repeats a key.
-struct NoDuplicateKeys;
+pub(crate) struct NoDuplicateKeys;
 
 impl<'de> Deserialize<'de> for NoDuplicateKeys {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
