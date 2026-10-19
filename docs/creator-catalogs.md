@@ -280,6 +280,13 @@ The node checks this on publish and readers check it on read. The rules are the 
 
 The request needs `Authorization: Bearer <Arkavo CWT>` and `Content-Type: application/json`. Its body is `{"document": "<base64url document bytes>", "bundle": {…}}`, at most 512 KiB.
 
+The request should name the base the client merged its document from, with a standard conditional header (RFC 9110). Without one, a publish signed while another device saved can replace that device's catalog.
+
+- **`If-Match: "<seq>"`:** the client merged from the stored pointer with this `seq`, as `GET /v2/catalogs/{sub}` tagged it (`ETag`). The tag is compared strongly: a weak tag (`W/"7"`) or a bare `7` never matches. `If-Match: *` matches any stored pointer.
+- **`If-None-Match: *`:** the client merged from "no v2 catalog yet" (a 404, seeded from v1). No pointer may be stored.
+
+If the stored pointer is no longer that base, the node answers 412 `catalog changed since it was read` and stores nothing. Read the pointer again, merge, sign and retry. When both headers are sent, only `If-Match` is evaluated. Without either header the node skips this check, for now; once clients send one, a missing precondition may become a 428.
+
 The node checks the following in order:
 
 | Check | Failure |
@@ -295,6 +302,7 @@ The node checks the following in order:
 | A valid catalog whose `owner` is `{sub}` | 422 `invalid catalog: <reason>` |
 | Nothing blocked, every payload ingested at its size (as `PUT /catalogs`, steps 6–8) | 403 / 422 |
 | The passkey credential is still the subject's, according to the IdP's status route | 403 `passkey credential unknown`, `… revoked` or `… belongs to another subject`; 502 `credential status unavailable` |
+| The stored pointer is the base named by `If-Match` or `If-None-Match`, if either is sent | 412 `catalog changed since it was read` |
 | `seq` is greater than the stored one | 409 `seq must be greater than <n>` |
 
 The node then stores the document at `catalog-documents/<blake3>` with its BAO outboard at `catalog-outboards/<blake3>`, and then the bundle at `catalog-pointers/<sub>`. The pointer is written only if no other publish replaced it in the meantime; otherwise 409 `seq must be greater than the stored seq: another publish won`. Read the pointer again and retry.
@@ -305,7 +313,7 @@ The node then stores the document at `catalog-documents/<blake3>` with its BAO o
 
 This route is public.
 
-- **200:** the stored bundle JSON, with `Cache-Control: public, max-age=300`.
+- **200:** the stored bundle JSON, with `ETag: "<seq>"` and `Cache-Control: public, max-age=300`. A publisher reads past caches, and sends the `ETag` back as `If-Match`.
 - **400:** `invalid subject`.
 - **404:** `catalog not found`. There is no catalog, or the creator is suspended with `hideCatalog`, or the catalog's hash is blocked. Only this 404 means "no catalog".
 
@@ -319,11 +327,11 @@ Fetch `catalogHash` from the pinned node, with a size limit of `catalogSize`. Th
 ### Publishing (Creator)
 
 1. Build the document as for v1.
-2. Read the stored pointer (`GET /v2/catalogs/<sub>`) and set `seq` to one more than the higher of its `seq` and the highest this device has used.
+2. Read the stored pointer (`GET /v2/catalogs/<sub>`), keeping its `ETag`, and merge into its document (a 404: seed from v1). Set `seq` to one more than the higher of its `seq` and the highest this device has used.
 3. Write the pointer bytes and keep them exactly.
 4. Get a passkey assertion for RP `identity.arkavo.net`, with challenge SHA-256(pointer bytes) and user verification required. Allow only the signed-in account's credentials.
 5. Get the attestation for the assertion's credential: `POST https://identity.arkavo.net/passkeys/credential-attestation`.
-6. `PUT /v2/catalogs/<sub>`. On a 409, read the pointer again and retry once.
+6. `PUT /v2/catalogs/<sub>` with `If-Match: <the ETag>`, or `If-None-Match: *` after a 404. On a 412 or a 409, go back to step 2 and retry once.
 
 ## Archive layout accepted at ingest
 

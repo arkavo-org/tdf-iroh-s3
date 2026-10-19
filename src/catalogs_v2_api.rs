@@ -4,9 +4,12 @@
 //!   creator's passkey-signed pointer bundle. The document is stored under
 //!   `catalog-documents/<blake3>` with its BAO outboard, so it is served
 //!   over iroh; the bundle replaces `catalog-pointers/<sub>` only when its
-//!   `seq` is greater than the stored one's.
-//! - `GET /v2/catalogs/{sub}` — public: the stored bundle, which readers
-//!   verify themselves before fetching the document over iroh by hash.
+//!   `seq` is greater than the stored one's, and only when the stored
+//!   pointer is still the base named by `If-Match` / `If-None-Match`, if
+//!   given (tdf-iroh-s3#29; 412 otherwise).
+//! - `GET /v2/catalogs/{sub}` — public: the stored bundle, with
+//!   `ETag: "<seq>"`, which readers verify themselves before fetching the
+//!   document over iroh by hash.
 //!
 //! Publishing takes the same token checks as v1 (`authorize_publisher`).
 
@@ -28,7 +31,9 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::catalog_v2::{self, Bundle, BundleError, Passkeys};
-use crate::catalogs_api::{CATALOG_DOCUMENT_CACHE_CONTROL, check_payloads, is_json, owner_hidden};
+use crate::catalogs_api::{
+    CATALOG_DOCUMENT_CACHE_CONTROL, check_payloads, if_none_match, is_json, owner_hidden,
+};
 use crate::creator_catalog::{self, MAX_CATALOG_BYTES, MAX_OWNER_BYTES, valid_identifier};
 use crate::moderation::now_secs;
 use crate::tags_api::{ApiState, TagStore, authorize_publisher, is_blocked};
@@ -177,6 +182,34 @@ fn stored_seq(body: &[u8]) -> anyhow::Result<(u64, String)> {
     Ok((pointer.seq, pointer.catalog_hash))
 }
 
+/// A stored pointer's entity tag: its `seq`, quoted. A stored seq only
+/// increases, so it is a strong validator.
+fn pointer_etag(seq: u64) -> String {
+    format!("\"{seq}\"")
+}
+
+/// Whether the request's preconditions (RFC 9110 §13.1) hold for the stored
+/// pointer's tag (`None`: no pointer stored). `If-Match` takes strong
+/// comparison, so a weak or unquoted tag never matches; `*` needs a stored
+/// pointer. `If-None-Match` is evaluated only without `If-Match`, and fails
+/// on `*` or the tag while a pointer is stored. No header: no condition.
+fn preconditions_hold(headers: &HeaderMap, stored: Option<&str>) -> bool {
+    let mut if_match = headers
+        .get_all(header::IF_MATCH)
+        .iter()
+        .map(|v| v.to_str().unwrap_or_default())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .peekable();
+    if if_match.peek().is_some() {
+        return stored.is_some_and(|etag| if_match.any(|t| t == "*" || t == etag));
+    }
+    match stored {
+        Some(etag) => !if_none_match(headers, etag),
+        None => true,
+    }
+}
+
 async fn put_catalog<S: TagStore>(
     State(state): State<Arc<V2State<S>>>,
     Path(sub): Path<String>,
@@ -293,29 +326,33 @@ async fn put_catalog<S: TagStore>(
             }
         })?;
 
-    // 7. Newer than what is stored.
+    // 7. Merged from the stored pointer, if the request names its base,
+    //    and newer than it.
     let current = api
         .store
         .get_catalog_pointer(&sub)
         .await
         .map_err(|e| storage_unavailable("Catalog pointer read", e))?;
-    let stale = |current_seq: u64| {
-        reject(
+    let current_seq = current
+        .as_ref()
+        .map(|stored| stored_seq(&stored.body).map(|(seq, _)| seq))
+        .transpose()
+        .map_err(|e| storage_unavailable("Catalog pointer parse", e))?;
+    if !preconditions_hold(&headers, current_seq.map(pointer_etag).as_deref()) {
+        return Err(reject(
+            StatusCode::PRECONDITION_FAILED,
+            "catalog changed since it was read".into(),
+        ));
+    }
+    if let Some(current_seq) = current_seq
+        && pointer.seq <= current_seq
+    {
+        return Err(reject(
             StatusCode::CONFLICT,
             format!("seq must be greater than {current_seq}"),
-        )
-    };
-    let expected = match &current {
-        Some(stored) => {
-            let (current_seq, _) = stored_seq(&stored.body)
-                .map_err(|e| storage_unavailable("Catalog pointer parse", e))?;
-            if pointer.seq <= current_seq {
-                return Err(stale(current_seq));
-            }
-            Some(stored.etag.as_str())
-        }
-        None => None,
-    };
+        ));
+    }
+    let expected = current.as_ref().map(|stored| stored.etag.as_str());
 
     // 8. The document and its outboard first, so a stored pointer never
     //    names a document that cannot be served; then the pointer, only if
@@ -375,15 +412,19 @@ async fn get_pointer<S: TagStore>(
         Ok(None) => return Err(not_found()),
         Err(e) => return Err(storage_unavailable("Catalog pointer read", e)),
     };
-    let (_, catalog_hash) =
+    let (seq, catalog_hash) =
         stored_seq(&stored.body).map_err(|e| storage_unavailable("Catalog pointer parse", e))?;
     if is_blocked(api, &catalog_hash) {
         return Err(not_found());
     }
     Ok((
         [
-            (header::CONTENT_TYPE, "application/json"),
-            (header::CACHE_CONTROL, CATALOG_DOCUMENT_CACHE_CONTROL),
+            (header::CONTENT_TYPE, "application/json".to_string()),
+            (
+                header::CACHE_CONTROL,
+                CATALOG_DOCUMENT_CACHE_CONTROL.to_string(),
+            ),
+            (header::ETAG, pointer_etag(seq)),
         ],
         stored.body,
     )
@@ -551,14 +592,37 @@ mod tests {
     }
 
     async fn put(h: &Harness, sub: &str, bearer: &str, body: Vec<u8>) -> Reply {
-        let req = Request::builder()
+        put_with(h, sub, bearer, body, &[]).await
+    }
+
+    async fn put_with(
+        h: &Harness,
+        sub: &str,
+        bearer: &str,
+        body: Vec<u8>,
+        extra: &[(header::HeaderName, &str)],
+    ) -> Reply {
+        let mut req = Request::builder()
             .method(Method::PUT)
             .uri(format!("/v2/catalogs/{sub}"))
             .header("content-type", "application/json")
-            .header("authorization", format!("Bearer {bearer}"))
-            .body(Body::from(body))
-            .unwrap();
-        send(&h.app, req).await
+            .header("authorization", format!("Bearer {bearer}"));
+        for (name, value) in extra {
+            req = req.header(name, *value);
+        }
+        send(&h.app, req.body(Body::from(body)).unwrap()).await
+    }
+
+    /// Publishes `seq` with one precondition header.
+    async fn publish_if(
+        h: &Harness,
+        seq: u64,
+        document: &[u8],
+        name: header::HeaderName,
+        value: &str,
+    ) -> Reply {
+        let body = body(document, &v2::bundle(SUB, seq, document));
+        put_with(h, SUB, &token(SUB), body, &[(name, value)]).await
     }
 
     async fn publish(h: &Harness, seq: u64, document: &[u8]) -> Reply {
@@ -653,6 +717,94 @@ mod tests {
             assert_eq!(r.error(), "seq must be greater than 2");
         }
         assert_eq!(publish(&h, 3, &doc()).await.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_pointer_is_tagged_with_its_seq() {
+        let h = ingested().await;
+        assert_eq!(publish(&h, 7, &doc()).await.status, StatusCode::OK);
+        assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"7\"");
+    }
+
+    /// A refused precondition stores nothing: not the refused document, not
+    /// its outboard, and no pointer beyond the `pointers` already there.
+    async fn assert_precondition_failed(h: &Harness, r: Reply, document: &[u8], pointers: usize) {
+        assert_eq!(r.status, StatusCode::PRECONDITION_FAILED, "{}", r.error());
+        assert_eq!(r.error(), "catalog changed since it was read");
+        let hash = blake3::hash(document).to_hex().to_string();
+        assert!(!h.store.catalog_documents.lock().await.contains_key(&hash));
+        assert!(!h.store.catalog_outboards.lock().await.contains_key(&hash));
+        assert_eq!(h.store.catalog_pointers.lock().await.len(), pointers);
+    }
+
+    #[tokio::test]
+    async fn if_match_names_the_base_the_publish_was_merged_from() {
+        let h = ingested().await;
+        assert_eq!(publish(&h, 6, &doc()).await.status, StatusCode::OK);
+        // Another device saves seq 7 from the same base.
+        let theirs = catalog(SUB, vec![]);
+        let r = publish_if(&h, 7, &theirs, header::IF_MATCH, "\"6\"").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+
+        // Ours, merged from seq 6 but signed with a higher seq: 412, not a
+        // silent overwrite of seq 7, and not a 409 either.
+        let ours = catalog(
+            SUB,
+            vec![entry("rec-1", &payload(1)), entry("rec-2", &payload(1))],
+        );
+        for seq in [11, 7] {
+            let r = publish_if(&h, seq, &ours, header::IF_MATCH, "\"6\"").await;
+            assert_precondition_failed(&h, r, &ours, 1).await;
+        }
+        for stale in ["W/\"7\"", "7", "\"6\", W/\"7\""] {
+            let r = publish_if(&h, 11, &ours, header::IF_MATCH, stale).await;
+            assert_precondition_failed(&h, r, &ours, 1).await;
+        }
+        let served: Bundle = serde_json::from_slice(&get(&h, SUB).await.body).unwrap();
+        assert_eq!(served, v2::bundle(SUB, 7, &theirs));
+
+        let r = publish_if(&h, 11, &ours, header::IF_MATCH, "\"6\", \"7\"").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let r = publish_if(&h, 12, &doc(), header::IF_MATCH, "*").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        // A matching base still needs a greater seq.
+        let r = publish_if(&h, 12, &doc(), header::IF_MATCH, "\"12\"").await;
+        assert_eq!(r.status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn if_match_needs_a_stored_pointer() {
+        let h = ingested().await;
+        for tag in ["\"1\"", "*"] {
+            let r = publish_if(&h, 1, &doc(), header::IF_MATCH, tag).await;
+            assert_precondition_failed(&h, r, &doc(), 0).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn if_none_match_star_publishes_only_the_first_pointer() {
+        let h = ingested().await;
+        let r = publish_if(&h, 1, &doc(), header::IF_NONE_MATCH, "*").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let other = catalog(SUB, vec![]);
+        let r = publish_if(&h, 2, &other, header::IF_NONE_MATCH, "*").await;
+        assert_precondition_failed(&h, r, &other, 1).await;
+        // The tag itself (or its weak form) also fails; another tag passes.
+        let r = publish_if(&h, 2, &other, header::IF_NONE_MATCH, "W/\"1\"").await;
+        assert_precondition_failed(&h, r, &other, 1).await;
+        let r = publish_if(&h, 2, &other, header::IF_NONE_MATCH, "\"9\"").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+    }
+
+    #[tokio::test]
+    async fn if_match_is_evaluated_before_if_none_match() {
+        let h = ingested().await;
+        assert_eq!(publish(&h, 1, &doc()).await.status, StatusCode::OK);
+        let other = catalog(SUB, vec![]);
+        let body = body(&other, &v2::bundle(SUB, 2, &other));
+        let both = [(header::IF_MATCH, "\"1\""), (header::IF_NONE_MATCH, "*")];
+        let r = put_with(&h, SUB, &token(SUB), body, &both).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
     }
 
     #[tokio::test]
