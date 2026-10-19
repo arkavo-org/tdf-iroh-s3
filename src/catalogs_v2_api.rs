@@ -28,9 +28,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::catalog_v2::{self, Bundle, BundleError, Passkeys};
-use crate::catalogs_api::{
-    CATALOG_DOCUMENT_CACHE_CONTROL, check_payloads, is_json, owner_hidden,
-};
+use crate::catalogs_api::{CATALOG_DOCUMENT_CACHE_CONTROL, check_payloads, is_json, owner_hidden};
 use crate::creator_catalog::{self, MAX_CATALOG_BYTES, MAX_OWNER_BYTES, valid_identifier};
 use crate::moderation::now_secs;
 use crate::tags_api::{ApiState, TagStore, authorize_publisher, is_blocked};
@@ -156,7 +154,10 @@ pub struct V2State<S: TagStore> {
 
 pub fn router<S: TagStore>(state: Arc<V2State<S>>) -> Router {
     Router::new()
-        .route("/v2/catalogs/{sub}", get(get_pointer::<S>).put(put_catalog::<S>))
+        .route(
+            "/v2/catalogs/{sub}",
+            get(get_pointer::<S>).put(put_catalog::<S>),
+        )
         .with_state(state)
 }
 
@@ -390,13 +391,11 @@ async fn get_pointer<S: TagStore>(
 }
 
 /// Build the v2 state from the API state and `[http]` settings.
-pub fn state<S: TagStore>(
-    api: Arc<ApiState<S>>,
-    rp_id: &str,
-    status_url: &str,
-) -> Arc<V2State<S>> {
+pub fn state<S: TagStore>(api: Arc<ApiState<S>>, rp_id: &str, status_url: &str) -> Arc<V2State<S>> {
     let status: Arc<dyn CredentialStatus> = if status_url.is_empty() {
-        warn!("[http] passkey_status_url empty: catalog v2 publishes skip the credential status check");
+        warn!(
+            "[http] passkey_status_url empty: catalog v2 publishes skip the credential status check"
+        );
         Arc::new(NoCredentialStatus)
     } else {
         Arc::new(IdpCredentialStatus::new(status_url.to_string()))
@@ -532,7 +531,10 @@ mod tests {
             serde_json::from_slice(&self.body).unwrap_or_default()
         }
         fn error(&self) -> String {
-            self.json()["error"].as_str().unwrap_or_default().to_string()
+            self.json()["error"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
         }
     }
 
@@ -560,7 +562,13 @@ mod tests {
     }
 
     async fn publish(h: &Harness, seq: u64, document: &[u8]) -> Reply {
-        put(h, SUB, &token(SUB), body(document, &v2::bundle(SUB, seq, document))).await
+        put(
+            h,
+            SUB,
+            &token(SUB),
+            body(document, &v2::bundle(SUB, seq, document)),
+        )
+        .await
     }
 
     async fn get(h: &Harness, sub: &str) -> Reply {
@@ -614,7 +622,11 @@ mod tests {
         let h = harness();
         let entries: Vec<_> = (0..120u8)
             .map(|i| {
-                h.store.blobs.try_lock().unwrap().insert(payload(i), PAYLOAD_SIZE);
+                h.store
+                    .blobs
+                    .try_lock()
+                    .unwrap()
+                    .insert(payload(i), PAYLOAD_SIZE);
                 entry(&format!("rec-{i}"), &payload(i))
             })
             .collect();
@@ -624,8 +636,9 @@ mod tests {
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
         let hash = blake3::hash(&document).to_hex().to_string();
         let outboard = h.store.catalog_outboards.lock().await[&hash].clone();
-        let want = bao_tree::BaoTree::new(document.len() as u64, iroh_blobs::store::IROH_BLOCK_SIZE)
-            .outboard_size();
+        let want =
+            bao_tree::BaoTree::new(document.len() as u64, iroh_blobs::store::IROH_BLOCK_SIZE)
+                .outboard_size();
         assert_eq!(outboard.len() as u64, want);
         assert!(want > 0);
     }
@@ -645,7 +658,9 @@ mod tests {
     #[tokio::test]
     async fn a_publish_that_loses_the_race_is_a_conflict() {
         let h = ingested().await;
-        h.store.lose_next_pointer_race.store(true, Ordering::Relaxed);
+        h.store
+            .lose_next_pointer_race
+            .store(true, Ordering::Relaxed);
         let r = publish(&h, 1, &doc()).await;
         assert_eq!(r.status, StatusCode::CONFLICT);
         assert!(r.error().contains("another publish won"));
@@ -672,7 +687,13 @@ mod tests {
         let h = ingested().await;
         let document = doc();
         let other = catalog(SUB, vec![]);
-        let r = put(&h, SUB, &token(SUB), body(&document, &v2::bundle(SUB, 1, &other))).await;
+        let r = put(
+            &h,
+            SUB,
+            &token(SUB),
+            body(&document, &v2::bundle(SUB, 1, &other)),
+        )
+        .await;
         assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(r.error().contains("catalogHash"), "{}", r.error());
     }
@@ -753,7 +774,10 @@ mod tests {
     async fn reads_of_unknown_and_invalid_subjects() {
         let h = harness();
         let r = get(&h, SUB).await;
-        assert_eq!((r.status, r.error().as_str()), (StatusCode::NOT_FOUND, "catalog not found"));
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::NOT_FOUND, "catalog not found")
+        );
         assert_eq!(get(&h, "a..b").await.status, StatusCode::BAD_REQUEST);
     }
 
@@ -763,7 +787,9 @@ mod tests {
         let document = doc();
         let bundle = v2::bundle(SUB, 1, &document);
         let mut b: serde_json::Value = serde_json::from_slice(&body(&document, &bundle)).unwrap();
-        b["document"] = serde_json::Value::String(base64::engine::general_purpose::URL_SAFE.encode(&document[..10]) + "=");
+        b["document"] = serde_json::Value::String(
+            base64::engine::general_purpose::URL_SAFE.encode(&document[..10]) + "=",
+        );
         let r = put(&h, SUB, &token(SUB), serde_json::to_vec(&b).unwrap()).await;
         assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(r.error().contains("unpadded base64url"), "{}", r.error());

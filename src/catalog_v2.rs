@@ -262,7 +262,9 @@ pub async fn verify_credential(
     // Required: one of the checks that keep a CWT, signed with the same
     // keys, from passing as an attestation.
     if sign1.protected.header.content_type
-        != Some(coset::ContentType::Text(CREDENTIAL_CONTENT_TYPE.to_string()))
+        != Some(coset::ContentType::Text(
+            CREDENTIAL_CONTENT_TYPE.to_string(),
+        ))
     {
         return Err(invalid(format!(
             "credential content type must be \"{CREDENTIAL_CONTENT_TYPE}\""
@@ -316,8 +318,8 @@ fn parse_credential(payload: &[u8]) -> Result<Credential, String> {
             ("publicKey", m @ Value::Map(_)) => {
                 let cose = coset::CoseKey::from_cbor_value(m)
                     .map_err(|_| "credential publicKey is not a COSE_Key")?;
-                let vk = p256_from_cose_key(&cose)
-                    .map_err(|e| format!("credential publicKey: {e}"))?;
+                let vk =
+                    p256_from_cose_key(&cose).map_err(|e| format!("credential publicKey: {e}"))?;
                 key = Some(vk);
             }
             ("rpId", Value::Text(s)) => rp = Some(s),
@@ -328,13 +330,19 @@ fn parse_credential(payload: &[u8]) -> Result<Credential, String> {
         }
     }
     if typ.as_deref() != Some(PASSKEY_CREDENTIAL_TYP) {
-        return Err(format!("credential typ must be \"{PASSKEY_CREDENTIAL_TYP}\""));
+        return Err(format!(
+            "credential typ must be \"{PASSKEY_CREDENTIAL_TYP}\""
+        ));
     }
     let missing = |name: &str| format!("credential is missing {name}");
     Ok(Credential {
         iss: iss.ok_or_else(|| missing("iss"))?,
-        sub: sub.filter(|s| !s.is_empty()).ok_or_else(|| missing("sub"))?,
-        credential_id: id.filter(|b| !b.is_empty()).ok_or_else(|| missing("credentialId"))?,
+        sub: sub
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| missing("sub"))?,
+        credential_id: id
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| missing("credentialId"))?,
         public_key: key.ok_or_else(|| missing("publicKey"))?,
         rp_id: rp.ok_or_else(|| missing("rpId"))?,
         iat: iat.ok_or_else(|| missing("iat"))?,
@@ -369,8 +377,8 @@ pub fn verify_assertion(
         MAX_SIGNATURE_BYTES,
     )?;
 
-    let cd: serde_json::Value = serde_json::from_slice(&client_data)
-        .map_err(|_| invalid("clientDataJSON is not JSON"))?;
+    let cd: serde_json::Value =
+        serde_json::from_slice(&client_data).map_err(|_| invalid("clientDataJSON is not JSON"))?;
     if cd.get("type").and_then(|v| v.as_str()) != Some("webauthn.get") {
         return Err(invalid("clientDataJSON type must be webauthn.get"));
     }
@@ -394,11 +402,15 @@ pub fn verify_assertion(
         return Err(invalid("authenticatorData too short"));
     }
     if auth_data[..32] != Sha256::digest(passkeys.rp_id.as_bytes())[..] {
-        return Err(invalid("authenticatorData rpIdHash is not this relying party"));
+        return Err(invalid(
+            "authenticatorData rpIdHash is not this relying party",
+        ));
     }
     let flags = auth_data[32];
     if flags & FLAG_UP == 0 || flags & FLAG_UV == 0 {
-        return Err(invalid("assertion must have user presence and verification"));
+        return Err(invalid(
+            "assertion must have user presence and verification",
+        ));
     }
 
     let signature = Signature::from_der(&signature)
@@ -477,7 +489,10 @@ pub(crate) mod test_support {
             ),
             (Value::Text("publicKey".into()), cose_key(key)),
             (Value::Text("rpId".into()), Value::Text(RP.into())),
-            (Value::Text("iat".into()), Value::Integer(1_700_000_000.into())),
+            (
+                Value::Text("iat".into()),
+                Value::Integer(1_700_000_000.into()),
+            ),
         ];
         map.extend(extra);
         let mut out = Vec::new();
@@ -619,7 +634,10 @@ mod tests {
     async fn a_valid_chain_verifies() {
         let v = verify(&bundle("u1", 7, DOC)).await.unwrap();
         assert_eq!(v.pointer.seq, 7);
-        assert_eq!(v.pointer.catalog_hash, blake3::hash(DOC).to_hex().to_string());
+        assert_eq!(
+            v.pointer.catalog_hash,
+            blake3::hash(DOC).to_hex().to_string()
+        );
         assert_eq!(v.pointer.catalog_size, DOC.len() as u64);
         assert_eq!(v.credential_id, CREDENTIAL_ID);
     }
@@ -678,15 +696,21 @@ mod tests {
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(&pointer));
         for (cd, want) in [
             (
-                format!(r#"{{"type":"webauthn.get","challenge":"{challenge}","origin":"https://evil.example"}}"#),
+                format!(
+                    r#"{{"type":"webauthn.get","challenge":"{challenge}","origin":"https://evil.example"}}"#
+                ),
                 "origin",
             ),
             (
-                format!(r#"{{"type":"webauthn.create","challenge":"{challenge}","origin":"https://{RP}"}}"#),
+                format!(
+                    r#"{{"type":"webauthn.create","challenge":"{challenge}","origin":"https://{RP}"}}"#
+                ),
                 "type",
             ),
             (
-                format!(r#"{{"type":"webauthn.get","challenge":"{challenge}","origin":"https://{RP}","crossOrigin":true}}"#),
+                format!(
+                    r#"{{"type":"webauthn.get","challenge":"{challenge}","origin":"https://{RP}","crossOrigin":true}}"#
+                ),
                 "cross-origin",
             ),
         ] {

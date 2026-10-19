@@ -575,7 +575,10 @@ impl S3Client {
                 if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
                     Ok(None)
                 } else {
-                    Err(anyhow::anyhow!("Failed to GET catalog pointer from S3: {}", e))
+                    Err(anyhow::anyhow!(
+                        "Failed to GET catalog pointer from S3: {}",
+                        e
+                    ))
                 }
             }
         }
@@ -605,10 +608,16 @@ impl S3Client {
             Ok(_) => Ok(true),
             // 412: the condition failed; 409: a concurrent conditional
             // write to the same key is in progress.
-            Err(e) if e.raw_response().is_some_and(|r| matches!(r.status().as_u16(), 409 | 412)) => {
+            Err(e)
+                if e.raw_response()
+                    .is_some_and(|r| matches!(r.status().as_u16(), 409 | 412)) =>
+            {
                 Ok(false)
             }
-            Err(e) => Err(anyhow::anyhow!("Failed to PUT catalog pointer to S3: {}", e)),
+            Err(e) => Err(anyhow::anyhow!(
+                "Failed to PUT catalog pointer to S3: {}",
+                e
+            )),
         }
     }
 
