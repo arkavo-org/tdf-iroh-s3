@@ -24,7 +24,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::Config;
 use crate::ingest::{self, IngestError};
 use crate::moderation::{BlobOwner, PublishGate, now_secs};
-use crate::s3_serve::{Refusal, S3Server};
+use crate::s3_serve::{Object, Refusal, S3Server};
 use crate::secret_key;
 use crate::staging::{PendingPush, Staging};
 use crate::store::s3::S3Client;
@@ -752,7 +752,7 @@ impl BlobsHandler {
         let Ok(_permit) = Arc::clone(&self.serves).try_acquire_owned() else {
             return refuse(send, ERR_LIMIT, "too many fetches at once", None);
         };
-        let mut sizes = Vec::with_capacity(wanted.len());
+        let mut servables = Vec::with_capacity(wanted.len());
         for (hash, _) in &wanted {
             let blocked = self
                 .gate
@@ -762,7 +762,25 @@ impl BlobsHandler {
                 return refuse(send, ERR_PERMISSION, "blocked content", Some(*hash));
             }
             match self.server.check(*hash).await {
-                Ok(size) => sizes.push(size),
+                Ok(servable) => {
+                    // A catalog document of a creator suspended with
+                    // `hideCatalog`. Checked on every fetch: the owner never
+                    // changes, suspensions do.
+                    let hidden = match &servable.object {
+                        Object::CatalogDocument { owner: Some(owner) } => {
+                            self.gate.as_ref().is_some_and(|g| {
+                                g.moderation
+                                    .suspension(owner)
+                                    .is_some_and(|s| s.hide_catalog)
+                            })
+                        }
+                        _ => false,
+                    };
+                    if hidden {
+                        return refuse(send, ERR_PERMISSION, "hidden catalog", Some(*hash));
+                    }
+                    servables.push(servable);
+                }
                 Err(Refusal::Gone) => {
                     return refuse(send, ERR_PERMISSION, "not in storage", Some(*hash));
                 }
@@ -771,8 +789,8 @@ impl BlobsHandler {
                 }
             }
         }
-        for ((hash, ranges), size) in wanted.iter().zip(sizes) {
-            if let Err(e) = self.server.send(*hash, size, ranges, &mut send).await {
+        for ((hash, ranges), servable) in wanted.iter().zip(&servables) {
+            if let Err(e) = self.server.send(*hash, servable, ranges, &mut send).await {
                 warn!(request, %hash, error = %e, "Serving from S3 broke off; the fetcher may try again");
                 // Checked again on the next fetch: a blob deleted from S3 is
                 // then refused for good.

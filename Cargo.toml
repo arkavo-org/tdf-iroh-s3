@@ -63,6 +63,8 @@ coset = "0.3"
 ciborium = "0.2"
 p256 = { version = "0.13", features = ["ecdsa"] }
 base64 = "0.22"
+# WebAuthn assertions (catalog v2): SHA-256 of clientDataJSON and the challenge
+sha2 = "0.10"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std"] }
 

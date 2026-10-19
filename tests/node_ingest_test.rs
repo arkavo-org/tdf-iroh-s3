@@ -74,7 +74,13 @@ struct FakeS3 {
     /// and then breaks the body with an error. A slice no longer than this
     /// is sent whole.
     fail_get_after: Arc<Mutex<Option<usize>>>,
+    /// `x-amz-meta-*` headers stored with each object, returned by HEAD and
+    /// GET (a catalog document's owner).
+    metadata: Arc<Mutex<std::collections::HashMap<String, Metadata>>>,
 }
+
+/// The `x-amz-meta-*` headers of one object, as (name, value).
+type Metadata = Vec<(String, String)>;
 
 /// The real object bytes of a PUT body: `aws-chunked` framing
 /// (`<hex-size>[;chunk-signature=...]\r\n<data>\r\n ... 0\r\n<trailers>`)
@@ -163,6 +169,12 @@ impl FakeS3 {
         let path = uri.path();
         let key = path.strip_prefix(&format!("/{BUCKET}/")).unwrap_or(path);
         if method == Method::PUT {
+            let meta: Vec<(String, String)> = headers
+                .iter()
+                .filter(|(name, _)| name.as_str().starts_with("x-amz-meta-"))
+                .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_string()))
+                .collect();
+            self.metadata.lock().unwrap().insert(key.to_string(), meta);
             self.objects
                 .lock()
                 .unwrap()
@@ -176,21 +188,30 @@ impl FakeS3 {
                 .map(|b| b.len() as u64)
                 .or_else(|| self.present.lock().unwrap().get(key).copied());
             return match size {
-                Some(size) => (
-                    StatusCode::OK,
-                    [
-                        ("content-length", size.to_string()),
-                        ("etag", "\"fake\"".to_string()),
-                    ],
-                )
-                    .into_response(),
+                Some(size) => {
+                    let mut response = axum::http::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-length", size.to_string())
+                        .header("etag", "\"fake\"");
+                    for (name, value) in self.meta(key) {
+                        response = response.header(name, value);
+                    }
+                    response.body(axum::body::Body::empty()).unwrap()
+                }
                 None => StatusCode::NOT_FOUND.into_response(),
             };
         }
         if method == Method::GET
             && let Some(object) = stored
         {
-            return self.get(&headers, &object);
+            let mut response = self.get(&headers, &object);
+            for (name, value) in self.meta(key) {
+                response.headers_mut().insert(
+                    axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    value.parse().unwrap(),
+                );
+            }
+            return response;
         }
         if method == Method::GET {
             return (
@@ -252,6 +273,27 @@ impl FakeS3 {
             response = response.header(name, value);
         }
         response.body(body).unwrap()
+    }
+
+    fn meta(&self, key: &str) -> Vec<(String, String)> {
+        self.metadata
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Store `body` under `key` with `x-amz-meta-*` headers, as if PUT
+    /// before the test.
+    fn put_object_with_meta(&self, key: &str, body: &[u8], meta: &[(&str, &str)]) {
+        self.put_object(key, body);
+        self.metadata.lock().unwrap().insert(
+            key.to_string(),
+            meta.iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect(),
+        );
     }
 
     /// Answer HEAD of `blobs/<hash>` as an ingested blob of `size` bytes.
@@ -825,6 +867,63 @@ async fn test_an_old_store_is_cleared_and_old_blobs_get_an_outboard() {
 
     wait_for_empty_staging(&node, data_dir.path(), &[ingested, never]).await;
     viewer.shutdown().await.unwrap();
+    node.shutdown().await.unwrap();
+}
+
+/// A creator's catalog document (catalog v2) is served over iroh from
+/// `catalog-documents/` and `catalog-outboards/`, computing a missing
+/// outboard there, never under `blobs/` or `outboards/`; a creator
+/// suspended with `hideCatalog` has its documents refused.
+#[tokio::test(flavor = "current_thread")]
+async fn test_catalog_documents_are_served_over_iroh() {
+    let gate = Arc::new(PublishGate::new(Arc::new(Moderation::default())));
+    let (node, s3, _data_dir) = spawn_node(Some(Arc::clone(&gate))).await;
+    let node_id = node.addr().id;
+    let owner = "5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10";
+    let meta = [("x-amz-meta-owner", owner)];
+
+    // Over one chunk group, so it has a real outboard.
+    let document = format!(
+        r#"{{"schema":"arkavo.creator-catalog/1","owner":"{owner}","entries":[],"pad":"{}"}}"#,
+        "x".repeat(40 * 1024)
+    )
+    .into_bytes();
+    let hash = Hash::new(&document);
+    let outboard =
+        tdf_iroh_s3::ingest::compute_outboard(&document[..], document.len() as u64, hash).unwrap();
+    assert!(!outboard.is_empty());
+    let hex = hash.to_hex();
+    s3.put_object_with_meta(&format!("catalog-documents/{hex}"), &document, &meta);
+    s3.put_object(&format!("catalog-outboards/{hex}"), &outboard);
+
+    let viewer = IrohTestClient::new().await.unwrap();
+    let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
+    assert!(fetched.as_ref() == document.as_slice());
+
+    // One stored without its outboard gets one computed into
+    // catalog-outboards/, and is served after.
+    let second = [document.clone(), b" ".to_vec()].concat();
+    let second_hash = Hash::new(&second);
+    let second_hex = second_hash.to_hex();
+    s3.put_object_with_meta(&format!("catalog-documents/{second_hex}"), &second, &meta);
+    assert_refused_as_rate_limited(viewer.fetch_from_node(node_id, second_hash).await, "get");
+    assert!(
+        s3.wait_for_put(&format!("catalog-outboards/{second_hex}"))
+            .await,
+        "the outboard is computed into catalog-outboards/"
+    );
+    assert!(!s3.has_put(&outboard_key(second_hash)));
+    let fetched = viewer.fetch_from_node(node_id, second_hash).await.unwrap();
+    assert!(fetched.as_ref() == second.as_slice());
+
+    // hideCatalog: refused on every fetch from then on.
+    gate.moderation.suspend_for_test(owner, true);
+    let client = IrohTestClient::new().await.unwrap();
+    assert_refused_for_permission(client.fetch_from_node(node_id, hash).await, "get");
+
+    for c in [viewer, client] {
+        c.shutdown().await.unwrap();
+    }
     node.shutdown().await.unwrap();
 }
 

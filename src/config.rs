@@ -383,6 +383,16 @@ pub struct HttpConfig {
     /// plain listener on `bind_port` binds to loopback only.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+    /// WebAuthn relying party ID creators sign catalog v2 pointers with;
+    /// the origin is `https://<rp id>`.
+    #[serde(default = "default_passkey_rp_id")]
+    pub passkey_rp_id: String,
+    /// The IdP's passkey credential status route, with `{credentialId}`
+    /// (unpadded base64url) in it. Catalog v2 publishes are refused for a
+    /// revoked or unknown credential. Empty skips the check (development
+    /// only).
+    #[serde(default = "default_passkey_status_url")]
+    pub passkey_status_url: String,
 }
 
 /// TLS for the HTTP API, terminated by the node (rustls). The PEM cert
@@ -420,8 +430,18 @@ impl Default for HttpConfig {
             expected_issuer: String::new(),
             tag_prefix: default_tag_prefix(),
             tls: None,
+            passkey_rp_id: default_passkey_rp_id(),
+            passkey_status_url: default_passkey_status_url(),
         }
     }
+}
+
+fn default_passkey_rp_id() -> String {
+    "identity.arkavo.net".to_string()
+}
+
+fn default_passkey_status_url() -> String {
+    "https://identity.arkavo.net/passkeys/credentials/{credentialId}/status".to_string()
 }
 
 fn default_http_bind_address() -> IpAddr {

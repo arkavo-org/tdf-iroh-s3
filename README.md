@@ -110,6 +110,10 @@ bind_port = 8090
 cose_keys_url = "https://identity.arkavo.net/.well-known/cose-keys"
 expected_issuer = "https://identity.arkavo.net"
 tag_prefix = "catalog/"
+# Catalog v2: the WebAuthn RP creators sign pointers with, and the IdP's
+# passkey credential status route ("" skips the check; development only).
+passkey_rp_id = "identity.arkavo.net"
+passkey_status_url = "https://identity.arkavo.net/passkeys/credentials/{credentialId}/status"
 
 # Optional: HTTPS terminated by the node itself (rustls). The plain
 # listener above then binds to 127.0.0.1 only. On EC2 the
@@ -189,11 +193,13 @@ read both; ingest writes both). It needs the same S3 write permissions on
 `manifests/` and `catalog-index/` as on `blobs/` — derived-artifact writes are best-effort
 (a failure is logged and never masks a successful blob ingest; re-pushing
 the content repairs the index). Creator catalogs need `s3:PutObject` and
-`s3:GetObject` on `catalog-documents/`, and `s3:PutObject`, `s3:GetObject`
-on `moderation/` when the publishing gate is on. It also needs
-`s3:ListBucket` on the bucket itself, without a prefix condition: without
-it S3 answers a missing key with 403, and the node reports unknown hashes
-as 502 `storage unavailable` instead of 404.
+`s3:GetObject` on `catalog-documents/`, and for catalog v2 also on
+`catalog-outboards/` and `catalog-pointers/` (pointer writes are
+conditional: `If-Match` / `If-None-Match`). It needs `s3:PutObject`,
+`s3:GetObject` on `moderation/` when the publishing gate is on. It also
+needs `s3:ListBucket` on the bucket itself, without a prefix condition:
+without it S3 answers a missing key with 403, and the node reports unknown
+hashes as 502 `storage unavailable` instead of 404.
 
 ## Entitled catalog
 
@@ -245,6 +251,8 @@ specified in [docs/creator-catalogs.md](docs/creator-catalogs.md).
 | `GET /catalog-documents/{hash}` | public | A stored catalog document, byte for byte (`ETag`, cached 5 minutes, `If-None-Match` → 304). |
 | `GET /tags/{name}` | public | Resolve a tag, e.g. `catalog/<sub>`. A catalog tag that names no stored catalog document (an older tag naming a TDF blob) is 404. |
 | `PUT /tags/catalog/{sub}` | publisher CWT | Roll the tag back to an earlier catalog document of the same subject; its payloads are checked again. New catalogs go through `PUT /catalogs/{sub}`. |
+| `PUT /v2/catalogs/{sub}` | publisher CWT + passkey | Catalog v2: publish a document with its passkey-signed pointer bundle ([docs/creator-catalogs.md](docs/creator-catalogs.md#catalog-v2-passkey-signed-catalogs-over-iroh)). |
+| `GET /v2/catalogs/{sub}` | public | Catalog v2: the creator's signed pointer bundle; the document is then fetched over iroh by hash. |
 | `POST /publish/sessions` | publisher CWT | Gated nodes only (404, empty body, when ungated); see below. |
 
 ```bash

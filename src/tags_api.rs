@@ -60,6 +60,34 @@ pub trait TagStore: Send + Sync + 'static {
         body: Bytes,
         owner: &str,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    /// Store a catalog document's BAO outboard (catalog v2: the document is
+    /// served over iroh).
+    fn put_catalog_outboard(
+        &self,
+        hash_hex: &str,
+        outboard: Bytes,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    /// A creator's stored catalog v2 pointer bundle.
+    fn get_catalog_pointer(
+        &self,
+        sub: &str,
+    ) -> impl Future<Output = anyhow::Result<Option<StoredPointer>>> + Send;
+    /// Store a creator's pointer bundle only if the stored one still has
+    /// the ETag `expected` (with `None`: only if none is stored). `false`
+    /// when another write got there first.
+    fn put_catalog_pointer(
+        &self,
+        sub: &str,
+        body: Bytes,
+        expected: Option<&str>,
+    ) -> impl Future<Output = anyhow::Result<bool>> + Send;
+}
+
+/// A stored catalog v2 pointer bundle and the version it was read at.
+#[derive(Debug, Clone)]
+pub struct StoredPointer {
+    pub body: Bytes,
+    pub etag: String,
 }
 
 /// A stored catalog document.
@@ -123,6 +151,25 @@ impl TagStore for crate::store::s3::S3Client {
         owner: &str,
     ) -> anyhow::Result<()> {
         Self::put_catalog_document(self, hash_hex, body, owner).await
+    }
+
+    async fn put_catalog_outboard(&self, hash_hex: &str, outboard: Bytes) -> anyhow::Result<()> {
+        Self::put_catalog_outboard(self, hash_hex, outboard).await
+    }
+
+    async fn get_catalog_pointer(&self, sub: &str) -> anyhow::Result<Option<StoredPointer>> {
+        Ok(Self::get_catalog_pointer(self, sub)
+            .await?
+            .map(|(body, etag)| StoredPointer { body, etag }))
+    }
+
+    async fn put_catalog_pointer(
+        &self,
+        sub: &str,
+        body: Bytes,
+        expected: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        Self::put_catalog_pointer(self, sub, body, expected).await
     }
 }
 
@@ -421,6 +468,13 @@ pub(crate) mod test_support {
         pub document_heads: std::sync::atomic::AtomicUsize,
         /// `head_catalog_document` fails.
         pub heads_down: std::sync::atomic::AtomicBool,
+        pub catalog_outboards: Mutex<HashMap<String, Bytes>>,
+        /// sub → (bundle, version). The version stands in for S3's ETag.
+        pub catalog_pointers: Mutex<HashMap<String, (Bytes, u64)>>,
+        pub pointer_versions: std::sync::atomic::AtomicU64,
+        /// The next conditional pointer write loses, as if another publish
+        /// had moved the pointer since it was read.
+        pub lose_next_pointer_race: std::sync::atomic::AtomicBool,
     }
 
     impl MemStore {
@@ -503,6 +557,56 @@ pub(crate) mod test_support {
                 },
             );
             Ok(())
+        }
+        async fn put_catalog_outboard(
+            &self,
+            hash_hex: &str,
+            outboard: Bytes,
+        ) -> anyhow::Result<()> {
+            self.up()?;
+            self.catalog_outboards
+                .lock()
+                .await
+                .insert(hash_hex.to_string(), outboard);
+            Ok(())
+        }
+        async fn get_catalog_pointer(&self, sub: &str) -> anyhow::Result<Option<StoredPointer>> {
+            self.up()?;
+            Ok(self
+                .catalog_pointers
+                .lock()
+                .await
+                .get(sub)
+                .map(|(body, v)| StoredPointer {
+                    body: body.clone(),
+                    etag: format!("\"{v}\""),
+                }))
+        }
+        /// As S3's conditional put: `If-Match` the version, or
+        /// `If-None-Match: *`.
+        async fn put_catalog_pointer(
+            &self,
+            sub: &str,
+            body: Bytes,
+            expected: Option<&str>,
+        ) -> anyhow::Result<bool> {
+            self.up()?;
+            if self
+                .lose_next_pointer_race
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                return Ok(false);
+            }
+            let mut pointers = self.catalog_pointers.lock().await;
+            let current = pointers.get(sub).map(|(_, v)| format!("\"{v}\""));
+            if current.as_deref() != expected {
+                return Ok(false);
+            }
+            let v = self
+                .pointer_versions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            pointers.insert(sub.to_string(), (body, v));
+            Ok(true)
         }
     }
 }

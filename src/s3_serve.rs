@@ -13,6 +13,11 @@
 //! of it computes the outboard by streaming the blob from S3 once, checks
 //! its root against the hash, and stores it; that fetch is told to try
 //! again.
+//!
+//! A hash that is not a blob may be a creator's catalog document (catalog
+//! v2), served the same way from `catalog-documents/<hash>` and
+//! `catalog-outboards/<hash>`. Those prefixes stay apart from `blobs/` so
+//! a catalog document never passes as an ingested recording.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -72,11 +77,45 @@ pub enum Refusal {
     Busy,
 }
 
+/// What a servable hash is in S3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Object {
+    /// A pushed TDF: `blobs/<hash>`, `outboards/<hash>`.
+    Blob,
+    /// A creator's catalog document: `catalog-documents/<hash>`,
+    /// `catalog-outboards/<hash>`. `owner` is the document's recorded owner,
+    /// so a fetch can apply that creator's `hideCatalog` suspension.
+    CatalogDocument { owner: Option<String> },
+}
+
+impl Object {
+    fn data_key(&self, s3: &S3Client, hex: &str) -> String {
+        match self {
+            Object::Blob => s3.blob_key(hex),
+            Object::CatalogDocument { .. } => s3.catalog_document_key(hex),
+        }
+    }
+
+    fn outboard_key(&self, s3: &S3Client, hex: &str) -> String {
+        match self {
+            Object::Blob => s3.outboard_key(hex),
+            Object::CatalogDocument { .. } => s3.catalog_outboard_key(hex),
+        }
+    }
+}
+
+/// A hash S3 can serve: its size and what it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Servable {
+    pub size: u64,
+    pub object: Object,
+}
+
 /// Serves blobs from S3.
 pub struct S3Server {
     s3: Arc<S3Client>,
-    /// Sizes of blobs known to be servable (blob and outboard in S3).
-    servable: Mutex<HashMap<Hash, u64>>,
+    /// Hashes known to be servable (object and outboard in S3).
+    servable: Mutex<HashMap<Hash, Servable>>,
     /// Hashes whose outboard is being computed.
     backfilling: Mutex<HashSet<Hash>>,
     backfills: Arc<Semaphore>,
@@ -102,20 +141,27 @@ impl S3Server {
         })
     }
 
-    /// The blob's size when S3 can serve it: the blob and its outboard are
-    /// both there. A blob without an outboard gets one computed in the
-    /// background, and is refused as busy meanwhile.
-    pub async fn check(self: &Arc<Self>, hash: Hash) -> Result<u64, Refusal> {
+    /// What S3 can serve for `hash`: a blob, or else a catalog document,
+    /// with its outboard there too. One without an outboard gets one
+    /// computed in the background, and is refused as busy meanwhile.
+    pub async fn check(self: &Arc<Self>, hash: Hash) -> Result<Servable, Refusal> {
         if lock(&self.corrupt).contains(&hash) {
             return Err(Refusal::Gone);
         }
-        if let Some(size) = lock(&self.servable).get(&hash) {
-            return Ok(*size);
+        if let Some(servable) = lock(&self.servable).get(&hash) {
+            return Ok(servable.clone());
         }
         let hex = hash.to_hex();
-        let size = match head(self.s3.blob_size(&hex)).await {
-            Ok(Some(size)) => size,
-            Ok(None) => return Err(Refusal::Gone),
+        let (size, object) = match head(self.s3.blob_size(&hex)).await {
+            Ok(Some(size)) => (size, Object::Blob),
+            Ok(None) => match head(self.s3.catalog_document_size(&hex)).await {
+                Ok(Some((size, owner))) => (size, Object::CatalogDocument { owner }),
+                Ok(None) => return Err(Refusal::Gone),
+                Err(e) => {
+                    warn!(%hash, error = %e, "Catalog document lookup failed");
+                    return Err(Refusal::Busy);
+                }
+            },
             Err(e) => {
                 warn!(%hash, error = %e, "Blob lookup failed");
                 return Err(Refusal::Busy);
@@ -123,13 +169,17 @@ impl S3Server {
         };
         let expected = BaoTree::new(size, IROH_BLOCK_SIZE).outboard_size();
         if expected > 0 {
-            match head(self.s3.outboard_size(&hex)).await {
+            let found = match &object {
+                Object::Blob => head(self.s3.outboard_size(&hex)).await,
+                Object::CatalogDocument { .. } => head(self.s3.catalog_outboard_size(&hex)).await,
+            };
+            match found {
                 Ok(Some(n)) if n == expected => {}
                 Ok(found) => {
                     if found.is_some() {
                         warn!(%hash, ?found, expected, "Outboard in S3 has the wrong size; computing it again");
                     }
-                    self.backfill(hash, size);
+                    self.backfill(hash, size, object);
                     return Err(Refusal::Busy);
                 }
                 Err(e) => {
@@ -138,32 +188,35 @@ impl S3Server {
                 }
             }
         }
-        let mut servable = lock(&self.servable);
-        if servable.len() >= SIZES_CAPACITY {
-            servable.clear();
+        let servable = Servable { size, object };
+        let mut known = lock(&self.servable);
+        if known.len() >= SIZES_CAPACITY {
+            known.clear();
         }
-        servable.insert(hash, size);
-        Ok(size)
+        known.insert(hash, servable.clone());
+        Ok(servable)
     }
 
     /// Write `hash`'s size, then the BAO encoding of `ranges`, to `writer`.
-    /// The hash must have passed [`Self::check`].
+    /// `servable` is what [`Self::check`] returned for the hash.
     pub async fn send(
         &self,
         hash: Hash,
-        size: u64,
+        servable: &Servable,
         ranges: &ChunkRanges,
         writer: &mut iroh::endpoint::SendStream,
     ) -> io::Result<()> {
         let hex = hash.to_hex();
+        let size = servable.size;
         let tree = BaoTree::new(size, IROH_BLOCK_SIZE);
-        let data = S3Reader::new(Arc::clone(&self.s3), self.s3.blob_key(&hex), size);
+        let object = &servable.object;
+        let data = S3Reader::new(Arc::clone(&self.s3), object.data_key(&self.s3, &hex), size);
         let outboard = PreOrderOutboard {
             root: blake3::Hash::from(hash),
             tree,
             data: S3Reader::new(
                 Arc::clone(&self.s3),
-                self.s3.outboard_key(&hex),
+                object.outboard_key(&self.s3, &hex),
                 tree.outboard_size(),
             ),
         };
@@ -177,15 +230,22 @@ impl S3Server {
                     EncodeError::LeafHashMismatch(_) | EncodeError::ParentHashMismatch(_)
                 ) {
                     // Nothing that fails the check is sent.
-                    self.mark_corrupt(hash, &format!("{e:?}"));
+                    self.mark_corrupt(hash, object, &format!("{e:?}"));
                 }
                 io::Error::other(e)
             })
     }
 
     /// Refuse `hash` for good: its S3 object does not match it.
-    fn mark_corrupt(&self, hash: Hash, why: &str) {
-        error!(%hash, why, "S3 object does not match its hash; refused until restart. Delete blobs/<hash> and outboards/<hash> so the publisher can push it again");
+    fn mark_corrupt(&self, hash: Hash, object: &Object, why: &str) {
+        match object {
+            Object::Blob => {
+                error!(%hash, why, "S3 object does not match its hash; refused until restart. Delete blobs/<hash> and outboards/<hash> so the publisher can push it again")
+            }
+            Object::CatalogDocument { .. } => {
+                error!(%hash, why, "S3 catalog document does not match its hash; refused until restart. Delete catalog-documents/<hash> and catalog-outboards/<hash> so the creator can publish it again")
+            }
+        }
         let mut corrupt = lock(&self.corrupt);
         if corrupt.len() >= BAD_CAPACITY {
             corrupt.clear();
@@ -201,7 +261,7 @@ impl S3Server {
 
     /// Compute and store the outboard of a blob that lacks one, unless that
     /// runs already or [`BACKFILLS`] run.
-    fn backfill(self: &Arc<Self>, hash: Hash, size: u64) {
+    fn backfill(self: &Arc<Self>, hash: Hash, size: u64, object: Object) {
         let cooling = lock(&self.backfill_failed)
             .get(&hash)
             .is_some_and(|at| at.elapsed() < BACKFILL_COOLDOWN);
@@ -216,10 +276,14 @@ impl S3Server {
         }
         let server = Arc::clone(self);
         tokio::spawn(async move {
-            match server.compute_outboard(hash, size).await {
+            match server.compute_outboard(hash, size, &object).await {
                 Ok(None) => info!(%hash, size, "Outboard computed from S3 and stored"),
                 Ok(Some(actual)) => {
-                    server.mark_corrupt(hash, &format!("the blob in S3 hashes to {actual}"));
+                    server.mark_corrupt(
+                        hash,
+                        &object,
+                        &format!("the object in S3 hashes to {actual}"),
+                    );
                 }
                 Err(e) => {
                     warn!(%hash, error = format!("{e:#}"), ?BACKFILL_COOLDOWN, "Computing the outboard failed; tried again after the cooldown");
@@ -235,27 +299,34 @@ impl S3Server {
         });
     }
 
-    /// Store the outboard of `hash`'s blob, computed from S3. `Some` (and
-    /// nothing stored) when the blob hashes to something else.
-    async fn compute_outboard(&self, hash: Hash, size: u64) -> anyhow::Result<Option<Hash>> {
+    /// Store the outboard of `hash`'s object, computed from S3. `Some` (and
+    /// nothing stored) when the object hashes to something else.
+    async fn compute_outboard(
+        &self,
+        hash: Hash,
+        size: u64,
+        object: &Object,
+    ) -> anyhow::Result<Option<Hash>> {
         let hex = hash.to_hex();
-        let data = S3Reader::new(Arc::clone(&self.s3), self.s3.blob_key(&hex), size);
+        let data = S3Reader::new(Arc::clone(&self.s3), object.data_key(&self.s3, &hex), size);
         let outboard = PreOrderOutboard::<Vec<u8>>::create(data, IROH_BLOCK_SIZE).await?;
         let actual = Hash::from(outboard.root);
         if actual != hash {
             return Ok(Some(actual));
         }
-        self.s3
-            .put_outboard(&hex, Bytes::from(outboard.data))
-            .await?;
+        let data = Bytes::from(outboard.data);
+        match object {
+            Object::Blob => self.s3.put_outboard(&hex, data).await?,
+            Object::CatalogDocument { .. } => self.s3.put_catalog_outboard(&hex, data).await?,
+        }
         Ok(None)
     }
 }
 
 /// An S3 HEAD, bounded by [`S3_HEAD_TIMEOUT`].
-async fn head<F: Future<Output = anyhow::Result<Option<u64>>>>(
+async fn head<T, F: Future<Output = anyhow::Result<Option<T>>>>(
     request: F,
-) -> anyhow::Result<Option<u64>> {
+) -> anyhow::Result<Option<T>> {
     tokio::time::timeout(S3_HEAD_TIMEOUT, request)
         .await
         .map_err(|_| anyhow::anyhow!("S3 HEAD timed out"))?

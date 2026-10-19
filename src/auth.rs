@@ -25,6 +25,9 @@ const CWT_TAG_PREFIX: [u8; 2] = [0xD8, 0x3D];
 /// Clock-skew tolerance for exp/iat checks. Expiry is `exp <= now - 60`.
 const SKEW_SECS: i64 = 60;
 
+/// `typ` of an IdP passkey credential attestation (catalog v2).
+pub const PASSKEY_CREDENTIAL_TYP: &str = "arkavo-passkey-credential";
+
 /// DeviceCheck assertion audience (draft-arkavo-authzen-cwt-00).
 pub const DEVICECHECK_AUD: &str = "arkavo:devicecheck";
 
@@ -237,7 +240,51 @@ impl CwtVerifier {
             .strip_prefix(&CWT_TAG_PREFIX[..])
             .ok_or(AuthError::Malformed)?;
         let sign1 = coset::CoseSign1::from_slice(inner).map_err(|_| AuthError::Malformed)?;
+        // Arkavo CWTs set no content type; a passkey credential attestation
+        // always does (authnz-rs refuses one on a CWT too).
+        if sign1.protected.header.content_type.is_some() {
+            return Err(AuthError::Malformed);
+        }
+        self.verify_sign1(&sign1).await?;
 
+        let payload = sign1.payload.as_deref().ok_or(AuthError::Malformed)?;
+        let claims = parse_claims(payload)?;
+
+        if let Some(expected) = &self.expected_iss
+            && &claims.iss != expected
+        {
+            return Err(AuthError::Issuer);
+        }
+        if let Some(want) = opts.expected_aud
+            && !claims.aud.contains(want)
+        {
+            return Err(AuthError::Audience);
+        }
+        if claims.iat > claims.exp {
+            return Err(AuthError::Malformed);
+        }
+        if claims.exp <= now - SKEW_SECS {
+            return Err(AuthError::Expired);
+        }
+        if claims.iat > now + SKEW_SECS {
+            return Err(AuthError::NotYetValid);
+        }
+        if claims.nbf.is_some_and(|nbf| nbf > now + SKEW_SECS) {
+            return Err(AuthError::NotYetValid);
+        }
+        Ok(claims)
+    }
+
+    /// The issuer every message must name, when one is configured.
+    pub fn expected_issuer(&self) -> Option<&str> {
+        self.expected_iss.as_deref()
+    }
+
+    /// Verify a COSE_Sign1 against the key set: ES256, no critical
+    /// headers, a known `kid` (refetching the set once for an unknown one),
+    /// a valid signature over an empty external AAD. Says nothing about the
+    /// payload; callers parse and check it themselves.
+    pub async fn verify_sign1(&self, sign1: &coset::CoseSign1) -> Result<(), AuthError> {
         match sign1.protected.header.alg {
             Some(coset::Algorithm::Assigned(coset::iana::Algorithm::ES256)) => {}
             _ => return Err(AuthError::Algorithm),
@@ -266,34 +313,7 @@ impl CwtVerifier {
                 let sig = Signature::from_slice(sig).map_err(|_| ())?;
                 key.verify(data, &sig).map_err(|_| ())
             })
-            .map_err(|_| AuthError::Signature)?;
-
-        let payload = sign1.payload.as_deref().ok_or(AuthError::Malformed)?;
-        let claims = parse_claims(payload)?;
-
-        if let Some(expected) = &self.expected_iss
-            && &claims.iss != expected
-        {
-            return Err(AuthError::Issuer);
-        }
-        if let Some(want) = opts.expected_aud
-            && !claims.aud.contains(want)
-        {
-            return Err(AuthError::Audience);
-        }
-        if claims.iat > claims.exp {
-            return Err(AuthError::Malformed);
-        }
-        if claims.exp <= now - SKEW_SECS {
-            return Err(AuthError::Expired);
-        }
-        if claims.iat > now + SKEW_SECS {
-            return Err(AuthError::NotYetValid);
-        }
-        if claims.nbf.is_some_and(|nbf| nbf > now + SKEW_SECS) {
-            return Err(AuthError::NotYetValid);
-        }
-        Ok(claims)
+            .map_err(|_| AuthError::Signature)
     }
 
     async fn lookup(&self, kid: &[u8]) -> Option<VerifyingKey> {
@@ -374,7 +394,7 @@ fn parse_cose_key_set(bytes: &[u8]) -> anyhow::Result<Vec<(Vec<u8>, VerifyingKey
 }
 
 /// Extract a P-256 verifying key from an EC2 COSE_Key.
-fn p256_from_cose_key(key: &coset::CoseKey) -> anyhow::Result<VerifyingKey> {
+pub(crate) fn p256_from_cose_key(key: &coset::CoseKey) -> anyhow::Result<VerifyingKey> {
     use coset::iana::{Ec2KeyParameter, EnumI64};
 
     if key.kty != coset::KeyType::Assigned(coset::iana::KeyType::EC2) {
@@ -491,6 +511,11 @@ fn parse_claims(payload: &[u8]) -> Result<VerifiedClaims, AuthError> {
                 _ => {}
             },
             Value::Text(key) => match (key.as_str(), v) {
+                // Arkavo CWTs carry no `typ`. A passkey credential
+                // attestation is signed with the same keys and does: it
+                // must never pass as a token (authnz-rs refuses any `typ`
+                // too).
+                ("typ", _) => return Err(AuthError::Malformed),
                 ("email", Value::Text(s)) => email = Some(s),
                 ("email_verified", Value::Bool(b)) => email_verified = Some(b),
                 ("idp", Value::Text(s)) => idp = Some(s),
@@ -777,6 +802,44 @@ mod tests {
         let claims = verifier(b"kid-1", vk).verify(&token, NOW).await.unwrap();
         assert_eq!(claims.sub, "arkavo:u1");
         assert_eq!(claims.iss, "https://identity.test");
+    }
+
+    /// A passkey credential attestation is signed with the IdP's keys. It
+    /// must never pass as a token: as itself (no CWT tag), and as a CWT
+    /// that carries its `typ`.
+    #[tokio::test]
+    async fn a_passkey_attestation_never_verifies_as_a_token() {
+        use crate::catalog_v2::test_support as v2;
+        let attestation = v2::sign_credential(
+            v2::credential_payload("u1", b"c", v2::passkey(9).verifying_key(), vec![]),
+            &v2::idp_key(),
+            v2::IDP_KID,
+        );
+        let token = URL_SAFE_NO_PAD.encode(&attestation);
+        let err = v2::verifier().verify(&token, NOW).await.unwrap_err();
+        assert!(matches!(err, AuthError::Malformed));
+        // Even CWT-tagged, its content type refuses it.
+        let mut tagged = CWT_TAG_PREFIX.to_vec();
+        tagged.extend_from_slice(&attestation[1..]);
+        let token = URL_SAFE_NO_PAD.encode(&tagged);
+        let err = v2::verifier().verify(&token, NOW).await.unwrap_err();
+        assert!(matches!(err, AuthError::Malformed));
+
+        let (sk, vk) = keypair();
+        let token = test_support::mint_with_extras(
+            &sk,
+            b"kid-1",
+            "i",
+            "s",
+            NOW,
+            NOW + 3600,
+            &[("typ", Value::Text("JWT".into()))],
+        );
+        let err = verifier(b"kid-1", vk)
+            .verify(&token, NOW)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::Malformed));
     }
 
     #[tokio::test]
