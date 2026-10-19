@@ -333,12 +333,19 @@ async fn put_catalog<S: TagStore>(
         .get_catalog_pointer(&sub)
         .await
         .map_err(|e| storage_unavailable("Catalog pointer read", e))?;
-    let current_seq = current
-        .as_ref()
-        .map(|stored| stored_seq(&stored.body).map(|(seq, _)| seq))
+    let current = current
+        .map(|stored| stored_seq(&stored.body).map(|parsed| (stored, parsed)))
         .transpose()
         .map_err(|e| storage_unavailable("Catalog pointer parse", e))?;
-    if !preconditions_hold(&headers, current_seq.map(pointer_etag).as_deref()) {
+    let current_seq = current.as_ref().map(|(_, (seq, _))| *seq);
+    // Preconditions see what `GET` serves: a pointer whose catalog is
+    // blocked reads as none, so a client that got the 404 can publish with
+    // `If-None-Match: *`.
+    let served_seq = current
+        .as_ref()
+        .filter(|(_, (_, hash))| !is_blocked(api, hash))
+        .map(|(_, (seq, _))| *seq);
+    if !preconditions_hold(&headers, served_seq.map(pointer_etag).as_deref()) {
         return Err(reject(
             StatusCode::PRECONDITION_FAILED,
             "catalog changed since it was read".into(),
@@ -352,7 +359,7 @@ async fn put_catalog<S: TagStore>(
             format!("seq must be greater than {current_seq}"),
         ));
     }
-    let expected = current.as_ref().map(|stored| stored.etag.as_str());
+    let expected = current.as_ref().map(|(stored, _)| stored.etag.as_str());
 
     // 8. The document and its outboard first, so a stored pointer never
     //    names a document that cannot be served; then the pointer, only if
@@ -794,6 +801,27 @@ mod tests {
         assert_precondition_failed(&h, r, &other, 1).await;
         let r = publish_if(&h, 2, &other, header::IF_NONE_MATCH, "\"9\"").await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+    }
+
+    #[tokio::test]
+    async fn a_blocked_catalog_reads_as_none_to_preconditions() {
+        let h = ingested().await;
+        let blocked = doc();
+        assert_eq!(publish(&h, 3, &blocked).await.status, StatusCode::OK);
+        h.moderation
+            .block_for_test(&blake3::hash(&blocked).to_hex().to_string());
+        assert_eq!(get(&h, SUB).await.status, StatusCode::NOT_FOUND);
+
+        // The 404 path: `If-None-Match: *` passes; `If-Match` on the hidden
+        // pointer fails. The seq must still exceed the stored one.
+        let fresh = catalog(SUB, vec![]);
+        let r = publish_if(&h, 4, &fresh, header::IF_MATCH, "\"3\"").await;
+        assert_precondition_failed(&h, r, &fresh, 1).await;
+        let r = publish_if(&h, 3, &fresh, header::IF_NONE_MATCH, "*").await;
+        assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.error());
+        let r = publish_if(&h, 4, &fresh, header::IF_NONE_MATCH, "*").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"4\"");
     }
 
     #[tokio::test]
