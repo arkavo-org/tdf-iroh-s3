@@ -282,10 +282,10 @@ The request needs `Authorization: Bearer <Arkavo CWT>` and `Content-Type: applic
 
 The request should name the base the client merged its document from, with a standard conditional header (RFC 9110). Without one, a publish signed while another device saved can replace that device's catalog.
 
-- **`If-Match: "<seq>"`:** the client merged from the stored pointer with this `seq`, as `GET /v2/catalogs/{sub}` tagged it (`ETag`). The tag is compared strongly: a weak tag (`W/"7"`) or a bare `7` never matches. `If-Match: *` matches any stored pointer.
+- **`If-Match: "<seq>"`:** the client merged from the stored pointer with this `seq`, as `GET /v2/catalogs/{sub}` tagged it (`ETag`). The tag is compared strongly: a weak tag (`W/"7"`) or a bare `7` never matches. `If-Match: *` matches any pointer that `GET` serves.
 - **`If-None-Match: *`:** the client merged from "no v2 catalog yet" (a 404, seeded from v1). No pointer may be stored, apart from one whose catalog is blocked: preconditions see what `GET` serves, and `GET` answers 404 for it. The `seq` must still be greater than the stored one's.
 
-If the stored pointer is no longer that base, the node answers 412 `catalog changed since it was read` and stores nothing. Read the pointer again, merge, sign and retry. When both headers are sent, only `If-Match` is evaluated. Without either header the node skips this check, for now; once clients send one, a missing precondition may become a 428.
+If the stored pointer is no longer that base, the node answers 412 `catalog changed since it was read` and stores nothing. Read the pointer again, merge, sign and retry. When both headers are sent, both must hold. A header value that is not visible ASCII fails. Without either header the node skips this check, for now; once clients send one, a missing precondition may become a 428.
 
 The node checks the following in order:
 

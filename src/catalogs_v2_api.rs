@@ -31,9 +31,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::catalog_v2::{self, Bundle, BundleError, Passkeys};
-use crate::catalogs_api::{
-    CATALOG_DOCUMENT_CACHE_CONTROL, check_payloads, if_none_match, is_json, owner_hidden,
-};
+use crate::catalogs_api::{CATALOG_DOCUMENT_CACHE_CONTROL, check_payloads, is_json, owner_hidden};
 use crate::creator_catalog::{self, MAX_CATALOG_BYTES, MAX_OWNER_BYTES, valid_identifier};
 use crate::moderation::now_secs;
 use crate::tags_api::{ApiState, TagStore, authorize_publisher, is_blocked};
@@ -188,26 +186,45 @@ fn pointer_etag(seq: u64) -> String {
     format!("\"{seq}\"")
 }
 
-/// Whether the request's preconditions (RFC 9110 §13.1) hold for the stored
-/// pointer's tag (`None`: no pointer stored). `If-Match` takes strong
-/// comparison, so a weak or unquoted tag never matches; `*` needs a stored
-/// pointer. `If-None-Match` is evaluated only without `If-Match`, and fails
-/// on `*` or the tag while a pointer is stored. No header: no condition.
-fn preconditions_hold(headers: &HeaderMap, stored: Option<&str>) -> bool {
-    let mut if_match = headers
-        .get_all(header::IF_MATCH)
-        .iter()
-        .map(|v| v.to_str().unwrap_or_default())
-        .flat_map(|v| v.split(','))
-        .map(str::trim)
-        .peekable();
-    if if_match.peek().is_some() {
-        return stored.is_some_and(|etag| if_match.any(|t| t == "*" || t == etag));
+/// The comma-separated entity tags of every `name` header line: `None`
+/// without one, `Err` when a value is not visible ASCII.
+fn entity_tags(headers: &HeaderMap, name: header::HeaderName) -> Option<Result<Vec<&str>, ()>> {
+    let mut values = headers.get_all(name).iter().peekable();
+    values.peek()?;
+    let mut tags = Vec::new();
+    for value in values {
+        let Ok(value) = value.to_str() else {
+            return Some(Err(()));
+        };
+        tags.extend(value.split(',').map(str::trim));
     }
-    match stored {
-        Some(etag) => !if_none_match(headers, etag),
-        None => true,
+    Some(Ok(tags))
+}
+
+/// Whether the request's preconditions (RFC 9110 §13.2.2) hold for the
+/// served pointer's tag (`None`: no pointer served). `If-Match` takes strong
+/// comparison, so a weak or unquoted tag never matches, and `*` needs a
+/// pointer; `If-None-Match` takes weak comparison and fails on `*` or the
+/// tag while a pointer is served. Both are evaluated when both are sent. A
+/// value that is not visible ASCII fails. No header: no condition.
+fn preconditions_hold(headers: &HeaderMap, served: Option<&str>) -> bool {
+    if let Some(tags) = entity_tags(headers, header::IF_MATCH) {
+        let Ok(tags) = tags else { return false };
+        if !served.is_some_and(|etag| tags.iter().any(|&t| t == "*" || t == etag)) {
+            return false;
+        }
     }
+    if let Some(tags) = entity_tags(headers, header::IF_NONE_MATCH) {
+        let Ok(tags) = tags else { return false };
+        if let Some(etag) = served
+            && tags
+                .iter()
+                .any(|&t| t == "*" || t.strip_prefix("W/").unwrap_or(t) == etag)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 async fn put_catalog<S: TagStore>(
@@ -809,7 +826,7 @@ mod tests {
         let blocked = doc();
         assert_eq!(publish(&h, 3, &blocked).await.status, StatusCode::OK);
         h.moderation
-            .block_for_test(&blake3::hash(&blocked).to_hex().to_string());
+            .block_for_test(blake3::hash(&blocked).to_hex().as_ref());
         assert_eq!(get(&h, SUB).await.status, StatusCode::NOT_FOUND);
 
         // The 404 path: `If-None-Match: *` passes; `If-Match` on the hidden
@@ -825,14 +842,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn if_match_is_evaluated_before_if_none_match() {
+    async fn both_preconditions_must_hold() {
         let h = ingested().await;
         assert_eq!(publish(&h, 1, &doc()).await.status, StatusCode::OK);
         let other = catalog(SUB, vec![]);
-        let body = body(&other, &v2::bundle(SUB, 2, &other));
-        let both = [(header::IF_MATCH, "\"1\""), (header::IF_NONE_MATCH, "*")];
-        let r = put_with(&h, SUB, &token(SUB), body, &both).await;
+        let put = |none_match: &'static str| {
+            let body = body(&other, &v2::bundle(SUB, 2, &other));
+            let both = [
+                (header::IF_MATCH, "\"1\""),
+                (header::IF_NONE_MATCH, none_match),
+            ];
+            let h = &h;
+            async move { put_with(h, SUB, &token(SUB), body, &both).await }
+        };
+        assert_precondition_failed(&h, put("*").await, &other, 1).await;
+        let r = put("\"9\"").await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+    }
+
+    #[tokio::test]
+    async fn a_precondition_that_is_not_ascii_fails() {
+        let h = ingested().await;
+        assert_eq!(publish(&h, 1, &doc()).await.status, StatusCode::OK);
+        let other = catalog(SUB, vec![]);
+        for name in [header::IF_MATCH, header::IF_NONE_MATCH] {
+            let req = Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/v2/catalogs/{SUB}"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", token(SUB)))
+                .header(name, header::HeaderValue::from_bytes(b"\"1\xff\"").unwrap())
+                .body(Body::from(body(&other, &v2::bundle(SUB, 2, &other))))
+                .unwrap();
+            let r = send(&h.app, req).await;
+            assert_precondition_failed(&h, r, &other, 1).await;
+        }
     }
 
     #[tokio::test]

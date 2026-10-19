@@ -310,7 +310,7 @@ pub(crate) fn owner_hidden<S: TagStore>(state: &ApiState<S>, owner: Option<&str>
 
 /// Whether `If-None-Match` names `etag`: `*`, the tag itself, or its weak
 /// form `W/"..."`, alone or in a comma-separated list.
-pub(crate) fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
+fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
     headers
         .get_all(header::IF_NONE_MATCH)
         .iter()
