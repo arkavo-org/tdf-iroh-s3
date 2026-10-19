@@ -811,6 +811,72 @@ mod tests {
         assert!(reason(verify(&with_credential(map)).await).contains("text"));
     }
 
+    /// authnz-rs's golden attestation (`golden_vector` in its
+    /// `src/credential_attestation.rs`, authnz-rs PR #105): bytes from its
+    /// real encoder, deterministic ES256. IdP key scalar 0x42…, credential
+    /// key scalar 0x07….
+    const GOLDEN_ATTESTATION: &str = "d2845846a3012603782a6170706c69636174696f6e2f61726b61766f2d706173736b65792d63726564656e7469616c2b63626f72045461726b61766f2d666978747572652d6b69642d31a0590100a763747970781961726b61766f2d706173736b65792d63726564656e7469616c63697373781b68747470733a2f2f6964656e746974792e61726b61766f2e6e657463737562782430613162326333642d303030302d343030302d383030302d3030303030303030303030316c63726564656e7469616c496450000102030405060708090a0b0c0d0e0f697075626c69634b6579a4010220012158201e18532fd4754c02f3041d9c75ceb33b83ffd81ac7ce4fe882ccb1c98bc5896e225820a46c311c4e2ff40dd96a3653e6e45445d32dfe486eced75c7a90c6a18881c0a36472704964736964656e746974792e61726b61766f2e6e6574636961741a68e778005840f568be35ab831986618bee8fc0b863cbb02169a3b8e870cc4a02a96982387707e21a8551a68a3f9c7349042b24bde95cba23692298a8df9760407c49d5821557";
+    const GOLDEN_IDP_KEY: &str = "043ad3861a95621392516bb593ef05583ed2e5866f5cb6260a3017237fd89b90afd0961c7e37075a6791a39c61f56295b02b6d26567b615e60aa41ee1c8e83388d";
+    const GOLDEN_KID: &[u8] = b"arkavo-fixture-kid-1";
+    const GOLDEN_SUB: &str = "0a1b2c3d-0000-4000-8000-000000000001";
+
+    fn golden_verifier() -> CwtVerifier {
+        let vk = VerifyingKey::from_sec1_bytes(&hex::decode(GOLDEN_IDP_KEY).unwrap()).unwrap();
+        CwtVerifier::with_static_keys(vec![(GOLDEN_KID.to_vec(), vk)])
+            .with_expected_issuer(ISS.to_string())
+    }
+
+    #[tokio::test]
+    async fn authnz_rs_golden_attestation_verifies_and_parses() {
+        let bytes = hex::decode(GOLDEN_ATTESTATION).unwrap();
+        let c = verify_credential(&bytes, &golden_verifier(), NOW)
+            .await
+            .unwrap();
+        assert_eq!(c.sub, GOLDEN_SUB);
+        assert_eq!(c.iss, ISS);
+        assert_eq!(c.rp_id, RP);
+        assert_eq!(c.iat, 1_760_000_000);
+        assert_eq!(c.credential_id, (0u8..16).collect::<Vec<_>>());
+        let point = c.public_key.to_encoded_point(false);
+        assert_eq!(
+            hex::encode(point.x().unwrap()),
+            "1e18532fd4754c02f3041d9c75ceb33b83ffd81ac7ce4fe882ccb1c98bc5896e"
+        );
+        assert_eq!(
+            hex::encode(point.y().unwrap()),
+            "a46c311c4e2ff40dd96a3653e6e45445d32dfe486eced75c7a90c6a18881c0a3"
+        );
+        // The attested key is the credential scalar 0x07….
+        assert_eq!(c.public_key, *passkey(7).verifying_key());
+    }
+
+    /// The whole chain with the real attestation: a pointer signed by the
+    /// attested credential key verifies; a byte flipped in the attestation
+    /// does not.
+    #[tokio::test]
+    async fn a_bundle_with_the_golden_attestation_verifies() {
+        let credential_id: Vec<u8> = (0u8..16).collect();
+        let pointer = pointer_bytes(GOLDEN_SUB, 1, DOC);
+        let mut b = Bundle {
+            pointer: URL_SAFE_NO_PAD.encode(&pointer),
+            assertion: AssertionParts::for_pointer(&pointer).sign(&passkey(7), &credential_id),
+            credential: URL_SAFE_NO_PAD.encode(hex::decode(GOLDEN_ATTESTATION).unwrap()),
+        };
+        let v = verify_bundle(&b, GOLDEN_SUB, &golden_verifier(), &passkeys(), NOW)
+            .await
+            .unwrap();
+        assert_eq!(v.credential_id, credential_id);
+
+        let mut tampered = hex::decode(GOLDEN_ATTESTATION).unwrap();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        b.credential = URL_SAFE_NO_PAD.encode(tampered);
+        let err = verify_bundle(&b, GOLDEN_SUB, &golden_verifier(), &passkeys(), NOW)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("signature"), "{err}");
+    }
+
     #[test]
     fn pointer_rules() {
         let ok = pointer_bytes("u1", 1, DOC);
