@@ -25,7 +25,9 @@ tls_value() {
         }' "$CONFIG_PATH"
 }
 
-[ -f "$CONFIG_PATH" ] || { echo "No config at $CONFIG_PATH yet"; exit 0; }
+# A failure, so the boot run's 60 s restart retries until the node's
+# bootstrap has written the config (a failed first bootstrap retries in 5 s).
+[ -f "$CONFIG_PATH" ] || { echo "No config at $CONFIG_PATH yet" >&2; exit 1; }
 
 CERT_ARN=$(tls_value acm_certificate_arn)
 CERT_PATH=$(tls_value cert_path)
