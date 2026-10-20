@@ -116,9 +116,10 @@ passkey_rp_id = "identity.arkavo.net"
 passkey_status_url = "https://identity.arkavo.net/passkeys/credentials/{credentialId}/status"
 
 # Optional: HTTPS terminated by the node itself (rustls). The plain
-# listener above then binds to 127.0.0.1 only. On EC2 the
-# tdf-iroh-s3-cert-sync timer exports the exportable ACM certificate into
-# these files every 12h, and the node reloads them when they change.
+# listener above then binds to 127.0.0.1 only. On EC2,
+# tdf-iroh-s3-cert-sync exports the exportable ACM certificate into these
+# files at boot, right after the node starts, and then every 12h; the node
+# reloads them when they change.
 [http.tls]
 bind_port = 443
 cert_path = "/etc/tdf-iroh-s3/tls/fullchain.pem"

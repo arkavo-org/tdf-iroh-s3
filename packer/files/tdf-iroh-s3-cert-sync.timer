@@ -2,7 +2,9 @@
 Description=Keep the TDF-Iroh-S3 HTTPS certificate current from ACM
 
 [Timer]
-OnBootSec=30s
+# Renewals only: the boot export is the service's own (multi-user.target).
+# OnBootSec just starts the 12h cycle; the random delay is fine here.
+OnBootSec=1h
 OnUnitActiveSec=12h
 RandomizedDelaySec=15m
 Persistent=true

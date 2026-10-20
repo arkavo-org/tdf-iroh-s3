@@ -13,4 +13,4 @@ install -d -o tdf-iroh-s3 -g tdf-iroh-s3 -m 750 /var/lib/tdf-iroh-s3/data
 
 systemctl daemon-reload
 systemctl enable tdf-iroh-s3.service
-systemctl enable tdf-iroh-s3-cert-sync.timer
+systemctl enable tdf-iroh-s3-cert-sync.service tdf-iroh-s3-cert-sync.timer
