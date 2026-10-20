@@ -44,7 +44,7 @@ The session lasts `[publishing] session_ttl_secs` (default 900).
 - The pusher's subject is recorded at `moderation/publishers/<hash>`.
 - Each session is also stored at `moderation/sessions/<endpointId>` as `{"endpointId", "subject", "expiresAt"}`. A node that receives a push from an endpoint it holds no session for reads this record (5 s timeout) before refusing. So a session opened on one instance holds for a push that reaches another, during an instance replacement or after a restart (#32). A record that has expired, names another endpoint, can't be read, or can't be fetched in time counts as no session.
 - If the node can't store a session, `POST /publish/sessions` still succeeds. The session then holds only on the instance that opened it, and the node logs `Publish session not stored`.
-- Session records are overwritten per endpoint and never deleted. An S3 lifecycle rule on `moderation/sessions/` (say, expire after 1 day) keeps the prefix small.
+- Session records are overwritten per endpoint and never deleted. An S3 lifecycle rule on `moderation/sessions/` keeps the prefix small: expire objects after 1 day. On a versioned bucket, every overwrite also keeps the old version, so expire noncurrent versions after 1 day as well.
 
 ### 2. Publish the catalog
 
