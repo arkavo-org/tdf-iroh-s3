@@ -381,13 +381,19 @@ pub struct PublishPolicy {
 
 impl PublishPolicy {
     /// Verify a publisher token and check the entitlement and suspension.
+    /// Every refusal is logged, with the token's subject once it verifies.
     pub async fn publisher(
         &self,
         verifier: &CwtVerifier,
         moderation: &Moderation,
         headers: &HeaderMap,
     ) -> Result<VerifiedClaims, (StatusCode, &'static str)> {
-        let token = bearer(headers).ok_or((StatusCode::UNAUTHORIZED, "missing bearer token"))?;
+        let refuse = |status: StatusCode, reason: &'static str| {
+            warn!(%status, reason, "Publisher refused");
+            (status, reason)
+        };
+        let token = bearer(headers)
+            .ok_or_else(|| refuse(StatusCode::UNAUTHORIZED, "missing bearer token"))?;
         let claims = verifier
             .verify_with(
                 token,
@@ -397,12 +403,29 @@ impl PublishPolicy {
                 },
             )
             .await
-            .map_err(|e| match e {
-                AuthError::KeySet(_) => (StatusCode::BAD_GATEWAY, "invalid token"),
-                _ => (StatusCode::UNAUTHORIZED, "invalid token"),
+            .map_err(|e| {
+                let status = match e {
+                    AuthError::KeySet(_) => StatusCode::BAD_GATEWAY,
+                    _ => StatusCode::UNAUTHORIZED,
+                };
+                warn!(%status, error = %e, "Publisher refused: invalid token");
+                (status, "invalid token")
             })?;
+        let refuse = |status: StatusCode, reason: &'static str| {
+            warn!(
+                sub = %claims.sub,
+                entitlements = ?claims.arkavo_entitlements,
+                %status,
+                reason,
+                "Publisher refused"
+            );
+            (status, reason)
+        };
         if claims.sub.starts_with("client:") {
-            return Err((StatusCode::FORBIDDEN, "service tokens cannot publish"));
+            return Err(refuse(
+                StatusCode::FORBIDDEN,
+                "service tokens cannot publish",
+            ));
         }
         if let Some(want) = &self.entitlement {
             let entitled = claims
@@ -410,11 +433,14 @@ impl PublishPolicy {
                 .as_ref()
                 .is_some_and(|e| e.iter().any(|x| x == want));
             if !entitled {
-                return Err((StatusCode::FORBIDDEN, "publishing entitlement required"));
+                return Err(refuse(
+                    StatusCode::FORBIDDEN,
+                    "publishing entitlement required",
+                ));
             }
         }
         if moderation.is_suspended(&claims.sub) {
-            return Err((StatusCode::FORBIDDEN, "publishing suspended"));
+            return Err(refuse(StatusCode::FORBIDDEN, "publishing suspended"));
         }
         Ok(claims)
     }
@@ -556,10 +582,14 @@ async fn open_session<S: ModerationStore>(
         .publisher(&s.verifier, &s.gate.moderation, &headers)
         .await
         .map_err(fail)?;
+    let refuse = |(status, reason): (StatusCode, &'static str)| {
+        warn!(sub = %claims.sub, %status, reason, "Publish session refused");
+        fail((status, reason))
+    };
     let endpoint = EndpointId::from_str(body.endpoint_id.trim())
-        .map_err(|_| fail((StatusCode::BAD_REQUEST, "invalid endpointId")))?;
+        .map_err(|_| refuse((StatusCode::BAD_REQUEST, "invalid endpointId")))?;
     let token = bearer(&headers).unwrap_or_default();
-    verify_possession(&endpoint, token, body.timestamp, &body.signature).map_err(fail)?;
+    verify_possession(&endpoint, token, body.timestamp, &body.signature).map_err(refuse)?;
     s.gate
         .open_session(endpoint, &claims.sub, s.policy.session_ttl);
     let expires_at = now_secs() + s.policy.session_ttl.as_secs() as i64;
