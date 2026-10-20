@@ -1,5 +1,9 @@
 [Unit]
 Description=Export the TDF-Iroh-S3 HTTPS certificate from ACM
+# Enabled for boot as well as run by the timer: the first export runs as soon
+# as the node has started, which is when its bootstrap has written the config
+# this reads, and the node picks the certificate up within 10 s (#32). Before,
+# the timer's random delay put HTTPS anywhere up to 15 min after boot.
 After=network-online.target tdf-iroh-s3.service
 Wants=network-online.target
 # Retry indefinitely: a failed first-boot export must not wait for the 12h timer.
@@ -8,5 +12,10 @@ StartLimitIntervalSec=0
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/tdf-iroh-s3-cert-sync
+# A oneshot has no start timeout by default, and boot waits on this one.
+TimeoutStartSec=120
 Restart=on-failure
 RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
