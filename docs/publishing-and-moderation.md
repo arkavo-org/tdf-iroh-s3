@@ -42,7 +42,9 @@ The session lasts `[publishing] session_ttl_secs` (default 900).
 - The node accepts iroh pushes only from an endpoint with a live session, and only while its subject is not suspended.
 - Any other push is refused with a permission error, and nothing is stored.
 - The pusher's subject is recorded at `moderation/publishers/<hash>`.
-- Sessions are held in memory on the node. After a restart, open a new one.
+- Each session is also stored at `moderation/sessions/<endpointId>` as `{"endpointId", "subject", "expiresAt"}`. A node that receives a push from an endpoint it holds no session for reads this record (5 s timeout) before refusing. So a session opened on one instance holds for a push that reaches another, during an instance replacement or after a restart (#32). A record that has expired, names another endpoint, can't be read, or can't be fetched in time counts as no session. At most 16 lookups run at once; a push that finds them all busy is refused. An endpoint whose lookup found no live session is refused for 10 s without another lookup. So a peer without a session can't make the node send S3 a request per push.
+- If the node can't store a session, `POST /publish/sessions` still succeeds. The session then holds only on the instance that opened it, and the node logs `Publish session not stored`.
+- Session records are overwritten per endpoint and never deleted. An S3 lifecycle rule on `moderation/sessions/` keeps the prefix small: expire objects after 1 day. On a versioned bucket, every overwrite also keeps the old version, so expire noncurrent versions after 1 day as well.
 
 ### 2. Publish the catalog
 

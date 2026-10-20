@@ -265,20 +265,23 @@ async fn run_ingest_loop(
                             msg.tx.send(Err(AbortReason::Permission)).await.ok();
                             continue;
                         }
-                        let owner = match &gate {
-                            None => None,
-                            Some(g) => match g.authorize_push(msg.inner.connection_id, &hash.to_hex()) {
-                                Ok(owner) => Some(owner),
-                                Err(why) => {
-                                    warn!(%hash, ?why, "Push refused");
-                                    msg.tx.send(Err(AbortReason::Permission)).await.ok();
-                                    continue;
-                                }
-                            },
-                        };
-                        info!(%hash, subject = ?owner.as_ref().map(|o| &o.0), "Push accepted");
                         let ingester = Arc::clone(&ingester);
+                        let gate = gate.clone();
+                        // In its own task: the gate may read the session
+                        // store, which must not hold up the loop.
                         tokio::spawn(async move {
+                            let owner = match &gate {
+                                None => None,
+                                Some(g) => match g.authorize_push(connection_id, &hash.to_hex()).await {
+                                    Ok(owner) => Some(owner),
+                                    Err(why) => {
+                                        warn!(%hash, ?why, "Push refused");
+                                        msg.tx.send(Err(AbortReason::Permission)).await.ok();
+                                        return;
+                                    }
+                                },
+                            };
+                            info!(%hash, subject = ?owner.as_ref().map(|o| &o.0), "Push accepted");
                             let pending = ingester.staging.track(hash);
                             msg.tx.send(Ok(())).await.ok();
                             // Recorded once the blob is ingested.
