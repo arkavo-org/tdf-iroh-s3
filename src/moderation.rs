@@ -163,6 +163,18 @@ const SESSIONS: &str = "sessions";
 /// How long a push waits for the session store before it is refused.
 const SESSION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Session lookups at once. A push that finds them all busy is refused:
+/// a peer with no session must not be able to make the node send S3 a
+/// request per push.
+const SESSION_LOOKUPS: usize = 16;
+
+/// How long an endpoint whose lookup found no live session is refused
+/// without asking the store again.
+const SESSION_MISS_TTL: Duration = Duration::from_secs(10);
+
+/// Most endpoints remembered as misses; past it the oldest are dropped.
+const SESSION_MISSES: usize = 4096;
+
 /// A stored publish session. `expiresAt` is Unix seconds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -330,6 +342,9 @@ pub struct PublishGate {
     sessions: Mutex<HashMap<EndpointId, Session>>,
     connections: Mutex<HashMap<u64, EndpointId>>,
     store: Option<Arc<dyn SessionStore>>,
+    lookups: tokio::sync::Semaphore,
+    /// Endpoints whose last lookup found no live session, and when.
+    misses: Mutex<HashMap<EndpointId, Instant>>,
 }
 
 /// Why a push was refused.
@@ -347,6 +362,8 @@ impl PublishGate {
             sessions: Mutex::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),
             store: None,
+            lookups: tokio::sync::Semaphore::new(SESSION_LOOKUPS),
+            misses: Mutex::new(HashMap::new()),
         }
     }
 
@@ -397,9 +414,46 @@ impl PublishGate {
 
     /// The live session for `endpoint` in the session store, kept in memory
     /// once found. A store that fails or does not answer in time refuses the
-    /// push, as no session would.
+    /// push, as no session would. An endpoint that just missed, or a push
+    /// that finds every lookup busy, is refused without asking the store.
     async fn stored_session(&self, endpoint: &EndpointId) -> Option<String> {
         let store = self.store.as_ref()?;
+        if self.recently_missed(endpoint) {
+            return None;
+        }
+        let Ok(_permit) = self.lookups.try_acquire() else {
+            warn!(%endpoint, "Session lookups busy; push refused");
+            return None;
+        };
+        let found = self.look_up(store.as_ref(), endpoint).await;
+        if found.is_none() {
+            self.missed(*endpoint);
+        }
+        found
+    }
+
+    fn recently_missed(&self, endpoint: &EndpointId) -> bool {
+        self.misses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(endpoint)
+            .is_some_and(|at| at.elapsed() < SESSION_MISS_TTL)
+    }
+
+    fn missed(&self, endpoint: EndpointId) {
+        let mut misses = self.misses.lock().unwrap_or_else(|e| e.into_inner());
+        if misses.len() >= SESSION_MISSES {
+            misses.retain(|_, at| at.elapsed() < SESSION_MISS_TTL);
+        }
+        if misses.len() >= SESSION_MISSES
+            && let Some(oldest) = misses.iter().min_by_key(|(_, at)| **at).map(|(e, _)| *e)
+        {
+            misses.remove(&oldest);
+        }
+        misses.insert(endpoint, Instant::now());
+    }
+
+    async fn look_up(&self, store: &dyn SessionStore, endpoint: &EndpointId) -> Option<String> {
         let key = endpoint.to_string();
         let body = match tokio::time::timeout(SESSION_LOOKUP_TIMEOUT, store.get_session(&key)).await
         {
@@ -928,6 +982,8 @@ pub(crate) mod test_support {
     pub struct MemModeration {
         pub records: Mutex<HashMap<String, Bytes>>,
         pub fail: Mutex<bool>,
+        /// Session lookups served.
+        pub session_gets: std::sync::atomic::AtomicUsize,
     }
 
     impl ModerationStore for MemModeration {
@@ -960,6 +1016,8 @@ pub(crate) mod test_support {
             endpoint: &'a str,
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<Bytes>>> + Send + 'a>> {
             Box::pin(async move {
+                self.session_gets
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 anyhow::ensure!(!*self.fail.lock().unwrap(), "down");
                 Ok(self
                     .records
@@ -1161,7 +1219,11 @@ mod tests {
         };
         let other = other_instance(&h);
         other.connected(1, Some(ep));
-        let refused = || async { other.authorize_push(1, &"a".repeat(64)).await };
+        // Each step asks the store afresh, past the miss a step leaves.
+        let refused = || async {
+            other.misses.lock().unwrap().clear();
+            other.authorize_push(1, &"a".repeat(64)).await
+        };
 
         assert_eq!(refused().await, Err(PushRefusal::NoSession), "no record");
         put(
@@ -1197,6 +1259,45 @@ mod tests {
             h.gate.authorize_push(2, &"a".repeat(64)).await,
             Err(PushRefusal::NoSession)
         );
+    }
+
+    #[tokio::test]
+    async fn a_missing_session_is_looked_up_once_then_refused_from_memory() {
+        use std::sync::atomic::Ordering;
+        let h = harness();
+        let other = other_instance(&h);
+        let ep = endpoint();
+        other.connected(1, Some(ep));
+        for _ in 0..5 {
+            assert_eq!(
+                other.authorize_push(1, &"a".repeat(64)).await,
+                Err(PushRefusal::NoSession)
+            );
+        }
+        assert_eq!(h.store.session_gets.load(Ordering::Relaxed), 1);
+
+        // With every lookup busy, a push is refused without one.
+        let _all = other
+            .lookups
+            .try_acquire_many(SESSION_LOOKUPS as u32)
+            .unwrap();
+        other.connected(2, Some(endpoint()));
+        assert_eq!(
+            other.authorize_push(2, &"a".repeat(64)).await,
+            Err(PushRefusal::NoSession)
+        );
+        assert_eq!(h.store.session_gets.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn misses_are_bounded() {
+        let gate = PublishGate::new(Arc::new(Moderation::default()));
+        for i in 0..SESSION_MISSES as u32 + 10 {
+            let mut seed = [0xa5; 32];
+            seed[..4].copy_from_slice(&i.to_le_bytes());
+            gate.missed(iroh::SecretKey::from_bytes(&seed).public());
+        }
+        assert_eq!(gate.misses.lock().unwrap().len(), SESSION_MISSES);
     }
 
     #[tokio::test]
