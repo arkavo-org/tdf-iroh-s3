@@ -63,13 +63,13 @@ async fn main() -> Result<()> {
     // before the node accepts anything, and startup fails if they cannot be:
     // a node that forgot its suspensions must not come up.
     let gate = if config.publishing.required {
-        let store = S3Client::from_config(&config.s3).await?;
+        let store = Arc::new(S3Client::from_config(&config.s3).await?);
         let view = Arc::new(Moderation::default());
-        view.reload(&store)
+        view.reload(store.as_ref())
             .await
             .context("Failed to load moderation records")?;
         view.spawn_refresh(
-            Arc::new(store),
+            Arc::clone(&store),
             std::time::Duration::from_secs(config.publishing.moderation_refresh_secs.max(5)),
         );
         info!(
@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
                 "[publishing] required but [http] disabled: no publish session can be opened, so every push is refused"
             );
         }
-        Some(Arc::new(PublishGate::new(view)))
+        Some(Arc::new(PublishGate::new(view).with_session_store(store)))
     } else {
         tracing::warn!("[publishing] required = false: pushes and tag writes are open");
         None

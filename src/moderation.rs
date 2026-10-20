@@ -15,6 +15,10 @@
 //! object is its own audit record (who, when, why, report ID), and lifting
 //! one marks it lifted rather than deleting it. Every node re-reads them
 //! periodically, so changes apply without a redeploy.
+//!
+//! Publish sessions are also written to `moderation/sessions/<endpoint>`,
+//! so a push finds its session on any instance, or after a restart, and
+//! not only on the one that opened it (tdf-iroh-s3#32).
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -24,6 +28,8 @@ use bytes::Bytes;
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -130,6 +136,40 @@ impl ModerationStore for crate::store::s3::S3Client {
     async fn put_record(&self, kind: &str, key: &str, body: Bytes) -> anyhow::Result<()> {
         self.put_moderation_record(kind, key, body).await
     }
+}
+
+/// Where the gate looks up a session it does not hold: the records
+/// `POST /publish/sessions` wrote. Object-safe, so the gate needs no type
+/// parameter.
+pub trait SessionStore: Send + Sync + 'static {
+    fn get_session<'a>(
+        &'a self,
+        endpoint: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<Bytes>>> + Send + 'a>>;
+}
+
+impl SessionStore for crate::store::s3::S3Client {
+    fn get_session<'a>(
+        &'a self,
+        endpoint: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<Bytes>>> + Send + 'a>> {
+        Box::pin(self.get_moderation_record(SESSIONS, endpoint))
+    }
+}
+
+/// `moderation/sessions/<endpoint>`.
+const SESSIONS: &str = "sessions";
+
+/// How long a push waits for the session store before it is refused.
+const SESSION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A stored publish session. `expiresAt` is Unix seconds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionRecord {
+    endpoint_id: String,
+    subject: String,
+    expires_at: i64,
 }
 
 /// The in-memory view every gate reads: active suspensions and blocks.
@@ -282,12 +322,14 @@ struct Session {
     expires: Instant,
 }
 
-/// Which iroh endpoints may push, and for whom. Node-local and in memory: a
-/// session lasts minutes, and a restart just means opening a new one.
+/// Which iroh endpoints may push, and for whom. Sessions are held in memory
+/// and, with a session store, read back from it on a miss: another instance
+/// (during a replacement) or this one before a restart may have opened it.
 pub struct PublishGate {
     pub moderation: Arc<Moderation>,
     sessions: Mutex<HashMap<EndpointId, Session>>,
     connections: Mutex<HashMap<u64, EndpointId>>,
+    store: Option<Arc<dyn SessionStore>>,
 }
 
 /// Why a push was refused.
@@ -304,7 +346,14 @@ impl PublishGate {
             moderation,
             sessions: Mutex::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),
+            store: None,
         }
+    }
+
+    /// Look up sessions this gate does not hold in `store`.
+    pub fn with_session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.store = Some(store);
+        self
     }
 
     pub fn open_session(&self, endpoint: EndpointId, subject: &str, ttl: Duration) -> Instant {
@@ -338,8 +387,46 @@ impl PublishGate {
             .remove(&connection_id);
     }
 
+    /// The live session's subject for `endpoint` held in memory.
+    fn held_session(&self, endpoint: &EndpointId) -> Option<String> {
+        let s = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        s.get(endpoint)
+            .filter(|session| session.expires > Instant::now())
+            .map(|session| session.subject.clone())
+    }
+
+    /// The live session for `endpoint` in the session store, kept in memory
+    /// once found. A store that fails or does not answer in time refuses the
+    /// push, as no session would.
+    async fn stored_session(&self, endpoint: &EndpointId) -> Option<String> {
+        let store = self.store.as_ref()?;
+        let key = endpoint.to_string();
+        let body = match tokio::time::timeout(SESSION_LOOKUP_TIMEOUT, store.get_session(&key)).await
+        {
+            Ok(Ok(body)) => body?,
+            Ok(Err(e)) => {
+                warn!(%endpoint, error = %e, "Session lookup failed");
+                return None;
+            }
+            Err(_) => {
+                warn!(%endpoint, "Session lookup timed out");
+                return None;
+            }
+        };
+        let record: SessionRecord = serde_json::from_slice(&body)
+            .inspect_err(|e| warn!(%endpoint, error = %e, "Unreadable session record"))
+            .ok()?;
+        let left = record.expires_at - now_secs();
+        if record.endpoint_id != key || left <= 0 {
+            return None;
+        }
+        info!(%endpoint, sub = %record.subject, "Publish session found in the session store");
+        self.open_session(*endpoint, &record.subject, Duration::from_secs(left as u64));
+        Some(canonical_subject(&record.subject).to_string())
+    }
+
     /// The subject a push on `connection_id` is accepted for, or why not.
-    pub fn authorize_push(
+    pub async fn authorize_push(
         &self,
         connection_id: u64,
         hash_hex: &str,
@@ -351,12 +438,12 @@ impl PublishGate {
             .get(&connection_id)
             .copied()
             .ok_or(PushRefusal::NoSession)?;
-        let subject = {
-            let s = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-            match s.get(&endpoint) {
-                Some(session) if session.expires > Instant::now() => session.subject.clone(),
-                _ => return Err(PushRefusal::NoSession),
-            }
+        let subject = match self.held_session(&endpoint) {
+            Some(subject) => subject,
+            None => self
+                .stored_session(&endpoint)
+                .await
+                .ok_or(PushRefusal::NoSession)?,
         };
         if self.moderation.is_suspended(&subject) {
             return Err(PushRefusal::Suspended);
@@ -590,9 +677,24 @@ async fn open_session<S: ModerationStore>(
         .map_err(|_| refuse((StatusCode::BAD_REQUEST, "invalid endpointId")))?;
     let token = bearer(&headers).unwrap_or_default();
     verify_possession(&endpoint, token, body.timestamp, &body.signature).map_err(refuse)?;
+    let expires_at = now_secs() + s.policy.session_ttl.as_secs() as i64;
+    // Stored so that any instance finds it (#32). Without it the session
+    // still works on this instance, as before.
+    let record = SessionRecord {
+        endpoint_id: endpoint.to_string(),
+        subject: claims.sub.clone(),
+        expires_at,
+    };
+    let body = Bytes::from(serde_json::to_vec(&record).expect("session record serializes"));
+    if let Err(e) = s
+        .store
+        .put_record(SESSIONS, &record.endpoint_id, body)
+        .await
+    {
+        warn!(sub = %claims.sub, %endpoint, error = %e, "Publish session not stored; it holds on this instance only");
+    }
     s.gate
         .open_session(endpoint, &claims.sub, s.policy.session_ttl);
-    let expires_at = now_secs() + s.policy.session_ttl.as_secs() as i64;
     info!(sub = %claims.sub, %endpoint, "Publish session opened");
     Ok((
         StatusCode::CREATED,
@@ -851,6 +953,23 @@ pub(crate) mod test_support {
             Ok(())
         }
     }
+
+    impl SessionStore for MemModeration {
+        fn get_session<'a>(
+            &'a self,
+            endpoint: &'a str,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<Bytes>>> + Send + 'a>> {
+            Box::pin(async move {
+                anyhow::ensure!(!*self.fail.lock().unwrap(), "down");
+                Ok(self
+                    .records
+                    .lock()
+                    .unwrap()
+                    .get(&format!("{SESSIONS}/{endpoint}"))
+                    .cloned())
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -982,18 +1101,130 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED, "{body}");
         assert_eq!(body["subject"], "u1");
         h.gate.connected(7, Some(ep));
-        let (sub, got) = h.gate.authorize_push(7, &"a".repeat(64)).unwrap();
+        let (sub, got) = h.gate.authorize_push(7, &"a".repeat(64)).await.unwrap();
         assert_eq!((sub.as_str(), got), ("u1", ep));
         // Another connection without a session is refused.
         h.gate.connected(8, Some(endpoint()));
         assert_eq!(
-            h.gate.authorize_push(8, &"a".repeat(64)),
+            h.gate.authorize_push(8, &"a".repeat(64)).await,
             Err(PushRefusal::NoSession)
         );
         assert_eq!(
-            h.gate.authorize_push(9, &"a".repeat(64)),
+            h.gate.authorize_push(9, &"a".repeat(64)).await,
             Err(PushRefusal::NoSession)
         );
+    }
+
+    /// Another instance's gate: the same moderation view and session store,
+    /// none of this gate's sessions.
+    fn other_instance(h: &Harness) -> PublishGate {
+        PublishGate::new(Arc::clone(&h.gate.moderation))
+            .with_session_store(Arc::clone(&h.store) as Arc<dyn SessionStore>)
+    }
+
+    #[tokio::test]
+    async fn a_session_is_stored_and_another_instance_accepts_its_push() {
+        let h = harness();
+        let sk = key();
+        let ep = sk.public();
+        let tok = creator("arkavo:u1");
+        let (status, body) =
+            call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let stored: SessionRecord =
+            serde_json::from_slice(&h.store.records.lock().unwrap()[&format!("sessions/{ep}")])
+                .unwrap();
+        assert_eq!(stored.endpoint_id, ep.to_string());
+        assert_eq!(stored.subject, "arkavo:u1");
+        assert_eq!(stored.expires_at, body["expiresAt"].as_i64().unwrap());
+
+        // The push lands on an instance that never saw the session (#32).
+        let other = other_instance(&h);
+        other.connected(1, Some(ep));
+        let (sub, got) = other.authorize_push(1, &"a".repeat(64)).await.unwrap();
+        assert_eq!((sub.as_str(), got), ("u1", ep));
+        // Found once, it is held: the store is no longer needed.
+        *h.store.fail.lock().unwrap() = true;
+        assert!(other.authorize_push(1, &"a".repeat(64)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_stored_session_is_refused_when_expired_foreign_unreadable_or_unreachable() {
+        let h = harness();
+        let ep = endpoint();
+        let put = |record: serde_json::Value| {
+            h.store
+                .records
+                .lock()
+                .unwrap()
+                .insert(format!("sessions/{ep}"), Bytes::from(record.to_string()));
+        };
+        let other = other_instance(&h);
+        other.connected(1, Some(ep));
+        let refused = || async { other.authorize_push(1, &"a".repeat(64)).await };
+
+        assert_eq!(refused().await, Err(PushRefusal::NoSession), "no record");
+        put(
+            serde_json::json!({"endpointId": ep.to_string(), "subject": "u1", "expiresAt": now_secs() - 1}),
+        );
+        assert_eq!(refused().await, Err(PushRefusal::NoSession), "expired");
+        put(
+            serde_json::json!({"endpointId": endpoint().to_string(), "subject": "u1", "expiresAt": now_secs() + 60}),
+        );
+        assert_eq!(
+            refused().await,
+            Err(PushRefusal::NoSession),
+            "another endpoint's"
+        );
+        h.store
+            .records
+            .lock()
+            .unwrap()
+            .insert(format!("sessions/{ep}"), Bytes::from_static(b"{"));
+        assert_eq!(refused().await, Err(PushRefusal::NoSession), "unreadable");
+
+        put(
+            serde_json::json!({"endpointId": ep.to_string(), "subject": "u1", "expiresAt": now_secs() + 60}),
+        );
+        *h.store.fail.lock().unwrap() = true;
+        assert_eq!(refused().await, Err(PushRefusal::NoSession), "store down");
+        *h.store.fail.lock().unwrap() = false;
+        assert!(refused().await.is_ok());
+
+        // A gate without a session store never looks.
+        h.gate.connected(2, Some(ep));
+        assert_eq!(
+            h.gate.authorize_push(2, &"a".repeat(64)).await,
+            Err(PushRefusal::NoSession)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_session_still_honours_suspensions() {
+        let h = harness();
+        let sk = key();
+        let tok = creator("u1");
+        let (status, _) = call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        h.gate.moderation.suspend_for_test("u1", false);
+        let other = other_instance(&h);
+        other.connected(1, Some(sk.public()));
+        assert_eq!(
+            other.authorize_push(1, &"a".repeat(64)).await,
+            Err(PushRefusal::Suspended)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_the_store_refuses_still_holds_on_this_instance() {
+        let h = harness();
+        let sk = key();
+        let tok = creator("u1");
+        *h.store.fail.lock().unwrap() = true;
+        let (status, _) = call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        h.gate.connected(1, Some(sk.public()));
+        assert!(h.gate.authorize_push(1, &"a".repeat(64)).await.is_ok());
     }
 
     #[tokio::test]
@@ -1050,7 +1281,7 @@ mod tests {
 
         // An open session no longer pushes; a new one cannot be opened.
         assert_eq!(
-            h.gate.authorize_push(1, &"b".repeat(64)),
+            h.gate.authorize_push(1, &"b".repeat(64)).await,
             Err(PushRefusal::Suspended)
         );
         let (status, _) = call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
@@ -1070,7 +1301,7 @@ mod tests {
         let stored: Suspension =
             serde_json::from_slice(&h.store.records.lock().unwrap()["suspensions/u1"]).unwrap();
         assert!(stored.lifted_at.is_some());
-        assert!(h.gate.authorize_push(1, &"b".repeat(64)).is_ok());
+        assert!(h.gate.authorize_push(1, &"b".repeat(64)).await.is_ok());
     }
 
     #[tokio::test]
@@ -1091,7 +1322,10 @@ mod tests {
         let ep = endpoint();
         h.gate.open_session(ep, "u2", Duration::from_secs(60));
         h.gate.connected(3, Some(ep));
-        assert_eq!(h.gate.authorize_push(3, &hash), Err(PushRefusal::Blocked));
+        assert_eq!(
+            h.gate.authorize_push(3, &hash).await,
+            Err(PushRefusal::Blocked)
+        );
 
         let (_, list) = call(&h.app, "GET", "/moderation/blocks", &operator(), None).await;
         assert_eq!(list.as_array().unwrap().len(), 1);
@@ -1268,7 +1502,7 @@ mod tests {
         }
         h.gate.connected(5, Some(victim));
         assert_eq!(
-            h.gate.authorize_push(5, &"a".repeat(64)),
+            h.gate.authorize_push(5, &"a".repeat(64)).await,
             Err(PushRefusal::NoSession)
         );
     }

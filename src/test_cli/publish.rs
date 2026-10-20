@@ -234,10 +234,10 @@ mod tests {
             other => panic!("{other:?}"),
         }
         gate.connected(1, Some(key.public()));
-        assert!(gate.authorize_push(1, &"a".repeat(64)).is_ok());
+        assert!(gate.authorize_push(1, &"a".repeat(64)).await.is_ok());
         gate.connected(2, Some(SecretKey::from_bytes(&[8; 32]).public()));
         assert_eq!(
-            gate.authorize_push(2, &"a".repeat(64)),
+            gate.authorize_push(2, &"a".repeat(64)).await,
             Err(PushRefusal::NoSession)
         );
 

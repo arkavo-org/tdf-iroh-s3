@@ -704,6 +704,25 @@ impl S3Client {
         Ok(())
     }
 
+    /// One moderation record (`moderation/<kind>/<key>`), or `None`.
+    pub async fn get_moderation_record(&self, kind: &str, key: &str) -> Result<Option<Bytes>> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(format!("{}{}", self.moderation_prefix(kind), key))
+            .send()
+            .await
+        {
+            Ok(resp) => Ok(Some(resp.body.collect().await?.into_bytes())),
+            Err(e) if e.as_service_error().is_some_and(|se| se.is_no_such_key()) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!(
+                "Failed to GET moderation record from S3: {}",
+                e
+            )),
+        }
+    }
+
     /// Every record under `moderation/<kind>/`, paginating as needed.
     pub async fn list_moderation_records(&self, kind: &str) -> Result<Vec<Bytes>> {
         let prefix = self.moderation_prefix(kind);
