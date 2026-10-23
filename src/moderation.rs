@@ -2311,4 +2311,22 @@ mod tests {
         m.suspend_for_test("u2", true);
         assert!(m.catalog_hidden("arkavo:u2"));
     }
+
+    #[tokio::test]
+    async fn shadow_ignores_a_bad_device_token_and_skips_the_pdp() {
+        let (h, pdp) = deciding(PublishDecisions::Shadow);
+        let tok = creator("arkavo:u1");
+        let sk = key();
+        let (status, _) = call_with(
+            &h.app,
+            "POST",
+            "/publish/sessions",
+            &tok,
+            &[("x-entity-token", "not-a-cwt")],
+            signed(&sk, &tok),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(pdp.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
 }

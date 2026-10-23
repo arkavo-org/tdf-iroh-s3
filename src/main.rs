@@ -70,6 +70,28 @@ async fn main() -> Result<()> {
         } else {
             None
         };
+    // A chain read back from a publish session carries no token, so the
+    // OpenTDF client's token mode could never decide a push: every push
+    // would be refused.
+    if config.publishing.decisions != PublishDecisions::Local
+        && config
+            .catalog
+            .authz
+            .protocol
+            .eq_ignore_ascii_case("opentdf-v2")
+    {
+        let entity_mode: tdf_iroh_s3::authz::EntityMode = config
+            .catalog
+            .authz
+            .entity_mode
+            .parse()
+            .map_err(|e: String| anyhow::anyhow!(e))?;
+        anyhow::ensure!(
+            entity_mode == tdf_iroh_s3::authz::EntityMode::Claims,
+            "[publishing] decisions = {:?} needs [catalog.authz] protocol authzen or entity_mode claims",
+            config.publishing.decisions
+        );
+    }
     let environment = environment_entity(&config.catalog.authz);
     let decider = Arc::new(PublishDecider::new(
         config.publishing.decisions,
