@@ -928,6 +928,7 @@ mod tests {
                     audience: Some("arkavo".into()),
                     session_ttl: std::time::Duration::from_secs(60),
                     operator_client_ids: Default::default(),
+                    decider: Default::default(),
                 }),
                 moderation: Arc::clone(&moderation),
             }),

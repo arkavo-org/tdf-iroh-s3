@@ -42,6 +42,22 @@ pub struct PublishingConfig {
     /// How often moderation records are re-read from S3.
     #[serde(default = "default_moderation_refresh_secs")]
     pub moderation_refresh_secs: u64,
+    /// Who decides whether a subject may publish (tdf-iroh-s3#35):
+    /// `local` (this node, from the CWT), `shadow` (both; the local answer
+    /// is enforced and every disagreement logged) or `pdp` (the platform's
+    /// decision service, through `[catalog.authz]`, failing closed).
+    #[serde(default)]
+    pub decisions: PublishDecisions,
+}
+
+/// `[publishing] decisions`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PublishDecisions {
+    #[default]
+    Local,
+    Shadow,
+    Pdp,
 }
 
 impl Default for PublishingConfig {
@@ -53,6 +69,7 @@ impl Default for PublishingConfig {
             session_ttl_secs: default_session_ttl_secs(),
             operator_client_ids: Vec::new(),
             moderation_refresh_secs: default_moderation_refresh_secs(),
+            decisions: PublishDecisions::Local,
         }
     }
 }

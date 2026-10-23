@@ -206,6 +206,7 @@ mod tests {
                 audience: Some("arkavo".into()),
                 session_ttl: Duration::from_secs(60),
                 operator_client_ids: Default::default(),
+                decider: Default::default(),
             }),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

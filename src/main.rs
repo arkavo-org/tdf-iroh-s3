@@ -10,14 +10,16 @@ use tdf_iroh_s3::attributes::{self, AttributeSet};
 use tdf_iroh_s3::auth::CwtVerifier;
 use tdf_iroh_s3::authz::{
     AuthZenClient, AuthzProtocol, ConnectAuthzClient, DecisionProvider, DenyAll,
+    SharedDecisionProvider,
 };
 use tdf_iroh_s3::catalog_api::{self, CatalogApiState, CatalogCache};
 use tdf_iroh_s3::catalogs_api;
 use tdf_iroh_s3::catalogs_v2_api;
-use tdf_iroh_s3::config::Config;
+use tdf_iroh_s3::config::{AuthzConfig, Config, PublishDecisions};
 use tdf_iroh_s3::moderation::{self, Moderation, ModerationApi, PublishGate, PublishPolicy};
 use tdf_iroh_s3::node::TdfIrohNode;
 use tdf_iroh_s3::node_api;
+use tdf_iroh_s3::publish_decision::PublishDecider;
 use tdf_iroh_s3::ssm;
 use tdf_iroh_s3::store::s3::S3Client;
 use tdf_iroh_s3::tags_api::{self, ApiState, TagPublishing};
@@ -59,6 +61,30 @@ async fn main() -> Result<()> {
     );
     info!("Assertion check: {}", config.validation.assertion.enabled);
 
+    // One decision service client, shared by the entitled catalog and the
+    // publishing decisions (tdf-iroh-s3#35). Built only when one of them
+    // uses it, since building it may read a secret from SSM.
+    let provider =
+        if config.catalog.enabled || config.publishing.decisions != PublishDecisions::Local {
+            decision_provider(&config).await?
+        } else {
+            None
+        };
+    let environment = environment_entity(&config.catalog.authz);
+    let decider = Arc::new(PublishDecider::new(
+        config.publishing.decisions,
+        provider.clone(),
+        config.publishing.entitlement.clone(),
+        environment.clone(),
+    )?);
+    info!("Publish decisions: {:?}", config.publishing.decisions);
+    if decider.asks() && !config.publishing.required {
+        tracing::warn!(
+            "[publishing] decisions = {:?} has no effect while required = false",
+            config.publishing.decisions
+        );
+    }
+
     // Creator publishing gate (tdf-iroh-s3#17). Moderation records are read
     // before the node accepts anything, and startup fails if they cannot be:
     // a node that forgot its suspensions must not come up.
@@ -83,7 +109,11 @@ async fn main() -> Result<()> {
                 "[publishing] required but [http] disabled: no publish session can be opened, so every push is refused"
             );
         }
-        Some(Arc::new(PublishGate::new(view).with_session_store(store)))
+        Some(Arc::new(
+            PublishGate::new(view)
+                .with_session_store(store)
+                .with_decider(Arc::clone(&decider)),
+        ))
     } else {
         tracing::warn!("[publishing] required = false: pushes and tag writes are open");
         None
@@ -125,6 +155,7 @@ async fn main() -> Result<()> {
             audience: Some(pub_cfg.audience.clone()).filter(|a| !a.is_empty()),
             session_ttl: std::time::Duration::from_secs(pub_cfg.session_ttl_secs),
             operator_client_ids: pub_cfg.operator_client_ids.iter().cloned().collect(),
+            decider: Arc::clone(&decider),
         });
         let state = Arc::new(ApiState {
             store: Arc::clone(&node.s3_client),
@@ -208,124 +239,33 @@ async fn main() -> Result<()> {
                 router = router.merge(attributes::router(Arc::new(set)));
             }
 
-            let environment = if cat.authz.environment_region.is_empty() {
-                None
-            } else {
-                Some(serde_json::json!({
-                    "kind": "environment",
-                    "region": cat.authz.environment_region,
-                }))
-            };
             let cache = CatalogCache::new(
                 Arc::clone(&node.s3_client),
                 std::time::Duration::from_secs(cat.cache_ttl_secs),
             );
-            if cat.authz.endpoint.is_empty() {
-                tracing::warn!(
-                    "[catalog.authz] endpoint unset — catalog decisions fail closed (nothing entitled)"
-                );
-                router = router.merge(catalog_router(
+            router = match &provider {
+                Some(provider) => router.merge(catalog_router(
                     cache,
-                    DenyAll,
+                    Arc::clone(provider),
                     Arc::clone(&verifier),
                     cat.authz.action.clone(),
-                    environment,
+                    environment.clone(),
                     moderation.clone(),
-                ));
-            } else {
-                let credential = if !cat.authz.token_url.is_empty() {
-                    // Secret resolution, in order of precedence. A long-lived
-                    // credential should never sit in the TOML, so config is the
-                    // least-preferred source (tests / local override):
-                    //   1. config client_secret
-                    //   2. CATALOG_AUTHZ_CLIENT_SECRET env var
-                    //   3. client_secret_param in SSM (the production path —
-                    //      mirrors the node-secret-key load in secret_key.rs;
-                    //      fetched decrypted via the instance role)
-                    let client_secret = if !cat.authz.client_secret.is_empty() {
-                        cat.authz.client_secret.clone()
-                    } else {
-                        let from_env =
-                            std::env::var("CATALOG_AUTHZ_CLIENT_SECRET").unwrap_or_default();
-                        if !from_env.is_empty() {
-                            from_env
-                        } else if !cat.authz.client_secret_param.is_empty() {
-                            ssm::load_secret(
-                                &cat.authz.client_secret_param,
-                                &node.config.s3.region,
-                            )
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "[catalog.authz] loading client secret from SSM parameter {}",
-                                    cat.authz.client_secret_param
-                                )
-                            })?
-                        } else {
-                            String::new()
-                        }
-                    };
-                    anyhow::ensure!(
-                        !cat.authz.client_id.is_empty() && !client_secret.is_empty(),
-                        "[catalog.authz] token_url requires client_id and a client secret \
-                         (config client_secret, CATALOG_AUTHZ_CLIENT_SECRET env, or client_secret_param in SSM)"
-                    );
-                    tdf_iroh_s3::authz::ServiceCredential::ClientCredentials {
-                        token_url: cat.authz.token_url.clone(),
-                        client_id: cat.authz.client_id.clone(),
-                        client_secret,
-                    }
-                } else if !cat.authz.bearer_token.is_empty() {
-                    tdf_iroh_s3::authz::ServiceCredential::Static(cat.authz.bearer_token.clone())
-                } else {
+                )),
+                None => {
                     tracing::warn!(
-                        "[catalog.authz] no credential configured — the platform requires an                          authenticated caller, decisions will be rejected"
+                        "[catalog.authz] endpoint unset — catalog decisions fail closed (nothing entitled)"
                     );
-                    tdf_iroh_s3::authz::ServiceCredential::None
-                };
-                let protocol: AuthzProtocol = cat
-                    .authz
-                    .protocol
-                    .parse()
-                    .map_err(|e: String| anyhow::anyhow!("[catalog.authz] {e}"))?;
-                match protocol {
-                    AuthzProtocol::Authzen => {
-                        info!(
-                            "Catalog authz protocol authzen (PDP {})",
-                            cat.authz.endpoint
-                        );
-                        let provider = AuthZenClient::new(cat.authz.endpoint.clone(), credential);
-                        router = router.merge(catalog_router(
-                            cache,
-                            provider,
-                            Arc::clone(&verifier),
-                            cat.authz.action.clone(),
-                            environment,
-                            moderation.clone(),
-                        ));
-                    }
-                    AuthzProtocol::OpentdfV2 => {
-                        let entity_mode: tdf_iroh_s3::authz::EntityMode = cat
-                            .authz
-                            .entity_mode
-                            .parse()
-                            .map_err(|e: String| anyhow::anyhow!(e))?;
-                        let provider = ConnectAuthzClient::new(
-                            cat.authz.endpoint.clone(),
-                            credential,
-                            entity_mode,
-                        );
-                        router = router.merge(catalog_router(
-                            cache,
-                            provider,
-                            Arc::clone(&verifier),
-                            cat.authz.action.clone(),
-                            environment,
-                            moderation.clone(),
-                        ));
-                    }
+                    router.merge(catalog_router(
+                        cache,
+                        DenyAll,
+                        Arc::clone(&verifier),
+                        cat.authz.action.clone(),
+                        environment.clone(),
+                        moderation.clone(),
+                    ))
                 }
-            }
+            };
             info!(
                 "Catalog endpoint enabled (group attribute {})",
                 cat.group_attribute_fqn
@@ -419,6 +359,98 @@ async fn shutdown_signal() -> Result<&'static str> {
             .context("Waiting for Ctrl-C")?;
         Ok("Ctrl-C")
     }
+}
+
+/// The environment entity this node asserts (its region), if configured.
+fn environment_entity(authz: &AuthzConfig) -> Option<serde_json::Value> {
+    if authz.environment_region.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "kind": "environment",
+        "region": authz.environment_region,
+    }))
+}
+
+/// The decision service client from `[catalog.authz]`, or `None` when no
+/// endpoint is configured.
+async fn decision_provider(config: &Config) -> Result<Option<SharedDecisionProvider>> {
+    let authz = &config.catalog.authz;
+    if authz.endpoint.is_empty() {
+        return Ok(None);
+    }
+    let credential = if !authz.token_url.is_empty() {
+        // Secret resolution, in order of precedence. A long-lived
+        // credential should never sit in the TOML, so config is the
+        // least-preferred source (tests / local override):
+        //   1. config client_secret
+        //   2. CATALOG_AUTHZ_CLIENT_SECRET env var
+        //   3. client_secret_param in SSM (the production path —
+        //      mirrors the node-secret-key load in secret_key.rs;
+        //      fetched decrypted via the instance role)
+        let client_secret = if !authz.client_secret.is_empty() {
+            authz.client_secret.clone()
+        } else {
+            let from_env = std::env::var("CATALOG_AUTHZ_CLIENT_SECRET").unwrap_or_default();
+            if !from_env.is_empty() {
+                from_env
+            } else if !authz.client_secret_param.is_empty() {
+                ssm::load_secret(&authz.client_secret_param, &config.s3.region)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "[catalog.authz] loading client secret from SSM parameter {}",
+                            authz.client_secret_param
+                        )
+                    })?
+            } else {
+                String::new()
+            }
+        };
+        anyhow::ensure!(
+            !authz.client_id.is_empty() && !client_secret.is_empty(),
+            "[catalog.authz] token_url requires client_id and a client secret \
+             (config client_secret, CATALOG_AUTHZ_CLIENT_SECRET env, or client_secret_param in SSM)"
+        );
+        tdf_iroh_s3::authz::ServiceCredential::ClientCredentials {
+            token_url: authz.token_url.clone(),
+            client_id: authz.client_id.clone(),
+            client_secret,
+        }
+    } else if !authz.bearer_token.is_empty() {
+        tdf_iroh_s3::authz::ServiceCredential::Static(authz.bearer_token.clone())
+    } else {
+        tracing::warn!(
+            "[catalog.authz] no credential configured — the platform requires an authenticated caller, decisions will be rejected"
+        );
+        tdf_iroh_s3::authz::ServiceCredential::None
+    };
+    let protocol: AuthzProtocol = authz
+        .protocol
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("[catalog.authz] {e}"))?;
+    let provider: SharedDecisionProvider = match protocol {
+        AuthzProtocol::Authzen => {
+            info!("Decision service protocol authzen (PDP {})", authz.endpoint);
+            Arc::new(AuthZenClient::new(authz.endpoint.clone(), credential))
+        }
+        AuthzProtocol::OpentdfV2 => {
+            let entity_mode: tdf_iroh_s3::authz::EntityMode = authz
+                .entity_mode
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!(e))?;
+            info!(
+                "Decision service protocol opentdf-v2 (PDP {})",
+                authz.endpoint
+            );
+            Arc::new(ConnectAuthzClient::new(
+                authz.endpoint.clone(),
+                credential,
+                entity_mode,
+            ))
+        }
+    };
+    Ok(Some(provider))
 }
 
 fn catalog_router<D: DecisionProvider>(
