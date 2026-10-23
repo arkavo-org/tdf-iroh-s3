@@ -18,6 +18,32 @@ A publisher's CWT must:
 - name a person, not a service client (`client:*`);
 - name a subject that is not suspended.
 
+### Who decides: `[publishing] decisions`
+
+The node always authenticates the publisher (the checks above, except the entitlement). Who decides whether the subject may publish depends on `decisions`:
+
+| Value | Who decides |
+|---|---|
+| `local` (default) | This node: the entitlement must be in `arkavo_entitlements`. |
+| `shadow` | Both. The local answer is enforced, and the decision service's answer is logged next to it (`Publish decision shadow: agrees` / `disagrees`). |
+| `pdp` | The platform's decision service at `[catalog.authz] endpoint` (tdf-iroh-s3#35). Its answer replaces the entitlement check. Refusals: deny is 403 `publishing not permitted`; no decision (error, timeout) is 503 `decision service unavailable`. Publishing fails closed. |
+
+**The request.** The node sends one AuthZEN evaluation through the same client as the catalog: action `read` on a resource of type `publisher`, carrying `[publishing] entitlement` as its `attribute_value_fqns`. Per draft-arkavo-authzen-cwt-00, the entity chain is:
+
+1. the verified person;
+2. each device presented in repeated `X-Entity-Token` headers (DeviceCheck CWTs: `aud` `arkavo:devicecheck`, bound to the person). A device token that fails verification is 401 in `pdp`; in `local` they are ignored;
+3. the environment (`[catalog.authz] environment_region`).
+
+At most 8 entities. The platform withholds the grant from a suspended account, and devices narrow it as its policy says.
+
+**Pushes.** A session opened in `shadow` or `pdp` stores the chain it was decided with, never a token. A push asks again with it, reusing an answer for 30 s per subject. A push is refused when:
+
+- the decision service denies it (`NotPermitted`);
+- it can't be asked (`DecisionUnavailable`);
+- in `pdp`, the session has no stored chain (`NoSession`).
+
+**Configuration.** `shadow` or `pdp` without a `[catalog.authz] endpoint` is a startup error. Local suspensions still apply in every mode until the platform's suspension check is live.
+
 ### 1. Open a publish session for the iroh endpoint that will push
 
 The caller must prove it holds the endpoint's key. It signs the following bytes with its iroh secret key (Ed25519, `SecretKey::sign`):
@@ -42,7 +68,7 @@ The session lasts `[publishing] session_ttl_secs` (default 900).
 - The node accepts iroh pushes only from an endpoint with a live session, and only while its subject is not suspended.
 - Any other push is refused with a permission error, and nothing is stored.
 - The pusher's subject is recorded at `moderation/publishers/<hash>`.
-- Each session is also stored at `moderation/sessions/<endpointId>` as `{"endpointId", "subject", "expiresAt"}`. A node that receives a push from an endpoint it holds no session for reads this record (5 s timeout) before refusing. So a session opened on one instance holds for a push that reaches another, during an instance replacement or after a restart (#32). A record that has expired, names another endpoint, can't be read, or can't be fetched in time counts as no session. At most 16 lookups run at once; a push that finds them all busy is refused. An endpoint whose lookup found no live session is refused for 10 s without another lookup. So a peer without a session can't make the node send S3 a request per push.
+- Each session is also stored at `moderation/sessions/<endpointId>` as `{"endpointId", "subject", "expiresAt"}`, plus `chain` when decisions aren't local (see above). A node that receives a push from an endpoint it holds no session for reads this record (5 s timeout) before refusing. So a session opened on one instance holds for a push that reaches another, during an instance replacement or after a restart (#32). A record that has expired, names another endpoint, can't be read, or can't be fetched in time counts as no session. At most 16 lookups run at once; a push that finds them all busy is refused. An endpoint whose lookup found no live session is refused for 10 s without another lookup. So a peer without a session can't make the node send S3 a request per push.
 - If the node can't store a session, `POST /publish/sessions` still succeeds. The session then holds only on the instance that opened it, and the node logs `Publish session not stored`.
 - Session records are overwritten per endpoint and never deleted. An S3 lifecycle rule on `moderation/sessions/` keeps the prefix small: expire objects after 1 day. On a versioned bucket, every overwrite also keeps the old version, so expire noncurrent versions after 1 day as well.
 
@@ -75,7 +101,9 @@ The authnz-rs `client_credentials` grant mints such tokens. If the list is empty
 | `DELETE /moderation/suspensions/{subject}` | Lifts the suspension. |
 | `PUT /moderation/blocks/{hash}` `{"reason","reportId"?}` | Takedown: iroh pushes of the hash are refused, and so are iroh get and get-many requests for it (a get-many that names it among other hashes is refused whole). Observe requests are always refused. It is left out of `/catalog/{group}` listings, no tag may point at it, and a tag already pointing at it returns 404. |
 | `DELETE /moderation/blocks/{hash}` | Lifts the block. |
-| `GET /moderation/suspensions`, `GET /moderation/blocks` | Active records. |
+| `PUT /moderation/blocks/catalogs/{subject}` `{"reason","reportId"?}` | Blocks the creator's catalog: `GET /tags/catalog/{subject}` and `GET /v2/catalogs/{subject}` return 404, and so does `GET /catalog-documents/{hash}` for any document the subject owns; iroh fetches of those documents are refused. The moderation client writes one when it suspends a creator (tdf-iroh-s3#35). Stored at `moderation/catalog-blocks/<subject>`. |
+| `DELETE /moderation/blocks/catalogs/{subject}` | Lifts the catalog block. |
+| `GET /moderation/suspensions`, `GET /moderation/blocks`, `GET /moderation/blocks/catalogs` | Active records. |
 
 ```bash
 curl -X PUT https://iroh.arkavo.net/moderation/blocks/<hash> \
@@ -87,10 +115,10 @@ Subjects compare in canonical form: `arkavo:<id>` and a bare `<id>` are the same
 
 ### Audit
 
-Each suspension or block is stored as a JSON object under `moderation/suspensions/<subject>` or `moderation/blocks/<hash>`. The object records who set it, when, why and the report ID.
+Each suspension, block or catalog block is stored as a JSON object under `moderation/suspensions/<subject>`, `moderation/blocks/<hash>` or `moderation/catalog-blocks/<subject>`. The object records who set it, when, why and the report ID.
 
 - Lifting one sets `liftedBy` and `liftedAt` instead of deleting it.
-- Those objects hold only the current state, so every suspend, block and lift also writes an immutable event under `moderation/audit/<suspensions|blocks>/<key>/<ns timestamp>`, as `{"action", "record"}`. A re-suspension or re-block never loses the earlier record.
+- Those objects hold only the current state, so every suspend, block and lift also writes an immutable event under `moderation/audit/<suspensions|blocks|catalog-blocks>/<key>/<ns timestamp>`, as `{"action", "record"}`. A re-suspension or re-block never loses the earlier record.
 - Each change is also logged with an `audit` field.
 
 ### Propagation
@@ -115,6 +143,7 @@ audience = "arkavo"                # "" disables the audience check
 session_ttl_secs = 900
 operator_client_ids = ["moderation"]
 moderation_refresh_secs = 30
+decisions = "local"                # local | shadow | pdp (needs [catalog.authz] endpoint)
 ```
 
 The node's IAM role needs `s3:PutObject`, `s3:GetObject` and `s3:ListBucket` on `<prefix>moderation/*`, which includes `moderation/audit/`.

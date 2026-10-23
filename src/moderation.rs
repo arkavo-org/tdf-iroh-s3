@@ -36,12 +36,20 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::auth::{AuthError, CwtVerifier, VerifiedClaims, VerifyOpts, subject_id_bind};
+use crate::authz::ChainEntity;
+use crate::entity_chain;
+use crate::publish_decision::{
+    PublishDecider, PublishDecisions, StoredEntity, Verdict, log_shadow, restore, strip_tokens,
+};
 
 pub const DEFAULT_PUBLISH_ENTITLEMENT: &str =
     "https://patreon.arkavo.com/attr/arkavo-creator/value/publish";
 
 const SUSPENSIONS: &str = "suspensions";
 const BLOCKS: &str = "blocks";
+/// `moderation/catalog-blocks/<subject>`: a sibling of `blocks/`, because
+/// records are listed recursively and would otherwise be read as blocks.
+const CATALOG_BLOCKS: &str = "catalog-blocks";
 const AUDIT: &str = "audit";
 const MAX_REASON_CHARS: usize = 1_000;
 
@@ -95,6 +103,25 @@ pub struct Suspension {
 pub struct Block {
     /// Lower-case hex BLAKE3 hash.
     pub hash: String,
+    pub reason: String,
+    #[serde(default)]
+    pub report_id: Option<String>,
+    pub by: String,
+    pub at: i64,
+    #[serde(default)]
+    pub lifted_by: Option<String>,
+    #[serde(default)]
+    pub lifted_at: Option<i64>,
+}
+
+/// A blocked creator catalog: the catalog tag, the v2 pointer and every
+/// catalog document the subject owns are refused (tdf-iroh-s3#35). Written
+/// by the moderation client when it suspends the creator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogBlock {
+    /// Canonical subject.
+    pub subject: String,
     pub reason: String,
     #[serde(default)]
     pub report_id: Option<String>,
@@ -182,6 +209,11 @@ struct SessionRecord {
     endpoint_id: String,
     subject: String,
     expires_at: i64,
+    /// The entity chain the session was decided with, without tokens, so a
+    /// push can be decided again (tdf-iroh-s3#35). Absent on records
+    /// written before it, and when decisions are local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chain: Option<Vec<StoredEntity>>,
 }
 
 /// The in-memory view every gate reads: active suspensions and blocks.
@@ -190,6 +222,7 @@ struct SessionRecord {
 pub struct Moderation {
     suspensions: RwLock<HashMap<String, Suspension>>,
     blocks: RwLock<HashMap<String, Block>>,
+    catalog_blocks: RwLock<HashMap<String, CatalogBlock>>,
 }
 
 impl Moderation {
@@ -211,6 +244,29 @@ impl Moderation {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(&hash_hex.to_ascii_lowercase())
+    }
+
+    /// Whether `subject`'s catalog and catalog documents are refused: a
+    /// catalog block, or a suspension with `hideCatalog`.
+    pub fn catalog_hidden(&self, subject: &str) -> bool {
+        let subject = canonical_subject(subject);
+        self.catalog_blocks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(subject)
+            || self.suspension(subject).is_some_and(|s| s.hide_catalog)
+    }
+
+    pub fn active_catalog_blocks(&self) -> Vec<CatalogBlock> {
+        let mut v: Vec<_> = self
+            .catalog_blocks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| a.subject.cmp(&b.subject));
+        v
     }
 
     pub fn active_suspensions(&self) -> Vec<Suspension> {
@@ -275,6 +331,32 @@ impl Moderation {
         }
     }
 
+    /// Block a subject's catalog in memory only (tests).
+    #[doc(hidden)]
+    pub fn block_catalog_for_test(&self, subject: &str) {
+        self.apply_catalog_block(CatalogBlock {
+            subject: canonical_subject(subject).to_string(),
+            reason: "test".into(),
+            report_id: None,
+            by: "test".into(),
+            at: now_secs(),
+            lifted_by: None,
+            lifted_at: None,
+        });
+    }
+
+    fn apply_catalog_block(&self, b: CatalogBlock) {
+        let mut m = self
+            .catalog_blocks
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if b.lifted_at.is_some() {
+            m.remove(&b.subject);
+        } else {
+            m.insert(b.subject.clone(), b);
+        }
+    }
+
     fn apply_block(&self, b: Block) {
         let mut m = self.blocks.write().unwrap_or_else(|e| e.into_inner());
         if b.lifted_at.is_some() {
@@ -307,8 +389,22 @@ impl Moderation {
                 Err(e) => warn!(error = %e, "Skipping unreadable block record"),
             }
         }
+        let mut catalog_blocks = HashMap::new();
+        for raw in store.list_records(CATALOG_BLOCKS).await? {
+            match serde_json::from_slice::<CatalogBlock>(&raw) {
+                Ok(b) if b.lifted_at.is_none() => {
+                    catalog_blocks.insert(b.subject.clone(), b);
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "Skipping unreadable catalog block record"),
+            }
+        }
         *self.suspensions.write().unwrap_or_else(|e| e.into_inner()) = suspensions;
         *self.blocks.write().unwrap_or_else(|e| e.into_inner()) = blocks;
+        *self
+            .catalog_blocks
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = catalog_blocks;
         Ok(())
     }
 
@@ -332,7 +428,11 @@ impl Moderation {
 struct Session {
     subject: String,
     expires: Instant,
+    chain: Option<Vec<StoredEntity>>,
 }
+
+/// A live session: its subject, and the chain it was decided with.
+type HeldSession = (String, Option<Vec<StoredEntity>>);
 
 /// Which iroh endpoints may push, and for whom. Sessions are held in memory
 /// and, with a session store, read back from it on a miss: another instance
@@ -345,6 +445,7 @@ pub struct PublishGate {
     lookups: tokio::sync::Semaphore,
     /// Endpoints whose last lookup found no live session, and when.
     misses: Mutex<HashMap<EndpointId, Instant>>,
+    decider: Arc<PublishDecider>,
 }
 
 /// Why a push was refused.
@@ -353,6 +454,11 @@ pub enum PushRefusal {
     NoSession,
     Suspended,
     Blocked,
+    /// The decision service denied the session's subject.
+    NotPermitted,
+    /// The decision service couldn't be asked (`decisions = pdp` fails
+    /// closed).
+    DecisionUnavailable,
 }
 
 impl PublishGate {
@@ -364,7 +470,14 @@ impl PublishGate {
             store: None,
             lookups: tokio::sync::Semaphore::new(SESSION_LOOKUPS),
             misses: Mutex::new(HashMap::new()),
+            decider: Arc::new(PublishDecider::default()),
         }
+    }
+
+    /// Decide pushes with `decider` as well (tdf-iroh-s3#35).
+    pub fn with_decider(mut self, decider: Arc<PublishDecider>) -> Self {
+        self.decider = decider;
+        self
     }
 
     /// Look up sessions this gate does not hold in `store`.
@@ -374,6 +487,17 @@ impl PublishGate {
     }
 
     pub fn open_session(&self, endpoint: EndpointId, subject: &str, ttl: Duration) -> Instant {
+        self.open_session_with_chain(endpoint, subject, ttl, None)
+    }
+
+    /// Open a session that keeps the (token-free) chain it was decided with.
+    pub fn open_session_with_chain(
+        &self,
+        endpoint: EndpointId,
+        subject: &str,
+        ttl: Duration,
+        chain: Option<Vec<StoredEntity>>,
+    ) -> Instant {
         let expires = Instant::now() + ttl;
         let mut s = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
@@ -383,6 +507,7 @@ impl PublishGate {
             Session {
                 subject: canonical_subject(subject).to_string(),
                 expires,
+                chain,
             },
         );
         expires
@@ -404,19 +529,20 @@ impl PublishGate {
             .remove(&connection_id);
     }
 
-    /// The live session's subject for `endpoint` held in memory.
-    fn held_session(&self, endpoint: &EndpointId) -> Option<String> {
+    /// The live session's subject and stored chain for `endpoint` held in
+    /// memory.
+    fn held_session(&self, endpoint: &EndpointId) -> Option<HeldSession> {
         let s = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         s.get(endpoint)
             .filter(|session| session.expires > Instant::now())
-            .map(|session| session.subject.clone())
+            .map(|session| (session.subject.clone(), session.chain.clone()))
     }
 
     /// The live session for `endpoint` in the session store, kept in memory
     /// once found. A store that fails or does not answer in time refuses the
     /// push, as no session would. An endpoint that just missed, or a push
     /// that finds every lookup busy, is refused without asking the store.
-    async fn stored_session(&self, endpoint: &EndpointId) -> Option<String> {
+    async fn stored_session(&self, endpoint: &EndpointId) -> Option<HeldSession> {
         let store = self.store.as_ref()?;
         if self.recently_missed(endpoint) {
             return None;
@@ -453,7 +579,11 @@ impl PublishGate {
         misses.insert(endpoint, Instant::now());
     }
 
-    async fn look_up(&self, store: &dyn SessionStore, endpoint: &EndpointId) -> Option<String> {
+    async fn look_up(
+        &self,
+        store: &dyn SessionStore,
+        endpoint: &EndpointId,
+    ) -> Option<HeldSession> {
         let key = endpoint.to_string();
         let body = match tokio::time::timeout(SESSION_LOOKUP_TIMEOUT, store.get_session(&key)).await
         {
@@ -475,8 +605,13 @@ impl PublishGate {
             return None;
         }
         info!(%endpoint, sub = %record.subject, "Publish session found in the session store");
-        self.open_session(*endpoint, &record.subject, Duration::from_secs(left as u64));
-        Some(canonical_subject(&record.subject).to_string())
+        self.open_session_with_chain(
+            *endpoint,
+            &record.subject,
+            Duration::from_secs(left as u64),
+            record.chain.clone(),
+        );
+        Some((canonical_subject(&record.subject).to_string(), record.chain))
     }
 
     /// The subject a push on `connection_id` is accepted for, or why not.
@@ -492,8 +627,8 @@ impl PublishGate {
             .get(&connection_id)
             .copied()
             .ok_or(PushRefusal::NoSession)?;
-        let subject = match self.held_session(&endpoint) {
-            Some(subject) => subject,
+        let (subject, chain) = match self.held_session(&endpoint) {
+            Some(held) => held,
             None => self
                 .stored_session(&endpoint)
                 .await
@@ -505,7 +640,44 @@ impl PublishGate {
         if self.moderation.is_blocked(hash_hex) {
             return Err(PushRefusal::Blocked);
         }
+        self.decide_push(&subject, chain.as_deref()).await?;
         Ok((subject, endpoint))
+    }
+
+    /// Ask the decision service again for a push, with the chain its session
+    /// was decided with (reused for 30 s per subject). So a suspension
+    /// stops pushes without waiting for the session to expire.
+    async fn decide_push(
+        &self,
+        subject: &str,
+        chain: Option<&[StoredEntity]>,
+    ) -> Result<(), PushRefusal> {
+        let mode = self.decider.mode();
+        if mode == PublishDecisions::Local {
+            return Ok(());
+        }
+        let Some(chain) = chain else {
+            // A session opened before decisions were asked, or by a node
+            // that decided locally, has nothing to ask with.
+            if mode == PublishDecisions::Pdp {
+                warn!(%subject, "Session has no stored chain; push refused");
+                return Err(PushRefusal::NoSession);
+            }
+            warn!(%subject, "Publish decision shadow: session has no stored chain");
+            return Ok(());
+        };
+        let verdict = self.decider.ask_for_push(subject, &restore(chain)).await;
+        match mode {
+            PublishDecisions::Shadow => {
+                log_shadow("push", subject, true, verdict);
+                Ok(())
+            }
+            _ => match verdict {
+                Verdict::Permit => Ok(()),
+                Verdict::Deny => Err(PushRefusal::NotPermitted),
+                Verdict::Unavailable => Err(PushRefusal::DecisionUnavailable),
+            },
+        }
     }
 }
 
@@ -518,6 +690,8 @@ pub struct PublishPolicy {
     pub session_ttl: Duration,
     /// Service clients allowed to use the operator API.
     pub operator_client_ids: HashSet<String>,
+    /// Who decides whether a subject may publish (tdf-iroh-s3#35).
+    pub decider: Arc<PublishDecider>,
 }
 
 impl PublishPolicy {
@@ -529,6 +703,19 @@ impl PublishPolicy {
         moderation: &Moderation,
         headers: &HeaderMap,
     ) -> Result<VerifiedClaims, (StatusCode, &'static str)> {
+        self.publisher_with_chain(verifier, moderation, headers)
+            .await
+            .map(|(claims, _)| claims)
+    }
+
+    /// [`publisher`](Self::publisher), also returning the entity chain the
+    /// decision service was asked with (`None` when decisions are local).
+    pub async fn publisher_with_chain(
+        &self,
+        verifier: &CwtVerifier,
+        moderation: &Moderation,
+        headers: &HeaderMap,
+    ) -> Result<(VerifiedClaims, Option<Vec<ChainEntity>>), (StatusCode, &'static str)> {
         let refuse = |status: StatusCode, reason: &'static str| {
             warn!(%status, reason, "Publisher refused");
             (status, reason)
@@ -568,22 +755,79 @@ impl PublishPolicy {
                 "service tokens cannot publish",
             ));
         }
-        if let Some(want) = &self.entitlement {
-            let entitled = claims
-                .arkavo_entitlements
-                .as_ref()
-                .is_some_and(|e| e.iter().any(|x| x == want));
-            if !entitled {
-                return Err(refuse(
-                    StatusCode::FORBIDDEN,
-                    "publishing entitlement required",
-                ));
-            }
-        }
+        // Kept in every mode until the platform's suspension constraint is
+        // live (tdf-iroh-s3#35, step 4e).
         if moderation.is_suspended(&claims.sub) {
             return Err(refuse(StatusCode::FORBIDDEN, "publishing suspended"));
         }
-        Ok(claims)
+        let local = match &self.entitlement {
+            Some(want)
+                if !claims
+                    .arkavo_entitlements
+                    .as_ref()
+                    .is_some_and(|e| e.iter().any(|x| x == want)) =>
+            {
+                Err((StatusCode::FORBIDDEN, "publishing entitlement required"))
+            }
+            _ => Ok(()),
+        };
+        match self.decider.mode() {
+            PublishDecisions::Local => {
+                local.map_err(|(status, reason)| refuse(status, reason))?;
+                Ok((claims, None))
+            }
+            PublishDecisions::Shadow => {
+                // A device token that fails here only means the shadow
+                // decision can't be asked: the local answer is enforced.
+                let chain = self.chain(verifier, headers, &claims, token).await;
+                let verdict = match &chain {
+                    Ok(chain) => self.decider.ask(chain).await,
+                    Err((_, reason)) => {
+                        warn!(sub = %claims.sub, reason, "Publish decision shadow: chain refused");
+                        Verdict::Unavailable
+                    }
+                };
+                log_shadow("publisher", &claims.sub, local.is_ok(), verdict);
+                local.map_err(|(status, reason)| refuse(status, reason))?;
+                Ok((claims, chain.ok()))
+            }
+            PublishDecisions::Pdp => {
+                let chain = self
+                    .chain(verifier, headers, &claims, token)
+                    .await
+                    .map_err(|(status, reason)| refuse(status, reason))?;
+                match self.decider.ask(&chain).await {
+                    Verdict::Permit => Ok((claims, Some(chain))),
+                    Verdict::Deny => Err(refuse(StatusCode::FORBIDDEN, "publishing not permitted")),
+                    Verdict::Unavailable => Err(refuse(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "decision service unavailable",
+                    )),
+                }
+            }
+        }
+    }
+
+    /// The verified entity chain for a publish decision: the person, each
+    /// `X-Entity-Token` device bound to it, and this node's environment.
+    async fn chain(
+        &self,
+        verifier: &CwtVerifier,
+        headers: &HeaderMap,
+        claims: &VerifiedClaims,
+        token: &str,
+    ) -> Result<Vec<ChainEntity>, (StatusCode, &'static str)> {
+        let devices = entity_chain::entity_tokens(headers);
+        let environment = self.decider.environment();
+        entity_chain::check_length(devices.len(), environment.is_some())?;
+        let mut chain = vec![entity_chain::subject_entity(claims, Some(token))];
+        chain.extend(
+            entity_chain::verified_devices(verifier, &devices, &claims.sub, now_secs()).await?,
+        );
+        if let Some(env) = environment {
+            chain.push(entity_chain::environment_entity(env));
+        }
+        Ok(chain)
     }
 
     /// Verify an operator: a service CWT (`sub = client:<id>`, role
@@ -658,6 +902,11 @@ pub fn router<S: ModerationStore>(state: Arc<ModerationApi<S>>) -> Router {
             put(suspend::<S>).delete(lift_suspension::<S>),
         )
         .route("/moderation/blocks", get(list_blocks::<S>))
+        .route("/moderation/blocks/catalogs", get(list_catalog_blocks::<S>))
+        .route(
+            "/moderation/blocks/catalogs/{subject}",
+            put(block_catalog::<S>).delete(lift_catalog_block::<S>),
+        )
         .route(
             "/moderation/blocks/{hash}",
             put(block::<S>).delete(lift_block::<S>),
@@ -718,11 +967,12 @@ async fn open_session<S: ModerationStore>(
     headers: HeaderMap,
     Json(body): Json<SessionRequest>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
-    let claims = s
+    let (claims, chain) = s
         .policy
-        .publisher(&s.verifier, &s.gate.moderation, &headers)
+        .publisher_with_chain(&s.verifier, &s.gate.moderation, &headers)
         .await
         .map_err(fail)?;
+    let chain = chain.as_deref().map(strip_tokens);
     let refuse = |(status, reason): (StatusCode, &'static str)| {
         warn!(sub = %claims.sub, %status, reason, "Publish session refused");
         fail((status, reason))
@@ -738,6 +988,7 @@ async fn open_session<S: ModerationStore>(
         endpoint_id: endpoint.to_string(),
         subject: claims.sub.clone(),
         expires_at,
+        chain: chain.clone(),
     };
     let body = Bytes::from(serde_json::to_vec(&record).expect("session record serializes"));
     if let Err(e) = s
@@ -748,7 +999,7 @@ async fn open_session<S: ModerationStore>(
         warn!(sub = %claims.sub, %endpoint, error = %e, "Publish session not stored; it holds on this instance only");
     }
     s.gate
-        .open_session(endpoint, &claims.sub, s.policy.session_ttl);
+        .open_session_with_chain(endpoint, &claims.sub, s.policy.session_ttl, chain);
     info!(sub = %claims.sub, %endpoint, "Publish session opened");
     Ok((
         StatusCode::CREATED,
@@ -973,6 +1224,95 @@ async fn lift_block<S: ModerationStore>(
     Ok(Json(record))
 }
 
+async fn list_catalog_blocks<S: ModerationStore>(
+    State(s): State<Arc<ModerationApi<S>>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<CatalogBlock>>> {
+    s.policy
+        .operator(&s.verifier, &headers)
+        .await
+        .map_err(fail)?;
+    Ok(Json(s.gate.moderation.active_catalog_blocks()))
+}
+
+async fn block_catalog<S: ModerationStore>(
+    State(s): State<Arc<ModerationApi<S>>>,
+    Path(subject): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ActionRequest>,
+) -> ApiResult<Json<CatalogBlock>> {
+    let by = s
+        .policy
+        .operator(&s.verifier, &headers)
+        .await
+        .map_err(fail)?;
+    let subject = canonical_subject(&subject).to_string();
+    if !valid_subject(&subject) {
+        return Err(fail((StatusCode::BAD_REQUEST, "invalid subject")));
+    }
+    if body.hide_catalog {
+        return Err(fail((
+            StatusCode::BAD_REQUEST,
+            "hideCatalog applies to suspensions",
+        )));
+    }
+    let record = CatalogBlock {
+        subject: subject.clone(),
+        reason: checked_reason(&body.reason)?,
+        report_id: checked_report_id(body.report_id)?,
+        by,
+        at: now_secs(),
+        lifted_by: None,
+        lifted_at: None,
+    };
+    audit(
+        s.store.as_ref(),
+        "block_catalog",
+        CATALOG_BLOCKS,
+        &subject,
+        &record,
+    )
+    .await?;
+    persist(s.store.as_ref(), CATALOG_BLOCKS, &subject, &record).await?;
+    s.gate.moderation.apply_catalog_block(record.clone());
+    info!(audit = "block_catalog", %subject, by = %record.by, report = ?record.report_id, "Creator catalog blocked");
+    Ok(Json(record))
+}
+
+async fn lift_catalog_block<S: ModerationStore>(
+    State(s): State<Arc<ModerationApi<S>>>,
+    Path(subject): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<CatalogBlock>> {
+    let by = s
+        .policy
+        .operator(&s.verifier, &headers)
+        .await
+        .map_err(fail)?;
+    let subject = canonical_subject(&subject).to_string();
+    let mut record = s
+        .gate
+        .moderation
+        .active_catalog_blocks()
+        .into_iter()
+        .find(|b| b.subject == subject)
+        .ok_or_else(|| fail((StatusCode::NOT_FOUND, "no active catalog block")))?;
+    record.lifted_by = Some(by);
+    record.lifted_at = Some(now_secs());
+    audit(
+        s.store.as_ref(),
+        "lift_catalog_block",
+        CATALOG_BLOCKS,
+        &subject,
+        &record,
+    )
+    .await?;
+    persist(s.store.as_ref(), CATALOG_BLOCKS, &subject, &record).await?;
+    s.gate.moderation.apply_catalog_block(record.clone());
+    info!(audit = "lift_catalog_block", %subject, by = ?record.lifted_by, "Catalog block lifted");
+    Ok(Json(record))
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
@@ -1082,9 +1422,15 @@ mod tests {
     }
 
     fn harness() -> Harness {
+        harness_with(Default::default())
+    }
+
+    fn harness_with(decider: Arc<PublishDecider>) -> Harness {
         let (_, vk) = keypair();
         let store = Arc::new(MemModeration::default());
-        let gate = Arc::new(PublishGate::new(Arc::new(Moderation::default())));
+        let gate = Arc::new(
+            PublishGate::new(Arc::new(Moderation::default())).with_decider(Arc::clone(&decider)),
+        );
         let api = Arc::new(ModerationApi {
             store: store.clone(),
             verifier: Arc::new(CwtVerifier::with_static_keys(vec![(KID.to_vec(), vk)])),
@@ -1094,6 +1440,7 @@ mod tests {
                 audience: Some("arkavo".into()),
                 session_ttl: Duration::from_secs(600),
                 operator_client_ids: HashSet::from(["moderation".to_string()]),
+                decider,
             }),
         });
         Harness {
@@ -1110,10 +1457,24 @@ mod tests {
         bearer: &str,
         body: Option<serde_json::Value>,
     ) -> (StatusCode, serde_json::Value) {
+        call_with(app, method, uri, bearer, &[], body).await
+    }
+
+    async fn call_with(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        bearer: &str,
+        headers: &[(&str, &str)],
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
         let mut req = Request::builder()
             .method(method)
             .uri(uri)
             .header("authorization", format!("Bearer {bearer}"));
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
         if body.is_some() {
             req = req.header("content-type", "application/json");
         }
@@ -1661,5 +2022,311 @@ mod tests {
         // The current record is the latest; history survives the overwrite.
         let current: Suspension = serde_json::from_slice(&records["suspensions/u1"]).unwrap();
         assert_eq!(current.reason, "second");
+    }
+
+    /// A decision service whose answer the test sets: permit, deny or down.
+    #[derive(Default)]
+    struct Pdp {
+        answer: std::sync::atomic::AtomicU8,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    const PERMIT: u8 = 0;
+    const DENY: u8 = 1;
+    const DOWN: u8 = 2;
+
+    impl crate::authz::DecisionProvider for Pdp {
+        async fn decide(
+            &self,
+            req: crate::authz::DecisionRequest,
+        ) -> anyhow::Result<crate::authz::Decisions> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let answer = self.answer.load(Ordering::SeqCst);
+            anyhow::ensure!(answer != DOWN, "pdp down");
+            Ok(req
+                .resources
+                .into_iter()
+                .map(|(id, _)| (id, answer == PERMIT))
+                .collect())
+        }
+    }
+
+    fn deciding(mode: PublishDecisions) -> (Harness, Arc<Pdp>) {
+        let pdp = Arc::new(Pdp::default());
+        let decider = PublishDecider::new(
+            mode,
+            Some(Arc::clone(&pdp) as crate::authz::SharedDecisionProvider),
+            DEFAULT_PUBLISH_ENTITLEMENT.into(),
+            Some(serde_json::json!({ "kind": "environment", "region": "us-east-1" })),
+        )
+        .unwrap();
+        (harness_with(Arc::new(decider)), pdp)
+    }
+
+    fn set(pdp: &Pdp, answer: u8) {
+        pdp.answer
+            .store(answer, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn pdp_decides_sessions_and_replaces_the_local_entitlement_check() {
+        let (h, pdp) = deciding(PublishDecisions::Pdp);
+        // No entitlement in the token, but the PDP permits: the PDP decides.
+        let tok = token("arkavo:u1", "arkavo", &[], &[]);
+        let sk = key();
+        let (status, body) =
+            call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        set(&pdp, DENY);
+        let sk = key();
+        let tok = creator("arkavo:u2");
+        let (status, body) =
+            call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "publishing not permitted");
+
+        set(&pdp, DOWN);
+        let (status, body) =
+            call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "decision service unavailable");
+    }
+
+    #[tokio::test]
+    async fn pdp_sessions_store_the_chain_without_tokens_and_pushes_are_decided_again() {
+        let (h, pdp) = deciding(PublishDecisions::Pdp);
+        let sk = key();
+        let ep = sk.public();
+        let tok = creator("arkavo:u1");
+        let (status, body) =
+            call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let raw = h.store.records.lock().unwrap()[&format!("sessions/{ep}")].clone();
+        assert!(!String::from_utf8_lossy(&raw).contains(&tok));
+        let stored: SessionRecord = serde_json::from_slice(&raw).unwrap();
+        let chain = stored.chain.expect("chain stored");
+        assert_eq!(
+            chain.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            vec![
+                crate::authz::EntityKind::Subject,
+                crate::authz::EntityKind::Environment
+            ]
+        );
+
+        // Another instance reads the session back and asks the PDP again.
+        let other = other_instance(&h).with_decider(Arc::clone(&h.gate.decider));
+        other.connected(1, Some(ep));
+        let before = pdp.calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(other.authorize_push(1, &"a".repeat(64)).await.is_ok());
+        assert_eq!(
+            pdp.calls.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn pdp_pushes_are_refused_when_denied_unavailable_or_without_a_stored_chain() {
+        for (answer, want) in [
+            (DENY, PushRefusal::NotPermitted),
+            (DOWN, PushRefusal::DecisionUnavailable),
+        ] {
+            let (h, pdp) = deciding(PublishDecisions::Pdp);
+            let sk = key();
+            let tok = creator("arkavo:u1");
+            let (status, _) =
+                call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
+            assert_eq!(status, StatusCode::CREATED);
+            set(&pdp, answer);
+            h.gate.connected(1, Some(sk.public()));
+            assert_eq!(h.gate.authorize_push(1, &"a".repeat(64)).await, Err(want));
+        }
+
+        // A session opened without a chain (before this change) has nothing
+        // to ask with.
+        let (h, _) = deciding(PublishDecisions::Pdp);
+        let ep = endpoint();
+        h.gate
+            .open_session(ep, "arkavo:u1", Duration::from_secs(60));
+        h.gate.connected(2, Some(ep));
+        assert_eq!(
+            h.gate.authorize_push(2, &"a".repeat(64)).await,
+            Err(PushRefusal::NoSession)
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_enforces_the_local_answer() {
+        let (h, pdp) = deciding(PublishDecisions::Shadow);
+        // Entitled locally, denied by the PDP: allowed.
+        set(&pdp, DENY);
+        let sk = key();
+        let tok = creator("arkavo:u1");
+        let (status, _) = call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        h.gate.connected(1, Some(sk.public()));
+        assert!(h.gate.authorize_push(1, &"a".repeat(64)).await.is_ok());
+
+        // Not entitled locally, permitted by the PDP: refused.
+        set(&pdp, PERMIT);
+        let sk = key();
+        let tok = token("arkavo:u2", "arkavo", &[], &[]);
+        let (status, body) =
+            call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "publishing entitlement required");
+
+        // The PDP being down changes nothing.
+        set(&pdp, DOWN);
+        let sk = key();
+        let tok = creator("arkavo:u3");
+        let (status, _) = call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(pdp.calls.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+    }
+
+    #[tokio::test]
+    async fn device_tokens_are_verified_only_when_the_pdp_is_asked() {
+        let bad = [("x-entity-token", "not-a-cwt")];
+        let tok = creator("arkavo:u1");
+
+        let h = harness();
+        let sk = key();
+        let (status, _) = call_with(
+            &h.app,
+            "POST",
+            "/publish/sessions",
+            &tok,
+            &bad,
+            signed(&sk, &tok),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "local mode ignores device tokens"
+        );
+
+        let (h, pdp) = deciding(PublishDecisions::Pdp);
+        let sk = key();
+        let (status, body) = call_with(
+            &h.app,
+            "POST",
+            "/publish/sessions",
+            &tok,
+            &bad,
+            signed(&sk, &tok),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "invalid entity token");
+        assert_eq!(pdp.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn suspensions_still_apply_when_the_pdp_decides() {
+        let (h, _) = deciding(PublishDecisions::Pdp);
+        h.gate.moderation.suspend_for_test("arkavo:u1", false);
+        let sk = key();
+        let tok = creator("arkavo:u1");
+        let (status, body) =
+            call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "publishing suspended");
+    }
+
+    #[tokio::test]
+    async fn catalog_blocks_are_audited_hide_the_catalog_and_can_be_lifted() {
+        let h = harness();
+        let op = operator();
+        let (status, body) = call(
+            &h.app,
+            "PUT",
+            "/moderation/blocks/catalogs/arkavo:u1",
+            &op,
+            Some(serde_json::json!({ "reason": "suspended", "reportId": "r-1" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["subject"], "u1");
+        assert!(h.gate.moderation.catalog_hidden("arkavo:u1"));
+        assert!(h.gate.moderation.catalog_hidden("u1"));
+        assert!(!h.gate.moderation.catalog_hidden("u2"));
+        // Stored under its own prefix, never read back as a hash block.
+        assert!(
+            h.store
+                .records
+                .lock()
+                .unwrap()
+                .contains_key("catalog-blocks/u1")
+        );
+        let view = Moderation::default();
+        view.reload(h.store.as_ref()).await.unwrap();
+        assert!(view.catalog_hidden("u1"));
+        assert!(view.active_blocks().is_empty());
+
+        let (status, list) = call(&h.app, "GET", "/moderation/blocks/catalogs", &op, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(list.as_array().unwrap().len(), 1);
+
+        let (status, _) = call(
+            &h.app,
+            "DELETE",
+            "/moderation/blocks/catalogs/u1",
+            &op,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!h.gate.moderation.catalog_hidden("u1"));
+        let audit = h
+            .store
+            .records
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|k| k.starts_with("audit/catalog-blocks/u1/"))
+            .count();
+        assert_eq!(audit, 2);
+
+        // Only operators.
+        let tok = creator("u3");
+        let (status, _) = call(
+            &h.app,
+            "PUT",
+            "/moderation/blocks/catalogs/u3",
+            &tok,
+            Some(serde_json::json!({ "reason": "x" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn a_hide_catalog_suspension_still_hides_the_catalog() {
+        let m = Moderation::default();
+        m.suspend_for_test("u1", false);
+        assert!(!m.catalog_hidden("u1"));
+        m.suspend_for_test("u2", true);
+        assert!(m.catalog_hidden("arkavo:u2"));
+    }
+
+    #[tokio::test]
+    async fn shadow_ignores_a_bad_device_token_and_skips_the_pdp() {
+        let (h, pdp) = deciding(PublishDecisions::Shadow);
+        let tok = creator("arkavo:u1");
+        let sk = key();
+        let (status, _) = call_with(
+            &h.app,
+            "POST",
+            "/publish/sessions",
+            &tok,
+            &[("x-entity-token", "not-a-cwt")],
+            signed(&sk, &tok),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(pdp.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

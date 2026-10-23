@@ -31,16 +31,31 @@
 //! Unconfigured ⇒ `DenyAll`: the catalog still lists, nothing is entitled.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::Arc;
 use tracing::warn;
+
+/// What a chain entity stands for. Explicit, not inferred from whether a
+/// token is held: a chain read back from a stored publish session keeps
+/// its devices but no tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntityKind {
+    /// The person entity (category SUBJECT).
+    Subject,
+    /// An attested device (DeviceCheck CWT), sent as category ENVIRONMENT.
+    Device,
+    /// What this node observes (its region), sent as category ENVIRONMENT.
+    Environment,
+}
 
 /// One entity in the chain, ordered PE first.
 #[derive(Debug, Clone)]
 pub struct ChainEntity {
-    /// True for the person entity; false for NPEs (category ENVIRONMENT).
-    pub is_subject: bool,
+    pub kind: EntityKind,
     /// Bearer token (base64url) — used only in token mode, and only for
     /// the subject.
     pub token: Option<String>,
@@ -50,10 +65,35 @@ pub struct ChainEntity {
     pub claims: Value,
 }
 
+impl ChainEntity {
+    pub fn is_subject(&self) -> bool {
+        self.kind == EntityKind::Subject
+    }
+}
+
+/// The AuthZEN `resource.type` a decision is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceType {
+    /// An item of `GET /catalog/{group}`.
+    CatalogItem,
+    /// The right to publish (tdf-iroh-s3#35).
+    Publisher,
+}
+
+impl ResourceType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResourceType::CatalogItem => "catalog_item",
+            ResourceType::Publisher => "publisher",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DecisionRequest {
     pub chain: Vec<ChainEntity>,
     pub action: String,
+    pub resource_type: ResourceType,
     /// (resource id, attribute-value FQNs) per catalog item.
     pub resources: Vec<(String, Vec<String>)>,
 }
@@ -63,6 +103,33 @@ pub type Decisions = HashMap<String, bool>;
 
 pub trait DecisionProvider: Send + Sync + 'static {
     fn decide(&self, req: DecisionRequest) -> impl Future<Output = Result<Decisions>> + Send;
+}
+
+/// Object-safe form of [`DecisionProvider`], for holders that are not
+/// generic over the provider: the publish gate and the HTTP state.
+pub trait DynDecisionProvider: Send + Sync + 'static {
+    fn decide_dyn(
+        &self,
+        req: DecisionRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Decisions>> + Send + '_>>;
+}
+
+impl<T: DecisionProvider> DynDecisionProvider for T {
+    fn decide_dyn(
+        &self,
+        req: DecisionRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Decisions>> + Send + '_>> {
+        Box::pin(self.decide(req))
+    }
+}
+
+/// One provider shared by the catalog and the publishing decisions.
+pub type SharedDecisionProvider = Arc<dyn DynDecisionProvider>;
+
+impl DecisionProvider for SharedDecisionProvider {
+    async fn decide(&self, req: DecisionRequest) -> Result<Decisions> {
+        self.decide_dyn(req).await
+    }
 }
 
 /// Fail-closed provider used when no authorization endpoint is configured.
@@ -193,7 +260,7 @@ impl ConnectAuthzClient {
         let pe = req
             .chain
             .iter()
-            .find(|e| e.is_subject)
+            .find(|e| e.is_subject())
             .context("decision request has no subject entity")?;
 
         let entity_identifier = match self.entity_mode {
@@ -220,7 +287,7 @@ impl ConnectAuthzClient {
                     .iter()
                     .enumerate()
                     .map(|(i, e)| {
-                        let category = if e.is_subject {
+                        let category = if e.is_subject() {
                             "CATEGORY_SUBJECT"
                         } else {
                             "CATEGORY_ENVIRONMENT"
@@ -492,6 +559,7 @@ impl DecisionProvider for AuthZenClient {
             let part = DecisionRequest {
                 chain: req.chain.clone(),
                 action: req.action.clone(),
+                resource_type: req.resource_type,
                 resources: chunk.to_vec(),
             };
             decisions.extend(self.decide_batch(&url, &part).await?);
@@ -531,7 +599,7 @@ pub(crate) fn build_authzen_request(req: &DecisionRequest) -> Result<Value> {
     let pe = req
         .chain
         .iter()
-        .find(|e| e.is_subject)
+        .find(|e| e.is_subject())
         .context("decision request has no subject entity")?;
     anyhow::ensure!(
         !req.resources.is_empty(),
@@ -541,12 +609,9 @@ pub(crate) fn build_authzen_request(req: &DecisionRequest) -> Result<Value> {
     let devices: Vec<&ChainEntity> = req
         .chain
         .iter()
-        .filter(|e| !e.is_subject && e.token.is_some())
+        .filter(|e| e.kind == EntityKind::Device)
         .collect();
-    let environment = req
-        .chain
-        .iter()
-        .find(|e| !e.is_subject && e.token.is_none());
+    let environment = req.chain.iter().find(|e| e.kind == EntityKind::Environment);
 
     let mut context = Map::new();
     match devices.len() {
@@ -577,7 +642,7 @@ pub(crate) fn build_authzen_request(req: &DecisionRequest) -> Result<Value> {
         "context": context,
         "evaluations": req.resources.iter().map(|(id, fqns)| json!({
             "resource": {
-                "type": "catalog_item",
+                "type": req.resource_type.as_str(),
                 "id": id,
                 "properties": { "attribute_value_fqns": fqns },
             }
@@ -712,7 +777,7 @@ mod tests {
 
     fn pe(token: &str) -> ChainEntity {
         ChainEntity {
-            is_subject: true,
+            kind: EntityKind::Subject,
             token: Some(token.to_string()),
             claims: json!({
                 "patreon_user_id": "p-1",
@@ -727,6 +792,7 @@ mod tests {
         let req = DecisionRequest {
             chain: vec![],
             action: "read".into(),
+            resource_type: ResourceType::CatalogItem,
             resources: vec![("r1".into(), vec![])],
         };
         let d = DenyAll.decide(req).await.unwrap();
@@ -749,6 +815,7 @@ mod tests {
         let req = DecisionRequest {
             chain: vec![pe("tok-abc")],
             action: "read".into(),
+            resource_type: ResourceType::CatalogItem,
             resources: vec![(
                 "hash1".into(),
                 vec!["https://p.example/attr/tier/value/gold".into()],
@@ -778,6 +845,7 @@ mod tests {
         let req = DecisionRequest {
             chain: vec![pe("tok-abc")],
             action: "read".into(),
+            resource_type: ResourceType::CatalogItem,
             resources: vec![("hash1".into(), vec![])],
         };
         let body = client(EntityMode::Token).build_request(&req).unwrap();
@@ -793,12 +861,13 @@ mod tests {
             chain: vec![
                 pe("pe-tok"),
                 ChainEntity {
-                    is_subject: false,
+                    kind: EntityKind::Environment,
                     token: None,
                     claims: json!({ "region": "us-east-1" }),
                 },
             ],
             action: "read".into(),
+            resource_type: ResourceType::CatalogItem,
             resources: vec![("r".into(), vec![])],
         };
         let body = client(EntityMode::Token).build_request(&req).unwrap();
@@ -810,11 +879,12 @@ mod tests {
     fn request_without_subject_is_an_error() {
         let req = DecisionRequest {
             chain: vec![ChainEntity {
-                is_subject: false,
+                kind: EntityKind::Environment,
                 token: None,
                 claims: json!({}),
             }],
             action: "read".into(),
+            resource_type: ResourceType::CatalogItem,
             resources: vec![],
         };
         assert!(client(EntityMode::Claims).build_request(&req).is_err());
@@ -826,17 +896,18 @@ mod tests {
             chain: vec![
                 pe("pe-tok"),
                 ChainEntity {
-                    is_subject: false,
+                    kind: EntityKind::Device,
                     token: Some("npe-tok".into()),
                     claims: json!({ "sub": "arkavo:u1", "kind": "ios-app" }),
                 },
                 ChainEntity {
-                    is_subject: false,
+                    kind: EntityKind::Environment,
                     token: None,
                     claims: json!({ "region": "us-east-1" }),
                 },
             ],
             action: "read".into(),
+            resource_type: ResourceType::CatalogItem,
             resources: vec![("r".into(), vec![])],
         };
         let body = client(EntityMode::Claims).build_request(&req).unwrap();
@@ -915,7 +986,7 @@ mod tests {
 
     fn device(sub: &str, kid: &str) -> ChainEntity {
         ChainEntity {
-            is_subject: false,
+            kind: EntityKind::Device,
             token: Some("device-cwt".into()),
             claims: json!({
                 "sub": sub,
@@ -935,7 +1006,7 @@ mod tests {
                 device("550e8400-e29b-41d4-a716-446655440000", "cGhvbmUta2lk"),
                 device("550e8400-e29b-41d4-a716-446655440000", "d2F0Y2gta2lk"),
                 ChainEntity {
-                    is_subject: false,
+                    kind: EntityKind::Environment,
                     token: None,
                     claims: json!({
                         "region": "us-east-1",
@@ -946,6 +1017,7 @@ mod tests {
                 },
             ],
             action: "read".into(),
+            resource_type: ResourceType::CatalogItem,
             resources: vec![(
                 "aa".repeat(32),
                 vec!["https://p.example/attr/tier/value/gold".into()],
@@ -983,6 +1055,7 @@ mod tests {
         let req = DecisionRequest {
             chain: vec![pe("pe-cwt"), device("arkavo:u1", "cGhvbmUta2lk")],
             action: "read".into(),
+            resource_type: ResourceType::CatalogItem,
             resources: vec![("r".into(), vec![])],
         };
         let body = build_authzen_request(&req).unwrap();
@@ -995,6 +1068,7 @@ mod tests {
         let req = DecisionRequest {
             chain: vec![pe("pe-cwt")],
             action: "read".into(),
+            resource_type: ResourceType::CatalogItem,
             resources: vec![("r".into(), vec![])],
         };
         let body = build_authzen_request(&req).unwrap();
@@ -1041,6 +1115,7 @@ mod tests {
         let req = DecisionRequest {
             chain: vec![pe("pe-cwt")],
             action: "read".into(),
+            resource_type: ResourceType::CatalogItem,
             resources: vec![],
         };
         assert!(build_authzen_request(&req).is_err());
@@ -1110,6 +1185,7 @@ mod tests {
         DecisionRequest {
             chain: vec![pe("tok")],
             action: "read".into(),
+            resource_type: ResourceType::CatalogItem,
             resources: (0..n).map(|i| (format!("h{i}"), vec![])).collect(),
         }
     }

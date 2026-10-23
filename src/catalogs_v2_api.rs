@@ -534,6 +534,7 @@ mod tests {
                     audience: Some("arkavo".into()),
                     session_ttl: Duration::from_secs(60),
                     operator_client_ids: Default::default(),
+                    decider: Default::default(),
                 }),
                 moderation: Arc::clone(&moderation),
             }),
@@ -991,6 +992,14 @@ mod tests {
         let h = ingested().await;
         assert_eq!(publish(&h, 1, &doc()).await.status, StatusCode::OK);
         h.moderation.suspend_for_test(SUB, true);
+        assert_eq!(get(&h, SUB).await.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_catalog_block_hides_the_pointer() {
+        let h = ingested().await;
+        assert_eq!(publish(&h, 1, &doc()).await.status, StatusCode::OK);
+        h.moderation.block_catalog_for_test(SUB);
         assert_eq!(get(&h, SUB).await.status, StatusCode::NOT_FOUND);
     }
 
