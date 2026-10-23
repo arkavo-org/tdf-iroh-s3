@@ -996,6 +996,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_catalog_block_hides_the_pointer() {
+        let h = ingested().await;
+        assert_eq!(publish(&h, 1, &doc()).await.status, StatusCode::OK);
+        h.moderation.block_catalog_for_test(SUB);
+        assert_eq!(get(&h, SUB).await.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn reads_of_unknown_and_invalid_subjects() {
         let h = harness();
         let r = get(&h, SUB).await;

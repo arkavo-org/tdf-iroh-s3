@@ -298,14 +298,13 @@ async fn get_catalog_document<S: TagStore>(
     }
 }
 
-/// True when the document's owner is suspended with `hideCatalog` on this
-/// (gated) node.
+/// True when the document's owner has a catalog block (or a `hideCatalog`
+/// suspension) on this (gated) node.
 pub(crate) fn owner_hidden<S: TagStore>(state: &ApiState<S>, owner: Option<&str>) -> bool {
-    state.publishing.as_ref().is_some_and(|p| {
-        owner
-            .and_then(|o| p.moderation.suspension(o))
-            .is_some_and(|s| s.hide_catalog)
-    })
+    state
+        .publishing
+        .as_ref()
+        .is_some_and(|p| owner.is_some_and(|o| p.moderation.catalog_hidden(o)))
 }
 
 /// Whether `If-None-Match` names `etag`: `*`, the tag itself, or its weak
@@ -985,6 +984,22 @@ mod tests {
         // A block reaches a client that revalidates.
         h.moderation.block_for_test(&hash);
         let r = get_with(&h.app, &path, &etag).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::NOT_FOUND, "catalog not found")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_catalog_block_hides_the_document() {
+        let h = harness(true);
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
+        let r = put_catalog(&h.app, SUB, Some(&creator()), doc()).await;
+        let hash = r.json()["hash"].as_str().unwrap().to_string();
+        let path = format!("/catalog-documents/{hash}");
+        assert_eq!(get(&h.app, &path).await.status, StatusCode::OK);
+        h.moderation.block_catalog_for_test(SUB);
+        let r = get(&h.app, &path).await;
         assert_eq!(
             (r.status, r.error().as_str()),
             (StatusCode::NOT_FOUND, "catalog not found")

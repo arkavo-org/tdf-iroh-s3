@@ -47,6 +47,9 @@ pub const DEFAULT_PUBLISH_ENTITLEMENT: &str =
 
 const SUSPENSIONS: &str = "suspensions";
 const BLOCKS: &str = "blocks";
+/// `moderation/catalog-blocks/<subject>`: a sibling of `blocks/`, because
+/// records are listed recursively and would otherwise be read as blocks.
+const CATALOG_BLOCKS: &str = "catalog-blocks";
 const AUDIT: &str = "audit";
 const MAX_REASON_CHARS: usize = 1_000;
 
@@ -100,6 +103,25 @@ pub struct Suspension {
 pub struct Block {
     /// Lower-case hex BLAKE3 hash.
     pub hash: String,
+    pub reason: String,
+    #[serde(default)]
+    pub report_id: Option<String>,
+    pub by: String,
+    pub at: i64,
+    #[serde(default)]
+    pub lifted_by: Option<String>,
+    #[serde(default)]
+    pub lifted_at: Option<i64>,
+}
+
+/// A blocked creator catalog: the catalog tag, the v2 pointer and every
+/// catalog document the subject owns are refused (tdf-iroh-s3#35). Written
+/// by the moderation client when it suspends the creator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogBlock {
+    /// Canonical subject.
+    pub subject: String,
     pub reason: String,
     #[serde(default)]
     pub report_id: Option<String>,
@@ -200,6 +222,7 @@ struct SessionRecord {
 pub struct Moderation {
     suspensions: RwLock<HashMap<String, Suspension>>,
     blocks: RwLock<HashMap<String, Block>>,
+    catalog_blocks: RwLock<HashMap<String, CatalogBlock>>,
 }
 
 impl Moderation {
@@ -221,6 +244,29 @@ impl Moderation {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(&hash_hex.to_ascii_lowercase())
+    }
+
+    /// Whether `subject`'s catalog and catalog documents are refused: a
+    /// catalog block, or a suspension with `hideCatalog`.
+    pub fn catalog_hidden(&self, subject: &str) -> bool {
+        let subject = canonical_subject(subject);
+        self.catalog_blocks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(subject)
+            || self.suspension(subject).is_some_and(|s| s.hide_catalog)
+    }
+
+    pub fn active_catalog_blocks(&self) -> Vec<CatalogBlock> {
+        let mut v: Vec<_> = self
+            .catalog_blocks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| a.subject.cmp(&b.subject));
+        v
     }
 
     pub fn active_suspensions(&self) -> Vec<Suspension> {
@@ -285,6 +331,32 @@ impl Moderation {
         }
     }
 
+    /// Block a subject's catalog in memory only (tests).
+    #[doc(hidden)]
+    pub fn block_catalog_for_test(&self, subject: &str) {
+        self.apply_catalog_block(CatalogBlock {
+            subject: canonical_subject(subject).to_string(),
+            reason: "test".into(),
+            report_id: None,
+            by: "test".into(),
+            at: now_secs(),
+            lifted_by: None,
+            lifted_at: None,
+        });
+    }
+
+    fn apply_catalog_block(&self, b: CatalogBlock) {
+        let mut m = self
+            .catalog_blocks
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if b.lifted_at.is_some() {
+            m.remove(&b.subject);
+        } else {
+            m.insert(b.subject.clone(), b);
+        }
+    }
+
     fn apply_block(&self, b: Block) {
         let mut m = self.blocks.write().unwrap_or_else(|e| e.into_inner());
         if b.lifted_at.is_some() {
@@ -317,8 +389,22 @@ impl Moderation {
                 Err(e) => warn!(error = %e, "Skipping unreadable block record"),
             }
         }
+        let mut catalog_blocks = HashMap::new();
+        for raw in store.list_records(CATALOG_BLOCKS).await? {
+            match serde_json::from_slice::<CatalogBlock>(&raw) {
+                Ok(b) if b.lifted_at.is_none() => {
+                    catalog_blocks.insert(b.subject.clone(), b);
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "Skipping unreadable catalog block record"),
+            }
+        }
         *self.suspensions.write().unwrap_or_else(|e| e.into_inner()) = suspensions;
         *self.blocks.write().unwrap_or_else(|e| e.into_inner()) = blocks;
+        *self
+            .catalog_blocks
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = catalog_blocks;
         Ok(())
     }
 
@@ -816,6 +902,11 @@ pub fn router<S: ModerationStore>(state: Arc<ModerationApi<S>>) -> Router {
             put(suspend::<S>).delete(lift_suspension::<S>),
         )
         .route("/moderation/blocks", get(list_blocks::<S>))
+        .route("/moderation/blocks/catalogs", get(list_catalog_blocks::<S>))
+        .route(
+            "/moderation/blocks/catalogs/{subject}",
+            put(block_catalog::<S>).delete(lift_catalog_block::<S>),
+        )
         .route(
             "/moderation/blocks/{hash}",
             put(block::<S>).delete(lift_block::<S>),
@@ -1130,6 +1221,95 @@ async fn lift_block<S: ModerationStore>(
     persist(s.store.as_ref(), BLOCKS, &hash, &record).await?;
     s.gate.moderation.apply_block(record.clone());
     info!(audit = "lift_block", %hash, by = ?record.lifted_by, "Block lifted");
+    Ok(Json(record))
+}
+
+async fn list_catalog_blocks<S: ModerationStore>(
+    State(s): State<Arc<ModerationApi<S>>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Vec<CatalogBlock>>> {
+    s.policy
+        .operator(&s.verifier, &headers)
+        .await
+        .map_err(fail)?;
+    Ok(Json(s.gate.moderation.active_catalog_blocks()))
+}
+
+async fn block_catalog<S: ModerationStore>(
+    State(s): State<Arc<ModerationApi<S>>>,
+    Path(subject): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ActionRequest>,
+) -> ApiResult<Json<CatalogBlock>> {
+    let by = s
+        .policy
+        .operator(&s.verifier, &headers)
+        .await
+        .map_err(fail)?;
+    let subject = canonical_subject(&subject).to_string();
+    if !valid_subject(&subject) {
+        return Err(fail((StatusCode::BAD_REQUEST, "invalid subject")));
+    }
+    if body.hide_catalog {
+        return Err(fail((
+            StatusCode::BAD_REQUEST,
+            "hideCatalog applies to suspensions",
+        )));
+    }
+    let record = CatalogBlock {
+        subject: subject.clone(),
+        reason: checked_reason(&body.reason)?,
+        report_id: checked_report_id(body.report_id)?,
+        by,
+        at: now_secs(),
+        lifted_by: None,
+        lifted_at: None,
+    };
+    audit(
+        s.store.as_ref(),
+        "block_catalog",
+        CATALOG_BLOCKS,
+        &subject,
+        &record,
+    )
+    .await?;
+    persist(s.store.as_ref(), CATALOG_BLOCKS, &subject, &record).await?;
+    s.gate.moderation.apply_catalog_block(record.clone());
+    info!(audit = "block_catalog", %subject, by = %record.by, report = ?record.report_id, "Creator catalog blocked");
+    Ok(Json(record))
+}
+
+async fn lift_catalog_block<S: ModerationStore>(
+    State(s): State<Arc<ModerationApi<S>>>,
+    Path(subject): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<CatalogBlock>> {
+    let by = s
+        .policy
+        .operator(&s.verifier, &headers)
+        .await
+        .map_err(fail)?;
+    let subject = canonical_subject(&subject).to_string();
+    let mut record = s
+        .gate
+        .moderation
+        .active_catalog_blocks()
+        .into_iter()
+        .find(|b| b.subject == subject)
+        .ok_or_else(|| fail((StatusCode::NOT_FOUND, "no active catalog block")))?;
+    record.lifted_by = Some(by);
+    record.lifted_at = Some(now_secs());
+    audit(
+        s.store.as_ref(),
+        "lift_catalog_block",
+        CATALOG_BLOCKS,
+        &subject,
+        &record,
+    )
+    .await?;
+    persist(s.store.as_ref(), CATALOG_BLOCKS, &subject, &record).await?;
+    s.gate.moderation.apply_catalog_block(record.clone());
+    info!(audit = "lift_catalog_block", %subject, by = ?record.lifted_by, "Catalog block lifted");
     Ok(Json(record))
 }
 
@@ -2054,5 +2234,81 @@ mod tests {
             call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"], "publishing suspended");
+    }
+
+    #[tokio::test]
+    async fn catalog_blocks_are_audited_hide_the_catalog_and_can_be_lifted() {
+        let h = harness();
+        let op = operator();
+        let (status, body) = call(
+            &h.app,
+            "PUT",
+            "/moderation/blocks/catalogs/arkavo:u1",
+            &op,
+            Some(serde_json::json!({ "reason": "suspended", "reportId": "r-1" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["subject"], "u1");
+        assert!(h.gate.moderation.catalog_hidden("arkavo:u1"));
+        assert!(h.gate.moderation.catalog_hidden("u1"));
+        assert!(!h.gate.moderation.catalog_hidden("u2"));
+        // Stored under its own prefix, never read back as a hash block.
+        assert!(
+            h.store
+                .records
+                .lock()
+                .unwrap()
+                .contains_key("catalog-blocks/u1")
+        );
+        let view = Moderation::default();
+        view.reload(h.store.as_ref()).await.unwrap();
+        assert!(view.catalog_hidden("u1"));
+        assert!(view.active_blocks().is_empty());
+
+        let (status, list) = call(&h.app, "GET", "/moderation/blocks/catalogs", &op, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(list.as_array().unwrap().len(), 1);
+
+        let (status, _) = call(
+            &h.app,
+            "DELETE",
+            "/moderation/blocks/catalogs/u1",
+            &op,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!h.gate.moderation.catalog_hidden("u1"));
+        let audit = h
+            .store
+            .records
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|k| k.starts_with("audit/catalog-blocks/u1/"))
+            .count();
+        assert_eq!(audit, 2);
+
+        // Only operators.
+        let tok = creator("u3");
+        let (status, _) = call(
+            &h.app,
+            "PUT",
+            "/moderation/blocks/catalogs/u3",
+            &tok,
+            Some(serde_json::json!({ "reason": "x" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn a_hide_catalog_suspension_still_hides_the_catalog() {
+        let m = Moderation::default();
+        m.suspend_for_test("u1", false);
+        assert!(!m.catalog_hidden("u1"));
+        m.suspend_for_test("u2", true);
+        assert!(m.catalog_hidden("arkavo:u2"));
     }
 }

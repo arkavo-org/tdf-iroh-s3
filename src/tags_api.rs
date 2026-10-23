@@ -273,15 +273,14 @@ async fn get_tag<S: TagStore>(
     if !valid_tag_name(&name) {
         return Err(error_json(StatusCode::BAD_REQUEST, "invalid tag name"));
     }
-    // A suspended creator's catalog may be hidden; a blocked hash is never
-    // handed out.
+    // A blocked creator's catalog is hidden; a blocked hash is never handed
+    // out.
     let hidden = |hash: Option<&str>| {
         state.publishing.as_ref().is_some_and(|p| {
             hash.is_some_and(|h| p.moderation.is_blocked(h))
                 || name
                     .strip_prefix(&state.tag_prefix)
-                    .and_then(|sub| p.moderation.suspension(sub))
-                    .is_some_and(|s| s.hide_catalog)
+                    .is_some_and(|sub| p.moderation.catalog_hidden(sub))
         })
     };
     if hidden(None) {
@@ -1028,6 +1027,20 @@ mod tests {
         );
         // Hidden: 404.
         g.moderation.suspend_for_test("creator-1", true);
+        assert_eq!(
+            get_status(&g.router, "catalog/arkavo:creator-1").await.0,
+            StatusCode::NOT_FOUND
+        );
+
+        // A catalog block hides it the same way.
+        let g = gated();
+        let hash = store_catalog(&g.store, "arkavo:creator-1", 1).await;
+        g.store
+            .tags
+            .lock()
+            .await
+            .insert("catalog/arkavo:creator-1".into(), hash);
+        g.moderation.block_catalog_for_test("arkavo:creator-1");
         assert_eq!(
             get_status(&g.router, "catalog/arkavo:creator-1").await.0,
             StatusCode::NOT_FOUND
