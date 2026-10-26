@@ -7,6 +7,9 @@
 //! the recording. Anyone holding a hash can read its manifest, so the
 //! metadata policy holds only `uuid` and `body`: a top-level key such as
 //! `arkavo:classification` would repeat the recording's labels in the clear.
+//! Its `payload.mimeType` is [`CATALOG_ENTRY_MIME_TYPE`], which keeps it out
+//! of the group index (`catalog::derive_artifacts`) though it carries the
+//! recording's attributes.
 //!
 //! Pure: no I/O.
 
@@ -15,9 +18,15 @@ use base64::engine::general_purpose::STANDARD;
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 
+/// A metadata TDF's `payload.mimeType`. Ingest doesn't index a blob of this
+/// type under `catalog-index/`, and a `/2` entry's metadata must have it.
+pub const CATALOG_ENTRY_MIME_TYPE: &str = "application/vnd.arkavo.catalog-entry+json";
+
 /// The parts of a stored manifest the comparison reads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ManifestPolicy {
+    /// `payload.mimeType`.
+    mime_type: Option<String>,
     /// The decoded policy object.
     policy: Map<String, Value>,
     /// `encryptionInformation.keyAccess[].url`.
@@ -29,6 +38,8 @@ pub struct ManifestPolicy {
 pub enum MetadataRefusal {
     /// The metadata policy has a top-level key besides `uuid` and `body`.
     ExtraPolicyKeys,
+    /// The metadata TDF's `payload.mimeType` isn't [`CATALOG_ENTRY_MIME_TYPE`].
+    NotCatalogMetadata,
     /// The attributes, dissemination list or KAS differ from the recording's.
     PolicyMismatch,
 }
@@ -37,6 +48,11 @@ pub enum MetadataRefusal {
 /// manifest with a base64 JSON-object policy and a `keyAccess` array.
 pub fn read_manifest(bytes: &[u8]) -> Option<ManifestPolicy> {
     let manifest: Value = serde_json::from_slice(bytes).ok()?;
+    let mime_type = manifest
+        .get("payload")
+        .and_then(|p| p.get("mimeType"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let info = manifest.get("encryptionInformation")?;
     let policy = STANDARD.decode(info.get("policy")?.as_str()?).ok()?;
     let Value::Object(policy) = serde_json::from_slice(&policy).ok()? else {
@@ -48,7 +64,11 @@ pub fn read_manifest(bytes: &[u8]) -> Option<ManifestPolicy> {
         .iter()
         .map(|k| k.get("url").and_then(Value::as_str).map(str::to_string))
         .collect::<Option<BTreeSet<_>>>()?;
-    Some(ManifestPolicy { policy, kas })
+    Some(ManifestPolicy {
+        mime_type,
+        policy,
+        kas,
+    })
 }
 
 /// Whether `metadata` may stand for the recording `payload` in a catalog.
@@ -57,6 +77,9 @@ pub fn check(payload: &ManifestPolicy, metadata: &ManifestPolicy) -> Result<(), 
     keys.sort_unstable();
     if keys != ["body", "uuid"] {
         return Err(MetadataRefusal::ExtraPolicyKeys);
+    }
+    if metadata.mime_type.as_deref() != Some(CATALOG_ENTRY_MIME_TYPE) {
+        return Err(MetadataRefusal::NotCatalogMetadata);
     }
     let same = payload.kas == metadata.kas
         && same_set(
@@ -97,8 +120,18 @@ pub(crate) mod test_support {
     use super::*;
     use serde_json::json;
 
-    /// A stored manifest with `policy` and one key access object per KAS.
+    /// A recording's stored manifest with `policy` and one key access object
+    /// per KAS.
     pub fn manifest(policy: Value, kas: &[&str]) -> Vec<u8> {
+        manifest_of_type(policy, kas, "application/octet-stream")
+    }
+
+    /// A metadata TDF's stored manifest.
+    pub fn metadata_manifest(policy: Value, kas: &[&str]) -> Vec<u8> {
+        manifest_of_type(policy, kas, CATALOG_ENTRY_MIME_TYPE)
+    }
+
+    pub fn manifest_of_type(policy: Value, kas: &[&str], mime_type: &str) -> Vec<u8> {
         let key_access: Vec<Value> = kas
             .iter()
             .map(|url| {
@@ -110,7 +143,7 @@ pub(crate) mod test_support {
             .collect();
         serde_json::to_vec(&json!({
             "payload": { "type": "reference", "url": "0.payload", "protocol": "zip",
-                         "isEncrypted": true, "mimeType": "application/octet-stream" },
+                         "isEncrypted": true, "mimeType": mime_type },
             "encryptionInformation": {
                 "type": "split",
                 "policy": STANDARD.encode(serde_json::to_vec(&policy).unwrap()),
@@ -149,8 +182,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Read as a metadata manifest; a recording's type is never checked.
     fn read(policy: Value, kas: &[&str]) -> ManifestPolicy {
-        read_manifest(&manifest(policy, kas)).expect("readable manifest")
+        read_manifest(&metadata_manifest(policy, kas)).expect("readable manifest")
     }
 
     fn checked(meta: Value) -> Result<(), MetadataRefusal> {
@@ -174,6 +208,38 @@ mod tests {
             p.as_object_mut().unwrap().remove(key);
             assert_eq!(checked(p), Err(MetadataRefusal::ExtraPolicyKeys), "{key}");
         }
+    }
+
+    #[test]
+    fn metadata_must_have_the_catalog_entry_type() {
+        let payload = read(recording_policy(), &[KAS]);
+        for mime in ["application/octet-stream", "application/json", ""] {
+            let meta = read_manifest(&manifest_of_type(metadata_policy(), &[KAS], mime)).unwrap();
+            assert_eq!(
+                check(&payload, &meta),
+                Err(MetadataRefusal::NotCatalogMetadata),
+                "{mime}"
+            );
+        }
+        let mut untyped: Value =
+            serde_json::from_slice(&metadata_manifest(metadata_policy(), &[KAS])).unwrap();
+        untyped["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mimeType");
+        let meta = read_manifest(&serde_json::to_vec(&untyped).unwrap()).unwrap();
+        assert_eq!(
+            check(&payload, &meta),
+            Err(MetadataRefusal::NotCatalogMetadata)
+        );
+        // The minimal-policy check comes first.
+        let mut classified = metadata_policy();
+        classified["arkavo:classification"] = json!("x");
+        let meta = read_manifest(&manifest(classified, &[KAS])).unwrap();
+        assert_eq!(
+            check(&payload, &meta),
+            Err(MetadataRefusal::ExtraPolicyKeys)
+        );
     }
 
     #[test]
@@ -274,10 +340,12 @@ mod tests {
     fn a_manifest_as_ingest_stores_it_is_read() {
         // `catalog::derive_artifacts` stores `TdfManifest::to_json`.
         let mut m = opentdf::TdfManifest::new("0.payload".into(), KAS.into());
+        m.payload.mime_type = Some(CATALOG_ENTRY_MIME_TYPE.into());
         m.encryption_information.policy =
             STANDARD.encode(serde_json::to_vec(&metadata_policy()).unwrap());
         let read = read_manifest(m.to_json().unwrap().as_bytes()).expect("readable");
         assert_eq!(read.kas, BTreeSet::from([KAS.to_string()]));
+        assert_eq!(read.mime_type.as_deref(), Some(CATALOG_ENTRY_MIME_TYPE));
         assert_eq!(check(&read, &read.clone()), Ok(()));
     }
 }

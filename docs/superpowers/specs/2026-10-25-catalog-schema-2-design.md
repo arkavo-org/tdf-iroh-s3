@@ -41,7 +41,7 @@ Run by `PUT /catalogs/{sub}`, `PUT /v2/catalogs/{sub}` and `PUT /tags/catalog/{s
 2. **Ingested and sized** (422): as today for payloads; then for metadata, `metadata <hash> is not ingested` and `metadata <hash> size does not match`.
 3. **Manifests** (422): both manifests are read from `manifests/<hash>` (written at ingest). A missing one is `payload <hash> manifest is not stored` or `metadata <hash> manifest is not stored`; ingest says to re-push to repair, and so does the contract.
 4. **Minimal policy** (422 `metadata <hash> policy may only hold uuid and body`): the metadata manifest's decoded policy has exactly the top-level keys `uuid` and `body`. Manifests are readable by anyone holding the hash, so anything else (`arkavo:classification`, `arkavo:components`) is refused.
-5. **Metadata type** (422 `metadata <hash> is not catalog metadata`), only if D3 is answered with the mimeType: the manifest's `payload.mimeType` is `application/vnd.arkavo.catalog-entry+json`.
+5. **Metadata type** (422 `metadata <hash> is not catalog metadata`, D3): the manifest's `payload.mimeType` is `application/vnd.arkavo.catalog-entry+json`.
 6. **Policy match** (422 `metadata <hash> policy does not match payload <hash>`):
    - `body.dataAttributes`: equal as sets of JSON values (order ignored, each entry compared whole, so the spec form and opentdf-rs's structured form are both compared exactly);
    - `body.dissem`: equal as sets (absent and `[]` are the same);
@@ -51,7 +51,7 @@ Distinct hashes are looked up once, at most 16 at a time, as today. Storage fail
 
 ### Metadata blobs and the group index (D3)
 
-A metadata TDF carries the recording's attributes, so ingest indexes it under the same `catalog-index/<group>/`, and `GET /catalog/{group}` lists it next to the recording. Its policy holds only `uuid` and `body`, so nothing in it says "metadata". Two ways out:
+A metadata TDF carries the recording's attributes, so ingest indexes it under the same `catalog-index/<group>/`, and `GET /catalog/{group}` lists it next to the recording. Its policy holds only `uuid` and `body`, so nothing in it says "metadata". **Decided (owner, 2026-10-25): (a).** Creator's ArkavoMediaKit already sets `payload.mimeType` through `TDFProtectionCore.buildManifest(…, mimeType:)`; recordings, through the FairPlay key envelope, carry `application/json`. The two options were:
 
 - **(a) mimeType, a Creator contract change.** Creator sets the metadata manifest's `payload.mimeType` to `application/vnd.arkavo.catalog-entry+json`. Ingest doesn't index a blob of that type, and check 5 requires it. The type reveals only that a blob is catalog metadata.
 - **(b) Node only.** At catalog publish the node already holds each metadata manifest (check 3). It derives that blob's groups and deletes `catalog-index/<group>/<metadataHash>`. No Creator change, but the listing shows the metadata blob between its ingest and the catalog publish, plus the listing cache TTL.
@@ -83,7 +83,7 @@ New `[http] catalog_token = "optional" | "required"`, default `optional`.
 
 1. `creator_catalog`: `/2` parse and validate, size limits per schema; unit tests.
 2. Publish checks: `get_manifest`, metadata ingest/size/manifest/policy checks in `check_payloads`, used by all three write routes; `accept_catalog_schema_1`. The `PUT /v2/catalogs` body limit grows with the `/2` document limit (the document travels base64url-encoded in the bundle).
-3. Group index for metadata blobs, per D3 (waits on the answer).
+3. Group index for metadata blobs, per D3 (a): `catalog::derive_artifacts` indexes no blob of type `application/vnd.arkavo.catalog-entry+json` (its manifest is still stored), and publish check 5 requires the type.
 4. Token on resolution routes: `[http] catalog_token`.
 5. `purge-catalogs-1` subcommand.
 6. Docs: `docs/creator-catalogs.md`, `CLAUDE.md`.
@@ -96,7 +96,7 @@ Everything here is the node's proposal, not yet in #38:
 
 - **D1. Size.** `/2` documents up to 524 288 bytes, `/1` stays at 262 144. A reader change for arkavo-ios#40.
 - **D2. Metadata size cap** 262 144 bytes.
-- **D3. Keeping metadata blobs out of `GET /catalog/{group}`:** (a) mimeType, a Creator#102 rule, or (b) node-only cleanup at publish.
+- **D3. Keeping metadata blobs out of `GET /catalog/{group}`:** decided 2026-10-25, (a) mimeType, a Creator#102 rule.
 - **D4. `optional` mode** verifies a presented token (401 when bad), as `/catalog/{group}` does today.
 - **D5. Purge** as a node subcommand, dry run by default, keeping documents a tag or pointer still names.
 

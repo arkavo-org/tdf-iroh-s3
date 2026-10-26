@@ -211,7 +211,9 @@ hashes as 502 `storage unavailable` instead of 404.
 ## Entitled catalog
 
 `GET /catalog/{group}` lists the group's ingested items, each annotated
-with whether the requesting entity chain is entitled to it:
+with whether the requesting entity chain is entitled to it. Catalog `/2`
+metadata TDFs (`payload.mimeType` `application/vnd.arkavo.catalog-entry+json`)
+are not items and are never listed:
 
 ```bash
 # Anonymous: full listing, nothing entitled (public storefront)
