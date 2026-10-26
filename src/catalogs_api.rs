@@ -1513,6 +1513,107 @@ mod tests {
         );
     }
 
+    async fn get_as(app: &Router, uri: &str, token: &str) -> Reply {
+        send(
+            app,
+            Request::get(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    }
+
+    /// A service CWT, as arks's moderation client holds.
+    fn service_token() -> String {
+        let (sk, _) = keypair();
+        mint_with_aud(
+            &sk,
+            b"kid-1",
+            ISS,
+            "client:arkavo-moderation",
+            "arkavo-moderation",
+            now_secs(),
+            now_secs() + 3600,
+            &[],
+        )
+    }
+
+    #[tokio::test]
+    async fn an_optional_token_is_verified_when_presented() {
+        let h = harness(true);
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
+        put_catalog(&h.app, SUB, Some(&creator()), doc()).await;
+        let tag = format!("/tags/catalog/{SUB}");
+        assert_eq!(get(&h.app, &tag).await.status, StatusCode::OK);
+        assert_eq!(
+            get_as(&h.app, &tag, &creator()).await.status,
+            StatusCode::OK
+        );
+        let r = get_as(&h.app, &tag, "not-a-cwt").await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::UNAUTHORIZED, "invalid token")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_required_token_guards_name_resolution_but_not_fetches_by_hash() {
+        let h = harness_with(
+            true,
+            CatalogRules {
+                token: crate::config::CatalogToken::Required,
+                ..Default::default()
+            },
+        );
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
+        let hash = put_catalog(&h.app, SUB, Some(&creator()), doc())
+            .await
+            .json()["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let tag = format!("/tags/catalog/{SUB}");
+
+        // No token: 401 before anything is looked up, so an unknown or
+        // hidden subject looks the same.
+        for uri in [tag.clone(), "/tags/catalog/nobody".to_string()] {
+            let r = get(&h.app, &uri).await;
+            assert_eq!(
+                (r.status, r.error().as_str()),
+                (StatusCode::UNAUTHORIZED, "token required"),
+                "{uri}"
+            );
+        }
+
+        // Any verified Arkavo token: the creator's, another person's, a
+        // service's.
+        for t in [creator(), token("someone-else", &[]), service_token()] {
+            let r = get_as(&h.app, &tag, &t).await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+            assert_eq!(r.json()["hash"], hash);
+        }
+
+        // Fetches by hash stay open.
+        let r = get(&h.app, &format!("/catalog-documents/{hash}")).await;
+        assert_eq!(r.status, StatusCode::OK);
+        let r = get(&h.app, &format!("/blobs/{}", payload(1))).await;
+        assert_eq!(r.status, StatusCode::OK);
+        // Tags outside the catalog prefix are not name resolution.
+        assert_ne!(
+            get(&h.app, "/tags/other").await.status,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // A blocked catalog is 401 without a token, as any other.
+        h.moderation.block_catalog_for_test(SUB);
+        assert_eq!(get(&h.app, &tag).await.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            get_as(&h.app, &tag, &creator()).await.status,
+            StatusCode::NOT_FOUND
+        );
+    }
+
     #[tokio::test]
     async fn the_tag_route_rolls_back_to_a_published_catalog() {
         let h = harness(true);

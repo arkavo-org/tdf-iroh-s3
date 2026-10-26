@@ -295,12 +295,51 @@ fn valid_blob_hash(hash: &str) -> bool {
     hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// The token rule on routes that resolve a subject to its catalog
+/// (`[http] catalog_token`, tdf-iroh-s3#39). Run before anything else, so
+/// a caller without a token learns nothing about which subjects have a
+/// catalog. Any Arkavo CWT the node verifies counts (issuer pin, no
+/// audience pin), service CWTs included: the token only shows the reader
+/// has an Arkavo identity.
+pub async fn authorize_catalog_reader(
+    verifier: &CwtVerifier,
+    rule: CatalogToken,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, &'static str)> {
+    let Some(token) = bearer(headers) else {
+        return match rule {
+            CatalogToken::Optional => Ok(()),
+            CatalogToken::Required => {
+                warn!("Catalog read refused: no token");
+                Err((StatusCode::UNAUTHORIZED, "token required"))
+            }
+        };
+    };
+    match verifier.verify(token, crate::moderation::now_secs()).await {
+        Ok(_) => Ok(()),
+        Err(AuthError::KeySet(e)) => {
+            warn!(error = %e, "Catalog read refused: key set unavailable");
+            Err((StatusCode::BAD_GATEWAY, "key set unavailable"))
+        }
+        Err(e) => {
+            warn!(error = %e, "Catalog read refused: invalid token");
+            Err((StatusCode::UNAUTHORIZED, "invalid token"))
+        }
+    }
+}
+
 async fn get_tag<S: TagStore>(
     State(state): State<Arc<ApiState<S>>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<TagResponse>, (StatusCode, Json<ErrorResponse>)> {
     if !valid_tag_name(&name) {
         return Err(error_json(StatusCode::BAD_REQUEST, "invalid tag name"));
+    }
+    if name.starts_with(&state.tag_prefix) {
+        authorize_catalog_reader(&state.verifier, state.catalog.token, &headers)
+            .await
+            .map_err(|(status, msg)| error_json(status, msg))?;
     }
     // A blocked creator's catalog is hidden; a blocked hash is never handed
     // out.

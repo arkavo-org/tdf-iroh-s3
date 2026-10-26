@@ -277,6 +277,7 @@ async fn main() -> Result<()> {
                     cat.authz.action.clone(),
                     environment.clone(),
                     moderation.clone(),
+                    http_cfg.catalog_token,
                 )),
                 None => {
                     tracing::warn!(
@@ -289,6 +290,7 @@ async fn main() -> Result<()> {
                         cat.authz.action.clone(),
                         environment.clone(),
                         moderation.clone(),
+                        http_cfg.catalog_token,
                     ))
                 }
             };
@@ -486,6 +488,7 @@ fn catalog_router<D: DecisionProvider>(
     action: String,
     environment: Option<serde_json::Value>,
     moderation: Option<Arc<Moderation>>,
+    token: tdf_iroh_s3::config::CatalogToken,
 ) -> axum::Router {
     catalog_api::router(Arc::new(CatalogApiState {
         cache,
@@ -494,5 +497,6 @@ fn catalog_router<D: DecisionProvider>(
         action,
         environment,
         moderation,
+        token,
     }))
 }
