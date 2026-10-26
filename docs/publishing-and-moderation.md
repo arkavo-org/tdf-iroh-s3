@@ -31,7 +31,7 @@ The node always authenticates the publisher (the checks above, except the entitl
 **The request.** The node sends one AuthZEN evaluation through the same client as the catalog: action `read` on a resource of type `publisher`, carrying `[publishing] entitlement` as its `attribute_value_fqns`. Per draft-arkavo-authzen-cwt-00, the entity chain is:
 
 1. the verified person;
-2. each device presented in repeated `X-Entity-Token` headers (DeviceCheck CWTs: `aud` `arkavo:devicecheck`, bound to the person). A device token that fails verification is 401 in `pdp`; in `local` they are ignored;
+2. each device presented in repeated `X-Entity-Token` headers (DeviceCheck CWTs: `aud` `arkavo:devicecheck`, bound to the person). A device token that fails verification is 401 in `pdp`; in `shadow` it only means the decision service isn't asked (`Publish decision shadow: chain refused`); in `local` they are ignored;
 3. the environment (`[catalog.authz] environment_region`).
 
 At most 8 entities. The platform withholds the grant from a suspended account, and devices narrow it as its policy says.
@@ -42,7 +42,7 @@ At most 8 entities. The platform withholds the grant from a suspended account, a
 - it can't be asked (`DecisionUnavailable`);
 - in `pdp`, the session has no stored chain (`NoSession`).
 
-**Configuration.** `shadow` or `pdp` without a `[catalog.authz] endpoint` is a startup error. Local suspensions still apply in every mode until the platform's suspension check is live.
+**Configuration.** `shadow` or `pdp` without a `[catalog.authz] endpoint` is a startup error. Local suspensions still apply in every mode until the platform's suspension check is live. In `shadow` a suspended subject's decision is still asked and logged before the suspension refuses it, so the platform's answer for a suspended account can be checked.
 
 ### 1. Open a publish session for the iroh endpoint that will push
 

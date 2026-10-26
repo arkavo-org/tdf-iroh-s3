@@ -1,6 +1,6 @@
 # Moderation through the platform's decision service
 
-**Status:** proposal, 2026-10-22.
+**Status:** proposal, 2026-10-22. Node side (4a, 4d) implemented on `feat/pdp-publish-decisions`; rollout (4c) and the clean-up (4e) wait on steps 0–3.
 **Scope:** tdf-iroh-s3, with the changes it needs in arkavo-rs (`arks`, the AuthZEN facade and moderation intake), arkavo-org/opentdf-platform (the fork serving platform.arkavo.net) and authnz-rs.
 **Read at:** tdf-iroh-s3 `1d27393`, arkavo-rs `origin/main` `7bdd073`, opentdf-platform `main` `e562aca`.
 
@@ -107,7 +107,7 @@ New config: `[publishing] decisions = "local" | "shadow" | "pdp"`.
 
 ## Plan
 
-**Ordering:** steps 0–3 block step 4. Within the platform work, 2a has to come before 2b.
+**Ordering:** steps 0–3 block the rollout (4c) and the clean-up (4e); 4a and 4d don't need them. Within the platform work, 2a has to come before 2b.
 
 **0. Pre-checks (read-only; they block everything else)**
 
@@ -146,9 +146,10 @@ New config: `[publishing] decisions = "local" | "shadow" | "pdp"`.
 
 - **4a. Publish decisions:** a `PublishDecider` over `DecisionProvider`, with the `decisions` flag and `shadow` logging. The publish routes accept repeated `X-Entity-Token` DeviceCheck CWTs, union-verify them per the profile and send `context.devices` and `context.environment`. Store the verified SARC (no tokens) in session records, and re-decide at push.
 - **4b. Operator client:** put arks's moderation client ID in `[publishing] operator_client_ids` (host config and launch template).
-- **4c. Rollout:** deploy with `shadow`, then switch to `pdp` after a set number of shadow decisions (say 50, including a suspended test account) with no disagreement. Count decisions, not days: publishes are rare.
+- **4c. Rollout:** deploy with `local`. Switch to `shadow` only once opentdf-platform#59 is merged and identity-core has `pep_assertable: true`: until then the platform can't grant the publish attribute, and every member's publish would log a disagreement (local permits, platform denies). Switch to `pdp` after a set number of agreeing permits from real members (`Publish decision shadow: agrees` with `pdp=Permit`), plus the suspended test account denied both ways (which needs 2a live; `shadow` asks for a suspended subject and logs the answer before the local suspension refuses it), with no disagreement. Count agreeing permits, not agreements: at most 2 Patreon accounts and no App Store account hold the entitlement, so most decisions are deny/deny and agree without proving anything. Count decisions, not days: publishes are rare.
+- **Devices** aren't required in the chain, so 4a works without them. Device tokens come in this order: authnz 0.23.1 deployed (before it no real device could get a DeviceCheck token from `/device-check/assert`), Creator#96 sends them, a real assertion fixture is captured, authnz#114 adds the app and environment claims, then platform#60's device rule uses them. Key rotation needs nothing here: `verify_device` looks keys up by `kid` and refreshes on a miss.
 - **4d. Catalog blocks:** add subject-scoped catalog blocks (`PUT/DELETE /moderation/blocks/catalogs/{subject}`), reusing the owner tracking of today's `hideCatalog`.
-- **4e. Clean up:** remove suspension records and routes from `moderation.rs`, and update `docs/publishing-and-moderation.md` and `CLAUDE.md`.
+- **4e. Clean up (after the switch to `pdp`, with 2a live):** until then the local suspension check stays in every mode, since removing it under `local` or `shadow` would leave suspensions enforced nowhere. Then remove suspension records, the `/moderation/suspensions` routes, `hideCatalog` (catalog blocks replace it) and the startup suspension count from the node, and update `docs/publishing-and-moderation.md` and `CLAUDE.md`.
 
 ## Decisions (owner, 2026-10-22)
 

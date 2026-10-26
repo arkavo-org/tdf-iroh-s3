@@ -634,13 +634,19 @@ impl PublishGate {
                 .await
                 .ok_or(PushRefusal::NoSession)?,
         };
-        if self.moderation.is_suspended(&subject) {
+        // In `shadow` a suspension is refused after the decision is logged.
+        let suspended = self.moderation.is_suspended(&subject);
+        if suspended && self.decider.mode() != PublishDecisions::Shadow {
             return Err(PushRefusal::Suspended);
         }
         if self.moderation.is_blocked(hash_hex) {
             return Err(PushRefusal::Blocked);
         }
-        self.decide_push(&subject, chain.as_deref()).await?;
+        self.decide_push(&subject, chain.as_deref(), !suspended)
+            .await?;
+        if suspended {
+            return Err(PushRefusal::Suspended);
+        }
         Ok((subject, endpoint))
     }
 
@@ -651,6 +657,7 @@ impl PublishGate {
         &self,
         subject: &str,
         chain: Option<&[StoredEntity]>,
+        local_permits: bool,
     ) -> Result<(), PushRefusal> {
         let mode = self.decider.mode();
         if mode == PublishDecisions::Local {
@@ -669,7 +676,7 @@ impl PublishGate {
         let verdict = self.decider.ask_for_push(subject, &restore(chain)).await;
         match mode {
             PublishDecisions::Shadow => {
-                log_shadow("push", subject, true, verdict);
+                log_shadow("push", subject, local_permits, verdict);
                 Ok(())
             }
             _ => match verdict {
@@ -756,11 +763,14 @@ impl PublishPolicy {
             ));
         }
         // Kept in every mode until the platform's suspension constraint is
-        // live (tdf-iroh-s3#35, step 4e).
-        if moderation.is_suspended(&claims.sub) {
+        // live (tdf-iroh-s3#35, step 4e). In `shadow` it is part of the local
+        // answer, so a suspended subject's decision is logged too.
+        let suspended = moderation.is_suspended(&claims.sub);
+        if suspended && self.decider.mode() != PublishDecisions::Shadow {
             return Err(refuse(StatusCode::FORBIDDEN, "publishing suspended"));
         }
         let local = match &self.entitlement {
+            _ if suspended => Err((StatusCode::FORBIDDEN, "publishing suspended")),
             Some(want)
                 if !claims
                     .arkavo_entitlements
@@ -2234,6 +2244,41 @@ mod tests {
             call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"], "publishing suspended");
+    }
+
+    #[tokio::test]
+    async fn shadow_asks_for_suspended_subjects_and_still_refuses_them() {
+        use std::sync::atomic::Ordering;
+        let (h, pdp) = deciding(PublishDecisions::Shadow);
+        set(&pdp, DENY);
+        let sk = key();
+        let tok = creator("arkavo:u1");
+        let (status, _) = call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        h.gate.moderation.suspend_for_test("arkavo:u1", false);
+
+        // The session route asks the PDP, then enforces the suspension.
+        let before = pdp.calls.load(Ordering::SeqCst);
+        let sk2 = key();
+        let (status, body) = call(
+            &h.app,
+            "POST",
+            "/publish/sessions",
+            &tok,
+            signed(&sk2, &tok),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "publishing suspended");
+        assert_eq!(pdp.calls.load(Ordering::SeqCst), before + 1);
+
+        // So does a push on the session opened before the suspension.
+        h.gate.connected(1, Some(sk.public()));
+        assert_eq!(
+            h.gate.authorize_push(1, &"a".repeat(64)).await,
+            Err(PushRefusal::Suspended)
+        );
+        assert_eq!(pdp.calls.load(Ordering::SeqCst), before + 2);
     }
 
     #[tokio::test]
