@@ -67,7 +67,7 @@ Moderation splits into two layers, and the decision service fits only the first.
   - It runs only when a subject's grants include a value of `…/arkavo-creator`, so catalog viewers never pay for it.
   - It withholds `…/arkavo-creator` grants from a suspended account. If the status can't be read, it withholds them too (fail closed).
   - A suspension takes effect within seconds on every route, not at the next mint (up to 1 h).
-  - The IdP's own `publishing-suspension` API is no longer part of the moderation flow.
+  - The IdP also withholds the publish entitlement from the suspended account's tokens (decision 5): arks's `suspend` calls identity's `PUT /admin/users/:id/publishing-suspension` as well.
 - **What the PDP adds:** in claims mode, the publish grant still rests on the entitlement that the node verified and asserted. What the PDP adds is the live suspension check, the agent gate, and one place for the policy. That is what the new fail-closed dependency buys.
 - **The chain counts:** devices have to affect the decision, not only travel with it. The platform has to stop skipping device NPEs, or tell them apart from the environment (the profile's named future). Composite constraints such as device-class caps and the agent gate then apply to a device that comes with a person. In OpenTDF every SUBJECT entity must be entitled, and a device never holds the publish entitlement. So non-person entities have to narrow the person's grants as constraints, not count as co-subjects. **Decided: devices narrow a grant according to policy.** The policy says which device attestation or class a grant requires, or which grants a device class is capped to. The ERS config doesn't hard-code it. Bug: opentdf-platform#60.
 - **Pushes:** the session record (`moderation/sessions/<endpoint>`) also stores the PEP-verified SARC the decision used: the person's `sub`, `iss` and publish entitlement, the device objects, and no bearer token. `authorize_push` asks the PDP again with those claims, cached per subject for 30 s. A suspension therefore stops pushes within about 30 s, as the node's refresh does today, without waiting for the session's 900 s TTL. A record written before this change has no stored claims, so a push that finds one is refused like a missing session. At most a session's 900 s are lost, once, at rollout.
@@ -116,7 +116,7 @@ New config: `[publishing] decisions = "local" | "shadow" | "pdp"`.
 
 **1. authnz-rs**
 
-- authnz-rs#103: register arks's moderation client (for its node calls). The platform needs no identity access for suspensions.
+- authnz-rs#103: register arks's moderation client (for its node calls). Done: `arkavo-moderation` (client credentials, `sub` `client:arkavo-moderation`, role `service-account`). The platform needs no identity access for suspensions.
 
 **2. opentdf-platform (fork)**
 
@@ -145,9 +145,9 @@ New config: `[publishing] decisions = "local" | "shadow" | "pdp"`.
 **4. tdf-iroh-s3**
 
 - **4a. Publish decisions:** a `PublishDecider` over `DecisionProvider`, with the `decisions` flag and `shadow` logging. The publish routes accept repeated `X-Entity-Token` DeviceCheck CWTs, union-verify them per the profile and send `context.devices` and `context.environment`. Store the verified SARC (no tokens) in session records, and re-decide at push.
-- **4b. Operator client:** put arks's moderation client ID in `[publishing] operator_client_ids` (host config and launch template).
+- **4b. Operator client:** put `arkavo-moderation` in `[publishing] operator_client_ids` (host config and launch template). Its secret stays in arks's secret store.
 - **4c. Rollout:** deploy with `local`. Switch to `shadow` only once opentdf-platform#59 is merged and identity-core has `pep_assertable: true`: until then the platform can't grant the publish attribute, and every member's publish would log a disagreement (local permits, platform denies). Switch to `pdp` after a set number of agreeing permits from real members (`Publish decision shadow: agrees` with `pdp=Permit`), plus the suspended test account denied both ways (which needs 2a live; `shadow` asks for a suspended subject and logs the answer before the local suspension refuses it), with no disagreement. Count agreeing permits, not agreements: at most 2 Patreon accounts and no App Store account hold the entitlement, so most decisions are deny/deny and agree without proving anything. Count decisions, not days: publishes are rare.
-- **Devices** aren't required in the chain, so 4a works without them. Device tokens come in this order: authnz 0.23.1 deployed (before it no real device could get a DeviceCheck token from `/device-check/assert`), Creator#96 sends them, a real assertion fixture is captured, authnz#114 adds the app and environment claims, then platform#60's device rule uses them. Key rotation needs nothing here: `verify_device` looks keys up by `kid` and refreshes on a miss.
+- **Devices** aren't required in the chain, so 4a works without them. Device tokens come in this order: authnz 0.23.1 deployed (live since 2026-10-25; before it no real device could get a DeviceCheck token from `/device-check/assert`), Creator#96 sends them, a real assertion fixture is captured, authnz#114 adds the app and environment claims, then platform#60's device rule uses them. Key rotation needs nothing here: `verify_device` looks keys up by `kid` and refreshes on a miss.
 - **4d. Catalog blocks:** add subject-scoped catalog blocks (`PUT/DELETE /moderation/blocks/catalogs/{subject}`), reusing the owner tracking of today's `hideCatalog`.
 - **4e. Clean up (after the switch to `pdp`, with 2a live):** until then the local suspension check stays in every mode, since removing it under `local` or `shadow` would leave suspensions enforced nowhere. Then remove suspension records, the `/moderation/suspensions` routes, `hideCatalog` (catalog blocks replace it) and the startup suspension count from the node, and update `docs/publishing-and-moderation.md` and `CLAUDE.md`.
 
@@ -157,3 +157,4 @@ New config: `[publishing] decisions = "local" | "shadow" | "pdp"`.
 2. **A suspended creator's catalog and catalog documents are blocked.**
 3. **The platform determines suspension status and reads it from itself**, with no identity call.
 4. **Devices narrow a grant based on policy.**
+5. **A suspension also removes the publish entitlement from tokens** (2026-10-25). arks's `suspend` writes its own store, identity's `publishing-suspension` and the node's catalog block. The node keeps its local suspension records until the platform's check is live in `pdp`.
