@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -28,11 +28,11 @@ use crate::authz::{
 };
 pub use crate::config::PublishDecisions;
 
-/// How long a push re-decision is reused for the same subject.
+/// How long a push re-decision is reused for the same stored chain.
 pub const PUSH_DECISION_TTL: Duration = Duration::from_secs(30);
 
-/// Most subjects whose push decision is remembered.
-const MAX_CACHED_SUBJECTS: usize = 4096;
+/// Most chains whose push decision is remembered.
+const MAX_CACHED_CHAINS: usize = 4096;
 
 /// The PDP's answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +81,11 @@ pub struct PublishDecider {
     entitlement: String,
     /// The environment entity this node appends (its region).
     environment: Option<Value>,
+    /// Push verdicts by [`chain_key`].
     pushes: Mutex<HashMap<String, (Instant, Verdict)>>,
+    /// One PDP call at a time per chain key: concurrent pushes on a miss
+    /// wait for it and reuse its verdict.
+    push_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Default for PublishDecider {
@@ -93,6 +97,7 @@ impl Default for PublishDecider {
             entitlement: crate::moderation::DEFAULT_PUBLISH_ENTITLEMENT.to_string(),
             environment: None,
             pushes: Mutex::new(HashMap::new()),
+            push_locks: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -116,6 +121,7 @@ impl PublishDecider {
             entitlement,
             environment,
             pushes: Mutex::new(HashMap::new()),
+            push_locks: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -163,30 +169,53 @@ impl PublishDecider {
     }
 
     /// Like [`ask`](Self::ask), reusing a Permit or Deny for the same
-    /// subject for [`PUSH_DECISION_TTL`]. `Unavailable` is never reused.
-    pub async fn ask_for_push(&self, subject: &str, chain: &[ChainEntity]) -> Verdict {
-        if let Some((at, v)) = self
-            .pushes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(subject)
-            .copied()
-            && at.elapsed() < PUSH_DECISION_TTL
-        {
+    /// chain (not just the same subject: two sessions of one person can hold
+    /// different devices) for [`PUSH_DECISION_TTL`]. `Unavailable` is never
+    /// reused. Concurrent pushes on a miss share one PDP call.
+    pub async fn ask_for_push(&self, chain: &[ChainEntity]) -> Verdict {
+        let key = chain_key(chain);
+        if let Some(v) = self.cached_push(&key) {
+            return v;
+        }
+        let lock = {
+            let mut locks = self.push_locks.lock().await;
+            if locks.len() > MAX_CACHED_CHAINS {
+                locks.retain(|_, l| Arc::strong_count(l) > 1);
+            }
+            Arc::clone(locks.entry(key.clone()).or_default())
+        };
+        let _guard = lock.lock().await;
+        if let Some(v) = self.cached_push(&key) {
             return v;
         }
         let v = self.ask(chain).await;
         if v != Verdict::Unavailable {
             let mut m = self.pushes.lock().unwrap_or_else(|e| e.into_inner());
-            if m.len() >= MAX_CACHED_SUBJECTS {
+            if m.len() >= MAX_CACHED_CHAINS {
                 m.retain(|_, (at, _)| at.elapsed() < PUSH_DECISION_TTL);
             }
-            if m.len() < MAX_CACHED_SUBJECTS {
-                m.insert(subject.to_string(), (Instant::now(), v));
+            if m.len() < MAX_CACHED_CHAINS {
+                m.insert(key, (Instant::now(), v));
             }
         }
         v
     }
+
+    fn cached_push(&self, key: &str) -> Option<Verdict> {
+        self.pushes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .filter(|(at, _)| at.elapsed() < PUSH_DECISION_TTL)
+            .map(|(_, v)| *v)
+    }
+}
+
+/// A chain's push-cache key: the BLAKE3 hash of its kinds and claims, so a
+/// verdict applies only to the chain it was asked with.
+fn chain_key(chain: &[ChainEntity]) -> String {
+    let stored = serde_json::to_vec(&strip_tokens(chain)).unwrap_or_default();
+    blake3::hash(&stored).to_hex().to_string()
 }
 
 /// Log a shadow decision that disagrees with the enforced local one.
@@ -206,7 +235,6 @@ pub fn log_shadow(on: &'static str, sub: &str, local_permits: bool, pdp: Verdict
 mod tests {
     use super::*;
     use crate::authz::{DecisionProvider, Decisions};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Stub {
@@ -214,11 +242,14 @@ mod tests {
         fail: bool,
         calls: AtomicUsize,
         seen: Mutex<Option<DecisionRequest>>,
+        /// How long a decision takes.
+        delay: Duration,
     }
 
     impl DecisionProvider for Stub {
         async fn decide(&self, req: DecisionRequest) -> anyhow::Result<Decisions> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
             *self.seen.lock().unwrap() = Some(req.clone());
             anyhow::ensure!(!self.fail, "pdp down");
             Ok(req
@@ -235,6 +266,7 @@ mod tests {
             fail,
             calls: AtomicUsize::new(0),
             seen: Mutex::new(None),
+            delay: Duration::ZERO,
         })
     }
 
@@ -305,15 +337,46 @@ mod tests {
     async fn push_decisions_are_reused_but_failures_are_not() {
         let s = stub(true, false);
         let d = decider(&s);
-        assert_eq!(d.ask_for_push("arkavo:u1", &chain()).await, Verdict::Permit);
-        assert_eq!(d.ask_for_push("arkavo:u1", &chain()).await, Verdict::Permit);
+        assert_eq!(d.ask_for_push(&chain()).await, Verdict::Permit);
+        assert_eq!(d.ask_for_push(&chain()).await, Verdict::Permit);
         assert_eq!(s.calls.load(Ordering::SeqCst), 1);
 
         let f = stub(true, true);
         let d = decider(&f);
-        d.ask_for_push("arkavo:u1", &chain()).await;
-        d.ask_for_push("arkavo:u1", &chain()).await;
+        d.ask_for_push(&chain()).await;
+        d.ask_for_push(&chain()).await;
         assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn push_decisions_are_reused_only_for_the_same_chain() {
+        let s = stub(true, false);
+        let d = decider(&s);
+        let without_device = chain()[..1].to_vec();
+        let mut other_device = chain();
+        other_device[1].claims["kid"] = "k2".into();
+        for c in [chain(), without_device, other_device] {
+            d.ask_for_push(&c).await;
+        }
+        assert_eq!(s.calls.load(Ordering::SeqCst), 3);
+        // Tokens aren't part of the key: a stored chain never has them.
+        let mut with_token = chain();
+        with_token[0].token = Some("cwt".into());
+        d.ask_for_push(&with_token).await;
+        assert_eq!(s.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn concurrent_pushes_on_a_miss_share_one_decision() {
+        let s = Arc::new(Stub {
+            delay: Duration::from_millis(50),
+            ..Arc::into_inner(stub(true, false)).unwrap()
+        });
+        let d = decider(&s);
+        let c = chain();
+        let (a, b, e) = tokio::join!(d.ask_for_push(&c), d.ask_for_push(&c), d.ask_for_push(&c));
+        assert_eq!([a, b, e], [Verdict::Permit; 3]);
+        assert_eq!(s.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

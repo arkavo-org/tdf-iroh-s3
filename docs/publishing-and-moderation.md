@@ -36,7 +36,7 @@ The node always authenticates the publisher (the checks above, except the entitl
 
 At most 8 entities. The platform withholds the grant from a suspended account, and devices narrow it as its policy says.
 
-**Pushes.** A session opened in `shadow` or `pdp` stores the chain it was decided with, never a token. A push asks again with it, reusing an answer for 30 s per subject. A push is refused when:
+**Pushes.** A session opened in `shadow` or `pdp` stores the chain it was decided with, never a token. A push asks again with it, reusing an answer for 30 s per chain (concurrent pushes share one request). So per push the platform re-checks its own live state, such as a suspension, but the chain's claims (the person's `arkavo_entitlements`, the devices) are those of the session's opening: a device revoked or an entitlement changed since then counts from the next session, at most `session_ttl_secs` later. A push is refused when:
 
 - the decision service denies it (`NotPermitted`);
 - it can't be asked (`DecisionUnavailable`);

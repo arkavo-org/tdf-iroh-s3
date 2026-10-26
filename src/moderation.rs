@@ -651,7 +651,7 @@ impl PublishGate {
     }
 
     /// Ask the decision service again for a push, with the chain its session
-    /// was decided with (reused for 30 s per subject). So a suspension
+    /// was decided with (reused for 30 s per chain). So a suspension
     /// stops pushes without waiting for the session to expire.
     async fn decide_push(
         &self,
@@ -673,7 +673,7 @@ impl PublishGate {
             warn!(%subject, "Publish decision shadow: session has no stored chain");
             return Ok(());
         };
-        let verdict = self.decider.ask_for_push(subject, &restore(chain)).await;
+        let verdict = self.decider.ask_for_push(&restore(chain)).await;
         match mode {
             PublishDecisions::Shadow => {
                 log_shadow("push", subject, local_permits, verdict);
