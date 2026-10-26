@@ -31,7 +31,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::catalog_v2::{self, Bundle, BundleError, Passkeys};
-use crate::catalogs_api::{CATALOG_DOCUMENT_CACHE_CONTROL, check_payloads, is_json, owner_hidden};
+use crate::catalogs_api::{CATALOG_DOCUMENT_CACHE_CONTROL, check_catalog, is_json, owner_hidden};
 use crate::creator_catalog::{self, MAX_CATALOG_BYTES, MAX_OWNER_BYTES, valid_identifier};
 use crate::moderation::now_secs;
 use crate::tags_api::{ApiState, TagStore, authorize_publisher, is_blocked};
@@ -47,9 +47,9 @@ fn storage_unavailable(what: &str, e: anyhow::Error) -> ApiError {
     fail(StatusCode::BAD_GATEWAY, "storage unavailable")
 }
 
-/// Largest publish body: a 256 KiB document in base64url (about 350 KiB)
-/// plus a bundle of a few KiB.
-pub const MAX_PUT_BYTES: usize = 512 * 1024;
+/// Largest publish body: a 512 KiB `/2` document in base64url (about
+/// 700 KiB) plus a bundle of a few KiB.
+pub const MAX_PUT_BYTES: usize = 1024 * 1024;
 
 /// Why the IdP's credential status refuses a publish.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,11 +323,12 @@ async fn put_catalog<S: TagStore>(
         ));
     }
 
-    // 5. Nothing blocked, every payload ingested at its size (as v1).
+    // 5. Nothing blocked, every payload (and `/2` metadata TDF) ingested at
+    //    its size, each metadata TDF fitting its recording (as v1).
     if is_blocked(api, &hash) {
         return Err(reject(StatusCode::FORBIDDEN, "content is blocked".into()));
     }
-    check_payloads(api, &doc.entries)
+    check_catalog(api, &doc)
         .await
         .map_err(|(status, msg)| reject(status, msg))?;
 
@@ -528,6 +529,7 @@ mod tests {
             ])),
             tag_prefix: "catalog/".to_string(),
             catalog_documents: Default::default(),
+            catalog: Default::default(),
             publishing: Some(TagPublishing {
                 policy: Arc::new(PublishPolicy {
                     entitlement: Some(DEFAULT_PUBLISH_ENTITLEMENT.into()),

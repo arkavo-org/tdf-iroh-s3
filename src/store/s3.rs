@@ -192,6 +192,23 @@ impl S3Client {
         Ok(())
     }
 
+    /// The extracted manifest.json of an ingested blob; `None` when none is
+    /// stored.
+    pub async fn get_manifest(&self, hash_hex: &str) -> Result<Option<Bytes>> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(self.manifest_key(hash_hex))
+            .send()
+            .await
+        {
+            Ok(resp) => Ok(Some(resp.body.collect().await?.into_bytes())),
+            Err(e) if e.as_service_error().is_some_and(|se| se.is_no_such_key()) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("Failed to GET manifest from S3: {}", e)),
+        }
+    }
+
     /// Store a catalog index entry under `catalog-index/<group>/<hash>`.
     pub async fn put_catalog_entry(
         &self,

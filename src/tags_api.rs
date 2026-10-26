@@ -29,6 +29,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::auth::{AuthError, CwtVerifier, VerifiedClaims};
+use crate::config::CatalogToken;
 use crate::creator_catalog;
 use crate::moderation::{Moderation, PublishPolicy, bearer};
 
@@ -44,6 +45,12 @@ pub trait TagStore: Send + Sync + 'static {
     /// Size of an ingested blob; `None` when it was never ingested.
     fn blob_size(&self, hash_hex: &str)
     -> impl Future<Output = anyhow::Result<Option<u64>>> + Send;
+    /// The manifest ingest stored for a blob (`manifests/<hash>`); `None`
+    /// when there is none.
+    fn get_manifest(
+        &self,
+        hash_hex: &str,
+    ) -> impl Future<Output = anyhow::Result<Option<Bytes>>> + Send;
     fn get_catalog_document(
         &self,
         hash_hex: &str,
@@ -132,6 +139,10 @@ impl TagStore for crate::store::s3::S3Client {
         Self::blob_size(self, hash_hex).await
     }
 
+    async fn get_manifest(&self, hash_hex: &str) -> anyhow::Result<Option<Bytes>> {
+        Self::get_manifest(self, hash_hex).await
+    }
+
     async fn get_catalog_document(&self, hash_hex: &str) -> anyhow::Result<Option<StoredDocument>> {
         Ok(Self::get_catalog_document(self, hash_hex)
             .await?
@@ -185,6 +196,24 @@ pub struct ApiState<S: TagStore> {
     /// Which tag targets are catalog documents, so `GET /tags` asks S3
     /// once per hash.
     pub catalog_documents: DocumentPresence,
+    pub catalog: CatalogRules,
+}
+
+/// Catalog settings from `[http]` (tdf-iroh-s3#39).
+#[derive(Debug, Clone, Copy)]
+pub struct CatalogRules {
+    pub token: CatalogToken,
+    /// Whether `/1` catalogs may still be published.
+    pub accept_schema_1: bool,
+}
+
+impl Default for CatalogRules {
+    fn default() -> Self {
+        Self {
+            token: CatalogToken::Optional,
+            accept_schema_1: true,
+        }
+    }
 }
 
 /// Whether a hash names a stored catalog document, as `GET /tags` found.
@@ -390,7 +419,7 @@ async fn put_tag<S: TagStore>(
     // The earlier catalog passes today's payload checks, as a new upload
     // would: a block, or a payload gone from storage, since it was
     // published keeps the tag off it.
-    crate::catalogs_api::check_payloads(&state, &doc.entries)
+    crate::catalogs_api::check_catalog(&state, &doc)
         .await
         .map_err(|(status, msg)| {
             warn!(tag = %name, hash = %body.hash, %status, reason = %msg, "Tag write rejected");
@@ -458,6 +487,10 @@ pub(crate) mod test_support {
     pub struct MemStore {
         pub tags: Mutex<HashMap<String, String>>,
         pub blobs: Mutex<HashMap<String, u64>>,
+        /// hash → stored manifest JSON.
+        pub manifests: Mutex<HashMap<String, Bytes>>,
+        /// How many times `get_manifest` was asked.
+        pub manifest_reads: std::sync::atomic::AtomicUsize,
         pub catalog_documents: Mutex<HashMap<String, StoredDocument>>,
         /// How many times `blob_size` was asked (one S3 HEAD each).
         pub blob_lookups: std::sync::atomic::AtomicUsize,
@@ -484,6 +517,15 @@ pub(crate) mod test_support {
         /// Record `hash` as ingested with `size` bytes.
         pub async fn ingest(&self, hash: &str, size: u64) {
             self.blobs.lock().await.insert(hash.to_string(), size);
+        }
+
+        /// Record `hash` as ingested with `size` bytes and `manifest`.
+        pub async fn ingest_with_manifest(&self, hash: &str, size: u64, manifest: Vec<u8>) {
+            self.ingest(hash, size).await;
+            self.manifests
+                .lock()
+                .await
+                .insert(hash.to_string(), Bytes::from(manifest));
         }
 
         fn up(&self) -> anyhow::Result<()> {
@@ -513,6 +555,12 @@ pub(crate) mod test_support {
             self.blob_lookups
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(self.blobs.lock().await.get(hash_hex).copied())
+        }
+        async fn get_manifest(&self, hash_hex: &str) -> anyhow::Result<Option<Bytes>> {
+            self.up()?;
+            self.manifest_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self.manifests.lock().await.get(hash_hex).cloned())
         }
         async fn get_catalog_document(
             &self,
@@ -644,6 +692,7 @@ mod tests {
             tag_prefix: "catalog/".to_string(),
             publishing: None,
             catalog_documents: Default::default(),
+            catalog: Default::default(),
         });
         let token = mint(
             &sk,
@@ -885,6 +934,7 @@ mod tests {
             tag_prefix: "catalog/".to_string(),
             publishing: None,
             catalog_documents: Default::default(),
+            catalog: Default::default(),
         });
         let router = router(state);
         let expired = mint(
@@ -921,6 +971,7 @@ mod tests {
             verifier: Arc::new(CwtVerifier::with_static_keys(vec![(b"kid-1".to_vec(), vk)])),
             tag_prefix: "catalog/".to_string(),
             catalog_documents: Default::default(),
+            catalog: Default::default(),
             publishing: Some(TagPublishing {
                 policy: Arc::new(PublishPolicy {
                     entitlement: Some(DEFAULT_PUBLISH_ENTITLEMENT.into()),

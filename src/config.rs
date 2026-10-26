@@ -410,6 +410,25 @@ pub struct HttpConfig {
     /// only).
     #[serde(default = "default_passkey_status_url")]
     pub passkey_status_url: String,
+    /// Whether resolving a creator's catalog needs a token (tdf-iroh-s3#39).
+    #[serde(default)]
+    pub catalog_token: CatalogToken,
+    /// Whether `arkavo.creator-catalog/1` may still be published. `false`
+    /// once Creator publishes `/2` (tdf-iroh-s3#39 cutover).
+    #[serde(default = "default_true")]
+    pub accept_catalog_schema_1: bool,
+}
+
+/// `[http] catalog_token`: on `GET /tags/catalog/{sub}`, `GET
+/// /v2/catalogs/{sub}` and `GET /catalog/{group}`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CatalogToken {
+    /// No token is served; a presented one must verify.
+    #[default]
+    Optional,
+    /// No token is 401.
+    Required,
 }
 
 /// TLS for the HTTP API, terminated by the node (rustls, TLS 1.3 only). The
@@ -449,6 +468,8 @@ impl Default for HttpConfig {
             tls: None,
             passkey_rp_id: default_passkey_rp_id(),
             passkey_status_url: default_passkey_status_url(),
+            catalog_token: CatalogToken::default(),
+            accept_catalog_schema_1: true,
         }
     }
 }

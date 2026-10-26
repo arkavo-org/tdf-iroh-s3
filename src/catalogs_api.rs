@@ -21,10 +21,14 @@ use axum::routing::{get, put};
 use axum::{Json, Router};
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::creator_catalog::{self, CreatorCatalogEntry, MAX_CATALOG_BYTES, is_lower_hex_hash};
+use crate::catalog_metadata::{self, MetadataRefusal};
+use crate::creator_catalog::{
+    self, CreatorCatalogEntry, MAX_CATALOG_BYTES, SCHEMA_2, Schema, is_lower_hex_hash,
+};
 use crate::tags_api::{ApiState, TagStore, authorize_publisher, is_blocked};
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
@@ -101,6 +105,10 @@ async fn put_catalog<S: TagStore>(
                 fail(StatusCode::BAD_REQUEST, "unreadable request body")
             }
         })?;
+    // A `/1` document keeps `/1`'s smaller limit.
+    if creator_catalog::too_large(&bytes) {
+        return Err(fail(StatusCode::PAYLOAD_TOO_LARGE, "catalog too large"));
+    }
 
     // 4. A valid document of this subject.
     let doc = creator_catalog::parse(&bytes).map_err(|reason| {
@@ -125,12 +133,10 @@ async fn put_catalog<S: TagStore>(
         warn!(%sub, "Catalog upload rejected: content is blocked");
         return Err(fail(StatusCode::FORBIDDEN, "content is blocked"));
     }
-    check_payloads(&state, &doc.entries)
-        .await
-        .map_err(|(status, msg)| {
-            warn!(%sub, %status, reason = %msg, "Catalog upload rejected");
-            fail(status, msg)
-        })?;
+    check_catalog(&state, &doc).await.map_err(|(status, msg)| {
+        warn!(%sub, %status, reason = %msg, "Catalog upload rejected");
+        fail(status, msg)
+    })?;
 
     // 9. Store the exact bytes, then move the tag.
     let size = bytes.len();
@@ -155,55 +161,59 @@ async fn put_catalog<S: TagStore>(
     })))
 }
 
-/// The payload checks for a catalog a tag will point at, in the contract's
-/// order: no payload blocked (403 `content is blocked`), every payload an
-/// ingested blob (422 `payload <hash> is not ingested`, the first missing
-/// one in entry order), and every entry's `payloadSize` equal to that
-/// blob's size (422 `payload <hash> size does not match`, the first
-/// mismatching entry). Each distinct hash is looked up once, at most
+/// Every check a catalog passes before a tag may point at it: its schema
+/// is still accepted (`[http] accept_catalog_schema_1`; 422 `invalid
+/// catalog: schema must be "arkavo.creator-catalog/2"`), then
+/// [`check_payloads`].
+pub(crate) async fn check_catalog<S: TagStore>(
+    state: &ApiState<S>,
+    doc: &creator_catalog::CreatorCatalog,
+) -> Result<(), (StatusCode, String)> {
+    if doc.schema == Schema::V1 && !state.catalog.accept_schema_1 {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("invalid catalog: schema must be \"{SCHEMA_2}\""),
+        ));
+    }
+    check_payloads(state, &doc.entries).await
+}
+
+/// The checks for a catalog a tag will point at, in the contract's order:
+/// - no payload or metadata TDF blocked (403 `content is blocked`);
+/// - every one ingested (422 `payload <hash> is not ingested`, then
+///   `metadata <hash> is not ingested`, the first missing one in entry
+///   order);
+/// - every entry's sizes equal to those blobs' (422 `payload <hash> size
+///   does not match`, then `metadata <hash> size does not match`);
+/// - for `/2`, each metadata TDF fits its recording (see [`check_metadata`]).
+///
+/// Each distinct hash is looked up once, at most
 /// [`INGEST_CHECK_CONCURRENCY`] at a time.
 pub(crate) async fn check_payloads<S: TagStore>(
     state: &ApiState<S>,
     entries: &[CreatorCatalogEntry],
 ) -> Result<(), (StatusCode, String)> {
-    if entries.iter().any(|e| is_blocked(state, &e.payload_hash)) {
+    let metadata = || entries.iter().filter_map(|e| e.metadata.as_ref());
+    if entries.iter().any(|e| is_blocked(state, &e.payload_hash))
+        || metadata().any(|m| is_blocked(state, &m.hash))
+    {
         return Err((StatusCode::FORBIDDEN, "content is blocked".to_string()));
     }
 
-    let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
-    let lookups: Vec<String> = entries
-        .iter()
-        .map(|e| e.payload_hash.as_str())
-        .filter(|h| seen.insert(h))
-        .map(str::to_string)
-        .collect();
-    let mut sizes = HashMap::with_capacity(lookups.len());
-    let mut checks = futures::stream::iter(lookups)
-        .map(|payload| {
-            let store = Arc::clone(&state.store);
-            async move {
-                let found = store.blob_size(&payload).await;
-                (payload, found)
-            }
-        })
-        .buffered(INGEST_CHECK_CONCURRENCY);
-    while let Some((payload, found)) = checks.next().await {
-        match found {
-            Ok(Some(size)) => {
-                sizes.insert(payload, size);
-            }
-            Ok(None) => {
-                return Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("payload {payload} is not ingested"),
-                ));
-            }
+    let sizes = look_up(state, hashes(entries), |store, kind, hash| async move {
+        match store.blob_size(&hash).await {
+            Ok(Some(size)) => Ok(size),
+            Ok(None) => Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("{kind} {hash} is not ingested"),
+            )),
             Err(e) => {
                 warn!(error = %e, "Payload ingest check failed");
-                return Err((StatusCode::BAD_GATEWAY, "storage unavailable".to_string()));
+                Err((StatusCode::BAD_GATEWAY, "storage unavailable".to_string()))
             }
         }
-    }
+    })
+    .await?;
 
     // Per entry, not per hash: two entries naming one payload are each
     // checked.
@@ -216,7 +226,139 @@ pub(crate) async fn check_payloads<S: TagStore>(
             format!("payload {} size does not match", e.payload_hash),
         ));
     }
+    if let Some(m) = metadata().find(|m| sizes.get(&m.hash) != Some(&m.size)) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("metadata {} size does not match", m.hash),
+        ));
+    }
+    check_metadata(state, entries).await
+}
+
+/// `/2`: each metadata TDF fits its recording, compared on the manifests
+/// ingest stored (`catalog_metadata`). In order:
+/// - both manifests are stored (422 `payload <hash> manifest is not
+///   stored`, then `metadata <hash> …`) and readable (`… manifest is
+///   unreadable`);
+/// - the metadata policy holds only `uuid` and `body` (422 `metadata <hash>
+///   policy may only hold uuid and body`);
+/// - its attributes, dissemination list and KAS are the recording's (422
+///   `metadata <hash> policy does not match payload <hash>`).
+async fn check_metadata<S: TagStore>(
+    state: &ApiState<S>,
+    entries: &[CreatorCatalogEntry],
+) -> Result<(), (StatusCode, String)> {
+    let with_metadata: Vec<&CreatorCatalogEntry> =
+        entries.iter().filter(|e| e.metadata.is_some()).collect();
+    if with_metadata.is_empty() {
+        return Ok(());
+    }
+    let manifests = look_up(
+        state,
+        hashes(with_metadata.iter().copied()),
+        |store, kind, hash| async move {
+            match store.get_manifest(&hash).await {
+                Ok(Some(bytes)) => catalog_metadata::read_manifest(&bytes).ok_or_else(|| {
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!("{kind} {hash} manifest is unreadable"),
+                    )
+                }),
+                Ok(None) => Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("{kind} {hash} manifest is not stored"),
+                )),
+                Err(e) => {
+                    warn!(error = %e, "Manifest read failed");
+                    Err((StatusCode::BAD_GATEWAY, "storage unavailable".to_string()))
+                }
+            }
+        },
+    )
+    .await?;
+    for e in with_metadata {
+        let Some(m) = &e.metadata else { continue };
+        let (Some(payload), Some(meta)) = (manifests.get(&e.payload_hash), manifests.get(&m.hash))
+        else {
+            continue;
+        };
+        catalog_metadata::check(payload, meta).map_err(|why| {
+            let msg = match why {
+                MetadataRefusal::ExtraPolicyKeys => {
+                    format!("metadata {} policy may only hold uuid and body", m.hash)
+                }
+                MetadataRefusal::PolicyMismatch => format!(
+                    "metadata {} policy does not match payload {}",
+                    m.hash, e.payload_hash
+                ),
+            };
+            (StatusCode::UNPROCESSABLE_ENTITY, msg)
+        })?;
+    }
     Ok(())
+}
+
+/// What a hash in a catalog entry names.
+#[derive(Debug, Clone, Copy)]
+enum Kind {
+    Payload,
+    Metadata,
+}
+
+impl std::fmt::Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(match self {
+            Kind::Payload => "payload",
+            Kind::Metadata => "metadata",
+        })
+    }
+}
+
+/// The distinct hashes `entries` name, each with what it is: every
+/// payload, then every metadata TDF, in entry order. `/2` never names one
+/// hash as both.
+fn hashes<'a>(
+    entries: impl IntoIterator<Item = &'a CreatorCatalogEntry> + Clone,
+) -> Vec<(Kind, String)> {
+    let mut seen = HashSet::new();
+    let payloads = entries
+        .clone()
+        .into_iter()
+        .map(|e| (Kind::Payload, e.payload_hash.as_str()));
+    let metadata = entries
+        .into_iter()
+        .filter_map(|e| e.metadata.as_ref())
+        .map(|m| (Kind::Metadata, m.hash.as_str()));
+    payloads
+        .chain(metadata)
+        .filter(|(_, h)| seen.insert(*h))
+        .map(|(kind, h)| (kind, h.to_string()))
+        .collect()
+}
+
+/// Run `f` for each hash, at most [`INGEST_CHECK_CONCURRENCY`] at a time,
+/// and stop at the first refusal in `hashes` order.
+async fn look_up<S, T, F, Fut>(
+    state: &ApiState<S>,
+    hashes: Vec<(Kind, String)>,
+    f: F,
+) -> Result<HashMap<String, T>, (StatusCode, String)>
+where
+    S: TagStore,
+    F: Fn(Arc<S>, Kind, String) -> Fut,
+    Fut: Future<Output = Result<T, (StatusCode, String)>>,
+{
+    let mut found = HashMap::with_capacity(hashes.len());
+    let mut checks = futures::stream::iter(hashes)
+        .map(|(kind, hash)| {
+            let lookup = f(Arc::clone(&state.store), kind, hash.clone());
+            async move { (hash, lookup.await) }
+        })
+        .buffered(INGEST_CHECK_CONCURRENCY);
+    while let Some((hash, result)) = checks.next().await {
+        found.insert(hash, result?);
+    }
+    Ok(found)
 }
 
 /// `application/json`, with or without parameters such as `charset`.
@@ -341,8 +483,12 @@ mod tests {
     use super::*;
     use crate::auth::CwtVerifier;
     use crate::auth::test_support::{keypair, mint, mint_with_aud};
-    use crate::creator_catalog::test_support::{catalog, entry};
+    use crate::catalog_metadata::test_support::{
+        CAMPAIGN, KAS, manifest, metadata_policy, recording_policy,
+    };
+    use crate::creator_catalog::test_support::{METADATA_SIZE, catalog, catalog2, entry, entry2};
     use crate::moderation::{DEFAULT_PUBLISH_ENTITLEMENT, Moderation, PublishPolicy, now_secs};
+    use crate::tags_api::CatalogRules;
     use crate::tags_api::TagPublishing;
     use crate::tags_api::test_support::MemStore;
     use axum::http::{Method, Request};
@@ -364,6 +510,10 @@ mod tests {
 
     /// The catalog routes plus the tag routes, as main.rs wires them.
     fn harness(gated: bool) -> Harness {
+        harness_with(gated, CatalogRules::default())
+    }
+
+    fn harness_with(gated: bool, catalog: CatalogRules) -> Harness {
         let (_, vk) = keypair();
         let store = Arc::new(MemStore::new());
         let moderation = Arc::new(Moderation::default());
@@ -372,6 +522,7 @@ mod tests {
             verifier: Arc::new(CwtVerifier::with_static_keys(vec![(b"kid-1".to_vec(), vk)])),
             tag_prefix: "catalog/".to_string(),
             catalog_documents: Default::default(),
+            catalog,
             publishing: gated.then(|| TagPublishing {
                 policy: Arc::new(PublishPolicy {
                     entitlement: Some(DEFAULT_PUBLISH_ENTITLEMENT.into()),
@@ -645,14 +796,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_body_is_at_most_262144_bytes() {
+    async fn the_body_is_at_most_262144_bytes_or_524288_for_v2() {
         let h = harness(true);
         h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
+
+        let mut v2 = catalog2(SUB, vec![]);
+        v2.resize(MAX_CATALOG_BYTES, b' ');
+        let r = put_catalog(&h.app, SUB, Some(&creator()), v2.clone()).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        v2.push(b' ');
+        let r = put_catalog(&h.app, SUB, Some(&creator()), v2).await;
+        assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+
         let mut bytes = doc();
-        bytes.resize(MAX_CATALOG_BYTES, b' ');
+        bytes.resize(creator_catalog::MAX_CATALOG_1_BYTES, b' ');
         let r = put_catalog(&h.app, SUB, Some(&creator()), bytes.clone()).await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
-        assert_eq!(r.json()["size"], MAX_CATALOG_BYTES);
+        assert_eq!(r.json()["size"], creator_catalog::MAX_CATALOG_1_BYTES);
 
         bytes.push(b' ');
         let r = put_catalog(&h.app, SUB, Some(&creator()), bytes.clone()).await;
@@ -1086,6 +1246,270 @@ mod tests {
         assert_eq!(
             (r.status, r.error().as_str()),
             (StatusCode::NOT_FOUND, "blob not found")
+        );
+    }
+
+    fn meta(n: u8) -> String {
+        format!("{:02x}", 0x80 + n).repeat(32)
+    }
+
+    /// Ingest payload(n) (a recording) and meta(n) (its metadata TDF), each
+    /// with a stored manifest.
+    async fn ingest_pair(h: &Harness, n: u8, meta_policy: serde_json::Value, kas: &[&str]) {
+        h.store
+            .ingest_with_manifest(
+                &payload(n),
+                PAYLOAD_SIZE,
+                manifest(recording_policy(), &[KAS]),
+            )
+            .await;
+        h.store
+            .ingest_with_manifest(&meta(n), METADATA_SIZE, manifest(meta_policy, kas))
+            .await;
+    }
+
+    fn doc2() -> Vec<u8> {
+        catalog2(SUB, vec![entry2("rec-1", &payload(1), &meta(1))])
+    }
+
+    async fn refusal(h: &Harness, body: Vec<u8>) -> (StatusCode, String) {
+        let r = put_catalog(&h.app, SUB, Some(&creator()), body).await;
+        (r.status, r.error())
+    }
+
+    #[tokio::test]
+    async fn a_v2_catalog_publishes_when_its_metadata_fits() {
+        let h = harness(true);
+        ingest_pair(&h, 1, metadata_policy(), &[KAS]).await;
+        let r = put_catalog(&h.app, SUB, Some(&creator()), doc2()).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let hash = r.json()["hash"].as_str().unwrap().to_string();
+        let r = get(&h.app, &format!("/catalog-documents/{hash}")).await;
+        assert_eq!(r.body.as_ref(), doc2().as_slice());
+    }
+
+    #[tokio::test]
+    async fn metadata_must_be_ingested_unblocked_and_of_its_size() {
+        let h = harness(true);
+        h.store
+            .ingest_with_manifest(
+                &payload(1),
+                PAYLOAD_SIZE,
+                manifest(recording_policy(), &[KAS]),
+            )
+            .await;
+        assert_eq!(
+            refusal(&h, doc2()).await,
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("metadata {} is not ingested", meta(1))
+            )
+        );
+
+        h.store
+            .ingest_with_manifest(
+                &meta(1),
+                METADATA_SIZE + 1,
+                manifest(metadata_policy(), &[KAS]),
+            )
+            .await;
+        assert_eq!(
+            refusal(&h, doc2()).await,
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("metadata {} size does not match", meta(1))
+            )
+        );
+
+        h.store.ingest(&meta(1), METADATA_SIZE).await;
+        h.moderation.block_for_test(&meta(1));
+        assert_eq!(
+            refusal(&h, doc2()).await,
+            (StatusCode::FORBIDDEN, "content is blocked".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_payload_is_reported_before_missing_metadata() {
+        let h = harness(true);
+        let r = refusal(&h, doc2()).await;
+        assert_eq!(
+            r,
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("payload {} is not ingested", payload(1))
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn both_manifests_must_be_stored_and_readable() {
+        let h = harness(true);
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
+        h.store
+            .ingest_with_manifest(&meta(1), METADATA_SIZE, manifest(metadata_policy(), &[KAS]))
+            .await;
+        assert_eq!(
+            refusal(&h, doc2()).await,
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("payload {} manifest is not stored", payload(1))
+            )
+        );
+        h.store
+            .ingest_with_manifest(
+                &payload(1),
+                PAYLOAD_SIZE,
+                manifest(recording_policy(), &[KAS]),
+            )
+            .await;
+        h.store
+            .ingest_with_manifest(&meta(1), METADATA_SIZE, b"not a manifest".to_vec())
+            .await;
+        assert_eq!(
+            refusal(&h, doc2()).await,
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("metadata {} manifest is unreadable", meta(1))
+            )
+        );
+
+        h.store
+            .down
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(refusal(&h, doc2()).await.0, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn the_metadata_policy_is_minimal_and_matches_the_recording() {
+        let mut classified = metadata_policy();
+        classified["arkavo:classification"] = serde_json::json!("flagged");
+        let h = harness(true);
+        ingest_pair(&h, 1, classified, &[KAS]).await;
+        assert_eq!(
+            refusal(&h, doc2()).await,
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("metadata {} policy may only hold uuid and body", meta(1))
+            )
+        );
+
+        let other_campaign = serde_json::json!({ "uuid": "u", "body": {
+            "dataAttributes": [{ "attribute": CAMPAIGN.replace("12345678", "1") }], "dissem": [] } });
+        let open =
+            serde_json::json!({ "uuid": "u", "body": { "dataAttributes": [], "dissem": [] } });
+        for (policy, kas) in [
+            (other_campaign, &[KAS][..]),
+            (open, &[KAS][..]),
+            (metadata_policy(), &["https://other.example/kas"][..]),
+        ] {
+            let h = harness(true);
+            ingest_pair(&h, 1, policy.clone(), kas).await;
+            assert_eq!(
+                refusal(&h, doc2()).await,
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!(
+                        "metadata {} policy does not match payload {}",
+                        meta(1),
+                        payload(1)
+                    )
+                ),
+                "{policy} {kas:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn each_manifest_is_read_once_per_publish() {
+        let h = harness(true);
+        ingest_pair(&h, 1, metadata_policy(), &[KAS]).await;
+        h.store
+            .ingest_with_manifest(&meta(2), METADATA_SIZE, manifest(metadata_policy(), &[KAS]))
+            .await;
+        // Two entries share one recording.
+        let body = catalog2(
+            SUB,
+            vec![
+                entry2("rec-1", &payload(1), &meta(1)),
+                entry2("rec-2", &payload(1), &meta(2)),
+            ],
+        );
+        let r = put_catalog(&h.app, SUB, Some(&creator()), body).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        assert_eq!(
+            h.store
+                .manifest_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+    }
+
+    async fn put_tag(h: &Harness, hash: &str) -> Reply {
+        send(
+            &h.app,
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/tags/catalog/{SUB}"))
+                .header("authorization", format!("Bearer {}", creator()))
+                .header("content-type", "application/json")
+                .body(Body::from(format!("{{\"hash\":\"{hash}\"}}")))
+                .unwrap(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn after_the_cutover_v1_is_refused_on_upload_and_rollback() {
+        let h = harness(true);
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
+        let v1 = put_catalog(&h.app, SUB, Some(&creator()), doc())
+            .await
+            .json()["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // The same store, past the cutover.
+        let after = harness_with(
+            true,
+            CatalogRules {
+                accept_schema_1: false,
+                ..Default::default()
+            },
+        );
+        after.store.ingest(&payload(1), PAYLOAD_SIZE).await;
+        let want = (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid catalog: schema must be \"arkavo.creator-catalog/2\"".to_string(),
+        );
+        assert_eq!(refusal(&after, doc()).await, want);
+        let stored = h.store.catalog_documents.lock().await.clone();
+        *after.store.catalog_documents.lock().await = stored;
+        let r = put_tag(&after, &v1).await;
+        assert_eq!((r.status, r.error()), want);
+
+        // `/2` still publishes.
+        ingest_pair(&after, 1, metadata_policy(), &[KAS]).await;
+        let r = put_catalog(&after.app, SUB, Some(&creator()), doc2()).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+    }
+
+    #[tokio::test]
+    async fn a_v2_rollback_passes_the_metadata_checks_again() {
+        let h = harness(true);
+        ingest_pair(&h, 1, metadata_policy(), &[KAS]).await;
+        let first = put_catalog(&h.app, SUB, Some(&creator()), doc2())
+            .await
+            .json()["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        h.moderation.block_for_test(&meta(1));
+        let r = put_tag(&h, &first).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::FORBIDDEN, "content is blocked")
         );
     }
 
