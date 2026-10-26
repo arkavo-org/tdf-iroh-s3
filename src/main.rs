@@ -59,6 +59,13 @@ async fn purge_catalogs_1(config: &Config, delete: bool) -> Result<()> {
     let s3 = tdf_iroh_s3::store::s3::S3Client::from_config(&config.s3).await?;
     let report =
         tdf_iroh_s3::catalog_purge::purge_schema_1(&s3, &config.http.tag_prefix, delete).await?;
+    for sub in &report.unreadable_pointers {
+        println!("unreadable v2 pointer for {sub}: it could name any document");
+    }
+    let delete = delete && report.unreadable_pointers.is_empty();
+    if !report.unreadable_pointers.is_empty() {
+        println!("nothing deleted while a pointer is unreadable");
+    }
     let verb = if delete { "deleted" } else { "would delete" };
     for hash in &report.purged {
         println!("{verb} {hash}");

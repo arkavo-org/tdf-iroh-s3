@@ -390,9 +390,9 @@ Fetch `catalogHash` from the pinned node, with a size limit of `catalogSize`. Th
 In the order of #38:
 
 1. The node accepts `/2` next to `/1`, and a token on the resolution routes (`[http] catalog_token = "optional"`).
-2. Creator publishes `/2` and republishes existing catalogs; the iOS viewer reads `/2` and sends a token.
+2. Creator publishes `/2` and republishes existing catalogs, only once the node from step 1 is live: a node before it indexes a metadata TDF like a recording, and that entry stays in `GET /catalog/{group}` for good; the iOS viewer reads `/2` and sends a token.
 3. The node sets `[http] catalog_token = "required"` and `accept_catalog_schema_1 = false`: `/1` uploads and rollbacks to `/1` are refused.
-4. The operator runs `tdf-iroh-s3 --config <file> purge-catalogs-1`, a dry run, then with `--delete`. It deletes each stored `/1` document and its outboard, except one a catalog tag or v2 pointer still names, which it reports. Until it is deleted, a `/1` document, plaintext titles included, stays readable by its hash.
+4. The operator runs `tdf-iroh-s3 --config <file> purge-catalogs-1`, a dry run, then with `--delete`. It deletes each stored `/1` document and its outboard, except one a catalog tag or v2 pointer still names, which it reports. If a v2 pointer can't be read, it reports that and deletes nothing, since the pointer could name any document. Until it is deleted, a `/1` document, plaintext titles included, stays readable by its hash.
 
 ## Archive layout accepted at ingest
 
