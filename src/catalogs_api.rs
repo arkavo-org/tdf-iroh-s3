@@ -242,6 +242,8 @@ pub(crate) async fn check_payloads<S: TagStore>(
 ///   unreadable`);
 /// - the metadata policy holds only `uuid` and `body` (422 `metadata <hash>
 ///   policy may only hold uuid and body`);
+/// - its `payload.mimeType` is `CATALOG_ENTRY_MIME_TYPE` (422 `metadata
+///   <hash> is not catalog metadata`);
 /// - its attributes, dissemination list and KAS are the recording's (422
 ///   `metadata <hash> policy does not match payload <hash>`).
 async fn check_metadata<S: TagStore>(
@@ -286,6 +288,9 @@ async fn check_metadata<S: TagStore>(
             let msg = match why {
                 MetadataRefusal::ExtraPolicyKeys => {
                     format!("metadata {} policy may only hold uuid and body", m.hash)
+                }
+                MetadataRefusal::NotCatalogMetadata => {
+                    format!("metadata {} is not catalog metadata", m.hash)
                 }
                 MetadataRefusal::PolicyMismatch => format!(
                     "metadata {} policy does not match payload {}",
@@ -484,7 +489,7 @@ mod tests {
     use crate::auth::CwtVerifier;
     use crate::auth::test_support::{keypair, mint, mint_with_aud};
     use crate::catalog_metadata::test_support::{
-        CAMPAIGN, KAS, manifest, metadata_policy, recording_policy,
+        CAMPAIGN, KAS, manifest, metadata_manifest, metadata_policy, recording_policy,
     };
     use crate::creator_catalog::test_support::{METADATA_SIZE, catalog, catalog2, entry, entry2};
     use crate::moderation::{DEFAULT_PUBLISH_ENTITLEMENT, Moderation, PublishPolicy, now_secs};
@@ -1264,7 +1269,7 @@ mod tests {
             )
             .await;
         h.store
-            .ingest_with_manifest(&meta(n), METADATA_SIZE, manifest(meta_policy, kas))
+            .ingest_with_manifest(&meta(n), METADATA_SIZE, metadata_manifest(meta_policy, kas))
             .await;
     }
 
@@ -1310,7 +1315,7 @@ mod tests {
             .ingest_with_manifest(
                 &meta(1),
                 METADATA_SIZE + 1,
-                manifest(metadata_policy(), &[KAS]),
+                metadata_manifest(metadata_policy(), &[KAS]),
             )
             .await;
         assert_eq!(
@@ -1347,7 +1352,11 @@ mod tests {
         let h = harness(true);
         h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
         h.store
-            .ingest_with_manifest(&meta(1), METADATA_SIZE, manifest(metadata_policy(), &[KAS]))
+            .ingest_with_manifest(
+                &meta(1),
+                METADATA_SIZE,
+                metadata_manifest(metadata_policy(), &[KAS]),
+            )
             .await;
         assert_eq!(
             refusal(&h, doc2()).await,
@@ -1394,6 +1403,26 @@ mod tests {
             )
         );
 
+        let h = harness(true);
+        h.store
+            .ingest_with_manifest(
+                &payload(1),
+                PAYLOAD_SIZE,
+                manifest(recording_policy(), &[KAS]),
+            )
+            .await;
+        // A recording's manifest, not a metadata TDF's.
+        h.store
+            .ingest_with_manifest(&meta(1), METADATA_SIZE, manifest(metadata_policy(), &[KAS]))
+            .await;
+        assert_eq!(
+            refusal(&h, doc2()).await,
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("metadata {} is not catalog metadata", meta(1))
+            )
+        );
+
         let other_campaign = serde_json::json!({ "uuid": "u", "body": {
             "dataAttributes": [{ "attribute": CAMPAIGN.replace("12345678", "1") }], "dissem": [] } });
         let open =
@@ -1425,7 +1454,11 @@ mod tests {
         let h = harness(true);
         ingest_pair(&h, 1, metadata_policy(), &[KAS]).await;
         h.store
-            .ingest_with_manifest(&meta(2), METADATA_SIZE, manifest(metadata_policy(), &[KAS]))
+            .ingest_with_manifest(
+                &meta(2),
+                METADATA_SIZE,
+                metadata_manifest(metadata_policy(), &[KAS]),
+            )
             .await;
         // Two entries share one recording.
         let body = catalog2(

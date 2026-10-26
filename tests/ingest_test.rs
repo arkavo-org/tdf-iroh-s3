@@ -96,6 +96,38 @@ fn derive_artifacts_produces_manifest_and_group_entries() {
 }
 
 #[test]
+fn derive_artifacts_indexes_no_catalog_metadata() {
+    use opentdf::prelude::*;
+    use tdf_iroh_s3::catalog::derive_artifacts;
+    use tdf_iroh_s3::catalog_metadata::{CATALOG_ENTRY_MIME_TYPE, read_manifest};
+    use tdf_iroh_s3::config::CatalogConfig;
+    use tdf_iroh_s3::validation::validate_blob;
+
+    // A catalog `/2` metadata TDF carries its recording's campaign but is in
+    // no group; its manifest is still stored for the publish check (#39).
+    let policy = PolicyBuilder::new()
+        .id_auto()
+        .attribute_fqn("https://patreon.arkavo.com/attr/campaign/value/12345678")
+        .unwrap()
+        .build()
+        .unwrap();
+    let tdf = Tdf::encrypt(br#"{"title":"t"}"#)
+        .kas_url("https://kas.example.com")
+        .policy(policy)
+        .mime_type(CATALOG_ENTRY_MIME_TYPE)
+        .to_bytes()
+        .unwrap();
+    let manifest = validate_blob(&tdf, &ValidationConfig::default()).unwrap();
+    let config = CatalogConfig {
+        enabled: true,
+        ..CatalogConfig::default()
+    };
+    let derived = derive_artifacts(&manifest, &"ef".repeat(32), 1, 0, &config).unwrap();
+    assert!(derived.entries.is_empty());
+    assert!(read_manifest(derived.manifest_json.as_bytes()).is_some());
+}
+
+#[test]
 fn derive_artifacts_with_catalog_disabled_still_extracts_manifest() {
     use tdf_iroh_s3::catalog::derive_artifacts;
     use tdf_iroh_s3::config::CatalogConfig;
