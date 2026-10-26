@@ -184,6 +184,10 @@ async fn main() -> Result<()> {
             verifier: Arc::clone(&verifier),
             tag_prefix: http_cfg.tag_prefix.clone(),
             catalog_documents: Default::default(),
+            catalog: tdf_iroh_s3::tags_api::CatalogRules {
+                token: http_cfg.catalog_token,
+                accept_schema_1: http_cfg.accept_catalog_schema_1,
+            },
             publishing: gate.as_ref().map(|g| TagPublishing {
                 policy: Arc::clone(&policy),
                 moderation: Arc::clone(&g.moderation),

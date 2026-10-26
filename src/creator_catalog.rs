@@ -1,4 +1,4 @@
-//! Creator catalog documents, `arkavo.creator-catalog/1`.
+//! Creator catalog documents, `arkavo.creator-catalog/1` and `/2`.
 //!
 //! A creator's catalog is one JSON document listing their published
 //! recordings (see `docs/creator-catalogs.md`). The node stores each version
@@ -8,6 +8,10 @@
 //! readers apply the same rules: a document this node accepts must never be
 //! one a viewer rejects.
 //!
+//! In `/2` (tdf-iroh-s3#39) an entry names only hashes and sizes: its title,
+//! publish time and attributes are in a metadata TDF under the recording's
+//! policy, named by `metadataHash`.
+//!
 //! Pure: no I/O, so every rule is a plain unit test.
 
 use serde::Deserialize;
@@ -15,10 +19,12 @@ use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-/// The only schema this node accepts.
-pub const SCHEMA: &str = "arkavo.creator-catalog/1";
-/// Largest document, in bytes.
-pub const MAX_CATALOG_BYTES: usize = 262_144;
+pub const SCHEMA_1: &str = "arkavo.creator-catalog/1";
+pub const SCHEMA_2: &str = "arkavo.creator-catalog/2";
+/// Largest document of any schema, in bytes (a `/2` document).
+pub const MAX_CATALOG_BYTES: usize = 524_288;
+/// Largest `/1` document: the limit `/1` readers enforce.
+pub const MAX_CATALOG_1_BYTES: usize = 262_144;
 pub const MAX_ENTRIES: usize = 1000;
 pub const MAX_OWNER_BYTES: usize = 248;
 pub const MAX_CONTENT_ID_BYTES: usize = 256;
@@ -27,35 +33,103 @@ pub const MAX_VERSION: u64 = 9_007_199_254_740_991;
 /// 4 GiB − 1 (`u32::MAX`): the largest TDF a catalog may name, and the
 /// default `[validation] max_blob_bytes` (`config::DEFAULT_MAX_BLOB_BYTES`).
 pub const MAX_PAYLOAD_SIZE: u64 = 4_294_967_295;
+/// Largest metadata TDF a `/2` entry may name.
+pub const MAX_METADATA_SIZE: u64 = 262_144;
 pub const MAX_TITLE_BYTES: usize = 512;
 pub const MAX_ATTRIBUTE_FQNS: usize = 32;
 pub const MAX_ATTRIBUTE_FQN_BYTES: usize = 512;
 
-/// A parsed, validated catalog document.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// A catalog document's schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Schema {
+    V1,
+    V2,
+}
+
+impl Schema {
+    pub fn name(self) -> &'static str {
+        match self {
+            Schema::V1 => SCHEMA_1,
+            Schema::V2 => SCHEMA_2,
+        }
+    }
+
+    /// The largest document of this schema, in bytes.
+    pub fn max_bytes(self) -> usize {
+        match self {
+            Schema::V1 => MAX_CATALOG_1_BYTES,
+            Schema::V2 => MAX_CATALOG_BYTES,
+        }
+    }
+}
+
+/// A parsed, validated catalog document of either schema.
+#[derive(Debug)]
 pub struct CreatorCatalog {
-    pub schema: String,
+    pub schema: Schema,
     pub owner: String,
     pub entries: Vec<CreatorCatalogEntry>,
 }
 
-/// One published recording.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+/// One published recording: what the node checks at publish.
+#[derive(Debug)]
 pub struct CreatorCatalogEntry {
-    #[serde(rename = "contentID")]
     pub content_id: String,
     pub version: u64,
     /// BLAKE3 hash of the TDF bytes, 64 lowercase hex characters.
     pub payload_hash: String,
     pub payload_size: u64,
+    /// The entry's metadata TDF; `Some` exactly in `/2`.
+    pub metadata: Option<EntryMetadata>,
+}
+
+/// A `/2` entry's metadata TDF.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryMetadata {
+    pub hash: String,
+    pub size: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Document<E> {
+    schema: String,
+    owner: String,
+    entries: Vec<E>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct EntryV1 {
+    #[serde(rename = "contentID")]
+    content_id: String,
+    version: u64,
+    payload_hash: String,
+    payload_size: u64,
     /// Optional, but never `null`: when present it is a string.
     #[serde(default, deserialize_with = "present_string")]
-    pub title: Option<String>,
-    pub published_at: String,
+    title: Option<String>,
+    published_at: String,
     #[serde(rename = "attributeFQNs")]
-    pub attribute_fqns: Vec<String>,
+    attribute_fqns: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct EntryV2 {
+    #[serde(rename = "contentID")]
+    content_id: String,
+    version: u64,
+    payload_hash: String,
+    payload_size: u64,
+    metadata_hash: String,
+    metadata_size: u64,
+}
+
+/// Only the `schema` key, to choose the shape to parse.
+#[derive(Deserialize)]
+struct SchemaProbe {
+    schema: Option<serde_json::Value>,
 }
 
 /// `title` is optional, so an absent key is `None`; a present key must be a
@@ -64,9 +138,27 @@ fn present_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::
     String::deserialize(d).map(Some)
 }
 
+/// Whether `bytes` exceed the size limit of the schema they declare: more
+/// than [`MAX_CATALOG_BYTES`], or more than [`MAX_CATALOG_1_BYTES`] unless
+/// they declare `/2`. The HTTP layer answers this with 413 before
+/// [`parse`], which refuses the same documents.
+pub fn too_large(bytes: &[u8]) -> bool {
+    bytes.len() > MAX_CATALOG_BYTES
+        || (bytes.len() > MAX_CATALOG_1_BYTES && declared_schema(bytes) != Some(Schema::V2))
+}
+
+fn declared_schema(bytes: &[u8]) -> Option<Schema> {
+    match serde_json::from_slice::<SchemaProbe>(bytes).ok()?.schema? {
+        serde_json::Value::String(s) if s == SCHEMA_1 => Some(Schema::V1),
+        serde_json::Value::String(s) if s == SCHEMA_2 => Some(Schema::V2),
+        _ => None,
+    }
+}
+
 /// Parse and validate a catalog document. The error is the reason the
 /// HTTP layer reports as `invalid catalog: <reason>`. The caller compares
-/// `owner` with the subject it expects.
+/// `owner` with the subject it expects, and decides whether it still
+/// accepts `/1`.
 pub fn parse(bytes: &[u8]) -> Result<CreatorCatalog, String> {
     if bytes.len() > MAX_CATALOG_BYTES {
         return Err(format!("larger than {MAX_CATALOG_BYTES} bytes"));
@@ -75,14 +167,95 @@ pub fn parse(bytes: &[u8]) -> Result<CreatorCatalog, String> {
     // serde_json keeps the last of two equal keys without complaint, so a
     // separate pass rejects them before the typed parse.
     serde_json::from_slice::<NoDuplicateKeys>(bytes).map_err(|e| e.to_string())?;
-    let doc: CreatorCatalog = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    validate(&doc)?;
+    let probe: SchemaProbe = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let schema = match probe.schema {
+        Some(serde_json::Value::String(s)) if s == SCHEMA_2 => Schema::V2,
+        Some(serde_json::Value::String(s)) if s != SCHEMA_1 => {
+            return Err(format!("schema must be \"{SCHEMA_1}\" or \"{SCHEMA_2}\""));
+        }
+        // `/1`, or a missing or non-string schema, which the typed parse
+        // reports.
+        _ => Schema::V1,
+    };
+    if bytes.len() > schema.max_bytes() {
+        return Err(format!("larger than {} bytes", schema.max_bytes()));
+    }
+    let doc = match schema {
+        Schema::V1 => {
+            let doc: Document<EntryV1> =
+                serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+            validate(schema, doc, |e| {
+                let extras = validate_v1_extras(&e);
+                let c = entry(
+                    e.content_id,
+                    e.version,
+                    e.payload_hash,
+                    e.payload_size,
+                    None,
+                );
+                validate_common(&c)?;
+                extras.map(|()| c)
+            })?
+        }
+        Schema::V2 => {
+            let doc: Document<EntryV2> =
+                serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+            validate(schema, doc, |e| {
+                let metadata = EntryMetadata {
+                    hash: e.metadata_hash,
+                    size: e.metadata_size,
+                };
+                let c = entry(
+                    e.content_id,
+                    e.version,
+                    e.payload_hash,
+                    e.payload_size,
+                    Some(metadata.clone()),
+                );
+                validate_common(&c)?;
+                if !is_lower_hex_hash(&metadata.hash) {
+                    return Err("metadataHash must be 64 lowercase hex characters".to_string());
+                }
+                if !(1..=MAX_METADATA_SIZE).contains(&metadata.size) {
+                    return Err(format!(
+                        "metadataSize must be an integer from 1 to {MAX_METADATA_SIZE}"
+                    ));
+                }
+                Ok(c)
+            })?
+        }
+    };
+    if schema == Schema::V2 {
+        validate_metadata_hashes(&doc.entries)?;
+    }
     Ok(doc)
 }
 
-fn validate(doc: &CreatorCatalog) -> Result<(), String> {
-    if doc.schema != SCHEMA {
-        return Err(format!("schema must be \"{SCHEMA}\""));
+fn entry(
+    content_id: String,
+    version: u64,
+    payload_hash: String,
+    payload_size: u64,
+    metadata: Option<EntryMetadata>,
+) -> CreatorCatalogEntry {
+    CreatorCatalogEntry {
+        content_id,
+        version,
+        payload_hash,
+        payload_size,
+        metadata,
+    }
+}
+
+/// The document rules both schemas share; `convert` checks one entry
+/// (shared rules first, then the schema's own) and yields it.
+fn validate<E>(
+    schema: Schema,
+    doc: Document<E>,
+    convert: impl Fn(E) -> Result<CreatorCatalogEntry, String>,
+) -> Result<CreatorCatalog, String> {
+    if doc.schema != schema.name() {
+        return Err(format!("schema must be \"{SCHEMA_1}\" or \"{SCHEMA_2}\""));
     }
     if !valid_identifier(&doc.owner, MAX_OWNER_BYTES) {
         return Err(format!(
@@ -92,19 +265,51 @@ fn validate(doc: &CreatorCatalog) -> Result<(), String> {
     if doc.entries.len() > MAX_ENTRIES {
         return Err(format!("entries must hold at most {MAX_ENTRIES} entries"));
     }
-    let mut content_ids: HashMap<&str, usize> = HashMap::with_capacity(doc.entries.len());
-    for (i, entry) in doc.entries.iter().enumerate() {
-        validate_entry(entry).map_err(|reason| format!("entries[{i}].{reason}"))?;
-        if let Some(first) = content_ids.insert(entry.content_id.as_str(), i) {
+    let mut entries = Vec::with_capacity(doc.entries.len());
+    let mut content_ids: HashMap<String, usize> = HashMap::with_capacity(doc.entries.len());
+    for (i, raw) in doc.entries.into_iter().enumerate() {
+        let e = convert(raw).map_err(|reason| format!("entries[{i}].{reason}"))?;
+        if let Some(first) = content_ids.insert(e.content_id.clone(), i) {
             return Err(format!(
                 "entries[{i}].contentID duplicates entries[{first}].contentID"
+            ));
+        }
+        entries.push(e);
+    }
+    Ok(CreatorCatalog {
+        schema,
+        owner: doc.owner,
+        entries,
+    })
+}
+
+/// `/2`: each `metadataHash` is unique and never any entry's `payloadHash`,
+/// so one TDF is never both a recording and metadata.
+fn validate_metadata_hashes(entries: &[CreatorCatalogEntry]) -> Result<(), String> {
+    let payloads: HashMap<&str, usize> = entries
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(i, e)| (e.payload_hash.as_str(), i))
+        .collect();
+    let mut seen: HashMap<&str, usize> = HashMap::with_capacity(entries.len());
+    for (i, e) in entries.iter().enumerate() {
+        let Some(m) = &e.metadata else { continue };
+        if let Some(first) = seen.insert(m.hash.as_str(), i) {
+            return Err(format!(
+                "entries[{i}].metadataHash duplicates entries[{first}].metadataHash"
+            ));
+        }
+        if let Some(j) = payloads.get(m.hash.as_str()) {
+            return Err(format!(
+                "entries[{i}].metadataHash equals entries[{j}].payloadHash"
             ));
         }
     }
     Ok(())
 }
 
-fn validate_entry(e: &CreatorCatalogEntry) -> Result<(), String> {
+fn validate_common(e: &CreatorCatalogEntry) -> Result<(), String> {
     if !valid_identifier(&e.content_id, MAX_CONTENT_ID_BYTES) {
         return Err(format!(
             "contentID must be 1-{MAX_CONTENT_ID_BYTES} bytes of [A-Za-z0-9:._@-] without \"..\""
@@ -123,6 +328,11 @@ fn validate_entry(e: &CreatorCatalogEntry) -> Result<(), String> {
             "payloadSize must be an integer from 1 to {MAX_PAYLOAD_SIZE}"
         ));
     }
+    Ok(())
+}
+
+/// `/1`'s display fields: title, publish time and attributes.
+fn validate_v1_extras(e: &EntryV1) -> Result<(), String> {
     if let Some(title) = &e.title
         && !(1..=MAX_TITLE_BYTES).contains(&title.len())
     {
@@ -291,7 +501,32 @@ pub(crate) mod test_support {
     /// A valid catalog for `owner` listing `entries`, serialized.
     pub fn catalog(owner: &str, entries: Vec<serde_json::Value>) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
-            "schema": super::SCHEMA,
+            "schema": super::SCHEMA_1,
+            "owner": owner,
+            "entries": entries,
+        }))
+        .unwrap()
+    }
+
+    /// The `metadataSize` of [`entry2`].
+    pub const METADATA_SIZE: u64 = 2148;
+
+    /// A valid `/2` entry for `payload` and `metadata`, as a JSON value.
+    pub fn entry2(content_id: &str, payload: &str, metadata: &str) -> serde_json::Value {
+        serde_json::json!({
+            "contentID": content_id,
+            "version": 1,
+            "payloadHash": payload,
+            "payloadSize": 7342067,
+            "metadataHash": metadata,
+            "metadataSize": METADATA_SIZE,
+        })
+    }
+
+    /// A valid `/2` catalog for `owner` listing `entries`, serialized.
+    pub fn catalog2(owner: &str, entries: Vec<serde_json::Value>) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema": super::SCHEMA_2,
             "owner": owner,
             "entries": entries,
         }))
@@ -301,7 +536,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{catalog, entry};
+    use super::test_support::{catalog, catalog2, entry, entry2};
     use super::*;
     use serde_json::{Value, json};
 
@@ -350,7 +585,8 @@ mod tests {
         assert_eq!(doc.entries[0].content_id, "rec-2b9c4f1e0d8a4c7f");
         assert_eq!(doc.entries[0].version, 2);
         assert_eq!(doc.entries[0].payload_size, 7_342_067);
-        assert_eq!(doc.entries[0].title.as_deref(), Some("Studio session"));
+        assert_eq!(doc.schema, Schema::V1);
+        assert!(doc.entries[0].metadata.is_none());
     }
 
     #[test]
@@ -360,11 +596,12 @@ mod tests {
 
     #[test]
     fn title_is_optional_but_never_null() {
-        let doc = parse(&entry_with(|e| {
-            e.as_object_mut().unwrap().remove("title");
-        }))
-        .unwrap();
-        assert!(doc.entries[0].title.is_none());
+        assert!(
+            parse(&entry_with(|e| {
+                e.as_object_mut().unwrap().remove("title");
+            }))
+            .is_ok()
+        );
         assert!(reason(&entry_with(|e| e["title"] = Value::Null)).contains("null"));
         assert!(reason(&entry_with(|e| e["title"] = json!(""))).contains("title"));
         assert!(parse(&entry_with(|e| e["title"] = json!("é".repeat(256)))).is_ok());
@@ -681,9 +918,213 @@ mod tests {
     #[test]
     fn size_limit_is_enforced() {
         let mut bytes = catalog(OWNER, vec![]);
+        bytes.resize(MAX_CATALOG_1_BYTES, b' ');
+        assert!(parse(&bytes).is_ok());
+        assert!(!too_large(&bytes));
+        bytes.push(b' ');
+        assert_eq!(reason(&bytes), "larger than 262144 bytes");
+        assert!(too_large(&bytes));
+
+        // `/2` documents may be twice as large.
+        let mut bytes = catalog2(OWNER, vec![]);
         bytes.resize(MAX_CATALOG_BYTES, b' ');
         assert!(parse(&bytes).is_ok());
+        assert!(!too_large(&bytes));
         bytes.push(b' ');
-        assert!(reason(&bytes).contains("larger than"));
+        assert_eq!(reason(&bytes), "larger than 524288 bytes");
+        assert!(too_large(&bytes));
+
+        // Without a readable `/2` schema, the `/1` limit applies.
+        let mut bytes = vec![b'x'; MAX_CATALOG_1_BYTES + 1];
+        assert!(too_large(&bytes));
+        bytes.truncate(MAX_CATALOG_1_BYTES);
+        assert!(!too_large(&bytes));
+    }
+
+    fn meta() -> String {
+        "6d".repeat(32)
+    }
+
+    fn doc2_with(f: impl FnOnce(&mut Value)) -> Vec<u8> {
+        let mut doc: Value =
+            serde_json::from_slice(&catalog2(OWNER, vec![entry2("rec-1", &hash(), &meta())]))
+                .unwrap();
+        f(&mut doc);
+        serde_json::to_vec(&doc).unwrap()
+    }
+
+    fn entry2_with(f: impl FnOnce(&mut Value)) -> Vec<u8> {
+        doc2_with(|d| f(&mut d["entries"][0]))
+    }
+
+    #[test]
+    fn the_v2_contract_example_is_valid() {
+        let doc = parse(
+            br#"{ "schema": "arkavo.creator-catalog/2", "owner": "5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10",
+  "entries": [ { "contentID": "rec-2b9c4f1e0d8a4c7f", "version": 2,
+                 "payloadHash": "4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a", "payloadSize": 7342067,
+                 "metadataHash": "6d0e6d0e6d0e6d0e6d0e6d0e6d0e6d0e6d0e6d0e6d0e6d0e6d0e6d0e6d0e6d0e", "metadataSize": 2148 } ] }"#,
+        )
+        .unwrap();
+        assert_eq!(doc.schema, Schema::V2);
+        assert_eq!(doc.owner, OWNER);
+        assert_eq!(
+            doc.entries[0].metadata,
+            Some(EntryMetadata {
+                hash: "6d0e".repeat(16),
+                size: 2148
+            })
+        );
+    }
+
+    #[test]
+    fn a_v2_entry_has_exactly_its_own_keys() {
+        // `/1`'s display fields are in the metadata TDF now.
+        for (key, value) in [
+            ("title", json!("Studio session")),
+            ("publishedAt", json!("2026-10-16T14:30:00Z")),
+            ("attributeFQNs", json!([])),
+            ("extra", json!(1)),
+        ] {
+            let r = reason(&entry2_with(|e| e[key] = value.clone()));
+            assert!(r.contains("unknown field"), "{key}: {r}");
+        }
+        for key in [
+            "contentID",
+            "version",
+            "payloadHash",
+            "payloadSize",
+            "metadataHash",
+            "metadataSize",
+        ] {
+            let r = reason(&entry2_with(|e| {
+                e.as_object_mut().unwrap().remove(key);
+            }));
+            assert!(r.contains("missing field"), "{key}: {r}");
+        }
+        // A `/1` entry under the `/2` schema, and the reverse.
+        assert!(reason(&doc2_with(|d| d["schema"] = json!(SCHEMA_1))).contains("unknown field"));
+        assert!(reason(&doc_with(|d| d["schema"] = json!(SCHEMA_2))).contains("unknown field"));
+        assert!(reason(&doc2_with(|d| d["extra"] = json!(1))).contains("unknown field"));
+    }
+
+    #[test]
+    fn an_unknown_schema_names_both() {
+        for schema in ["arkavo.creator-catalog/3", "Arkavo.creator-catalog/2", ""] {
+            assert_eq!(
+                reason(&doc2_with(|d| d["schema"] = json!(schema))),
+                "schema must be \"arkavo.creator-catalog/1\" or \"arkavo.creator-catalog/2\"",
+                "{schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_shared_fields_follow_the_v1_rules() {
+        assert!(
+            reason(&entry2_with(|e| e["contentID"] = json!("a..b")))
+                .starts_with("entries[0].contentID")
+        );
+        assert!(reason(&entry2_with(|e| e["version"] = json!(0))).contains("version"));
+        assert!(
+            reason(&entry2_with(|e| e["payloadHash"] = json!("4F".repeat(32))))
+                .contains("payloadHash")
+        );
+        assert!(reason(&entry2_with(|e| e["payloadSize"] = json!(0))).contains("payloadSize"));
+        let bytes = catalog2(
+            OWNER,
+            vec![
+                entry2("rec-1", &hash(), &meta()),
+                entry2("rec-1", &"5a".repeat(32), &"7b".repeat(32)),
+            ],
+        );
+        assert!(reason(&bytes).contains("entries[1].contentID duplicates entries[0]"));
+    }
+
+    #[test]
+    fn metadata_hash_and_size_are_checked() {
+        for h in ["6D".repeat(32), "6d".repeat(31), String::new()] {
+            assert!(
+                reason(&entry2_with(|e| e["metadataHash"] = json!(h))).contains("metadataHash"),
+                "{h}"
+            );
+        }
+        for ok in [json!(1), json!(262_144)] {
+            assert!(
+                parse(&entry2_with(|e| e["metadataSize"] = ok.clone())).is_ok(),
+                "{ok}"
+            );
+        }
+        for bad in [json!(0), json!(262_145), json!(-1), json!(1.5), Value::Null] {
+            assert!(
+                parse(&entry2_with(|e| e["metadataSize"] = bad.clone())).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(
+            reason(&entry2_with(|e| e["metadataSize"] = json!(262_145)))
+                .contains("metadataSize must be an integer from 1 to 262144")
+        );
+    }
+
+    #[test]
+    fn metadata_hashes_are_unique_and_never_a_payload() {
+        let (p1, p2) = ("4f".repeat(32), "5a".repeat(32));
+        let bytes = catalog2(
+            OWNER,
+            vec![entry2("rec-1", &p1, &meta()), entry2("rec-2", &p2, &meta())],
+        );
+        assert_eq!(
+            reason(&bytes),
+            "entries[1].metadataHash duplicates entries[0].metadataHash"
+        );
+        // Its own payload, or another entry's.
+        let bytes = catalog2(OWNER, vec![entry2("rec-1", &p1, &p1)]);
+        assert_eq!(
+            reason(&bytes),
+            "entries[0].metadataHash equals entries[0].payloadHash"
+        );
+        let bytes = catalog2(
+            OWNER,
+            vec![entry2("rec-1", &p1, &meta()), entry2("rec-2", &p2, &p1)],
+        );
+        assert_eq!(
+            reason(&bytes),
+            "entries[1].metadataHash equals entries[0].payloadHash"
+        );
+        let bytes = catalog2(
+            OWNER,
+            vec![entry2("rec-1", &p1, &p2), entry2("rec-2", &p2, &meta())],
+        );
+        assert_eq!(
+            reason(&bytes),
+            "entries[0].metadataHash equals entries[1].payloadHash"
+        );
+        // Two entries may name one payload (as in `/1`), each with its own
+        // metadata.
+        let bytes = catalog2(
+            OWNER,
+            vec![
+                entry2("rec-1", &p1, &meta()),
+                entry2("rec-2", &p1, &"7b".repeat(32)),
+            ],
+        );
+        assert!(parse(&bytes).is_ok());
+    }
+
+    #[test]
+    fn a_thousand_v2_entries_fit() {
+        let entries: Vec<Value> = (0..1000)
+            .map(|i| {
+                entry2(
+                    &format!("rec-{i:032x}"),
+                    &format!("{i:064x}"),
+                    &format!("{:064x}", i + 1_000_000),
+                )
+            })
+            .collect();
+        let bytes = catalog2(OWNER, entries);
+        assert!(bytes.len() > MAX_CATALOG_1_BYTES, "{}", bytes.len());
+        assert_eq!(parse(&bytes).unwrap().entries.len(), 1000);
     }
 }
