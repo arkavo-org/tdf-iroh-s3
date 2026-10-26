@@ -33,6 +33,50 @@ use tdf_iroh_s3::tls;
 struct Cli {
     #[arg(short, long, default_value = "/etc/tdf-iroh-s3/config.toml")]
     config: PathBuf,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Delete stored arkavo.creator-catalog/1 documents and their outboards,
+    /// except those a catalog tag or v2 pointer still names
+    /// (tdf-iroh-s3#39). A dry run unless --delete is given.
+    PurgeCatalogs1 {
+        #[arg(long)]
+        delete: bool,
+    },
+}
+
+/// `purge-catalogs-1`: one line per document, then a summary.
+async fn purge_catalogs_1(config: &Config, delete: bool) -> Result<()> {
+    // While /1 is accepted, a creator could move a tag back onto a document
+    // the purge is about to delete.
+    anyhow::ensure!(
+        !delete || !config.http.accept_catalog_schema_1,
+        "refusing to delete: set [http] accept_catalog_schema_1 = false and restart the node first"
+    );
+    let s3 = tdf_iroh_s3::store::s3::S3Client::from_config(&config.s3).await?;
+    let report =
+        tdf_iroh_s3::catalog_purge::purge_schema_1(&s3, &config.http.tag_prefix, delete).await?;
+    let verb = if delete { "deleted" } else { "would delete" };
+    for hash in &report.purged {
+        println!("{verb} {hash}");
+    }
+    for hash in &report.in_use {
+        println!("kept {hash}: a catalog tag or pointer names it");
+    }
+    for hash in &report.unreadable {
+        println!("kept {hash}: no readable schema");
+    }
+    println!(
+        "{} /1 {verb}, {} /1 in use, {} unreadable, {} /2 kept",
+        report.purged.len(),
+        report.in_use.len(),
+        report.unreadable.len(),
+        report.kept
+    );
+    Ok(())
 }
 
 #[tokio::main]
@@ -55,6 +99,9 @@ async fn main() -> Result<()> {
     let config = Config::from_file(&cli.config)?;
     info!("Config loaded from {:?}", cli.config);
     info!("S3: {}:{}", config.s3.bucket, config.s3.region);
+    if let Some(Command::PurgeCatalogs1 { delete }) = cli.command {
+        return purge_catalogs_1(&config, delete).await;
+    }
     info!(
         "Required attributes: {:?}",
         config.validation.required_attributes
