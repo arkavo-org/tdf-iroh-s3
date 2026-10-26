@@ -71,7 +71,7 @@ New `[http] catalog_token = "optional" | "required"`, default `optional`.
 
 ### Cutover
 
-- New `[catalog] accept_schema_1 = true` (default). Set to `false` once Creator publishes `/2`: `PUT /catalogs`, `PUT /v2/catalogs` and `PUT /tags/catalog` then refuse `/1` (422 `invalid catalog: schema must be "arkavo.creator-catalog/2"`; for a tag, the stored document's schema).
+- New `[http] accept_catalog_schema_1 = true` (default; `[http]` holds the catalog routes' settings, `[catalog]` the group index). Set to `false` once Creator publishes `/2`: `PUT /catalogs`, `PUT /v2/catalogs` and `PUT /tags/catalog` then refuse `/1` (422 `invalid catalog: schema must be "arkavo.creator-catalog/2"`; for a tag, the stored document's schema).
 - Deleting stored `/1` documents (D5): a one-off subcommand of the node binary, `tdf-iroh-s3 --config <file> purge-catalogs-1 [--delete]`. It lists `catalog-documents/`, reads each, and for every `/1` document reports, and with `--delete` removes, `catalog-documents/<hash>` and `catalog-outboards/<hash>`. A document a `catalog/<sub>` tag or a v2 pointer still names is reported and kept: deleting it would leave that creator with a dangling catalog. Dry run by default.
 - Moderation is unchanged on the node: a takedown blocks both hashes (arks writes two blocks, arkavo-rs#93). `catalog_hidden` and catalog blocks apply to `/2` documents as to `/1`.
 
@@ -82,13 +82,13 @@ New `[http] catalog_token = "optional" | "required"`, default `optional`.
 ## Plan
 
 1. `creator_catalog`: `/2` parse and validate, size limits per schema; unit tests.
-2. Publish checks: `get_manifest`, metadata ingest/size/manifest/policy checks in `check_payloads`, used by all three write routes; `accept_schema_1`. The `PUT /v2/catalogs` body limit grows with the `/2` document limit (the document travels base64url-encoded in the bundle).
+2. Publish checks: `get_manifest`, metadata ingest/size/manifest/policy checks in `check_payloads`, used by all three write routes; `accept_catalog_schema_1`. The `PUT /v2/catalogs` body limit grows with the `/2` document limit (the document travels base64url-encoded in the bundle).
 3. Group index for metadata blobs, per D3 (waits on the answer).
 4. Token on resolution routes: `[http] catalog_token`.
 5. `purge-catalogs-1` subcommand.
 6. Docs: `docs/creator-catalogs.md`, `CLAUDE.md`.
 
-Rollout follows #38. **Before Creator republishes as `/2`:** count `blobs/` against `manifests/` in production and list recordings without a manifest. Check 3 refuses any catalog naming one, and the only repair is re-pushing the recording, so a gap may hold up #38 step 3. Then deploy with `catalog_token = "optional"` and `accept_schema_1 = true`; after Creator#102 and arkavo-ios#40 ship, set `required` and `false`, then run `purge-catalogs-1 --delete`.
+Rollout follows #38. **Before Creator republishes as `/2`:** count `blobs/` against `manifests/` in production and list recordings without a manifest. Check 3 refuses any catalog naming one, and the only repair is re-pushing the recording, so a gap may hold up #38 step 3. Then deploy with `catalog_token = "optional"` and `accept_catalog_schema_1 = true`; after Creator#102 and arkavo-ios#40 ship, set `required` and `false`, then run `purge-catalogs-1 --delete`.
 
 ## Decisions needed (owner)
 

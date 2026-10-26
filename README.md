@@ -114,6 +114,12 @@ tag_prefix = "catalog/"
 # passkey credential status route ("" skips the check; development only).
 passkey_rp_id = "identity.arkavo.net"
 passkey_status_url = "https://identity.arkavo.net/passkeys/credentials/{credentialId}/status"
+# Resolving a creator's catalog (GET /tags/catalog, /v2/catalogs,
+# /catalog/{group}): "optional" verifies a presented token, "required"
+# refuses none (tdf-iroh-s3#39).
+catalog_token = "optional"
+# false after the cutover to arkavo.creator-catalog/2.
+accept_catalog_schema_1 = true
 
 # Optional: HTTPS terminated by the node itself (rustls, TLS 1.3 only).
 # The plain listener above then binds to 127.0.0.1 only. On EC2,
