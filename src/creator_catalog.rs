@@ -147,7 +147,8 @@ pub fn too_large(bytes: &[u8]) -> bool {
         || (bytes.len() > MAX_CATALOG_1_BYTES && declared_schema(bytes) != Some(Schema::V2))
 }
 
-fn declared_schema(bytes: &[u8]) -> Option<Schema> {
+/// The schema `bytes` declare, without validating anything else.
+pub fn declared_schema(bytes: &[u8]) -> Option<Schema> {
     match serde_json::from_slice::<SchemaProbe>(bytes).ok()?.schema? {
         serde_json::Value::String(s) if s == SCHEMA_1 => Some(Schema::V1),
         serde_json::Value::String(s) if s == SCHEMA_2 => Some(Schema::V2),

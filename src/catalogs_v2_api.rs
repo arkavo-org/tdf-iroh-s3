@@ -179,7 +179,7 @@ struct PutRequest {
 
 /// The `seq` of a stored bundle. The node wrote it after verifying it, so
 /// failing to read it back is a storage fault.
-fn stored_seq(body: &[u8]) -> anyhow::Result<(u64, String)> {
+pub(crate) fn stored_seq(body: &[u8]) -> anyhow::Result<(u64, String)> {
     let bundle: Bundle = serde_json::from_slice(body)?;
     let bytes = URL_SAFE_NO_PAD.decode(&bundle.pointer)?;
     let pointer = catalog_v2::parse_pointer(&bytes).map_err(anyhow::Error::msg)?;

@@ -638,6 +638,58 @@ impl S3Client {
         }
     }
 
+    /// The names of every object under `{prefix}<rel_prefix>`, with that
+    /// prefix taken off, paginating as needed.
+    pub async fn list_names(&self, rel_prefix: &str) -> Result<Vec<String>> {
+        let prefix = format!("{}{}", self.prefix, rel_prefix);
+        let mut names = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&prefix);
+            if let Some(token) = &continuation {
+                req = req.continuation_token(token);
+            }
+            let resp = req
+                .send()
+                .await
+                .with_context(|| format!("Failed to LIST {rel_prefix} in S3"))?;
+            names.extend(
+                resp.contents()
+                    .iter()
+                    .filter_map(|obj| obj.key()?.strip_prefix(&prefix).map(str::to_string)),
+            );
+            match resp.next_continuation_token() {
+                Some(token) => continuation = Some(token.to_string()),
+                None => break,
+            }
+        }
+        Ok(names)
+    }
+
+    /// Delete a catalog document and its outboard (a `/1` document may have
+    /// none; deleting a missing key succeeds).
+    pub async fn delete_catalog_document(&self, hash_hex: &str) -> Result<()> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_outboard_key(hash_hex))
+            .send()
+            .await
+            .context("Failed to DELETE catalog outboard from S3")?;
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_document_key(hash_hex))
+            .send()
+            .await
+            .context("Failed to DELETE catalog document from S3")?;
+        Ok(())
+    }
+
     pub async fn delete_blob(&self, hash_hex: &str) -> Result<()> {
         self.client
             .delete_object()
