@@ -28,7 +28,7 @@ The node always authenticates the publisher (the checks above, except the entitl
 | `shadow` | Both. The local answer is enforced, and the decision service's answer is logged next to it (`Publish decision shadow: agrees` / `disagrees`). |
 | `pdp` | The platform's decision service at `[catalog.authz] endpoint` (tdf-iroh-s3#35). Its answer replaces the entitlement check. Refusals: deny is 403 `publishing not permitted`; no decision (error, timeout) is 503 `decision service unavailable`. Publishing fails closed. |
 
-**The request.** The node sends one AuthZEN evaluation through the same client as the catalog: action `read` on a resource of type `publisher`, carrying `[publishing] entitlement` as its `attribute_value_fqns`. Per draft-arkavo-authzen-cwt-00, the entity chain is:
+**The request.** The node sends one AuthZEN evaluation through the same client as the catalog: action `publish` (not the catalog's `[catalog.authz] action`) on a resource of type `publisher`, carrying `[publishing] entitlement` as its `attribute_value_fqns`. Per draft-arkavo-authzen-cwt-00, the entity chain is:
 
 1. the verified person;
 2. each device presented in repeated `X-Entity-Token` headers (DeviceCheck CWTs: `aud` `arkavo:devicecheck`, bound to the person). A device token that fails verification is 401 in `pdp`; in `shadow` it only means the decision service isn't asked (`Publish decision shadow: chain refused`); in `local` they are ignored;

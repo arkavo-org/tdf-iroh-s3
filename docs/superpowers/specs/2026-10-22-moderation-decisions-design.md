@@ -46,7 +46,7 @@ Moderation splits into two layers, and the decision service fits only the first.
 ```json
 {
   "subject": { "type": "identity", "id": "<sub>", "properties": { "iss": "…", "arkavo_entitlements": ["…/arkavo-creator/value/publish"] } },
-  "action": { "name": "read" },
+  "action": { "name": "publish" },
   "context": {
     "devices": [{ "sub": "<uuid>", "iss": "https://identity.arkavo.net", "aud": "arkavo:devicecheck", "kid": "<cnf.kid>" }],
     "environment": { "region": "us-east-1" }
@@ -56,7 +56,7 @@ Moderation splits into two layers, and the decision service fits only the first.
 }
 ```
 
-- **Action:** `read`, following the fork's convention (`policy.arkavo.yaml`: "values are attribute values, NOT action names — the action on every direct entitlement is `read`"). The attribute value carries the meaning, so the source needs no `actions` setting.
+- **Action:** `publish` (owner, 2026-10-25, on opentdf-platform#59; arks's facade passes it through lowercased). A `read` request is denied. #59 first proposed `read`, the fork's convention for direct entitlements (`policy.arkavo.yaml`).
 - **Where the node asks:**
   - `POST /publish/sessions`;
   - `PUT /tags/catalog/*`;

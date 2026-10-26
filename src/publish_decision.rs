@@ -3,7 +3,7 @@
 //!
 //! The node still authenticates the publisher (CWT signature, issuer, `aud`,
 //! a person rather than a service client). What it asks the PDP is one
-//! AuthZEN evaluation: action `read` on a `publisher` resource carrying the
+//! AuthZEN evaluation: action `publish` on a `publisher` resource carrying the
 //! publish entitlement's attribute value, for the whole entity chain (the
 //! person, each attested device, the environment). The platform withholds
 //! that grant from a suspended account, and devices narrow it as its policy
@@ -148,7 +148,7 @@ impl PublishDecider {
         };
         let req = DecisionRequest {
             chain: chain.to_vec(),
-            action: "read".into(),
+            action: "publish".into(),
             resource_type: ResourceType::Publisher,
             resources: vec![(sub.to_string(), vec![self.entitlement.clone()])],
         };
@@ -277,7 +277,7 @@ mod tests {
         assert_eq!(decider(&s).ask(&chain()).await, Verdict::Permit);
         let req = s.seen.lock().unwrap().clone().unwrap();
         assert_eq!(req.resource_type, ResourceType::Publisher);
-        assert_eq!(req.action, "read");
+        assert_eq!(req.action, "publish");
         assert_eq!(
             req.resources,
             vec![(
