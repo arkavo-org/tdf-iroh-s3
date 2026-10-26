@@ -33,12 +33,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::warn;
 
-use crate::auth::{CwtVerifier, subject_id_bind};
-use crate::authz::{ChainEntity, DecisionProvider, DecisionRequest};
+use crate::auth::CwtVerifier;
+use crate::authz::{ChainEntity, DecisionProvider, DecisionRequest, ResourceType};
 use crate::catalog::CatalogEntry;
-
-/// 1 PE + D devices + E environment (E is 0 or 1).
-const MAX_CHAIN_ENTITIES: usize = 8;
+use crate::entity_chain;
 
 /// Read side of the catalog index. `S3Client` is the production impl.
 pub trait CatalogStore: Send + Sync + 'static {
@@ -262,6 +260,7 @@ async fn get_catalog<S: CatalogStore, D: DecisionProvider>(
             let req = DecisionRequest {
                 chain: chain.clone(),
                 action: state.action.clone(),
+                resource_type: ResourceType::CatalogItem,
                 resources: entries
                     .iter()
                     .map(|e| (e.hash.clone(), e.attribute_fqns.clone()))
@@ -303,11 +302,7 @@ async fn build_chain<S: CatalogStore, D: DecisionProvider>(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    let npe_tokens: Vec<&str> = headers
-        .get_all("x-entity-token")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .collect();
+    let npe_tokens = entity_chain::entity_tokens(headers);
 
     let Some(pe_token) = pe_token else {
         if npe_tokens.is_empty() {
@@ -320,10 +315,8 @@ async fn build_chain<S: CatalogStore, D: DecisionProvider>(
         ));
     };
 
-    let extra = usize::from(state.environment.is_some());
-    if 1 + npe_tokens.len() + extra > MAX_CHAIN_ENTITIES {
-        return Err(err(StatusCode::BAD_REQUEST, "too many entities"));
-    }
+    entity_chain::check_length(npe_tokens.len(), state.environment.is_some())
+        .map_err(|(status, e)| err(status, e))?;
 
     let now = unix_now();
     let pe = state.verifier.verify(pe_token, now).await.map_err(|e| {
@@ -331,91 +324,14 @@ async fn build_chain<S: CatalogStore, D: DecisionProvider>(
         err(StatusCode::UNAUTHORIZED, "invalid token")
     })?;
 
-    // Subject claims for the decision: extracted from the *verified* CWT.
-    // Forward the whole arkavo_patreon claim so the platform's
-    // claims-passthrough derives campaign-qualified entitlements from the
-    // memberships array — this node verified the CWT signature, so the
-    // claim is authoritative. iss is included so the platform can pin the
-    // materializer's issuer. patreon_user_id/email remain as the ERS's
-    // fallback lookup keys.
-    let mut subject_claims = serde_json::Map::new();
-    subject_claims.insert("sub".into(), pe.sub.clone().into());
-    subject_claims.insert("iss".into(), pe.iss.clone().into());
-    if let Some(uid) = &pe.patreon_user_id {
-        subject_claims.insert("patreon_user_id".into(), uid.clone().into());
-    }
-    if let Some(email) = &pe.email {
-        subject_claims.insert("email".into(), email.clone().into());
-    }
-    if let Some(v) = pe.email_verified {
-        subject_claims.insert("email_verified".into(), v.into());
-    }
-    if let Some(idp) = &pe.idp {
-        subject_claims.insert("idp".into(), idp.clone().into());
-    }
-    if let Some(id) = &pe.arkavo_account_id {
-        subject_claims.insert("arkavo_account_id".into(), id.clone().into());
-    }
-    if let Some(roles) = &pe.arkavo_roles {
-        subject_claims.insert("arkavo_roles".into(), roles.clone().into());
-    }
-    if let Some(ents) = &pe.arkavo_entitlements {
-        subject_claims.insert("arkavo_entitlements".into(), ents.clone().into());
-    }
-    if let Some(id) = &pe.client_id {
-        subject_claims.insert("client_id".into(), id.clone().into());
-    }
-    if let Some(patreon) = &pe.arkavo_patreon {
-        subject_claims.insert("arkavo_patreon".into(), patreon.clone());
-    }
-    let mut chain = vec![ChainEntity {
-        is_subject: true,
-        token: Some(pe_token.to_string()),
-        claims: serde_json::Value::Object(subject_claims),
-    }];
-
-    for token in npe_tokens {
-        let claims = state
-            .verifier
-            .verify_device(token, now)
+    let mut chain = vec![entity_chain::subject_entity(&pe, Some(pe_token))];
+    chain.extend(
+        entity_chain::verified_devices(&state.verifier, &npe_tokens, &pe.sub, now)
             .await
-            .map_err(|e| {
-                warn!(error = %e, "NPE token verification failed");
-                err(StatusCode::UNAUTHORIZED, "invalid entity token")
-            })?;
-        if subject_id_bind(&claims.sub) != subject_id_bind(&pe.sub) {
-            warn!("Entity chain subject mismatch");
-            return Err(err(
-                StatusCode::UNAUTHORIZED,
-                "entity token subject does not match bearer subject",
-            ));
-        }
-        // verify_device guarantees the DeviceCheck audience is present; the
-        // PDP's device schema takes exactly that string, whatever else `aud`
-        // listed.
-        let aud = crate::auth::DEVICECHECK_AUD;
-        let Some(kid) = claims.kid.as_deref().filter(|k| !k.is_empty()) else {
-            return Err(err(StatusCode::UNAUTHORIZED, "invalid entity token"));
-        };
-        chain.push(ChainEntity {
-            is_subject: false,
-            token: Some(token.to_string()),
-            claims: serde_json::json!({
-                "sub": claims.sub,
-                "iss": claims.iss,
-                "aud": aud,
-                "kid": kid,
-            }),
-        });
-    }
-
-    // Observed environment: asserted by this node, never client-supplied.
+            .map_err(|(status, e)| err(status, e))?,
+    );
     if let Some(env) = &state.environment {
-        chain.push(ChainEntity {
-            is_subject: false,
-            token: None,
-            claims: env.clone(),
-        });
+        chain.push(entity_chain::environment_entity(env));
     }
 
     Ok(Some(chain))
@@ -479,7 +395,7 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.seen_chain_len.lock().unwrap() = Some(req.chain.len());
             *self.seen_chain.lock().unwrap() = Some(req.chain.clone());
-            if let Some(pe) = req.chain.iter().find(|e| e.is_subject) {
+            if let Some(pe) = req.chain.iter().find(|e| e.is_subject()) {
                 *self.seen_subject_claims.lock().unwrap() = Some(pe.claims.clone());
             }
             Ok(req
@@ -871,6 +787,7 @@ mod tests {
         let req = DecisionRequest {
             chain,
             action: "read".into(),
+            resource_type: ResourceType::CatalogItem,
             resources: vec![(
                 "aa".repeat(32),
                 vec!["https://p.example/attr/tier/value/gold".into()],

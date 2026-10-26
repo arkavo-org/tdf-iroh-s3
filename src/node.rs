@@ -766,17 +766,14 @@ impl BlobsHandler {
             }
             match self.server.check(*hash).await {
                 Ok(servable) => {
-                    // A catalog document of a creator suspended with
-                    // `hideCatalog`. Checked on every fetch: the owner never
-                    // changes, suspensions do.
+                    // A catalog document of a creator whose catalog is
+                    // blocked. Checked on every fetch: the owner never
+                    // changes, blocks do.
                     let hidden = match &servable.object {
-                        Object::CatalogDocument { owner: Some(owner) } => {
-                            self.gate.as_ref().is_some_and(|g| {
-                                g.moderation
-                                    .suspension(owner)
-                                    .is_some_and(|s| s.hide_catalog)
-                            })
-                        }
+                        Object::CatalogDocument { owner: Some(owner) } => self
+                            .gate
+                            .as_ref()
+                            .is_some_and(|g| g.moderation.catalog_hidden(owner)),
                         _ => false,
                     };
                     if hidden {

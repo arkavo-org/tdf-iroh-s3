@@ -916,8 +916,8 @@ async fn test_catalog_documents_are_served_over_iroh() {
     let fetched = viewer.fetch_from_node(node_id, second_hash).await.unwrap();
     assert!(fetched.as_ref() == second.as_slice());
 
-    // hideCatalog: refused on every fetch from then on.
-    gate.moderation.suspend_for_test(owner, true);
+    // A blocked creator catalog: refused on every fetch from then on.
+    gate.moderation.block_catalog_for_test(owner);
     let client = IrohTestClient::new().await.unwrap();
     assert_refused_for_permission(client.fetch_from_node(node_id, hash).await, "get");
 
