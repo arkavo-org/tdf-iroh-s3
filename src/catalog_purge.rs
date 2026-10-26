@@ -6,8 +6,9 @@
 //! one's `catalog-documents/<hash>` and `catalog-outboards/<hash>`, except a
 //! document a catalog tag or a v2 pointer still names: deleting it would
 //! leave that creator's catalog dangling, so it is reported and kept until
-//! the creator publishes `/2`. Run as `tdf-iroh-s3 purge-catalogs-1`, a dry
-//! run unless `--delete` is given.
+//! the creator publishes `/2`. A pointer that can't be read could name any
+//! document, so it is reported and then nothing is deleted. Run as
+//! `tdf-iroh-s3 purge-catalogs-1`, a dry run unless `--delete` is given.
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -23,8 +24,9 @@ pub trait PurgeStore {
     fn catalog_document(&self, hash: &str) -> impl Future<Output = Result<Option<Bytes>>>;
     /// The hashes the tags under `tag_prefix` name.
     fn tag_targets(&self, tag_prefix: &str) -> impl Future<Output = Result<Vec<String>>>;
-    /// The catalog hashes the stored v2 pointers name.
-    fn pointer_targets(&self) -> impl Future<Output = Result<Vec<String>>>;
+    /// The catalog hashes the stored v2 pointers name, and the subjects
+    /// whose stored pointer can't be read.
+    fn pointer_targets(&self) -> impl Future<Output = Result<(Vec<String>, Vec<String>)>>;
     /// Delete a catalog document and its outboard.
     fn delete_catalog_document(&self, hash: &str) -> impl Future<Output = Result<()>>;
 }
@@ -38,6 +40,9 @@ pub struct PurgeReport {
     pub in_use: Vec<String>,
     /// Documents without a readable schema: kept, for a person to look at.
     pub unreadable: Vec<String>,
+    /// Subjects whose v2 pointer can't be read. While there is one, nothing
+    /// is deleted, even with `delete`.
+    pub unreadable_pointers: Vec<String>,
     /// `/2` documents, untouched.
     pub kept: usize,
 }
@@ -49,11 +54,17 @@ pub async fn purge_schema_1<S: PurgeStore>(
     delete: bool,
 ) -> Result<PurgeReport> {
     let mut named: HashSet<String> = store.tag_targets(tag_prefix).await?.into_iter().collect();
-    named.extend(store.pointer_targets().await?);
+    let (targets, mut unreadable_pointers) = store.pointer_targets().await?;
+    named.extend(targets);
+    unreadable_pointers.sort();
+    let delete = delete && unreadable_pointers.is_empty();
 
     let mut hashes = store.catalog_document_hashes().await?;
     hashes.sort();
-    let mut report = PurgeReport::default();
+    let mut report = PurgeReport {
+        unreadable_pointers,
+        ..PurgeReport::default()
+    };
     for hash in hashes {
         let Some(body) = store.catalog_document(&hash).await? else {
             continue;
@@ -92,14 +103,17 @@ impl PurgeStore for crate::store::s3::S3Client {
         Ok(targets)
     }
 
-    async fn pointer_targets(&self) -> Result<Vec<String>> {
-        let mut targets = Vec::new();
+    async fn pointer_targets(&self) -> Result<(Vec<String>, Vec<String>)> {
+        let (mut targets, mut unreadable) = (Vec::new(), Vec::new());
         for sub in self.list_names("catalog-pointers/").await? {
             if let Some((body, _)) = self.get_catalog_pointer(&sub).await? {
-                targets.push(crate::catalogs_v2_api::stored_seq(&body)?.1);
+                match crate::catalogs_v2_api::stored_seq(&body) {
+                    Ok((_, hash)) => targets.push(hash),
+                    Err(_) => unreadable.push(sub),
+                }
             }
         }
-        Ok(targets)
+        Ok((targets, unreadable))
     }
 
     async fn delete_catalog_document(&self, hash: &str) -> Result<()> {
@@ -119,6 +133,7 @@ mod tests {
         documents: Mutex<BTreeMap<String, Bytes>>,
         tags: Vec<String>,
         pointers: Vec<String>,
+        unreadable_pointers: Vec<String>,
         deleted: Mutex<Vec<String>>,
     }
 
@@ -141,8 +156,8 @@ mod tests {
             assert_eq!(tag_prefix, "catalog/");
             Ok(self.tags.clone())
         }
-        async fn pointer_targets(&self) -> Result<Vec<String>> {
-            Ok(self.pointers.clone())
+        async fn pointer_targets(&self) -> Result<(Vec<String>, Vec<String>)> {
+            Ok((self.pointers.clone(), self.unreadable_pointers.clone()))
         }
         async fn delete_catalog_document(&self, hash: &str) -> Result<()> {
             self.documents.lock().unwrap().remove(hash);
@@ -185,6 +200,7 @@ mod tests {
                 purged: vec![h(1)],
                 in_use: vec![h(2), h(3)],
                 unreadable: vec![h(5)],
+                unreadable_pointers: vec![],
                 kept: 1,
             }
         );
@@ -198,5 +214,15 @@ mod tests {
         assert_eq!(report.purged, vec![h(1)]);
         assert_eq!(*s.deleted.lock().unwrap(), vec![h(1)]);
         assert_eq!(s.documents.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_pointer_stops_every_deletion() {
+        let mut s = store();
+        s.unreadable_pointers = vec!["sub-b".into()];
+        let report = purge_schema_1(&s, "catalog/", true).await.unwrap();
+        assert_eq!(report.purged, vec![h(1)]);
+        assert_eq!(report.unreadable_pointers, vec!["sub-b".to_string()]);
+        assert!(s.deleted.lock().unwrap().is_empty());
     }
 }

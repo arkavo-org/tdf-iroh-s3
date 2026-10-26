@@ -51,7 +51,7 @@ Distinct hashes are looked up once, at most 16 at a time, as today. Storage fail
 
 ### Metadata blobs and the group index (D3)
 
-A metadata TDF carries the recording's attributes, so ingest indexes it under the same `catalog-index/<group>/`, and `GET /catalog/{group}` lists it next to the recording. Its policy holds only `uuid` and `body`, so nothing in it says "metadata". **Decided (owner, 2026-10-25): (a).** Creator's ArkavoMediaKit already sets `payload.mimeType` through `TDFProtectionCore.buildManifest(…, mimeType:)`; recordings, through the FairPlay key envelope, carry `application/json`. The two options were:
+A metadata TDF carries the recording's attributes, so ingest indexes it under the same `catalog-index/<group>/`, and `GET /catalog/{group}` lists it next to the recording. Its policy holds only `uuid` and `body`, so nothing in it says "metadata". **Decided (owner, 2026-10-25): (a).** Per the Creator session's read of ArkavoMediaKit (not checked against Creator's pinned revision), its manifest builders already take a `mimeType`, and recordings, through the FairPlay key envelope, carry `application/json`. The two options were:
 
 - **(a) mimeType, a Creator contract change.** Creator sets the metadata manifest's `payload.mimeType` to `application/vnd.arkavo.catalog-entry+json`. Ingest doesn't index a blob of that type, and check 5 requires it. The type reveals only that a blob is catalog metadata.
 - **(b) Node only.** At catalog publish the node already holds each metadata manifest (check 3). It derives that blob's groups and deletes `catalog-index/<group>/<metadataHash>`. No Creator change, but the listing shows the metadata blob between its ingest and the catalog publish, plus the listing cache TTL.
@@ -72,7 +72,7 @@ New `[http] catalog_token = "optional" | "required"`, default `optional`.
 ### Cutover
 
 - New `[http] accept_catalog_schema_1 = true` (default; `[http]` holds the catalog routes' settings, `[catalog]` the group index). Set to `false` once Creator publishes `/2`: `PUT /catalogs`, `PUT /v2/catalogs` and `PUT /tags/catalog` then refuse `/1` (422 `invalid catalog: schema must be "arkavo.creator-catalog/2"`; for a tag, the stored document's schema).
-- Deleting stored `/1` documents (D5): a one-off subcommand of the node binary, `tdf-iroh-s3 --config <file> purge-catalogs-1 [--delete]`. It lists `catalog-documents/`, reads each, and for every `/1` document reports, and with `--delete` removes, `catalog-documents/<hash>` and `catalog-outboards/<hash>`. A document a `catalog/<sub>` tag or a v2 pointer still names is reported and kept: deleting it would leave that creator with a dangling catalog. Dry run by default.
+- Deleting stored `/1` documents (D5): a one-off subcommand of the node binary, `tdf-iroh-s3 --config <file> purge-catalogs-1 [--delete]`. It lists `catalog-documents/`, reads each, and for every `/1` document reports, and with `--delete` removes, `catalog-documents/<hash>` and `catalog-outboards/<hash>`. A document a `catalog/<sub>` tag or a v2 pointer still names is reported and kept: deleting it would leave that creator with a dangling catalog. A v2 pointer that can't be read is reported, and then nothing is deleted. Dry run by default.
 - Moderation is unchanged on the node: a takedown blocks both hashes (arks writes two blocks, arkavo-rs#93). `catalog_hidden` and catalog blocks apply to `/2` documents as to `/1`.
 
 ### Contract
@@ -88,7 +88,7 @@ New `[http] catalog_token = "optional" | "required"`, default `optional`.
 5. `purge-catalogs-1` subcommand.
 6. Docs: `docs/creator-catalogs.md`, `CLAUDE.md`.
 
-Rollout follows #38. **Before Creator republishes as `/2`:** count `blobs/` against `manifests/` in production and list recordings without a manifest. Check 3 refuses any catalog naming one, and the only repair is re-pushing the recording, so a gap may hold up #38 step 3. Then deploy with `catalog_token = "optional"` and `accept_catalog_schema_1 = true`; after Creator#102 and arkavo-ios#40 ship, set `required` and `false`, then run `purge-catalogs-1 --delete`.
+Rollout follows #38. **Before Creator pushes any `/2` metadata TDF,** the node with D3 (a) must be live: an older node indexes it like a recording, and nothing removes that entry later. **Before Creator republishes as `/2`:** count `blobs/` against `manifests/` in production and list recordings without a manifest. Check 3 refuses any catalog naming one, and the only repair is re-pushing the recording, so a gap may hold up #38 step 3. Then deploy with `catalog_token = "optional"` and `accept_catalog_schema_1 = true`; after Creator#102 and arkavo-ios#40 ship, set `required` and `false`, then run `purge-catalogs-1 --delete`.
 
 ## Decisions needed (owner)
 
