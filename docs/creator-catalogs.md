@@ -81,6 +81,8 @@ The document is UTF-8 JSON, at most **262 144 bytes**. The node stores the uploa
 
 ## Catalog document, `arkavo.creator-catalog/2`
 
+> **Proposed, not yet agreed (#38):** the `/2` limits (524 288 bytes per document, 262 144 per metadata TDF, pointer `catalogSize` up to 524 288) and `catalog_token = "optional"` verifying a presented token. Build against them, but expect changes until #38 records them.
+
 Schema `/2` ([tdf-iroh-s3#39](https://github.com/arkavo-org/tdf-iroh-s3/issues/39), design in #38) protects what `/1` shows in the clear. An entry names only hashes and sizes. Its title, publish time and attributes are in a **metadata TDF**: a small standard ZTDF under the recording's own policy, so a viewer reads exactly the entries they could play. The node never decrypts it.
 
 The document is UTF-8 JSON, at most **524 288 bytes** (a `/1` document stays at most 262 144).

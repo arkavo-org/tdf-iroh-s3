@@ -103,7 +103,7 @@ impl PurgeStore for crate::store::s3::S3Client {
     }
 
     async fn delete_catalog_document(&self, hash: &str) -> Result<()> {
-        self.delete_catalog_document(hash).await
+        Self::delete_catalog_document(self, hash).await
     }
 }
 
