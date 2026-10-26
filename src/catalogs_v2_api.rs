@@ -31,10 +31,12 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::catalog_v2::{self, Bundle, BundleError, Passkeys};
-use crate::catalogs_api::{CATALOG_DOCUMENT_CACHE_CONTROL, check_catalog, is_json, owner_hidden};
+use crate::catalogs_api::{check_catalog, is_json, owner_hidden};
 use crate::creator_catalog::{self, MAX_CATALOG_BYTES, MAX_OWNER_BYTES, valid_identifier};
 use crate::moderation::now_secs;
-use crate::tags_api::{ApiState, TagStore, authorize_publisher, is_blocked};
+use crate::tags_api::{
+    ApiState, TagStore, authorize_catalog_reader, authorize_publisher, is_blocked,
+};
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
 
@@ -46,6 +48,10 @@ fn storage_unavailable(what: &str, e: anyhow::Error) -> ApiError {
     warn!(error = %e, "{what} failed");
     fail(StatusCode::BAD_GATEWAY, "storage unavailable")
 }
+
+/// A pointer is resolved per caller (it may need a token), so only the
+/// caller may reuse it, unlike a catalog document fetched by hash.
+pub const CATALOG_POINTER_CACHE_CONTROL: &str = "private, max-age=300";
 
 /// Largest publish body: a 512 KiB `/2` document in base64url (about
 /// 700 KiB) plus a bundle of a few KiB.
@@ -423,8 +429,12 @@ async fn put_catalog<S: TagStore>(
 async fn get_pointer<S: TagStore>(
     State(state): State<Arc<V2State<S>>>,
     Path(sub): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let api = &state.api;
+    authorize_catalog_reader(&api.verifier, api.catalog.token, &headers)
+        .await
+        .map_err(|(status, msg)| fail(status, msg))?;
     if !valid_identifier(&sub, MAX_OWNER_BYTES) {
         return Err(fail(StatusCode::BAD_REQUEST, "invalid subject"));
     }
@@ -447,7 +457,7 @@ async fn get_pointer<S: TagStore>(
             (header::CONTENT_TYPE, "application/json".to_string()),
             (
                 header::CACHE_CONTROL,
-                CATALOG_DOCUMENT_CACHE_CONTROL.to_string(),
+                CATALOG_POINTER_CACHE_CONTROL.to_string(),
             ),
             (header::ETAG, pointer_etag(seq)),
         ],
@@ -518,6 +528,10 @@ mod tests {
     /// The v2 routes on a gated node whose key set holds both the token key
     /// and the IdP attestation key.
     fn harness() -> Harness {
+        harness_with(Default::default())
+    }
+
+    fn harness_with(catalog: crate::tags_api::CatalogRules) -> Harness {
         let (_, token_vk) = keypair();
         let store = Arc::new(MemStore::new());
         let moderation = Arc::new(Moderation::default());
@@ -529,7 +543,7 @@ mod tests {
             ])),
             tag_prefix: "catalog/".to_string(),
             catalog_documents: Default::default(),
-            catalog: Default::default(),
+            catalog,
             publishing: Some(TagPublishing {
                 policy: Arc::new(PublishPolicy {
                     entitlement: Some(DEFAULT_PUBLISH_ENTITLEMENT.into()),
@@ -672,6 +686,36 @@ mod tests {
         .await
     }
 
+    #[tokio::test]
+    async fn a_required_token_guards_the_pointer() {
+        let h = harness_with(crate::tags_api::CatalogRules {
+            token: crate::config::CatalogToken::Required,
+            ..Default::default()
+        });
+        let r = get(&h, SUB).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::UNAUTHORIZED, "token required")
+        );
+        let with = |t: String| {
+            Request::get(format!("/v2/catalogs/{SUB}"))
+                .header("authorization", format!("Bearer {t}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        // A verified token reaches the lookup (no pointer stored: 404).
+        let r = send(&h.app, with(token(SUB))).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+        // Any subject's token, not only the creator's.
+        let r = send(&h.app, with(token("someone-else"))).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+        let r = send(&h.app, with("not-a-cwt".into())).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::UNAUTHORIZED, "invalid token")
+        );
+    }
+
     async fn ingested() -> Harness {
         let h = harness();
         h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
@@ -702,7 +746,7 @@ mod tests {
         assert_eq!(r.status, StatusCode::OK);
         assert_eq!(
             r.headers[header::CACHE_CONTROL],
-            CATALOG_DOCUMENT_CACHE_CONTROL
+            CATALOG_POINTER_CACHE_CONTROL
         );
         let served: Bundle = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(served, bundle, "readers get the bundle as published");

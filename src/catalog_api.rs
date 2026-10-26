@@ -179,6 +179,9 @@ pub struct CatalogApiState<S: CatalogStore, D: DecisionProvider> {
     pub environment: Option<serde_json::Value>,
     /// Blocked content is left out of listings (tdf-iroh-s3#17).
     pub moderation: Option<Arc<crate::moderation::Moderation>>,
+    /// `[http] catalog_token`: `Required` refuses anonymous listings
+    /// (tdf-iroh-s3#39).
+    pub token: crate::config::CatalogToken,
 }
 
 #[derive(Serialize)]
@@ -227,6 +230,12 @@ async fn get_catalog<S: CatalogStore, D: DecisionProvider>(
 ) -> Result<Json<CatalogResponse>, (StatusCode, Json<ApiError>)> {
     if !valid_group(&group) {
         return Err(err(StatusCode::BAD_REQUEST, "invalid group"));
+    }
+    // A presented token is verified with the chain below.
+    if state.token == crate::config::CatalogToken::Required
+        && crate::moderation::bearer(&headers).is_none()
+    {
+        return Err(err(StatusCode::UNAUTHORIZED, "token required"));
     }
 
     let cached = state.cache.entries(&group).await.map_err(|e| {
@@ -433,6 +442,14 @@ mod tests {
     }
 
     fn rig(permit: Vec<String>, environment: Option<serde_json::Value>) -> Rig {
+        rig_with(permit, environment, Default::default())
+    }
+
+    fn rig_with(
+        permit: Vec<String>,
+        environment: Option<serde_json::Value>,
+        token: crate::config::CatalogToken,
+    ) -> Rig {
         let (sk, vk) = keypair();
         let store = Arc::new(MemCatalog::new(HashMap::from([(
             "camp1".to_string(),
@@ -451,6 +468,7 @@ mod tests {
             action: "read".into(),
             environment,
             moderation: None,
+            token,
         });
         let token = mint(
             &sk,
@@ -486,6 +504,30 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
         (status, value)
+    }
+
+    #[tokio::test]
+    async fn a_required_token_refuses_anonymous_listings_only() {
+        let r = rig_with(vec![], None, crate::config::CatalogToken::Required);
+        let (status, body) = get_json(&r.router, "/catalog/camp1", &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "token required");
+        // Refused before the listing is read.
+        let (status, _) = get_json(&r.router, "/catalog/unknown", &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let bearer = format!("Bearer {}", r.token);
+        let (status, body) =
+            get_json(&r.router, "/catalog/camp1", &[("authorization", &bearer)]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["decision"], "evaluated");
+        let (status, _) = get_json(
+            &r.router,
+            "/catalog/camp1",
+            &[("authorization", "Bearer not-a-cwt")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -942,6 +984,7 @@ mod tests {
             action: "read".into(),
             environment: None,
             moderation: Some(Arc::clone(&moderation)),
+            token: Default::default(),
         });
         let app = router(state);
         let (_, body) = get_json(&app, "/catalog/camp1", &[]).await;
