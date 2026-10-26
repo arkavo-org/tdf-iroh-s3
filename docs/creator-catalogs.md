@@ -79,6 +79,41 @@ The document is UTF-8 JSON, at most **262 144 bytes**. The node stores the uploa
 - A key that appears twice in one JSON object is rejected.
 - Entry order carries no meaning. Readers sort.
 
+## Catalog document, `arkavo.creator-catalog/2`
+
+Schema `/2` ([tdf-iroh-s3#39](https://github.com/arkavo-org/tdf-iroh-s3/issues/39), design in #38) protects what `/1` shows in the clear. An entry names only hashes and sizes. Its title, publish time and attributes are in a **metadata TDF**: a small standard ZTDF under the recording's own policy, so a viewer reads exactly the entries they could play. The node never decrypts it.
+
+The document is UTF-8 JSON, at most **524 288 bytes** (a `/1` document stays at most 262 144).
+
+```json
+{
+  "schema": "arkavo.creator-catalog/2",
+  "owner": "5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10",
+  "entries": [
+    {
+      "contentID": "rec-2b9c4f1e0d8a4c7f9e1d3b5a6c8f0e2d",
+      "version": 2,
+      "payloadHash": "4f8a…64 lowercase hex…",
+      "payloadSize": 7342067,
+      "metadataHash": "6d0e…64 lowercase hex…",
+      "metadataSize": 2148
+    }
+  ]
+}
+```
+
+- `schema` is exactly `"arkavo.creator-catalog/2"`. `owner` and `entries` follow the `/1` rules, and so do `contentID`, `version`, `payloadHash` and `payloadSize`.
+- `metadataHash`: 64 lowercase hex characters, the BLAKE3 hash of the metadata TDF. It is unique within the document and never equals any entry's `payloadHash` (`entries[<i>].metadataHash duplicates entries[<j>].metadataHash`, `entries[<i>].metadataHash equals entries[<j>].payloadHash`).
+- `metadataSize`: an integer from 1 to 262 144, the metadata TDF's size in bytes.
+- An entry has exactly these six keys. `title`, `publishedAt` and `attributeFQNs` are refused as unknown keys. The `/1` key rules apply.
+
+**The metadata TDF.**
+
+- Its payload is the UTF-8 JSON object `{"contentID", "version", "title", "publishedAt", "attributeFQNs"}`, each field with the `/1` entry's rules (`title` optional). `contentID` and `version` equal the entry's: a reader refuses metadata that names another entry.
+- Its policy has **only** the top-level keys `uuid` (fresh for each metadata TDF) and `body`. Every manifest can be read by anyone holding its hash, so the policy must not repeat the recording's `arkavo:classification`, `arkavo:components` or any other extension.
+- Its `body.dataAttributes` and `body.dissem` equal the recording's, each as a set, and its key access objects name the same KAS URLs.
+- It is pushed and ingested like a recording, in the same publish session.
+
 ## HTTP routes
 
 TLS terminates in front of the node. Every error body is `{"error":"<message>"}`, with one exception: on an ungated node `POST /publish/sessions` answers 404 with an empty body (see [Publishing a recording](#publishing-a-recording-creator)).
@@ -99,11 +134,15 @@ The node checks the following in order. Each failure returns its own status.
    - On a node with `[publishing] required = false`, the token still has to verify. The publishing checks are skipped.
 2. **`{sub}` equals the token's `sub`.** Otherwise 403 `catalog does not match token subject`.
 3. **The `Content-Type` is `application/json`.** Otherwise, including when the header is missing, 415 `content type must be application/json`. The media type is matched without regard to case, and parameters such as `; charset=utf-8` are allowed.
-4. **The body is at most 262 144 bytes.** Otherwise 413 `catalog too large`.
-5. **The body is a valid `arkavo.creator-catalog/1` document whose `owner` equals `{sub}`.** Otherwise 422 `invalid catalog: <reason>`.
-6. **Nothing is blocked:** no entry's `payloadHash`, and not the document's own BLAKE3 hash. Otherwise 403 `content is blocked`.
-7. **Every `payloadHash` is an ingested blob.** Otherwise 422 `payload <hash> is not ingested`, naming the first missing payload in entry order.
-8. **Every entry's `payloadSize` equals the ingested blob's size.** Otherwise 422 `payload <hash> size does not match`, naming the first mismatching entry's payload in entry order. Each entry is checked, including entries that share a payload.
+4. **The body is at most 524 288 bytes, and a `/1` document at most 262 144.** Otherwise 413 `catalog too large`.
+5. **The body is a valid `arkavo.creator-catalog/1` or `/2` document whose `owner` equals `{sub}`.** Otherwise 422 `invalid catalog: <reason>`. After the cutover to `/2` a `/1` document is refused with 422 `invalid catalog: schema must be "arkavo.creator-catalog/2"`.
+6. **Nothing is blocked:** no entry's `payloadHash` or `metadataHash`, and not the document's own BLAKE3 hash. Otherwise 403 `content is blocked`.
+7. **Every `payloadHash`, then every `metadataHash`, is an ingested blob.** Otherwise 422 `payload <hash> is not ingested` or `metadata <hash> is not ingested`, naming the first missing one in entry order.
+8. **Every entry's `payloadSize`, then every `metadataSize`, equals the ingested blob's size.** Otherwise 422 `payload <hash> size does not match` or `metadata <hash> size does not match`, naming the first mismatching entry in entry order. Each entry is checked, including entries that share a payload.
+   - For `/2`, steps 8a–8c compare each metadata TDF with its recording, on the manifests the node stored at ingest:
+   - **8a.** Both manifests are stored and readable. Otherwise 422 `payload <hash> manifest is not stored`, `metadata <hash> manifest is not stored`, or `… manifest is unreadable`. A recording ingested before the node stored manifests has none: push it again.
+   - **8b.** The metadata policy has only `uuid` and `body`. Otherwise 422 `metadata <hash> policy may only hold uuid and body`.
+   - **8c.** Its attributes, dissemination list and KAS are the recording's. Otherwise 422 `metadata <hash> policy does not match payload <hash>`.
 9. **The node stores the bytes and moves the tag.**
    - It stores the bytes at `catalog-documents/<blake3>` and points the tag `catalog/<sub>` at that hash.
    - 200 `{"name":"catalog/<sub>","hash":"<blake3 hex>","size":<bytes>}`.
@@ -123,7 +162,13 @@ The bytes behind a hash never change, but the node may later block a document or
 
 ### `GET /tags/catalog/{sub}`: find a creator's current catalog
 
-This route is public and existed before this contract.
+This route existed before this contract. It resolves a creator to their catalog, so it follows the node's token rule (`[http] catalog_token`, tdf-iroh-s3#39), checked before anything else:
+
+- **`optional`** (until Creator and the iOS viewer send a token): no token is served as before. A presented `Authorization: Bearer <Arkavo CWT>` must verify, otherwise 401 `invalid token`.
+- **`required`:** no token is 401 `token required`, whatever the subject.
+- Any Arkavo CWT the node verifies counts, a service's included. It needn't be the creator's.
+
+Then:
 
 - **200:** `{"name":"catalog/<sub>","hash":"<hex>"}`.
 - **404:** `tag not found`. There is no catalog, the creator is suspended with `hideCatalog`, the catalog is blocked, or the tag does not name a stored catalog document.
@@ -139,7 +184,7 @@ This route needs the same token checks as `PUT /catalogs/{sub}`.
 - The body is `{"hash":"<hex>"}`.
 - The hash must not be blocked. Otherwise 403 `content is blocked`.
 - The hash must be a stored catalog document whose `owner` equals `{sub}`. Otherwise 422 `hash does not reference a catalog document of this subject`. A TDF blob's hash is refused this way.
-- The document's entries must pass the same payload checks as an upload, steps 6–8 of `PUT /catalogs/{sub}`: no payload blocked (403 `content is blocked`), every payload ingested (422 `payload <hash> is not ingested`), and every `payloadSize` matching (422 `payload <hash> size does not match`). So a rollback never brings back a recording blocked since that version was published.
+- The document must pass steps 5–8c of `PUT /catalogs/{sub}`: a schema still accepted, no payload or metadata blocked (403 `content is blocked`), every one ingested and of its size (422), and for `/2` every metadata TDF fitting its recording (422). So a rollback never brings back a recording blocked since that version was published, nor a `/1` catalog after the cutover.
 - Success returns **204**.
 
 ### `GET /blobs/{hash}`: confirm ingest
@@ -186,15 +231,18 @@ Creator reads the node to push to from this route. The iOS viewer does not. The 
    - Otherwise write the new hash, size and `publishedAt`, with `version` one higher than the old entry's.
 7. **Publish the catalog** with `PUT /catalogs/<sub>`.
 
+For a `/2` catalog, steps 3–4 also push and confirm the entry's metadata TDF (see [the metadata TDF](#catalog-document-arkavocreator-catalog2)), and step 6 writes its hash and size, with the new `version` inside the metadata as well. Send a token on step 5's `GET /tags/catalog`.
+
 To remove a recording, Creator uploads the catalog without its entry. The TDF stays on the node, but no catalog lists it.
 
 ## Reading a catalog and downloading (viewer)
 
-1. **Find the current catalog.** `GET https://iroh.arkavo.net/tags/catalog/<sub>`, without credentials.
+1. **Find the current catalog.** `GET https://iroh.arkavo.net/tags/catalog/<sub>` with `Authorization: Bearer <Arkavo CWT>`; the node requires one after the token rollout.
 2. **Fetch and verify it.**
-   - `GET /catalog-documents/<hash>`, reading at most 262 144 bytes.
+   - `GET /catalog-documents/<hash>`, reading at most 524 288 bytes (262 144 for `/1`). Fetches by hash need no token.
    - The BLAKE3 hash of the bytes must equal `<hash>`.
    - The document must be valid, and its `owner` must equal `<sub>`.
+   - For `/2`: fetch every entry's `metadataHash` over iroh (reject one larger than `metadataSize`), unwrap them in one bulk rewrap, refuse metadata whose `contentID` or `version` differs from its entry's, and show only the entries that decrypt.
 3. **Download a recording.** Fetch `payloadHash` over iroh, from the endpoint ID compiled into the viewer.
    - Reject the download if it is larger than `payloadSize`.
    - Verify the BLAKE3 hash before using the file.
@@ -234,7 +282,7 @@ The exact UTF-8 bytes of one JSON object. It is carried base64url-encoded and is
 | `owner` | the publisher's `sub`, byte for byte (the same rules as a catalog's `owner`) |
 | `seq` | integer, 1 to 9 007 199 254 740 991 |
 | `catalogHash` | BLAKE3 of the document's bytes, 64 lowercase hex characters |
-| `catalogSize` | the document's length in bytes, 1 to 262 144 |
+| `catalogSize` | the document's length in bytes, 1 to 524 288 |
 | `issuedAt` | `YYYY-MM-DDTHH:MM:SSZ` |
 
 The object holds exactly these keys, with no key repeated and nothing after it, and is at most 1024 bytes.
@@ -273,12 +321,12 @@ The node checks this on publish and readers check it on read. The rules are the 
    - `signature` (ASN.1 DER) verifies with ES256 over `authenticatorData || SHA-256(clientDataJSON)`.
    - The signature counter is ignored: synced passkeys report 0.
 3. **The pointer** follows the rules above, and its `owner` is the subject asked for.
-4. **The document** hashes to `catalogHash`, is `catalogSize` bytes long, is a valid `arkavo.creator-catalog/1`, and its `owner` is the pointer's `owner`.
+4. **The document** hashes to `catalogHash`, is `catalogSize` bytes long, is a valid `arkavo.creator-catalog/1` or `/2`, and its `owner` is the pointer's `owner`.
 5. **Rollback.** The node refuses a `seq` that is not greater than the stored one. A reader refuses a `seq` lower than the highest it has seen for that creator.
 
 ### `PUT /v2/catalogs/{sub}`: publish
 
-The request needs `Authorization: Bearer <Arkavo CWT>` and `Content-Type: application/json`. Its body is `{"document": "<base64url document bytes>", "bundle": {…}}`, at most 512 KiB.
+The request needs `Authorization: Bearer <Arkavo CWT>` and `Content-Type: application/json`. Its body is `{"document": "<base64url document bytes>", "bundle": {…}}`, at most 1 MiB.
 
 The request should name the base the client merged its document from, with a standard conditional header (RFC 9110). Without one, a publish signed while another device saved can replace that device's catalog.
 
@@ -294,13 +342,13 @@ The node checks the following in order:
 | The token passes the publishing checks (as `PUT /catalogs`) | 401 / 403 |
 | `{sub}` equals the token's `sub` | 403 `catalog does not match token subject` |
 | `Content-Type` is `application/json` | 415 |
-| The body is at most 512 KiB | 413 `request too large` |
+| The body is at most 1 MiB | 413 `request too large` |
 | The body has exactly `document` and `bundle` | 400 `invalid request: <reason>` |
-| `document` is 1–262 144 bytes of unpadded base64url | 422 `invalid request: …` |
+| `document` is 1–524 288 bytes of unpadded base64url | 422 `invalid request: …` |
 | Verification steps 1–3 | 422 `invalid bundle: <reason>`; 502 `key set unavailable` |
 | The pointer names this document | 422 `invalid bundle: catalogHash or catalogSize does not match the document` |
 | A valid catalog whose `owner` is `{sub}` | 422 `invalid catalog: <reason>` |
-| Nothing blocked, every payload ingested at its size (as `PUT /catalogs`, steps 6–8) | 403 / 422 |
+| A schema still accepted; nothing blocked; every payload and metadata TDF ingested at its size; for `/2`, each metadata TDF fitting its recording (as `PUT /catalogs`, steps 5–8c) | 403 / 422 |
 | The passkey credential is still the subject's, according to the IdP's status route | 403 `passkey credential unknown`, `… revoked` or `… belongs to another subject`; 502 `credential status unavailable` |
 | The stored pointer is the base named by `If-Match` or `If-None-Match`, if either is sent | 412 `catalog changed since it was read` |
 | `seq` is greater than the stored one | 409 `seq must be greater than <n>` |
@@ -311,9 +359,9 @@ The node then stores the document at `catalog-documents/<blake3>` with its BAO o
 
 ### `GET /v2/catalogs/{sub}`: read the pointer
 
-This route is public.
+This route follows the token rule of [`GET /tags/catalog/{sub}`](#get-tagscatalogsub-find-a-creators-current-catalog), checked first.
 
-- **200:** the stored bundle JSON, with `ETag: "<seq>"` and `Cache-Control: public, max-age=300`. A publisher reads past caches, and sends the `ETag` back as `If-Match`.
+- **200:** the stored bundle JSON, with `ETag: "<seq>"` and `Cache-Control: private, max-age=300`: it may need a token, so only the caller reuses it. A publisher reads past caches, and sends the `ETag` back as `If-Match`.
 - **400:** `invalid subject`.
 - **404:** `catalog not found`. There is no catalog, or the creator is suspended with `hideCatalog`, or the catalog's hash is blocked. Only this 404 means "no catalog".
 
@@ -332,6 +380,15 @@ Fetch `catalogHash` from the pinned node, with a size limit of `catalogSize`. Th
 4. Get a passkey assertion for RP `identity.arkavo.net`, with challenge SHA-256(pointer bytes) and user verification required. Allow only the signed-in account's credentials.
 5. Get the attestation for the assertion's credential: `POST https://identity.arkavo.net/passkeys/credential-attestation`.
 6. `PUT /v2/catalogs/<sub>` with `If-Match: <the ETag>`, or `If-None-Match: *` after a 404. On a 412 or a 409, go back to step 2 and retry once.
+
+## Cutover to `/2`
+
+In the order of #38:
+
+1. The node accepts `/2` next to `/1`, and a token on the resolution routes (`[http] catalog_token = "optional"`).
+2. Creator publishes `/2` and republishes existing catalogs; the iOS viewer reads `/2` and sends a token.
+3. The node sets `[http] catalog_token = "required"` and `accept_catalog_schema_1 = false`: `/1` uploads and rollbacks to `/1` are refused.
+4. The operator runs `tdf-iroh-s3 --config <file> purge-catalogs-1`, a dry run, then with `--delete`. It deletes each stored `/1` document and its outboard, except one a catalog tag or v2 pointer still names, which it reports. Until it is deleted, a `/1` document, plaintext titles included, stays readable by its hash.
 
 ## Archive layout accepted at ingest
 
