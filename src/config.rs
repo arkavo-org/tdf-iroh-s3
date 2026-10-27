@@ -394,8 +394,6 @@ pub struct HttpConfig {
     /// any token signed by a key in the key set is accepted.
     #[serde(default)]
     pub expected_issuer: String,
-    #[serde(default = "default_tag_prefix")]
-    pub tag_prefix: String,
     /// HTTPS listener. When set, the node terminates TLS itself and the
     /// plain listener on `bind_port` binds to loopback only.
     #[serde(default)]
@@ -410,6 +408,22 @@ pub struct HttpConfig {
     /// only).
     #[serde(default = "default_passkey_status_url")]
     pub passkey_status_url: String,
+    /// Whether `GET /catalog/{group}` needs a token (tdf-iroh-s3#39). `GET
+    /// /v2/catalogs/{sub}` always does: it asks whether the reader may open
+    /// the catalog.
+    #[serde(default)]
+    pub catalog_token: CatalogToken,
+}
+
+/// `[http] catalog_token`, on `GET /catalog/{group}`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CatalogToken {
+    /// No token is served; a presented one must verify.
+    #[default]
+    Optional,
+    /// No token is 401.
+    Required,
 }
 
 /// TLS for the HTTP API, terminated by the node (rustls, TLS 1.3 only). The
@@ -445,10 +459,10 @@ impl Default for HttpConfig {
             bind_port: default_http_bind_port(),
             cose_keys_url: String::new(),
             expected_issuer: String::new(),
-            tag_prefix: default_tag_prefix(),
             tls: None,
             passkey_rp_id: default_passkey_rp_id(),
             passkey_status_url: default_passkey_status_url(),
+            catalog_token: CatalogToken::default(),
         }
     }
 }
@@ -467,10 +481,6 @@ fn default_http_bind_address() -> IpAddr {
 
 fn default_http_bind_port() -> u16 {
     8090
-}
-
-fn default_tag_prefix() -> String {
-    "catalog/".to_string()
 }
 
 impl Config {

@@ -17,7 +17,12 @@
 //!
 //! Grouping derives from the TDF's own data attributes — consistent with
 //! the curation model (ArkavoKit#1): creators curate by labeling, and a
-//! blob with no grouping attribute is simply in no catalog.
+//! blob with no grouping attribute is simply in no catalog. A catalog `/2`
+//! metadata TDF (`payload.mimeType` =
+//! `catalog_metadata::CATALOG_ENTRY_MIME_TYPE`) carries its recording's
+//! attributes but is no item, so it is in no group either, and neither is a
+//! catalog envelope (`CATALOG_MIME_TYPE`) pushed like a recording
+//! (tdf-iroh-s3#39).
 
 use anyhow::{Context, Result};
 use opentdf::{AttributePolicy, AttributeValue, LogicalOperator};
@@ -138,7 +143,14 @@ pub fn derive_artifacts(
         .context("Failed to serialize manifest for extraction")?;
 
     let mut entries = Vec::new();
-    if catalog_config.enabled {
+    let catalog_part = matches!(
+        manifest.payload.mime_type.as_deref(),
+        Some(
+            crate::catalog_metadata::CATALOG_ENTRY_MIME_TYPE
+                | crate::catalog_metadata::CATALOG_MIME_TYPE
+        )
+    );
+    if catalog_config.enabled && !catalog_part {
         let policy_json = manifest
             .get_policy_raw()
             .context("Failed to decode policy from manifest")?;

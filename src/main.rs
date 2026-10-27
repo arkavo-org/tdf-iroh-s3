@@ -153,8 +153,8 @@ async fn main() -> Result<()> {
         node.config.iroh.public_addresses
     );
 
-    // HTTP tag API (catalog discovery): GET resolution is public; PUT is
-    // CWT-authenticated against the configured IdP key set.
+    // HTTP API: catalog publishing and resolution, CWT-authenticated
+    // against the configured IdP key set.
     let mut https = None;
     if node.config.http.enabled {
         let http_cfg = &node.config.http;
@@ -185,21 +185,30 @@ async fn main() -> Result<()> {
         let state = Arc::new(ApiState {
             store: Arc::clone(&node.s3_client),
             verifier: Arc::clone(&verifier),
-            tag_prefix: http_cfg.tag_prefix.clone(),
-            catalog_documents: Default::default(),
             publishing: gate.as_ref().map(|g| TagPublishing {
                 policy: Arc::clone(&policy),
                 moderation: Arc::clone(&g.moderation),
             }),
         });
-        // Tags and the creator catalog routes exist whenever HTTP does; on
-        // an ungated node they still verify tokens but skip the publishing
-        // checks.
+        // The creator catalog routes exist whenever HTTP does; on an
+        // ungated node they still verify tokens but skip the publishing
+        // checks. Resolving a catalog asks the catalog decision service
+        // (`[catalog.authz]`) whether the reader may open it.
         let v2 = catalogs_v2_api::state(
             Arc::clone(&state),
             &http_cfg.passkey_rp_id,
             &http_cfg.passkey_status_url,
+            catalogs_v2_api::Readers {
+                provider: provider.clone(),
+                action: node.config.catalog.authz.action.clone(),
+                environment: environment.clone(),
+            },
         );
+        if provider.is_none() {
+            tracing::warn!(
+                "[catalog.authz] endpoint unset — GET /v2/catalogs answers 502 decision unavailable"
+            );
+        }
         let mut router = tags_api::router(Arc::clone(&state))
             .merge(catalogs_api::router(state))
             .merge(catalogs_v2_api::router(v2))
@@ -268,6 +277,8 @@ async fn main() -> Result<()> {
                 Arc::clone(&node.s3_client),
                 std::time::Duration::from_secs(cat.cache_ttl_secs),
             );
+            let campaign_groups =
+                cat.group_attribute_prefix() == tdf_iroh_s3::catalog_metadata::CAMPAIGN_FQN_PREFIX;
             router = match &provider {
                 Some(provider) => router.merge(catalog_router(
                     cache,
@@ -276,6 +287,8 @@ async fn main() -> Result<()> {
                     cat.authz.action.clone(),
                     environment.clone(),
                     moderation.clone(),
+                    http_cfg.catalog_token,
+                    campaign_groups,
                 )),
                 None => {
                     tracing::warn!(
@@ -288,6 +301,8 @@ async fn main() -> Result<()> {
                         cat.authz.action.clone(),
                         environment.clone(),
                         moderation.clone(),
+                        http_cfg.catalog_token,
+                        campaign_groups,
                     ))
                 }
             };
@@ -311,11 +326,7 @@ async fn main() -> Result<()> {
             http_cfg.bind_address
         };
         let listener = tokio::net::TcpListener::bind((plain_host, http_cfg.bind_port)).await?;
-        info!(
-            "HTTP API listening on {} (tag prefix {:?})",
-            listener.local_addr()?,
-            http_cfg.tag_prefix
-        );
+        info!("HTTP API listening on {}", listener.local_addr()?);
         if let Some(tls_cfg) = &http_cfg.tls {
             let tls_router = router.clone();
             let tls_cfg = tls_cfg.clone();
@@ -478,6 +489,7 @@ async fn decision_provider(config: &Config) -> Result<Option<SharedDecisionProvi
     Ok(Some(provider))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn catalog_router<D: DecisionProvider>(
     cache: CatalogCache<tdf_iroh_s3::store::s3::S3Client>,
     provider: D,
@@ -485,6 +497,8 @@ fn catalog_router<D: DecisionProvider>(
     action: String,
     environment: Option<serde_json::Value>,
     moderation: Option<Arc<Moderation>>,
+    token: tdf_iroh_s3::config::CatalogToken,
+    campaign_groups: bool,
 ) -> axum::Router {
     catalog_api::router(Arc::new(CatalogApiState {
         cache,
@@ -493,5 +507,7 @@ fn catalog_router<D: DecisionProvider>(
         action,
         environment,
         moderation,
+        token,
+        campaign_groups,
     }))
 }

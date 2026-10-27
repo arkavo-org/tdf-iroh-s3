@@ -92,10 +92,6 @@ impl S3Client {
         format!("{}outboards/{}", self.prefix, hash_hex)
     }
 
-    pub fn tag_key(&self, tag_name: &str) -> String {
-        format!("{}tags/{}", self.prefix, tag_name)
-    }
-
     pub fn manifest_key(&self, hash_hex: &str) -> String {
         format!("{}manifests/{}", self.prefix, hash_hex)
     }
@@ -112,6 +108,18 @@ impl S3Client {
     /// `outboards/` as the document is kept apart from `blobs/`.
     pub fn catalog_outboard_key(&self, hash_hex: &str) -> String {
         format!("{}catalog-outboards/{}", self.prefix, hash_hex)
+    }
+
+    /// A catalog's clear entry list and envelope attribute, as checked at
+    /// publish. Never served: moderation reads it.
+    pub fn catalog_index_key(&self, hash_hex: &str) -> String {
+        format!("{}catalog-indexes/{}", self.prefix, hash_hex)
+    }
+
+    /// The creator of a Patreon campaign, recorded at a v2 catalog publish
+    /// whose envelope is under that campaign.
+    pub fn campaign_creator_key(&self, campaign_id: &str) -> String {
+        format!("{}campaign-creators/{}", self.prefix, campaign_id)
     }
 
     /// A creator's signed catalog pointer bundle (catalog v2).
@@ -190,6 +198,23 @@ impl S3Client {
             .await
             .context("Failed to PUT manifest to S3")?;
         Ok(())
+    }
+
+    /// The extracted manifest.json of an ingested blob; `None` when none is
+    /// stored.
+    pub async fn get_manifest(&self, hash_hex: &str) -> Result<Option<Bytes>> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(self.manifest_key(hash_hex))
+            .send()
+            .await
+        {
+            Ok(resp) => Ok(Some(resp.body.collect().await?.into_bytes())),
+            Err(e) if e.as_service_error().is_some_and(|se| se.is_no_such_key()) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("Failed to GET manifest from S3: {}", e)),
+        }
     }
 
     /// Store a catalog index entry under `catalog-index/<group>/<hash>`.
@@ -401,7 +426,7 @@ impl S3Client {
             .put_object()
             .bucket(&self.bucket)
             .key(self.catalog_document_key(hash_hex))
-            .content_type("application/json")
+            .content_type("application/zip")
             .metadata(CATALOG_OWNER_METADATA, owner)
             .body(body.into())
             .send()
@@ -584,6 +609,79 @@ impl S3Client {
         }
     }
 
+    /// Store a catalog's index record under `catalog-indexes/<hash>`.
+    pub async fn put_catalog_index(&self, hash_hex: &str, body: Bytes) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_index_key(hash_hex))
+            .content_type("application/json")
+            .body(body.into())
+            .send()
+            .await
+            .context("Failed to PUT catalog index to S3")?;
+        Ok(())
+    }
+
+    /// A catalog's index record, or `None` (a catalog published before
+    /// envelopes has none).
+    pub async fn get_catalog_index(&self, hash_hex: &str) -> Result<Option<Bytes>> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_index_key(hash_hex))
+            .send()
+            .await
+        {
+            Ok(resp) => Ok(Some(resp.body.collect().await?.into_bytes())),
+            Err(e) if e.as_service_error().is_some_and(|se| se.is_no_such_key()) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!(
+                "Failed to GET catalog index from S3: {}",
+                e
+            )),
+        }
+    }
+
+    /// Record `creator` as the creator of `campaign_id`
+    /// (`campaign-creators/<id>`, `{"creator":"<sub>"}`).
+    pub async fn put_campaign_creator(&self, campaign_id: &str, creator: &str) -> Result<()> {
+        let body = serde_json::to_vec(&serde_json::json!({ "creator": creator }))?;
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.campaign_creator_key(campaign_id))
+            .content_type("application/json")
+            .body(Bytes::from(body).into())
+            .send()
+            .await
+            .context("Failed to PUT campaign creator to S3")?;
+        Ok(())
+    }
+
+    /// The recorded creator of `campaign_id`, or `None`.
+    pub async fn get_campaign_creator(&self, campaign_id: &str) -> Result<Option<String>> {
+        let body = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(self.campaign_creator_key(campaign_id))
+            .send()
+            .await
+        {
+            Ok(resp) => resp.body.collect().await?.into_bytes(),
+            Err(e) if e.as_service_error().is_some_and(|se| se.is_no_such_key()) => {
+                return Ok(None);
+            }
+            Err(e) => anyhow::bail!("Failed to GET campaign creator from S3: {e}"),
+        };
+        #[derive(serde::Deserialize)]
+        struct Record {
+            creator: String,
+        }
+        Ok(Some(serde_json::from_slice::<Record>(&body)?.creator))
+    }
+
     /// Store a creator's pointer bundle only if the stored one is still
     /// `expected` (its ETag), or, with `None`, only if there is none.
     /// `false` when another write got there first.
@@ -636,53 +734,6 @@ impl S3Client {
             .send()
             .await
             .context("Failed to DELETE outboard from S3")?;
-        Ok(())
-    }
-
-    pub async fn put_tag(&self, tag_name: &str, hash_hex: &str) -> Result<()> {
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(self.tag_key(tag_name))
-            .body(Bytes::from(hash_hex.to_string()).into())
-            .send()
-            .await
-            .context("Failed to PUT tag to S3")?;
-        Ok(())
-    }
-
-    pub async fn get_tag(&self, tag_name: &str) -> Result<Option<String>> {
-        match self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(self.tag_key(tag_name))
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let data = resp.body.collect().await?;
-                let hash_hex = String::from_utf8(data.into_bytes().to_vec())?;
-                Ok(Some(hash_hex))
-            }
-            Err(e) => {
-                if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
-                    Ok(None)
-                } else {
-                    Err(anyhow::anyhow!("Failed to GET tag from S3: {}", e))
-                }
-            }
-        }
-    }
-
-    pub async fn delete_tag(&self, tag_name: &str) -> Result<()> {
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(self.tag_key(tag_name))
-            .send()
-            .await
-            .context("Failed to DELETE tag from S3")?;
         Ok(())
     }
 

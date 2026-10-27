@@ -1,31 +1,30 @@
-//! Creator catalog routes (`docs/creator-catalogs.md`).
+//! Creator catalog routes shared by every catalog (`docs/creator-catalogs.md`).
 //!
-//! - `PUT /catalogs/{sub}` — publish a catalog document: store its exact
-//!   bytes under `catalog-documents/<blake3>` and point the tag
-//!   `<tag_prefix><sub>` at it. Same token checks as `PUT /tags/{name}`.
 //! - `GET /catalog-documents/{hash}` — public, immutable read of a stored
-//!   document.
+//!   catalog document: the envelope ZTDF, ciphertext to anyone without the
+//!   catalog's attribute.
 //! - `GET /blobs/{hash}` — public ingest confirmation: the size of an
 //!   ingested, unblocked TDF.
 //!
-//! The routes share [`ApiState`] with the tag API and exist whenever the
-//! HTTP listener does. On an ungated node (`[publishing] required = false`)
-//! the token still has to verify, the publishing checks are skipped, and
-//! nothing is blocked (moderation records are only loaded when gated).
+//! [`check_payloads`] holds the per-entry publish checks `PUT
+//! /v2/catalogs/{sub}` runs on a catalog's index: the recordings it lists. On an ungated node
+//! (`[publishing] required = false`) nothing is blocked (moderation records
+//! are only loaded when gated).
 
-use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, put};
+use axum::routing::get;
 use axum::{Json, Router};
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::warn;
 
-use crate::creator_catalog::{self, CreatorCatalogEntry, MAX_CATALOG_BYTES, is_lower_hex_hash};
-use crate::tags_api::{ApiState, TagStore, authorize_publisher, is_blocked};
+use crate::catalog_metadata;
+use crate::creator_catalog::{CreatorCatalogEntry, is_lower_hex_hash};
+use crate::tags_api::{ApiState, TagStore, is_blocked};
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
 
@@ -43,167 +42,49 @@ const INGEST_CHECK_CONCURRENCY: usize = 16;
 
 pub fn router<S: TagStore>(state: Arc<ApiState<S>>) -> Router {
     Router::new()
-        .route("/catalogs/{sub}", put(put_catalog::<S>))
         .route("/catalog-documents/{hash}", get(get_catalog_document::<S>))
         .route("/blobs/{hash}", get(get_blob::<S>))
         .with_state(state)
 }
 
-async fn put_catalog<S: TagStore>(
-    State(state): State<Arc<ApiState<S>>>,
-    Path(sub): Path<String>,
-    headers: HeaderMap,
-    body: Body,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    // 1. The publishing token checks (on an ungated node: verification only).
-    let claims = authorize_publisher(&state, &headers)
-        .await
-        .map_err(|(status, msg)| {
-            warn!(%status, reason = msg, %sub, "Catalog upload rejected");
-            fail(status, msg)
-        })?;
-
-    // 2. A subject publishes only its own catalog. Byte for byte: no
-    //    canonicalization, so `arkavo:<uuid>` and `<uuid>` differ.
-    if sub != claims.sub {
-        warn!(%sub, token_sub = %claims.sub, "Catalog upload rejected: subject mismatch");
-        return Err(fail(
-            StatusCode::FORBIDDEN,
-            "catalog does not match token subject",
-        ));
-    }
-
-    if !is_json(&headers) {
-        return Err(fail(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "content type must be application/json",
-        ));
-    }
-
-    // 3. At most MAX_CATALOG_BYTES, read only after the token checks.
-    let declared_too_large = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .is_some_and(|n| n > MAX_CATALOG_BYTES as u64);
-    if declared_too_large {
-        return Err(fail(StatusCode::PAYLOAD_TOO_LARGE, "catalog too large"));
-    }
-    let bytes = axum::body::to_bytes(body, MAX_CATALOG_BYTES)
-        .await
-        .map_err(|e| {
-            let too_large = std::error::Error::source(&e)
-                .is_some_and(|s| s.is::<http_body_util::LengthLimitError>());
-            if too_large {
-                fail(StatusCode::PAYLOAD_TOO_LARGE, "catalog too large")
-            } else {
-                warn!(error = %e, "Catalog upload body unreadable");
-                fail(StatusCode::BAD_REQUEST, "unreadable request body")
-            }
-        })?;
-
-    // 4. A valid document of this subject.
-    let doc = creator_catalog::parse(&bytes).map_err(|reason| {
-        fail(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("invalid catalog: {reason}"),
-        )
-    })?;
-    if doc.owner != sub {
-        return Err(fail(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid catalog: owner does not match the catalog subject",
-        ));
-    }
-
-    // 5. The document itself is not blocked (no tag may point at blocked
-    //    content), then 6–8: its payloads pass the checks every catalog a
-    //    tag points at must pass, each looked up again: a payload the
-    //    current catalog lists may have left storage since it was published.
-    let hash = blake3::hash(&bytes).to_hex().to_string();
-    if is_blocked(&state, &hash) {
-        warn!(%sub, "Catalog upload rejected: content is blocked");
-        return Err(fail(StatusCode::FORBIDDEN, "content is blocked"));
-    }
-    check_payloads(&state, &doc.entries)
-        .await
-        .map_err(|(status, msg)| {
-            warn!(%sub, %status, reason = %msg, "Catalog upload rejected");
-            fail(status, msg)
-        })?;
-
-    // 9. Store the exact bytes, then move the tag.
-    let size = bytes.len();
-    let entries = doc.entries.len();
-    state
-        .store
-        .put_catalog_document(&hash, bytes, &sub)
-        .await
-        .map_err(|e| storage_unavailable("Catalog document write", e))?;
-    let name = format!("{}{}", state.tag_prefix, sub);
-    state
-        .store
-        .put_tag(&name, &hash)
-        .await
-        .map_err(|e| storage_unavailable("Catalog tag write", e))?;
-
-    info!(tag = %name, %hash, size, entries, "Catalog published");
-    Ok(Json(serde_json::json!({
-        "name": name,
-        "hash": hash,
-        "size": size,
-    })))
-}
-
-/// The payload checks for a catalog a tag will point at, in the contract's
-/// order: no payload blocked (403 `content is blocked`), every payload an
-/// ingested blob (422 `payload <hash> is not ingested`, the first missing
-/// one in entry order), and every entry's `payloadSize` equal to that
-/// blob's size (422 `payload <hash> size does not match`, the first
-/// mismatching entry). Each distinct hash is looked up once, at most
+/// The checks for a catalog's index entries, in the contract's order:
+/// - no recording blocked (403 `content is blocked`);
+/// - every one ingested (422 `payload <hash> is not ingested`, the first
+///   missing one in entry order);
+/// - every entry's size equal to that blob's (422 `payload <hash> size does
+///   not match`);
+/// - every recording's manifest stored at ingest (422 `payload <hash>
+///   manifest is not stored`) and readable (`… manifest is unreadable`);
+/// - every recording's policy names `attribute`, the envelope's (422 `entry
+///   <contentID> policy does not include the catalog attribute`): a viewer
+///   who can open an entry can open the catalog.
+///
+/// Each entry's metadata TDF is inside the envelope; Creator checks it.
+/// Each distinct hash is looked up once, at most
 /// [`INGEST_CHECK_CONCURRENCY`] at a time.
 pub(crate) async fn check_payloads<S: TagStore>(
     state: &ApiState<S>,
     entries: &[CreatorCatalogEntry],
+    attribute: &str,
 ) -> Result<(), (StatusCode, String)> {
     if entries.iter().any(|e| is_blocked(state, &e.payload_hash)) {
         return Err((StatusCode::FORBIDDEN, "content is blocked".to_string()));
     }
 
-    let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
-    let lookups: Vec<String> = entries
-        .iter()
-        .map(|e| e.payload_hash.as_str())
-        .filter(|h| seen.insert(h))
-        .map(str::to_string)
-        .collect();
-    let mut sizes = HashMap::with_capacity(lookups.len());
-    let mut checks = futures::stream::iter(lookups)
-        .map(|payload| {
-            let store = Arc::clone(&state.store);
-            async move {
-                let found = store.blob_size(&payload).await;
-                (payload, found)
-            }
-        })
-        .buffered(INGEST_CHECK_CONCURRENCY);
-    while let Some((payload, found)) = checks.next().await {
-        match found {
-            Ok(Some(size)) => {
-                sizes.insert(payload, size);
-            }
-            Ok(None) => {
-                return Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("payload {payload} is not ingested"),
-                ));
-            }
+    let sizes = look_up(state, hashes(entries), |store, hash| async move {
+        match store.blob_size(&hash).await {
+            Ok(Some(size)) => Ok(size),
+            Ok(None) => Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("payload {hash} is not ingested"),
+            )),
             Err(e) => {
                 warn!(error = %e, "Payload ingest check failed");
-                return Err((StatusCode::BAD_GATEWAY, "storage unavailable".to_string()));
+                Err((StatusCode::BAD_GATEWAY, "storage unavailable".to_string()))
             }
         }
-    }
+    })
+    .await?;
 
     // Per entry, not per hash: two entries naming one payload are each
     // checked.
@@ -216,7 +97,76 @@ pub(crate) async fn check_payloads<S: TagStore>(
             format!("payload {} size does not match", e.payload_hash),
         ));
     }
+
+    let manifests = look_up(state, hashes(entries), |store, hash| async move {
+        match store.get_manifest(&hash).await {
+            Ok(Some(bytes)) => catalog_metadata::read_manifest(&bytes).ok_or_else(|| {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("payload {hash} manifest is unreadable"),
+                )
+            }),
+            Ok(None) => Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("payload {hash} manifest is not stored"),
+            )),
+            Err(e) => {
+                warn!(error = %e, "Manifest read failed");
+                Err((StatusCode::BAD_GATEWAY, "storage unavailable".to_string()))
+            }
+        }
+    })
+    .await?;
+    if let Some(e) = entries.iter().find(|e| {
+        !manifests
+            .get(&e.payload_hash)
+            .is_some_and(|p| p.has_attribute(attribute))
+    }) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "entry {} policy does not include the catalog attribute",
+                e.content_id
+            ),
+        ));
+    }
     Ok(())
+}
+
+/// The distinct recording hashes `entries` name, in entry order.
+fn hashes(entries: &[CreatorCatalogEntry]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    entries
+        .iter()
+        .map(|e| e.payload_hash.as_str())
+        .filter(|h| seen.insert(*h))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Run `f` for each hash, at most [`INGEST_CHECK_CONCURRENCY`] at a time,
+/// and stop at the first refusal in `hashes` order.
+async fn look_up<S, T, F, Fut>(
+    state: &ApiState<S>,
+    hashes: Vec<String>,
+    f: F,
+) -> Result<HashMap<String, T>, (StatusCode, String)>
+where
+    S: TagStore,
+    F: Fn(Arc<S>, String) -> Fut,
+    Fut: Future<Output = Result<T, (StatusCode, String)>>,
+{
+    let mut found = HashMap::with_capacity(hashes.len());
+    let mut checks = futures::stream::iter(hashes)
+        .map(|hash| {
+            let lookup = f(Arc::clone(&state.store), hash.clone());
+            async move { (hash, lookup.await) }
+        })
+        .buffered(INGEST_CHECK_CONCURRENCY);
+    while let Some((hash, result)) = checks.next().await {
+        found.insert(hash, result?);
+    }
+    Ok(found)
 }
 
 /// `application/json`, with or without parameters such as `charset`.
@@ -262,20 +212,7 @@ async fn get_catalog_document<S: TagStore>(
             Ok(None) => return Err(not_found()),
             Err(e) => return Err(storage_unavailable("Catalog document lookup", e)),
         };
-        let owner = match head.owner {
-            Some(owner) => Some(owner),
-            // Stored without owner metadata: the bytes name the owner. Only
-            // a gated node hides anything, so only it needs them.
-            None if state.publishing.is_some() => {
-                match state.store.get_catalog_document(&hash).await {
-                    Ok(Some(doc)) => doc.owner(),
-                    Ok(None) => return Err(not_found()),
-                    Err(e) => return Err(storage_unavailable("Catalog document read", e)),
-                }
-            }
-            None => None,
-        };
-        if owner_hidden(&state, owner.as_deref()) {
+        if owner_hidden(&state, head.owner.as_deref()) {
             return Err(not_found());
         }
         return Ok((StatusCode::NOT_MODIFIED, cache_headers).into_response());
@@ -283,12 +220,12 @@ async fn get_catalog_document<S: TagStore>(
 
     match state.store.get_catalog_document(&hash).await {
         Ok(Some(doc)) => {
-            if state.publishing.is_some() && owner_hidden(&state, doc.owner().as_deref()) {
+            if owner_hidden(&state, doc.owner.as_deref()) {
                 return Err(not_found());
             }
             Ok((
                 cache_headers,
-                [(header::CONTENT_TYPE, "application/json")],
+                [(header::CONTENT_TYPE, "application/zip")],
                 doc.body,
             )
                 .into_response())
@@ -340,29 +277,29 @@ async fn get_blob<S: TagStore>(
 mod tests {
     use super::*;
     use crate::auth::CwtVerifier;
-    use crate::auth::test_support::{keypair, mint, mint_with_aud};
-    use crate::creator_catalog::test_support::{catalog, entry};
-    use crate::moderation::{DEFAULT_PUBLISH_ENTITLEMENT, Moderation, PublishPolicy, now_secs};
-    use crate::tags_api::TagPublishing;
+    use crate::auth::test_support::keypair;
+    use crate::catalog_metadata::test_support::{CAMPAIGN, KAS, manifest, recording_policy};
+    use crate::creator_catalog::test_support::{PAYLOAD_SIZE, entry};
+    use crate::creator_catalog::{self, CreatorCatalogEntry};
+    use crate::moderation::{DEFAULT_PUBLISH_ENTITLEMENT, Moderation, PublishPolicy};
     use crate::tags_api::test_support::MemStore;
-    use axum::http::{Method, Request};
+    use crate::tags_api::{StoredDocument, TagPublishing};
+    use axum::body::Body;
+    use axum::http::Request;
     use bytes::Bytes;
-    use ciborium::value::Value;
     use http_body_util::BodyExt;
+    use serde_json::json;
     use tower::ServiceExt;
 
     const SUB: &str = "5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10";
-    /// The `payloadSize` of `creator_catalog::test_support::entry`.
-    const PAYLOAD_SIZE: u64 = 7_342_067;
-    const ISS: &str = "https://identity.test";
 
     struct Harness {
         app: Router,
+        state: Arc<ApiState<MemStore>>,
         store: Arc<MemStore>,
         moderation: Arc<Moderation>,
     }
 
-    /// The catalog routes plus the tag routes, as main.rs wires them.
     fn harness(gated: bool) -> Harness {
         let (_, vk) = keypair();
         let store = Arc::new(MemStore::new());
@@ -370,8 +307,6 @@ mod tests {
         let state = Arc::new(ApiState {
             store: Arc::clone(&store),
             verifier: Arc::new(CwtVerifier::with_static_keys(vec![(b"kid-1".to_vec(), vk)])),
-            tag_prefix: "catalog/".to_string(),
-            catalog_documents: Default::default(),
             publishing: gated.then(|| TagPublishing {
                 policy: Arc::new(PublishPolicy {
                     entitlement: Some(DEFAULT_PUBLISH_ENTITLEMENT.into()),
@@ -384,46 +319,46 @@ mod tests {
             }),
         });
         Harness {
-            app: router(Arc::clone(&state)).merge(crate::tags_api::router(state)),
+            app: router(Arc::clone(&state)),
+            state,
             store,
             moderation,
         }
-    }
-
-    /// A passkey-style token for `sub` carrying `entitlements`.
-    fn token(sub: &str, entitlements: &[&str]) -> String {
-        let (sk, _) = keypair();
-        mint_with_aud(
-            &sk,
-            b"kid-1",
-            ISS,
-            sub,
-            "arkavo",
-            now_secs(),
-            now_secs() + 3600,
-            &[(
-                "arkavo_entitlements",
-                Value::Array(
-                    entitlements
-                        .iter()
-                        .map(|e| Value::Text((*e).into()))
-                        .collect(),
-                ),
-            )],
-        )
-    }
-
-    fn creator() -> String {
-        token(SUB, &[DEFAULT_PUBLISH_ENTITLEMENT])
     }
 
     fn payload(n: u8) -> String {
         format!("{n:02x}").repeat(32)
     }
 
-    /// A catalog of SUB listing payload(1).
-    fn doc() -> Vec<u8> {
-        catalog(SUB, vec![entry("rec-1", &payload(1))])
+    /// Ingest payload(n), a campaign recording, with its stored manifest.
+    async fn ingest(h: &Harness, n: u8) {
+        h.store
+            .ingest_with_manifest(
+                &payload(n),
+                PAYLOAD_SIZE,
+                manifest(recording_policy(), &[KAS]),
+            )
+            .await;
+    }
+
+    fn index(entries: Vec<serde_json::Value>) -> Vec<CreatorCatalogEntry> {
+        creator_catalog::parse_index(json!(entries)).unwrap()
+    }
+
+    /// One entry: rec-1, payload(1).
+    fn one() -> Vec<CreatorCatalogEntry> {
+        index(vec![entry("rec-1", &payload(1))])
+    }
+
+    async fn check(
+        h: &Harness,
+        entries: &[CreatorCatalogEntry],
+    ) -> Result<(), (StatusCode, String)> {
+        check_payloads(&h.state, entries, CAMPAIGN).await
+    }
+
+    fn unprocessable(msg: String) -> Result<(), (StatusCode, String)> {
+        Err((StatusCode::UNPROCESSABLE_ENTITY, msg))
     }
 
     struct Reply {
@@ -433,20 +368,24 @@ mod tests {
     }
 
     impl Reply {
-        fn json(&self) -> serde_json::Value {
-            serde_json::from_slice(&self.body).unwrap_or_default()
-        }
-
         fn error(&self) -> String {
-            self.json()["error"]
+            serde_json::from_slice::<serde_json::Value>(&self.body).unwrap_or_default()["error"]
                 .as_str()
                 .unwrap_or_default()
                 .to_string()
         }
     }
 
-    async fn send(app: &Router, req: Request<axum::body::Body>) -> Reply {
-        let res = app.clone().oneshot(req).await.unwrap();
+    async fn get_with(app: &Router, uri: &str, if_none_match: Option<&str>) -> Reply {
+        let mut req = Request::get(uri);
+        if let Some(tag) = if_none_match {
+            req = req.header(header::IF_NONE_MATCH, tag);
+        }
+        let res = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         let status = res.status();
         let headers = res.headers().clone();
         let body = res.into_body().collect().await.unwrap().to_bytes();
@@ -457,458 +396,169 @@ mod tests {
         }
     }
 
-    async fn put_catalog(app: &Router, sub: &str, bearer: Option<&str>, body: Vec<u8>) -> Reply {
-        let mut req = Request::builder()
-            .method(Method::PUT)
-            .uri(format!("/catalogs/{sub}"))
-            .header("content-type", "application/json");
-        if let Some(t) = bearer {
-            req = req.header("authorization", format!("Bearer {t}"));
-        }
-        send(app, req.body(Body::from(body)).unwrap()).await
-    }
-
     async fn get(app: &Router, uri: &str) -> Reply {
-        send(app, Request::get(uri).body(Body::empty()).unwrap()).await
+        get_with(app, uri, None).await
+    }
+
+    /// Store `body` as a catalog document of `owner`; its hash.
+    async fn store_document(h: &Harness, body: &[u8], owner: Option<&str>) -> String {
+        let hash = blake3::hash(body).to_hex().to_string();
+        h.store.catalog_documents.lock().await.insert(
+            hash.clone(),
+            StoredDocument {
+                body: Bytes::copy_from_slice(body),
+                owner: owner.map(str::to_string),
+            },
+        );
+        hash
     }
 
     #[tokio::test]
-    async fn publish_stores_the_exact_bytes_and_moves_the_tag() {
+    async fn an_index_of_ingested_campaign_recordings_passes() {
         let h = harness(true);
-        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
-        let bytes = doc();
-        let want = blake3::hash(&bytes).to_hex().to_string();
-
-        let r = put_catalog(&h.app, SUB, Some(&creator()), bytes.clone()).await;
-        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
-        assert_eq!(
-            r.json(),
-            serde_json::json!({
-                "name": format!("catalog/{SUB}"),
-                "hash": want,
-                "size": bytes.len(),
-            })
-        );
-        {
-            let stored = &h.store.catalog_documents.lock().await[&want];
-            assert_eq!(stored.body, Bytes::from(bytes.clone()));
-            assert_eq!(stored.owner.as_deref(), Some(SUB), "owner recorded");
-        }
-
-        // Readers: tag, then the document, byte for byte.
-        let r = get(&h.app, &format!("/tags/catalog/{SUB}")).await;
-        assert_eq!(r.status, StatusCode::OK);
-        assert_eq!(
-            r.json(),
-            serde_json::json!({ "name": format!("catalog/{SUB}"), "hash": want })
-        );
-        let r = get(&h.app, &format!("/catalog-documents/{want}")).await;
-        assert_eq!(r.status, StatusCode::OK);
-        assert_eq!(r.body, Bytes::from(bytes.clone()));
-        assert_eq!(r.headers[header::CONTENT_TYPE], "application/json");
-        assert_eq!(r.headers[header::CACHE_CONTROL], "public, max-age=300");
-        assert_eq!(r.headers[header::ETAG], format!("\"{want}\"").as_str());
-
-        // Uploading the same catalog again is harmless.
-        let r = put_catalog(&h.app, SUB, Some(&creator()), bytes).await;
-        assert_eq!(r.status, StatusCode::OK);
-        assert_eq!(r.json()["hash"], want);
-        assert_eq!(h.store.catalog_documents.lock().await.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn an_empty_catalog_publishes() {
-        let h = harness(true);
-        let r = put_catalog(&h.app, SUB, Some(&creator()), catalog(SUB, vec![])).await;
-        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
-    }
-
-    #[tokio::test]
-    async fn token_checks_come_first() {
-        let h = harness(true);
-        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
-        let (sk, _) = keypair();
-        let expired = mint(
-            &sk,
-            b"kid-1",
-            ISS,
-            SUB,
-            now_secs() - 7200,
-            now_secs() - 3600,
-        );
-        for (bearer, status, msg) in [
-            (None, StatusCode::UNAUTHORIZED, "missing bearer token"),
-            (Some("garbage"), StatusCode::UNAUTHORIZED, "invalid token"),
-            (
-                Some(expired.as_str()),
-                StatusCode::UNAUTHORIZED,
-                "invalid token",
-            ),
-        ] {
-            // Even an oversize body is answered by the token check.
-            let r = put_catalog(&h.app, SUB, bearer, vec![b' '; MAX_CATALOG_BYTES + 1]).await;
-            assert_eq!((r.status, r.error().as_str()), (status, msg));
-        }
-
-        let unentitled = token(SUB, &["https://arkavo.ai/attr/action/value/read"]);
-        let service = token("client:svc", &[DEFAULT_PUBLISH_ENTITLEMENT]);
-        for (bearer, sub, msg) in [
-            (unentitled.as_str(), SUB, "publishing entitlement required"),
-            (
-                service.as_str(),
-                "client:svc",
-                "service tokens cannot publish",
-            ),
-        ] {
-            let r = put_catalog(&h.app, sub, Some(bearer), doc()).await;
-            assert_eq!((r.status, r.error().as_str()), (StatusCode::FORBIDDEN, msg));
-        }
-
-        h.moderation.suspend_for_test(SUB, false);
-        let r = put_catalog(&h.app, SUB, Some(&creator()), doc()).await;
-        assert_eq!(
-            (r.status, r.error().as_str()),
-            (StatusCode::FORBIDDEN, "publishing suspended")
-        );
-        assert!(h.store.tags.lock().await.is_empty());
-        assert!(h.store.catalog_documents.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn an_ungated_node_still_verifies_the_token() {
-        let h = harness(false);
-        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
-        let r = put_catalog(&h.app, SUB, Some("garbage"), doc()).await;
-        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
-        let r = put_catalog(&h.app, SUB, None, doc()).await;
-        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
-        // No entitlement needed when ungated.
-        let r = put_catalog(&h.app, SUB, Some(&token(SUB, &[])), doc()).await;
-        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
-    }
-
-    #[tokio::test]
-    async fn the_path_must_be_the_token_subject_byte_for_byte() {
-        let h = harness(true);
-        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
-        let tok = token(&format!("arkavo:{SUB}"), &[DEFAULT_PUBLISH_ENTITLEMENT]);
-        // The bare UUID is a different subject from arkavo:<uuid>.
-        let r = put_catalog(&h.app, SUB, Some(&tok), doc()).await;
-        assert_eq!(
-            (r.status, r.error().as_str()),
-            (
-                StatusCode::FORBIDDEN,
-                "catalog does not match token subject"
-            )
-        );
-        let r = put_catalog(&h.app, "someone-else", Some(&creator()), doc()).await;
-        assert_eq!(r.status, StatusCode::FORBIDDEN);
-        // The prefixed subject publishes its own, prefixed tag.
-        let mine = catalog(&format!("arkavo:{SUB}"), vec![entry("rec-1", &payload(1))]);
-        let r = put_catalog(&h.app, &format!("arkavo:{SUB}"), Some(&tok), mine).await;
-        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
-        assert_eq!(r.json()["name"], format!("catalog/arkavo:{SUB}"));
-    }
-
-    #[tokio::test]
-    async fn the_body_must_be_json() {
-        let h = harness(true);
-        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
-        for content_type in [None, Some("text/plain"), Some("application/jsonx")] {
-            let mut req = Request::builder()
-                .method(Method::PUT)
-                .uri(format!("/catalogs/{SUB}"))
-                .header("authorization", format!("Bearer {}", creator()));
-            if let Some(ct) = content_type {
-                req = req.header("content-type", ct);
-            }
-            let r = send(&h.app, req.body(Body::from(doc())).unwrap()).await;
-            assert_eq!(
-                r.status,
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "{content_type:?}"
-            );
-            assert_eq!(r.error(), "content type must be application/json");
-        }
-        let r = send(
-            &h.app,
-            Request::builder()
-                .method(Method::PUT)
-                .uri(format!("/catalogs/{SUB}"))
-                .header("authorization", format!("Bearer {}", creator()))
-                .header("content-type", "application/json; charset=utf-8")
-                .body(Body::from(doc()))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
-    }
-
-    #[tokio::test]
-    async fn the_body_is_at_most_262144_bytes() {
-        let h = harness(true);
-        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
-        let mut bytes = doc();
-        bytes.resize(MAX_CATALOG_BYTES, b' ');
-        let r = put_catalog(&h.app, SUB, Some(&creator()), bytes.clone()).await;
-        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
-        assert_eq!(r.json()["size"], MAX_CATALOG_BYTES);
-
-        bytes.push(b' ');
-        let r = put_catalog(&h.app, SUB, Some(&creator()), bytes.clone()).await;
-        assert_eq!(
-            (r.status, r.error().as_str()),
-            (StatusCode::PAYLOAD_TOO_LARGE, "catalog too large")
-        );
-
-        // Streamed without a Content-Length: the limit still holds.
-        let chunks: Vec<Result<Bytes, std::io::Error>> = bytes
-            .chunks(4096)
-            .map(|c| Ok(Bytes::copy_from_slice(c)))
-            .collect();
-        let r = send(
-            &h.app,
-            Request::builder()
-                .method(Method::PUT)
-                .uri(format!("/catalogs/{SUB}"))
-                .header("authorization", format!("Bearer {}", creator()))
-                .header("content-type", "application/json")
-                .body(Body::from_stream(futures::stream::iter(chunks)))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
-
-        // An oversize invalid document is too large, not invalid.
-        let r = put_catalog(
-            &h.app,
-            SUB,
-            Some(&creator()),
-            vec![b'x'; MAX_CATALOG_BYTES + 1],
-        )
-        .await;
-        assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
-
-        // Beyond axum's 2 MB default body limit the handler still answers,
-        // with the contract's JSON error, after the token checks.
-        let huge = vec![b' '; 3 * 1024 * 1024];
-        let r = put_catalog(&h.app, SUB, Some(&creator()), huge.clone()).await;
-        assert_eq!(
-            (r.status, r.error().as_str()),
-            (StatusCode::PAYLOAD_TOO_LARGE, "catalog too large")
-        );
-        let r = put_catalog(&h.app, SUB, None, huge).await;
-        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn an_invalid_document_is_422_with_its_reason() {
-        let h = harness(true);
-        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
-        let r = put_catalog(&h.app, SUB, Some(&creator()), b"{\"schema\":1}".to_vec()).await;
-        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(r.error().starts_with("invalid catalog: "), "{}", r.error());
-
-        let dup = format!(
-            r#"{{"schema":"arkavo.creator-catalog/1","owner":"{SUB}","owner":"{SUB}","entries":[]}}"#
-        );
-        let r = put_catalog(&h.app, SUB, Some(&creator()), dup.into_bytes()).await;
-        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(r.error().contains("duplicate key"), "{}", r.error());
-
-        // A valid document of another owner.
-        let theirs = catalog("someone-else", vec![entry("rec-1", &payload(1))]);
-        let r = put_catalog(&h.app, SUB, Some(&creator()), theirs).await;
-        assert_eq!(
-            (r.status, r.error().as_str()),
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid catalog: owner does not match the catalog subject"
-            )
-        );
-        assert!(h.store.tags.lock().await.is_empty());
+        ingest(&h, 1).await;
+        assert_eq!(check(&h, &one()).await, Ok(()));
+        assert_eq!(check(&h, &[]).await, Ok(()));
     }
 
     #[tokio::test]
     async fn blocked_content_is_refused_before_the_ingest_check() {
-        let h = harness(true);
         // payload(1) blocked and never ingested: the block answers.
-        h.moderation.block_for_test(&payload(1));
-        let r = put_catalog(&h.app, SUB, Some(&creator()), doc()).await;
-        assert_eq!(
-            (r.status, r.error().as_str()),
-            (StatusCode::FORBIDDEN, "content is blocked")
-        );
-
-        // A blocked catalog document cannot be republished either.
         let h = harness(true);
-        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
-        h.moderation
-            .block_for_test(blake3::hash(&doc()).to_hex().as_str());
-        let r = put_catalog(&h.app, SUB, Some(&creator()), doc()).await;
-        assert_eq!(r.status, StatusCode::FORBIDDEN);
-        assert!(h.store.tags.lock().await.is_empty());
+        h.moderation.block_for_test(&payload(1));
+        assert_eq!(
+            check(&h, &one()).await,
+            Err((StatusCode::FORBIDDEN, "content is blocked".to_string()))
+        );
+        // An ungated node blocks nothing.
+        let h = harness(false);
+        ingest(&h, 1).await;
+        h.moderation.block_for_test(&payload(1));
+        assert_eq!(check(&h, &one()).await, Ok(()));
     }
 
     #[tokio::test]
     async fn every_payload_must_be_ingested() {
         let h = harness(true);
-        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
-        let bytes = catalog(
-            SUB,
-            vec![
-                entry("rec-1", &payload(1)),
-                entry("rec-2", &payload(2)),
-                entry("rec-3", &payload(3)),
-            ],
-        );
-        let r = put_catalog(&h.app, SUB, Some(&creator()), bytes).await;
+        for n in [1, 3] {
+            ingest(&h, n).await;
+        }
+        let entries = index(vec![
+            entry("rec-1", &payload(1)),
+            entry("rec-2", &payload(2)),
+            entry("rec-3", &payload(3)),
+        ]);
         assert_eq!(
-            (r.status, r.error()),
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("payload {} is not ingested", payload(2))
-            )
+            check(&h, &entries).await,
+            unprocessable(format!("payload {} is not ingested", payload(2)))
         );
-        assert!(h.store.tags.lock().await.is_empty());
-        assert!(h.store.catalog_documents.lock().await.is_empty());
     }
 
     #[tokio::test]
-    async fn every_payload_size_must_match_the_stored_blob() {
+    async fn every_size_must_match_the_stored_blob() {
         let h = harness(true);
-        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
+        for n in 1..=3 {
+            ingest(&h, n).await;
+        }
         h.store.ingest(&payload(2), PAYLOAD_SIZE - 1).await;
         h.store.ingest(&payload(3), PAYLOAD_SIZE + 1).await;
-
         // The first mismatching entry, in entry order, is reported.
-        let bytes = catalog(
-            SUB,
-            vec![
-                entry("rec-1", &payload(1)),
-                entry("rec-3", &payload(3)),
-                entry("rec-2", &payload(2)),
-            ],
-        );
-        let r = put_catalog(&h.app, SUB, Some(&creator()), bytes).await;
+        let entries = index(vec![
+            entry("rec-1", &payload(1)),
+            entry("rec-3", &payload(3)),
+            entry("rec-2", &payload(2)),
+        ]);
         assert_eq!(
-            (r.status, r.error()),
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("payload {} size does not match", payload(3))
-            )
+            check(&h, &entries).await,
+            unprocessable(format!("payload {} size does not match", payload(3)))
         );
-        assert!(h.store.tags.lock().await.is_empty());
-        assert!(h.store.catalog_documents.lock().await.is_empty());
-
-        // Two entries naming one payload are each checked: the second is
-        // wrong although the first is right.
+        // Two entries naming one payload are each checked.
         let mut wrong = entry("rec-1b", &payload(1));
-        wrong["payloadSize"] = serde_json::json!(PAYLOAD_SIZE + 1);
-        let bytes = catalog(SUB, vec![entry("rec-1", &payload(1)), wrong]);
-        let r = put_catalog(&h.app, SUB, Some(&creator()), bytes).await;
+        wrong["payloadSize"] = json!(PAYLOAD_SIZE + 1);
+        let entries = index(vec![entry("rec-1", &payload(1)), wrong]);
         assert_eq!(
-            (r.status, r.error()),
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("payload {} size does not match", payload(1))
-            )
+            check(&h, &entries).await,
+            unprocessable(format!("payload {} size does not match", payload(1)))
         );
-
         // An ingest failure is reported before any size mismatch.
-        let bytes = catalog(
-            SUB,
-            vec![entry("rec-3", &payload(3)), entry("rec-4", &payload(4))],
+        let entries = index(vec![
+            entry("rec-3", &payload(3)),
+            entry("rec-4", &payload(4)),
+        ]);
+        assert_eq!(
+            check(&h, &entries).await,
+            unprocessable(format!("payload {} is not ingested", payload(4)))
         );
-        let r = put_catalog(&h.app, SUB, Some(&creator()), bytes).await;
-        assert_eq!(r.error(), format!("payload {} is not ingested", payload(4)));
-
-        // Sizes that match publish.
-        let r = put_catalog(&h.app, SUB, Some(&creator()), doc()).await;
-        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
-        assert_eq!(h.store.tags.lock().await.len(), 1);
     }
 
-    /// An edit looks up every payload, including those the current catalog
-    /// lists, each distinct hash once.
     #[tokio::test]
-    async fn an_edit_looks_up_every_payload() {
+    async fn each_distinct_hash_is_looked_up_once() {
         use std::sync::atomic::Ordering::Relaxed;
         let h = harness(true);
-        for n in 1..=4 {
-            h.store.ingest(&payload(n), PAYLOAD_SIZE).await;
-        }
-        let lookups = || h.store.blob_lookups.load(Relaxed);
-
-        // First publish: both payloads, the duplicate once.
-        let first = catalog(
-            SUB,
-            vec![
-                entry("rec-1", &payload(1)),
-                entry("rec-2", &payload(2)),
-                entry("rec-2b", &payload(2)),
-            ],
-        );
-        let r = put_catalog(&h.app, SUB, Some(&creator()), first).await;
-        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
-        assert_eq!(lookups(), 2);
-
-        // An edit looks up every distinct payload again, listed or new.
-        let second = catalog(
-            SUB,
-            vec![
-                entry("rec-1", &payload(1)),
-                entry("rec-2", &payload(2)),
-                entry("rec-3", &payload(3)),
-            ],
-        );
-        let r = put_catalog(&h.app, SUB, Some(&creator()), second).await;
-        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
-        assert_eq!(lookups(), 5);
-
-        // A payload gone from storage since the current catalog listed it
-        // is refused.
-        h.store.blobs.lock().await.remove(&payload(1));
-        let third = catalog(
-            SUB,
-            vec![entry("rec-1", &payload(1)), entry("rec-2", &payload(2))],
-        );
-        let r = put_catalog(&h.app, SUB, Some(&creator()), third).await;
-        assert_eq!(
-            (r.status, r.error()),
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("payload {} is not ingested", payload(1))
-            )
-        );
-
-        // Blocks still apply to listed payloads.
-        h.moderation.block_for_test(&payload(2));
-        let fourth = catalog(SUB, vec![entry("rec-2", &payload(2))]);
-        let r = put_catalog(&h.app, SUB, Some(&creator()), fourth).await;
-        assert_eq!(
-            (r.status, r.error().as_str()),
-            (StatusCode::FORBIDDEN, "content is blocked")
-        );
+        ingest(&h, 1).await;
+        ingest(&h, 2).await;
+        let entries = index(vec![
+            entry("rec-1", &payload(1)),
+            entry("rec-1b", &payload(1)),
+            entry("rec-2", &payload(2)),
+        ]);
+        assert_eq!(check(&h, &entries).await, Ok(()));
+        assert_eq!(h.store.blob_lookups.load(Relaxed), 2);
+        assert_eq!(h.store.manifest_reads.load(Relaxed), 2);
     }
 
     #[tokio::test]
-    async fn storage_failure_is_502() {
+    async fn every_manifest_must_be_stored_and_readable() {
         let h = harness(true);
         h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
+        assert_eq!(
+            check(&h, &one()).await,
+            unprocessable(format!("payload {} manifest is not stored", payload(1)))
+        );
+        h.store
+            .ingest_with_manifest(&payload(1), PAYLOAD_SIZE, b"not a manifest".to_vec())
+            .await;
+        assert_eq!(
+            check(&h, &one()).await,
+            unprocessable(format!("payload {} manifest is unreadable", payload(1)))
+        );
         h.store
             .down
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let r = put_catalog(&h.app, SUB, Some(&creator()), doc()).await;
-        assert_eq!(r.status, StatusCode::BAD_GATEWAY);
-        let r = get(&h.app, &format!("/blobs/{}", payload(1))).await;
-        assert_eq!(r.status, StatusCode::BAD_GATEWAY);
-        let r = get(&h.app, &format!("/catalog-documents/{}", payload(1))).await;
-        assert_eq!(r.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            check(&h, &one()).await,
+            Err((StatusCode::BAD_GATEWAY, "storage unavailable".to_string()))
+        );
     }
 
     #[tokio::test]
-    async fn catalog_documents_404_400_and_blocked() {
+    async fn every_recording_carries_the_catalog_attribute() {
+        let h = harness(true);
+        ingest(&h, 1).await;
+        let other = "https://patreon.arkavo.com/attr/campaign/value/99";
+        assert_eq!(
+            check_payloads(&h.state, &one(), other).await,
+            unprocessable("entry rec-1 policy does not include the catalog attribute".into())
+        );
+
+        // The first entry whose recording lacks it is named.
+        let other_policy = json!({ "uuid": "r2", "body": {
+            "dataAttributes": [{ "attribute": other }], "dissem": [] } });
+        h.store
+            .ingest_with_manifest(&payload(2), PAYLOAD_SIZE, manifest(other_policy, &[KAS]))
+            .await;
+        let entries = index(vec![
+            entry("rec-1", &payload(1)),
+            entry("rec-2", &payload(2)),
+        ]);
+        assert_eq!(
+            check(&h, &entries).await,
+            unprocessable("entry rec-2 policy does not include the catalog attribute".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_documents_404_400_blocked_and_zip() {
         let h = harness(true);
         let r = get(&h.app, &format!("/catalog-documents/{}", payload(9))).await;
         assert_eq!(
@@ -923,35 +573,20 @@ mod tests {
                 "{bad}"
             );
         }
-
-        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
-        let r = put_catalog(&h.app, SUB, Some(&creator()), doc()).await;
-        let hash = r.json()["hash"].as_str().unwrap().to_string();
+        let hash = store_document(&h, b"PK envelope", Some(SUB)).await;
+        let path = format!("/catalog-documents/{hash}");
+        let r = get(&h.app, &path).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(r.body.as_ref(), b"PK envelope");
+        assert_eq!(r.headers[header::CONTENT_TYPE], "application/zip");
         h.moderation.block_for_test(&hash);
-        let r = get(&h.app, &format!("/catalog-documents/{hash}")).await;
-        assert_eq!(r.status, StatusCode::NOT_FOUND);
-        // ...and the tag pointing at it no longer resolves.
-        let r = get(&h.app, &format!("/tags/catalog/{SUB}")).await;
-        assert_eq!(r.status, StatusCode::NOT_FOUND);
-    }
-
-    async fn get_with(app: &Router, path: &str, if_none_match: &str) -> Reply {
-        send(
-            app,
-            Request::get(path)
-                .header(header::IF_NONE_MATCH, if_none_match)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
+        assert_eq!(get(&h.app, &path).await.status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn a_held_version_revalidates_with_its_etag() {
         let h = harness(true);
-        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
-        let r = put_catalog(&h.app, SUB, Some(&creator()), doc()).await;
-        let hash = r.json()["hash"].as_str().unwrap().to_string();
+        let hash = store_document(&h, b"PK envelope", Some(SUB)).await;
         let path = format!("/catalog-documents/{hash}");
         let etag = format!("\"{hash}\"");
 
@@ -961,21 +596,21 @@ mod tests {
             format!("\"{}\", {etag}", payload(7)),
             "*".to_string(),
         ] {
-            let r = get_with(&h.app, &path, &held).await;
+            let r = get_with(&h.app, &path, Some(&held)).await;
             assert_eq!(r.status, StatusCode::NOT_MODIFIED, "{held}");
             assert!(r.body.is_empty(), "{held}");
             assert_eq!(r.headers[header::ETAG], etag.as_str());
             assert_eq!(r.headers[header::CACHE_CONTROL], "public, max-age=300");
         }
 
-        // Another version, or none held: the full document.
-        let r = get_with(&h.app, &path, &format!("\"{}\"", payload(7))).await;
+        // Another version held: the full document.
+        let r = get_with(&h.app, &path, Some(&format!("\"{}\"", payload(7)))).await;
         assert_eq!(r.status, StatusCode::OK);
-        assert_eq!(r.body, Bytes::from(doc()));
+        assert_eq!(r.body.as_ref(), b"PK envelope");
 
-        // A document that is not stored is 404 even to a matching tag.
+        // A document that is not stored is 404 even to `*`.
         let missing = format!("/catalog-documents/{}", payload(9));
-        let r = get_with(&h.app, &missing, "*").await;
+        let r = get_with(&h.app, &missing, Some("*")).await;
         assert_eq!(
             (r.status, r.error().as_str()),
             (StatusCode::NOT_FOUND, "catalog not found")
@@ -983,7 +618,7 @@ mod tests {
 
         // A block reaches a client that revalidates.
         h.moderation.block_for_test(&hash);
-        let r = get_with(&h.app, &path, &etag).await;
+        let r = get_with(&h.app, &path, Some(&etag)).await;
         assert_eq!(
             (r.status, r.error().as_str()),
             (StatusCode::NOT_FOUND, "catalog not found")
@@ -991,70 +626,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_catalog_block_hides_the_document() {
+    async fn a_catalog_block_or_hidden_owner_hides_the_document() {
         let h = harness(true);
-        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
-        let r = put_catalog(&h.app, SUB, Some(&creator()), doc()).await;
-        let hash = r.json()["hash"].as_str().unwrap().to_string();
-        let path = format!("/catalog-documents/{hash}");
-        assert_eq!(get(&h.app, &path).await.status, StatusCode::OK);
-        h.moderation.block_catalog_for_test(SUB);
-        let r = get(&h.app, &path).await;
-        assert_eq!(
-            (r.status, r.error().as_str()),
-            (StatusCode::NOT_FOUND, "catalog not found")
-        );
-    }
-
-    #[tokio::test]
-    async fn a_hidden_owner_hides_the_document() {
-        let h = harness(true);
-        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
-        let r = put_catalog(&h.app, SUB, Some(&creator()), doc()).await;
-        let hash = r.json()["hash"].as_str().unwrap().to_string();
+        let hash = store_document(&h, b"PK envelope", Some(SUB)).await;
         let path = format!("/catalog-documents/{hash}");
         let etag = format!("\"{hash}\"");
+        assert_eq!(get(&h.app, &path).await.status, StatusCode::OK);
 
         // Suspended without hideCatalog: still served.
         h.moderation.suspend_for_test(SUB, false);
         assert_eq!(get(&h.app, &path).await.status, StatusCode::OK);
-
         // With hideCatalog: 404 to a plain read and to a revalidation.
         h.moderation.suspend_for_test(SUB, true);
-        let r = get(&h.app, &path).await;
+        assert_eq!(get(&h.app, &path).await.status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            get_with(&h.app, &path, Some(&etag)).await.status,
+            StatusCode::NOT_FOUND
+        );
+
+        let h = harness(true);
+        let hash = store_document(&h, b"PK envelope", Some(SUB)).await;
+        h.moderation.block_catalog_for_test(SUB);
+        let r = get(&h.app, &format!("/catalog-documents/{hash}")).await;
         assert_eq!(
             (r.status, r.error().as_str()),
             (StatusCode::NOT_FOUND, "catalog not found")
         );
-        let r = get_with(&h.app, &path, &etag).await;
-        assert_eq!(r.status, StatusCode::NOT_FOUND);
-
-        // A document stored without owner metadata: the owner its bytes name
-        // is hidden the same way.
-        let legacy = catalog(SUB, vec![]);
-        let legacy_hash = blake3::hash(&legacy).to_hex().to_string();
-        h.store.catalog_documents.lock().await.insert(
-            legacy_hash.clone(),
-            crate::tags_api::StoredDocument {
-                body: Bytes::from(legacy),
-                owner: None,
-            },
-        );
-        let legacy_path = format!("/catalog-documents/{legacy_hash}");
-        assert_eq!(
-            get(&h.app, &legacy_path).await.status,
-            StatusCode::NOT_FOUND
-        );
-        let r = get_with(&h.app, &legacy_path, &format!("\"{legacy_hash}\"")).await;
-        assert_eq!(r.status, StatusCode::NOT_FOUND);
 
         // An ungated node hides nothing.
-        let ungated = harness(false);
-        ungated.store.catalog_documents.lock().await.insert(
-            hash.clone(),
-            h.store.catalog_documents.lock().await[&hash].clone(),
-        );
-        assert_eq!(get(&ungated.app, &path).await.status, StatusCode::OK);
+        let h = harness(false);
+        let hash = store_document(&h, b"PK envelope", Some(SUB)).await;
+        h.moderation.block_catalog_for_test(SUB);
+        let r = get(&h.app, &format!("/catalog-documents/{hash}")).await;
+        assert_eq!(r.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn storage_failure_is_502() {
+        let h = harness(true);
+        h.store
+            .down
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let r = get(&h.app, &format!("/blobs/{}", payload(1))).await;
+        assert_eq!(r.status, StatusCode::BAD_GATEWAY);
+        let r = get(&h.app, &format!("/catalog-documents/{}", payload(1))).await;
+        assert_eq!(r.status, StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -1064,10 +680,9 @@ mod tests {
         let r = get(&h.app, &format!("/blobs/{}", payload(1))).await;
         assert_eq!(r.status, StatusCode::OK);
         assert_eq!(
-            r.json(),
-            serde_json::json!({ "hash": payload(1), "size": 7_342_067 })
+            serde_json::from_slice::<serde_json::Value>(&r.body).unwrap(),
+            json!({ "hash": payload(1), "size": 7_342_067 })
         );
-
         let r = get(&h.app, &format!("/blobs/{}", payload(2))).await;
         assert_eq!(
             (r.status, r.error().as_str()),
@@ -1080,65 +695,11 @@ mod tests {
                 (StatusCode::BAD_REQUEST, "invalid hash")
             );
         }
-
         h.moderation.block_for_test(&payload(1));
         let r = get(&h.app, &format!("/blobs/{}", payload(1))).await;
         assert_eq!(
             (r.status, r.error().as_str()),
             (StatusCode::NOT_FOUND, "blob not found")
-        );
-    }
-
-    #[tokio::test]
-    async fn the_tag_route_rolls_back_to_a_published_catalog() {
-        let h = harness(true);
-        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
-        h.store.ingest(&payload(2), PAYLOAD_SIZE).await;
-        let first = put_catalog(&h.app, SUB, Some(&creator()), doc())
-            .await
-            .json()["hash"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let second = catalog(SUB, vec![entry("rec-1", &payload(2))]);
-        let r = put_catalog(&h.app, SUB, Some(&creator()), second).await;
-        assert_ne!(r.json()["hash"], first);
-
-        let r = send(
-            &h.app,
-            Request::builder()
-                .method(Method::PUT)
-                .uri(format!("/tags/catalog/{SUB}"))
-                .header("authorization", format!("Bearer {}", creator()))
-                .header("content-type", "application/json")
-                .body(Body::from(format!("{{\"hash\":\"{first}\"}}")))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(r.status, StatusCode::NO_CONTENT);
-        assert_eq!(
-            get(&h.app, &format!("/tags/catalog/{SUB}")).await.json()["hash"],
-            first
-        );
-
-        // A payload blob is not a catalog document.
-        let r = send(
-            &h.app,
-            Request::builder()
-                .method(Method::PUT)
-                .uri(format!("/tags/catalog/{SUB}"))
-                .header("authorization", format!("Bearer {}", creator()))
-                .header("content-type", "application/json")
-                .body(Body::from(format!("{{\"hash\":\"{}\"}}", payload(1))))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(
-            (r.status, r.error().as_str()),
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "hash does not reference a catalog document of this subject"
-            )
         );
     }
 }

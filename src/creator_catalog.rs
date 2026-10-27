@@ -1,12 +1,14 @@
-//! Creator catalog documents, `arkavo.creator-catalog/1`.
+//! A creator catalog's clear entry list, the `index` of `PUT
+//! /v2/catalogs/{sub}` (tdf-iroh-s3#39).
 //!
-//! A creator's catalog is one JSON document listing their published
-//! recordings (see `docs/creator-catalogs.md`). The node stores each version
-//! verbatim under the BLAKE3 hash of its bytes and points the tag
-//! `catalog/<sub>` at the current one, so the bytes a reader fetches are
-//! exactly the bytes the creator uploaded. Validation here is strict because
-//! readers apply the same rules: a document this node accepts must never be
-//! one a viewer rejects.
+//! The catalog document itself, `arkavo.creator-catalog/2`, is the payload
+//! of a ZTDF envelope (`catalog_metadata::check_envelope`) the node never
+//! decrypts, so the node checks the recordings it lists through the index
+//! the publisher sends with it (`docs/creator-catalogs.md`). Each document
+//! entry names a recording by hash and size and carries its metadata TDF
+//! (title, publish time, attributes) inline; an index entry is the same
+//! entry without the metadata, which only Creator and the viewer read.
+//! Strict: unknown and duplicate keys are refused.
 //!
 //! Pure: no I/O, so every rule is a plain unit test.
 
@@ -15,10 +17,9 @@ use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-/// The only schema this node accepts.
-pub const SCHEMA: &str = "arkavo.creator-catalog/1";
-/// Largest document, in bytes.
-pub const MAX_CATALOG_BYTES: usize = 262_144;
+/// Largest catalog document (the envelope ZTDF), in bytes: 4 MiB, room for
+/// 1000 entries with their metadata TDFs inline.
+pub const MAX_CATALOG_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_ENTRIES: usize = 1000;
 pub const MAX_OWNER_BYTES: usize = 248;
 pub const MAX_CONTENT_ID_BYTES: usize = 256;
@@ -27,21 +28,8 @@ pub const MAX_VERSION: u64 = 9_007_199_254_740_991;
 /// 4 GiB − 1 (`u32::MAX`): the largest TDF a catalog may name, and the
 /// default `[validation] max_blob_bytes` (`config::DEFAULT_MAX_BLOB_BYTES`).
 pub const MAX_PAYLOAD_SIZE: u64 = 4_294_967_295;
-pub const MAX_TITLE_BYTES: usize = 512;
-pub const MAX_ATTRIBUTE_FQNS: usize = 32;
-pub const MAX_ATTRIBUTE_FQN_BYTES: usize = 512;
-
-/// A parsed, validated catalog document.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CreatorCatalog {
-    pub schema: String,
-    pub owner: String,
-    pub entries: Vec<CreatorCatalogEntry>,
-}
-
-/// One published recording.
-#[derive(Debug, Deserialize)]
+/// One published recording: what the node checks at publish.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CreatorCatalogEntry {
     #[serde(rename = "contentID")]
@@ -50,61 +38,35 @@ pub struct CreatorCatalogEntry {
     /// BLAKE3 hash of the TDF bytes, 64 lowercase hex characters.
     pub payload_hash: String,
     pub payload_size: u64,
-    /// Optional, but never `null`: when present it is a string.
-    #[serde(default, deserialize_with = "present_string")]
-    pub title: Option<String>,
-    pub published_at: String,
-    #[serde(rename = "attributeFQNs")]
-    pub attribute_fqns: Vec<String>,
 }
 
-/// `title` is optional, so an absent key is `None`; a present key must be a
-/// string (`null` is rejected, not read as absent).
-fn present_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
-    String::deserialize(d).map(Some)
-}
-
-/// Parse and validate a catalog document. The error is the reason the
-/// HTTP layer reports as `invalid catalog: <reason>`. The caller compares
-/// `owner` with the subject it expects.
-pub fn parse(bytes: &[u8]) -> Result<CreatorCatalog, String> {
-    if bytes.len() > MAX_CATALOG_BYTES {
-        return Err(format!("larger than {MAX_CATALOG_BYTES} bytes"));
+/// Parse and validate an index: an array of at most [`MAX_ENTRIES`] entries
+/// with unique `contentID`s. The caller has already refused duplicate keys
+/// ([`NoDuplicateKeys`]) in the bytes it came from. The error is the reason
+/// the HTTP layer reports as `invalid index: <reason>`.
+pub fn parse_index(index: serde_json::Value) -> Result<Vec<CreatorCatalogEntry>, String> {
+    let serde_json::Value::Array(raw) = index else {
+        return Err(format!("must be an array of at most {MAX_ENTRIES} entries"));
+    };
+    if raw.len() > MAX_ENTRIES {
+        return Err(format!("must be an array of at most {MAX_ENTRIES} entries"));
     }
-    std::str::from_utf8(bytes).map_err(|_| "not UTF-8".to_string())?;
-    // serde_json keeps the last of two equal keys without complaint, so a
-    // separate pass rejects them before the typed parse.
-    serde_json::from_slice::<NoDuplicateKeys>(bytes).map_err(|e| e.to_string())?;
-    let doc: CreatorCatalog = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    validate(&doc)?;
-    Ok(doc)
-}
-
-fn validate(doc: &CreatorCatalog) -> Result<(), String> {
-    if doc.schema != SCHEMA {
-        return Err(format!("schema must be \"{SCHEMA}\""));
-    }
-    if !valid_identifier(&doc.owner, MAX_OWNER_BYTES) {
-        return Err(format!(
-            "owner must be 1-{MAX_OWNER_BYTES} bytes of [A-Za-z0-9:._@-] without \"..\""
-        ));
-    }
-    if doc.entries.len() > MAX_ENTRIES {
-        return Err(format!("entries must hold at most {MAX_ENTRIES} entries"));
-    }
-    let mut content_ids: HashMap<&str, usize> = HashMap::with_capacity(doc.entries.len());
-    for (i, entry) in doc.entries.iter().enumerate() {
-        validate_entry(entry).map_err(|reason| format!("entries[{i}].{reason}"))?;
-        if let Some(first) = content_ids.insert(entry.content_id.as_str(), i) {
+    let mut entries = Vec::with_capacity(raw.len());
+    let mut content_ids: HashMap<String, usize> = HashMap::with_capacity(raw.len());
+    for (i, raw) in raw.into_iter().enumerate() {
+        let e = entry(raw).map_err(|reason| format!("entries[{i}].{reason}"))?;
+        if let Some(first) = content_ids.insert(e.content_id.clone(), i) {
             return Err(format!(
                 "entries[{i}].contentID duplicates entries[{first}].contentID"
             ));
         }
+        entries.push(e);
     }
-    Ok(())
+    Ok(entries)
 }
 
-fn validate_entry(e: &CreatorCatalogEntry) -> Result<(), String> {
+fn entry(raw: serde_json::Value) -> Result<CreatorCatalogEntry, String> {
+    let e: CreatorCatalogEntry = serde_json::from_value(raw).map_err(|e| e.to_string())?;
     if !valid_identifier(&e.content_id, MAX_CONTENT_ID_BYTES) {
         return Err(format!(
             "contentID must be 1-{MAX_CONTENT_ID_BYTES} bytes of [A-Za-z0-9:._@-] without \"..\""
@@ -123,29 +85,7 @@ fn validate_entry(e: &CreatorCatalogEntry) -> Result<(), String> {
             "payloadSize must be an integer from 1 to {MAX_PAYLOAD_SIZE}"
         ));
     }
-    if let Some(title) = &e.title
-        && !(1..=MAX_TITLE_BYTES).contains(&title.len())
-    {
-        return Err(format!("title must be 1-{MAX_TITLE_BYTES} bytes"));
-    }
-    if !is_utc_timestamp(&e.published_at) {
-        return Err(
-            "publishedAt must be RFC 3339 UTC in the form YYYY-MM-DDTHH:MM:SSZ".to_string(),
-        );
-    }
-    if e.attribute_fqns.len() > MAX_ATTRIBUTE_FQNS {
-        return Err(format!(
-            "attributeFQNs must hold at most {MAX_ATTRIBUTE_FQNS} URLs"
-        ));
-    }
-    for (j, fqn) in e.attribute_fqns.iter().enumerate() {
-        if !is_https_url(fqn) {
-            return Err(format!(
-                "attributeFQNs[{j}] must be an https:// URL of at most {MAX_ATTRIBUTE_FQN_BYTES} bytes"
-            ));
-        }
-    }
-    Ok(())
+    Ok(e)
 }
 
 /// `owner` and `contentID`: `[A-Za-z0-9:._@-]{1,max}`, never `.` and never
@@ -197,21 +137,6 @@ pub fn is_utc_timestamp(s: &str) -> bool {
         _ => return false,
     };
     (1..=days_in_month).contains(&day) && hour <= 23 && minute <= 59 && second <= 59
-}
-
-/// An `https://` URL of at most 512 bytes with a host, in visible ASCII.
-///
-/// The URL must parse (WHATWG rules, as browsers and Foundation read it)
-/// with scheme `https` and a non-empty host. The literal `https://`
-/// followed by something other than `/` is required as well, because the
-/// parser repairs `https:///a` into host `a`, which a strict reader refuses.
-fn is_https_url(s: &str) -> bool {
-    s.len() <= MAX_ATTRIBUTE_FQN_BYTES
-        && s.bytes().all(|b| b.is_ascii_graphic())
-        && s.strip_prefix("https://")
-            .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
-        && url::Url::parse(s)
-            .is_ok_and(|u| u.scheme() == "https" && u.host_str().is_some_and(|h| !h.is_empty()))
 }
 
 /// Deserializes any JSON value, failing on an object that repeats a key.
@@ -275,138 +200,142 @@ impl<'de> Visitor<'de> for NoDuplicateKeysVisitor {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    /// A valid entry for `hash`, as a JSON value.
-    pub fn entry(content_id: &str, hash: &str) -> serde_json::Value {
+    /// ArkavoKit's shared catalog vectors of `kind`
+    /// (`Tests/ArkavoCatalogTests/Vectors/catalog-vectors.json`), so the node
+    /// and the Swift readers agree: (name, valid, bytes).
+    pub fn vectors(kind: &str) -> Vec<(String, bool, Vec<u8>)> {
+        use base64::Engine as _;
+        let file: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/arkavo-catalog-vectors.json"
+        ))
+        .unwrap();
+        let vectors: Vec<_> = file["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["kind"] == kind)
+            .map(|v| {
+                let bytes = match (v["text"].as_str(), v["base64"].as_str()) {
+                    (Some(text), _) => text.as_bytes().to_vec(),
+                    (None, Some(b64)) => base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .unwrap(),
+                    _ => panic!("vector without bytes: {v}"),
+                };
+                (
+                    v["name"].as_str().unwrap().to_string(),
+                    v["valid"].as_bool().unwrap(),
+                    bytes,
+                )
+            })
+            .collect();
+        assert!(!vectors.is_empty(), "no {kind} vectors");
+        vectors
+    }
+
+    /// The `payloadSize` of [`entry`].
+    pub const PAYLOAD_SIZE: u64 = 7_342_067;
+
+    /// A valid index entry for `payload`, as a JSON value.
+    pub fn entry(content_id: &str, payload: &str) -> serde_json::Value {
         serde_json::json!({
             "contentID": content_id,
             "version": 1,
-            "payloadHash": hash,
-            "payloadSize": 7342067,
-            "title": "Studio session",
-            "publishedAt": "2026-10-16T14:30:00Z",
-            "attributeFQNs": ["https://patreon.arkavo.com/attr/campaign/value/12345678"],
+            "payloadHash": payload,
+            "payloadSize": PAYLOAD_SIZE,
         })
-    }
-
-    /// A valid catalog for `owner` listing `entries`, serialized.
-    pub fn catalog(owner: &str, entries: Vec<serde_json::Value>) -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "schema": super::SCHEMA,
-            "owner": owner,
-            "entries": entries,
-        }))
-        .unwrap()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{catalog, entry};
+    use super::test_support::entry;
     use super::*;
     use serde_json::{Value, json};
-
-    const OWNER: &str = "5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10";
 
     fn hash() -> String {
         "4f".repeat(32)
     }
 
-    fn doc_with(f: impl FnOnce(&mut Value)) -> Vec<u8> {
-        let mut doc: Value =
-            serde_json::from_slice(&catalog(OWNER, vec![entry("rec-1", &hash())])).unwrap();
-        f(&mut doc);
-        serde_json::to_vec(&doc).unwrap()
+    /// As the route parses it: duplicate keys refused in the bytes, then
+    /// the value.
+    fn parse(bytes: &[u8]) -> Result<Vec<CreatorCatalogEntry>, String> {
+        serde_json::from_slice::<NoDuplicateKeys>(bytes).map_err(|e| e.to_string())?;
+        parse_index(serde_json::from_slice(bytes).map_err(|e| e.to_string())?)
+    }
+
+    fn index(entries: Vec<Value>) -> Vec<u8> {
+        serde_json::to_vec(&entries).unwrap()
     }
 
     fn entry_with(f: impl FnOnce(&mut Value)) -> Vec<u8> {
-        doc_with(|d| f(&mut d["entries"][0]))
+        let mut e = entry("rec-1", &hash());
+        f(&mut e);
+        index(vec![e])
     }
 
     fn reason(bytes: &[u8]) -> String {
-        parse(bytes).expect_err("document should be refused")
+        parse(bytes).expect_err("index should be refused")
     }
 
     #[test]
     fn the_contract_example_is_valid() {
-        let doc = parse(
-            br#"{
-  "schema": "arkavo.creator-catalog/1",
-  "owner": "5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10",
-  "entries": [
-    {
-      "contentID": "rec-2b9c4f1e0d8a4c7f",
-      "version": 2,
-      "payloadHash": "4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a",
-      "payloadSize": 7342067,
-      "title": "Studio session",
-      "publishedAt": "2026-10-16T14:30:00Z",
-      "attributeFQNs": ["https://patreon.arkavo.com/attr/campaign/value/12345678"]
-    }
-  ]
-}"#,
+        let entries = parse(
+            br#"[ { "contentID": "rec-2b9c4f1e0d8a4c7f", "version": 2,
+                 "payloadHash": "4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a", "payloadSize": 7342067 } ]"#,
         )
         .unwrap();
-        assert_eq!(doc.owner, OWNER);
-        assert_eq!(doc.entries[0].content_id, "rec-2b9c4f1e0d8a4c7f");
-        assert_eq!(doc.entries[0].version, 2);
-        assert_eq!(doc.entries[0].payload_size, 7_342_067);
-        assert_eq!(doc.entries[0].title.as_deref(), Some("Studio session"));
+        assert_eq!(
+            entries,
+            vec![CreatorCatalogEntry {
+                content_id: "rec-2b9c4f1e0d8a4c7f".into(),
+                version: 2,
+                payload_hash: "4f8a".repeat(16),
+                payload_size: 7_342_067,
+            }]
+        );
     }
 
     #[test]
-    fn an_empty_catalog_is_valid() {
-        assert!(parse(&catalog(OWNER, vec![])).unwrap().entries.is_empty());
+    fn an_empty_index_is_valid() {
+        assert!(parse(b"[]").unwrap().is_empty());
     }
 
     #[test]
-    fn title_is_optional_but_never_null() {
-        let doc = parse(&entry_with(|e| {
-            e.as_object_mut().unwrap().remove("title");
-        }))
-        .unwrap();
-        assert!(doc.entries[0].title.is_none());
-        assert!(reason(&entry_with(|e| e["title"] = Value::Null)).contains("null"));
-        assert!(reason(&entry_with(|e| e["title"] = json!(""))).contains("title"));
-        assert!(parse(&entry_with(|e| e["title"] = json!("é".repeat(256)))).is_ok());
-        assert!(reason(&entry_with(|e| e["title"] = json!("x".repeat(513)))).contains("title"));
-    }
-
-    #[test]
-    fn schema_must_match_exactly() {
-        for schema in [
-            json!("arkavo.creator-catalog/2"),
-            json!("Arkavo.creator-catalog/1"),
-            json!(1),
-        ] {
-            assert!(parse(&doc_with(|d| d["schema"] = schema.clone())).is_err());
-        }
-    }
-
-    #[test]
-    fn owner_rules() {
-        for owner in [
-            "arkavo:abc",
-            "user@example.com",
-            "a.b_c-d",
-            &"o".repeat(248),
-        ] {
-            assert!(
-                parse(&doc_with(|d| d["owner"] = json!(owner))).is_ok(),
-                "{owner}"
-            );
-        }
-        for owner in ["", "a..b", "a/b", "a b", "ü", &"o".repeat(249)] {
-            assert!(
-                reason(&doc_with(|d| d["owner"] = json!(owner))).starts_with("owner"),
-                "{owner}"
+    fn an_index_is_an_array() {
+        for bad in [&b"{}"[..], b"null", b"\"x\"", br#"{"entries":[]}"#] {
+            assert_eq!(
+                reason(bad),
+                "must be an array of at most 1000 entries",
+                "{}",
+                String::from_utf8_lossy(bad)
             );
         }
     }
 
     #[test]
-    fn unknown_keys_are_refused_everywhere() {
-        assert!(reason(&doc_with(|d| d["extra"] = json!(1))).contains("unknown field"));
-        assert!(reason(&entry_with(|e| e["extra"] = json!(1))).contains("unknown field"));
+    fn an_entry_has_exactly_its_own_keys() {
+        // The metadata stays in the envelope; neither its TDF nor a hash of
+        // it, nor `/1`'s display fields, belongs in the index.
+        for (key, value) in [
+            ("metadata", json!("AAAA")),
+            ("metadataHash", json!("6d".repeat(32))),
+            ("metadataSize", json!(2148)),
+            ("metadataManifest", json!("e30")),
+            ("title", json!("Studio session")),
+            ("publishedAt", json!("2026-10-16T14:30:00Z")),
+            ("attributeFQNs", json!([])),
+            ("extra", json!(1)),
+        ] {
+            let r = reason(&entry_with(|e| e[key] = value.clone()));
+            assert!(r.contains("unknown field"), "{key}: {r}");
+        }
+        for key in ["contentID", "version", "payloadHash", "payloadSize"] {
+            let r = reason(&entry_with(|e| {
+                e.as_object_mut().unwrap().remove(key);
+            }));
+            assert!(r.contains("missing field"), "{key}: {r}");
+        }
         // Case matters: contentId is not contentID.
         let r = reason(&entry_with(|e| {
             let id = e.as_object_mut().unwrap().remove("contentID").unwrap();
@@ -416,274 +345,116 @@ mod tests {
     }
 
     #[test]
-    fn missing_required_keys_are_refused() {
-        for key in [
-            "contentID",
-            "version",
-            "payloadHash",
-            "payloadSize",
-            "publishedAt",
-            "attributeFQNs",
-        ] {
-            let r = reason(&entry_with(|e| {
-                e.as_object_mut().unwrap().remove(key);
-            }));
-            assert!(r.contains("missing field"), "{key}: {r}");
-        }
-        for key in ["schema", "owner", "entries"] {
-            let r = reason(&doc_with(|d| {
-                d.as_object_mut().unwrap().remove(key);
-            }));
-            assert!(r.contains("missing field"), "{key}: {r}");
-        }
-    }
-
-    #[test]
-    fn duplicate_keys_are_refused_at_every_level() {
-        let top = br#"{"schema":"arkavo.creator-catalog/1","owner":"a","owner":"a","entries":[]}"#;
-        assert!(reason(top).contains("duplicate key `owner`"));
-
+    fn duplicate_keys_are_refused() {
         let h = hash();
-        let nested = format!(
-            r#"{{"schema":"arkavo.creator-catalog/1","owner":"a","entries":[{{"contentID":"x","version":1,"version":2,"payloadHash":"{h}","payloadSize":1,"publishedAt":"2026-10-16T14:30:00Z","attributeFQNs":[]}}]}}"#
+        let repeated = format!(
+            r#"[{{"contentID":"x","version":1,"version":2,"payloadHash":"{h}","payloadSize":1}}]"#
         );
-        assert!(reason(nested.as_bytes()).contains("duplicate key `version`"));
-
-        // An escaped spelling of the same key is the same key: `\u006fwner`
-        // is `owner`, at the top level and in an entry.
-        let escaped =
-            br#"{"schema":"arkavo.creator-catalog/1","owner":"a","\u006fwner":"b","entries":[]}"#;
-        assert!(reason(escaped).contains("duplicate key `owner`"));
-        let escaped_nested = format!(
-            r#"{{"schema":"arkavo.creator-catalog/1","owner":"a","entries":[{{"contentID":"x","\u0063ontentID":"y","version":1,"payloadHash":"{h}","payloadSize":1,"publishedAt":"2026-10-16T14:30:00Z","attributeFQNs":[]}}]}}"#
+        assert!(reason(repeated.as_bytes()).contains("duplicate key `version`"));
+        // An escaped spelling of the same key is the same key.
+        let escaped = format!(
+            r#"[{{"contentID":"x","contentID":"y","version":1,"payloadHash":"{h}","payloadSize":1}}]"#
         );
-        assert!(reason(escaped_nested.as_bytes()).contains("duplicate key `contentID`"));
+        assert!(reason(escaped.as_bytes()).contains("duplicate key `contentID`"));
     }
 
     #[test]
     fn content_ids_are_unique_and_well_formed() {
-        let bytes = catalog(
-            OWNER,
-            vec![entry("rec-1", &hash()), entry("rec-1", &hash())],
-        );
+        let bytes = index(vec![
+            entry("rec-1", &hash()),
+            entry("rec-1", &"5a".repeat(32)),
+        ]);
         assert!(reason(&bytes).contains("entries[1].contentID duplicates entries[0]"));
-        for id in ["", "a..b", "a/b", &"c".repeat(257)] {
+        for id in ["", ".", "a..b", "a/b", &"c".repeat(257)] {
             assert!(
-                reason(&entry_with(|e| e["contentID"] = json!(id))).contains("contentID"),
+                reason(&entry_with(|e| e["contentID"] = json!(id)))
+                    .starts_with("entries[0].contentID"),
                 "{id}"
             );
         }
         assert!(parse(&entry_with(|e| e["contentID"] = json!("c".repeat(256)))).is_ok());
+        // Two entries may name one recording.
+        let bytes = index(vec![entry("rec-1", &hash()), entry("rec-2", &hash())]);
+        assert!(parse(&bytes).is_ok());
     }
 
     #[test]
     fn version_is_an_integer_in_range() {
-        for v in [json!(1), json!(9_007_199_254_740_991u64)] {
+        for ok in [json!(1), json!(MAX_VERSION)] {
             assert!(
-                parse(&entry_with(|e| e["version"] = v.clone())).is_ok(),
-                "{v}"
+                parse(&entry_with(|e| e["version"] = ok.clone())).is_ok(),
+                "{ok}"
             );
         }
-        for v in [
+        for bad in [
             json!(0),
+            json!(MAX_VERSION + 1),
             json!(-1),
-            json!(9_007_199_254_740_992u64),
             json!(1.0),
-            json!(1.5),
             json!("1"),
             Value::Null,
         ] {
             assert!(
-                parse(&entry_with(|e| e["version"] = v.clone())).is_err(),
-                "{v}"
+                reason(&entry_with(|e| e["version"] = bad.clone())).starts_with("entries[0]."),
+                "{bad}"
             );
         }
-        // An exponent is a float to JSON readers: refused.
-        let h = hash();
-        let exp = format!(
-            r#"{{"schema":"arkavo.creator-catalog/1","owner":"a","entries":[{{"contentID":"x","version":1e0,"payloadHash":"{h}","payloadSize":1,"publishedAt":"2026-10-16T14:30:00Z","attributeFQNs":[]}}]}}"#
-        );
-        assert!(parse(exp.as_bytes()).is_err());
     }
 
     #[test]
-    fn payload_hash_is_lowercase_hex() {
-        for h in [
-            "4F".repeat(32),
-            "4f".repeat(31),
-            "zz".repeat(32),
-            String::new(),
-        ] {
+    fn payload_hash_and_size_are_checked() {
+        for h in ["4F".repeat(32), "4f".repeat(31), String::new()] {
             assert!(
                 reason(&entry_with(|e| e["payloadHash"] = json!(h))).contains("payloadHash"),
                 "{h}"
             );
         }
-    }
-
-    #[test]
-    fn payload_size_is_in_range() {
-        assert!(parse(&entry_with(|e| e["payloadSize"] = json!(4_294_967_295u64))).is_ok());
-        assert!(
-            reason(&entry_with(|e| e["payloadSize"] = json!(4_294_967_296u64)))
-                .contains("payloadSize")
-        );
-        assert!(reason(&entry_with(|e| e["contentID"] = json!("."))).contains("contentID"));
-        assert!(parse(&entry_with(|e| e["payloadSize"] = json!(1))).is_ok());
-        for v in [json!(0), json!(4_294_967_297u64), json!(-5), json!(2.5)] {
+        assert!(parse(&entry_with(|e| e["payloadSize"] = json!(MAX_PAYLOAD_SIZE))).is_ok());
+        for bad in [json!(0), json!(MAX_PAYLOAD_SIZE + 1), json!(1.5)] {
             assert!(
-                parse(&entry_with(|e| e["payloadSize"] = v.clone())).is_err(),
-                "{v}"
+                reason(&entry_with(|e| e["payloadSize"] = bad.clone())).starts_with("entries[0]."),
+                "{bad}"
             );
         }
     }
 
     #[test]
-    fn published_at_has_the_exact_form() {
-        for ok in [
-            "2026-10-16T14:30:00Z",
-            "2024-02-29T23:59:59Z",
-            "2000-02-29T00:00:00Z",
-            "1999-12-31T00:00:00Z",
-        ] {
+    fn at_most_a_thousand_entries() {
+        let entries = |n: usize| -> Vec<Value> {
+            (0..n)
+                .map(|i| entry(&format!("rec-{i:032x}"), &format!("{i:064x}")))
+                .collect()
+        };
+        assert_eq!(parse(&index(entries(1000))).unwrap().len(), 1000);
+        assert_eq!(
+            reason(&index(entries(1001))),
+            "must be an array of at most 1000 entries"
+        );
+    }
+
+    #[test]
+    fn arkavo_kit_index_vectors_agree() {
+        for (name, valid, bytes) in test_support::vectors("index") {
+            assert_eq!(parse(&bytes).is_ok(), valid, "{name}: {:?}", parse(&bytes));
+        }
+    }
+
+    #[test]
+    fn utc_timestamps_have_the_exact_form() {
+        for ok in ["2026-10-16T14:30:00Z", "2024-02-29T23:59:59Z"] {
             assert!(is_utc_timestamp(ok), "{ok}");
         }
         for bad in [
             "2026-10-16T14:30:00",
-            "2026-10-16T14:30:00z",
-            "2026-10-16t14:30:00Z",
-            "2026-10-16 14:30:00Z",
             "2026-10-16T14:30:00.000Z",
             "2026-10-16T14:30:00+00:00",
-            "2026-10-16T14:30Z",
-            "2026-13-01T00:00:00Z",
-            "2026-00-01T00:00:00Z",
-            "2026-04-31T00:00:00Z",
+            "2026-10-16 14:30:00Z",
             "2025-02-29T00:00:00Z",
-            "1900-02-29T00:00:00Z",
-            "2026-10-00T00:00:00Z",
+            "2026-13-01T00:00:00Z",
             "2026-10-16T24:00:00Z",
-            "2026-10-16T23:60:00Z",
-            "2026-12-31T23:59:60Z",
-            "+026-10-16T14:30:00Z",
-            "２026-10-16T14:30:00Z",
+            "2026-10-16T23:59:60Z",
         ] {
             assert!(!is_utc_timestamp(bad), "{bad}");
         }
-        assert!(
-            reason(&entry_with(
-                |e| e["publishedAt"] = json!("2026-10-16T14:30:00+00:00")
-            ))
-            .contains("publishedAt")
-        );
-    }
-
-    #[test]
-    fn attribute_fqns_are_https_urls() {
-        assert!(parse(&entry_with(|e| e["attributeFQNs"] = json!([]))).is_ok());
-        let max = format!("https://a.example/{}", "v".repeat(512 - 18));
-        assert_eq!(max.len(), 512);
-        assert!(parse(&entry_with(|e| e["attributeFQNs"] = json!([max]))).is_ok());
-        let fqns: Vec<String> = (0..32).map(|i| format!("https://a.example/{i}")).collect();
-        assert!(parse(&entry_with(|e| e["attributeFQNs"] = json!(fqns))).is_ok());
-        for good in [
-            "https://a.example:8443/attr/x/value/y",
-            "https://[2001:db8::1]/attr/x",
-            "https://192.0.2.7/attr/x",
-            "https://user@a.example/attr/x",
-        ] {
-            assert!(
-                parse(&entry_with(|e| e["attributeFQNs"] = json!([good]))).is_ok(),
-                "{good}"
-            );
-        }
-
-        let fqns: Vec<String> = (0..33).map(|i| format!("https://a.example/{i}")).collect();
-        assert!(reason(&entry_with(|e| e["attributeFQNs"] = json!(fqns))).contains("at most 32"));
-        for bad in [
-            "http://a.example/attr/x".to_string(),
-            "HTTPS://a.example/attr/x".to_string(),
-            "https://".to_string(),
-            "https:///path".to_string(),
-            // No host: the parser refuses these, a prefix check alone did not.
-            "https://?x".to_string(),
-            "https://#fragment".to_string(),
-            "https://:443/attr".to_string(),
-            "https://user@/attr".to_string(),
-            "https://a.example:99999/attr".to_string(),
-            "https://exa%00mple/attr".to_string(),
-            "https://a.example/with space".to_string(),
-            format!("https://a.example/{}", "v".repeat(512 - 17)),
-            "ftp://a.example".to_string(),
-        ] {
-            assert!(
-                reason(&entry_with(|e| e["attributeFQNs"] = json!([bad.clone()])))
-                    .contains("attributeFQNs[0]"),
-                "{bad}"
-            );
-        }
-        assert!(
-            parse(&entry_with(
-                |e| e["attributeFQNs"] = json!("https://a.example")
-            ))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn entry_count_is_bounded() {
-        let entries = |n: usize| -> Vec<Value> {
-            (0..n)
-                .map(|i| {
-                    json!({
-                        "contentID": format!("r{i}"),
-                        "version": 1,
-                        "payloadHash": "4f".repeat(32),
-                        "payloadSize": 1,
-                        "publishedAt": "2026-10-16T14:30:00Z",
-                        "attributeFQNs": [],
-                    })
-                })
-                .collect()
-        };
-        let bytes = catalog("a", entries(1000));
-        assert!(bytes.len() <= MAX_CATALOG_BYTES, "{}", bytes.len());
-        assert_eq!(parse(&bytes).unwrap().entries.len(), 1000);
-        let bytes = catalog("a", entries(1001));
-        assert!(bytes.len() <= MAX_CATALOG_BYTES, "{}", bytes.len());
-        assert!(reason(&bytes).contains("at most 1000"));
-    }
-
-    #[test]
-    fn non_documents_are_refused() {
-        for bad in [
-            &b""[..],
-            b"null",
-            b"[]",
-            b"\"catalog\"",
-            b"{",
-            b"\xEF\xBB\xBF{}",
-            b"{\"schema\":\"\xff\"}",
-        ] {
-            assert!(parse(bad).is_err(), "{bad:?}");
-        }
-        assert_eq!(reason(b"{\"a\":\"\xff\"}"), "not UTF-8");
-        // Trailing content after the document.
-        let mut bytes = catalog(OWNER, vec![]);
-        bytes.extend_from_slice(b" {}");
-        assert!(parse(&bytes).is_err());
-        // Trailing whitespace is still JSON.
-        let mut bytes = catalog(OWNER, vec![]);
-        bytes.extend_from_slice(b" \n");
-        assert!(parse(&bytes).is_ok());
-    }
-
-    #[test]
-    fn size_limit_is_enforced() {
-        let mut bytes = catalog(OWNER, vec![]);
-        bytes.resize(MAX_CATALOG_BYTES, b' ');
-        assert!(parse(&bytes).is_ok());
-        bytes.push(b' ');
-        assert!(reason(&bytes).contains("larger than"));
     }
 }
