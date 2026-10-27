@@ -39,7 +39,7 @@ use crate::auth::{AuthError, CwtVerifier, VerifiedClaims, VerifyOpts, subject_id
 use crate::authz::ChainEntity;
 use crate::entity_chain;
 use crate::publish_decision::{
-    PublishDecider, PublishDecisions, StoredEntity, Verdict, log_shadow, restore, strip_tokens,
+    PublishDecider, PublishDecisions, StoredEntity, Verdict, log_shadow, strip_tokens,
 };
 
 pub const DEFAULT_PUBLISH_ENTITLEMENT: &str =
@@ -454,11 +454,6 @@ pub enum PushRefusal {
     NoSession,
     Suspended,
     Blocked,
-    /// The decision service denied the session's subject.
-    NotPermitted,
-    /// The decision service couldn't be asked (`decisions = pdp` fails
-    /// closed).
-    DecisionUnavailable,
 }
 
 impl PublishGate {
@@ -634,57 +629,34 @@ impl PublishGate {
                 .await
                 .ok_or(PushRefusal::NoSession)?,
         };
-        // In `shadow` a suspension is refused after the decision is logged.
-        let suspended = self.moderation.is_suspended(&subject);
-        if suspended && self.decider.mode() != PublishDecisions::Shadow {
+        if self.moderation.is_suspended(&subject) {
             return Err(PushRefusal::Suspended);
         }
         if self.moderation.is_blocked(hash_hex) {
             return Err(PushRefusal::Blocked);
         }
-        self.decide_push(&subject, chain.as_deref(), !suspended)
-            .await?;
-        if suspended {
-            return Err(PushRefusal::Suspended);
-        }
+        self.decided_session(&subject, chain.as_deref())?;
         Ok((subject, endpoint))
     }
 
-    /// Ask the decision service again for a push, with the chain its session
-    /// was decided with (reused for 30 s per chain). So a suspension
-    /// stops pushes without waiting for the session to expire.
-    async fn decide_push(
+    /// A push is decided by its session (tdf-iroh-s3#44): the decision
+    /// service is not asked again. In `pdp` it permitted the session when it
+    /// opened, and that holds until the session expires, at most
+    /// `session_ttl_secs` later. So a suspension made at the platform stops
+    /// pushes from the next session; a local one stops them at once. Only a
+    /// session the decision service permitted stores a chain.
+    fn decided_session(
         &self,
         subject: &str,
         chain: Option<&[StoredEntity]>,
-        local_permits: bool,
     ) -> Result<(), PushRefusal> {
-        let mode = self.decider.mode();
-        if mode == PublishDecisions::Local {
-            return Ok(());
+        if self.decider.mode() == PublishDecisions::Pdp && chain.is_none() {
+            // Opened before decisions were asked, or by a node that decided
+            // locally: the decision service never permitted it.
+            warn!(%subject, "Session has no stored chain; push refused");
+            return Err(PushRefusal::NoSession);
         }
-        let Some(chain) = chain else {
-            // A session opened before decisions were asked, or by a node
-            // that decided locally, has nothing to ask with.
-            if mode == PublishDecisions::Pdp {
-                warn!(%subject, "Session has no stored chain; push refused");
-                return Err(PushRefusal::NoSession);
-            }
-            warn!(%subject, "Publish decision shadow: session has no stored chain");
-            return Ok(());
-        };
-        let verdict = self.decider.ask_for_push(&restore(chain)).await;
-        match mode {
-            PublishDecisions::Shadow => {
-                log_shadow("push", subject, local_permits, verdict);
-                Ok(())
-            }
-            _ => match verdict {
-                Verdict::Permit => Ok(()),
-                Verdict::Deny => Err(PushRefusal::NotPermitted),
-                Verdict::Unavailable => Err(PushRefusal::DecisionUnavailable),
-            },
-        }
+        Ok(())
     }
 }
 
@@ -799,7 +771,10 @@ impl PublishPolicy {
                 };
                 log_shadow("publisher", &claims.sub, local.is_ok(), verdict);
                 local.map_err(|(status, reason)| refuse(status, reason))?;
-                Ok((claims, chain.ok()))
+                // Only a session the decision service permitted keeps its
+                // chain: after a switch to `pdp`, the only kind a push takes.
+                let chain = chain.ok().filter(|_| verdict == Verdict::Permit);
+                Ok((claims, chain))
             }
             PublishDecisions::Pdp => {
                 let chain = self
@@ -2105,7 +2080,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pdp_sessions_store_the_chain_without_tokens_and_pushes_are_decided_again() {
+    async fn pdp_sessions_store_the_chain_without_tokens_and_pushes_trust_the_session() {
         let (h, pdp) = deciding(PublishDecisions::Pdp);
         let sk = key();
         let ep = sk.public();
@@ -2125,23 +2100,19 @@ mod tests {
             ]
         );
 
-        // Another instance reads the session back and asks the PDP again.
+        // Another instance reads the session back; the PDP isn't asked again.
         let other = other_instance(&h).with_decider(Arc::clone(&h.gate.decider));
         other.connected(1, Some(ep));
         let before = pdp.calls.load(std::sync::atomic::Ordering::SeqCst);
         assert!(other.authorize_push(1, &"a".repeat(64)).await.is_ok());
-        assert_eq!(
-            pdp.calls.load(std::sync::atomic::Ordering::SeqCst),
-            before + 1
-        );
+        assert_eq!(pdp.calls.load(std::sync::atomic::Ordering::SeqCst), before);
     }
 
     #[tokio::test]
-    async fn pdp_pushes_are_refused_when_denied_unavailable_or_without_a_stored_chain() {
-        for (answer, want) in [
-            (DENY, PushRefusal::NotPermitted),
-            (DOWN, PushRefusal::DecisionUnavailable),
-        ] {
+    async fn pdp_pushes_hold_for_the_permitted_session_and_need_one() {
+        // The session's Permit holds whatever the PDP says later, until the
+        // session expires (tdf-iroh-s3#44).
+        for answer in [DENY, DOWN] {
             let (h, pdp) = deciding(PublishDecisions::Pdp);
             let sk = key();
             let tok = creator("arkavo:u1");
@@ -2150,11 +2121,12 @@ mod tests {
             assert_eq!(status, StatusCode::CREATED);
             set(&pdp, answer);
             h.gate.connected(1, Some(sk.public()));
-            assert_eq!(h.gate.authorize_push(1, &"a".repeat(64)).await, Err(want));
+            assert!(h.gate.authorize_push(1, &"a".repeat(64)).await.is_ok());
+            assert_eq!(pdp.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         }
 
-        // A session opened without a chain (before this change) has nothing
-        // to ask with.
+        // A session the PDP never permitted (opened while decisions were
+        // local) has no chain, and pushes on it are refused.
         let (h, _) = deciding(PublishDecisions::Pdp);
         let ep = endpoint();
         h.gate
@@ -2177,6 +2149,11 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED);
         h.gate.connected(1, Some(sk.public()));
         assert!(h.gate.authorize_push(1, &"a".repeat(64)).await.is_ok());
+        // The PDP denied it, so it keeps no chain: after a switch to `pdp`
+        // its pushes would be refused.
+        let raw = h.store.records.lock().unwrap()[&format!("sessions/{}", sk.public())].clone();
+        let stored: SessionRecord = serde_json::from_slice(&raw).unwrap();
+        assert!(stored.chain.is_none());
 
         // Not entitled locally, permitted by the PDP: refused.
         set(&pdp, PERMIT);
@@ -2272,13 +2249,14 @@ mod tests {
         assert_eq!(body["error"], "publishing suspended");
         assert_eq!(pdp.calls.load(Ordering::SeqCst), before + 1);
 
-        // So does a push on the session opened before the suspension.
+        // A push on the session opened before the suspension is refused
+        // without asking.
         h.gate.connected(1, Some(sk.public()));
         assert_eq!(
             h.gate.authorize_push(1, &"a".repeat(64)).await,
             Err(PushRefusal::Suspended)
         );
-        assert_eq!(pdp.calls.load(Ordering::SeqCst), before + 2);
+        assert_eq!(pdp.calls.load(Ordering::SeqCst), before + 1);
     }
 
     #[tokio::test]

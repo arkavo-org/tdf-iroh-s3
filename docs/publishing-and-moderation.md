@@ -36,13 +36,9 @@ The node always authenticates the publisher (the checks above, except the entitl
 
 At most 8 entities. The platform withholds the grant from a suspended account, and devices narrow it as its policy says.
 
-**Pushes.** A session opened in `shadow` or `pdp` stores the chain it was decided with, never a token. A push asks again with it, reusing an answer for 30 s per chain (concurrent pushes share one request). So per push the platform re-checks its own live state, such as a suspension, but the chain's claims (the person's `arkavo_entitlements`, the devices) are those of the session's opening: a device revoked or an entitlement changed since then counts from the next session, at most `session_ttl_secs` later. Having no tokens, the stored devices are dropped by arks, so a push is decided on the person and the environment. That holds only while no device requirement guards the publish grant; before one is configured, pushes need a new design (tdf-iroh-s3#44). A push is refused when:
+**Pushes.** The decision service is asked when a session opens, not for each push (tdf-iroh-s3#44). A session it permitted stores the chain it was decided with, never a token; one it denied or wasn't asked about stores none. A push on a permitted session is accepted until the session expires, at most `session_ttl_secs` later, whatever the platform says in between. So a suspension made at the platform, a device revoked or an entitlement changed stops pushes from the next session; a local suspension or a block stops them at once. Since a stored session record alone authorizes pushes, it must not be writable by anyone else (tdf-iroh-s3#46). In `pdp` a push is refused when its session has no stored chain (`NoSession`): it was opened while decisions were local, or is missing or expired.
 
-- the decision service denies it (`NotPermitted`);
-- it can't be asked (`DecisionUnavailable`);
-- in `pdp`, the session has no stored chain (`NoSession`).
-
-**Configuration.** `shadow` or `pdp` without a `[catalog.authz] endpoint` is a startup error. Local suspensions still apply in every mode until the platform's suspension check is live. In `shadow` a suspended subject's decision is still asked and logged before the suspension refuses it, so the platform's answer for a suspended account can be checked.
+**Configuration.** `shadow` or `pdp` without a `[catalog.authz] endpoint` is a startup error. Local suspensions still apply in every mode until the platform's suspension check is live. In `shadow` a suspended subject's session request is still asked and logged before the suspension refuses it, so the platform's answer for a suspended account can be checked.
 
 ### 1. Open a publish session for the iroh endpoint that will push
 
