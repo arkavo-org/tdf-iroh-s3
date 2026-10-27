@@ -128,7 +128,9 @@ pub type SharedDecisionProvider = Arc<dyn DynDecisionProvider>;
 
 impl DecisionProvider for SharedDecisionProvider {
     async fn decide(&self, req: DecisionRequest) -> Result<Decisions> {
-        self.decide_dyn(req).await
+        // `self.decide_dyn` would be the blanket impl on the Arc itself,
+        // which comes back here: call the provider inside the Arc.
+        (**self).decide_dyn(req).await
     }
 }
 
@@ -796,6 +798,23 @@ mod tests {
             resources: vec![("r1".into(), vec![])],
         };
         let d = DenyAll.decide(req).await.unwrap();
+        assert_eq!(d.get("r1"), Some(&false));
+    }
+
+    /// The shared provider reaches the provider inside it, by either trait
+    /// (it used to call itself until the stack overflowed).
+    #[tokio::test]
+    async fn shared_provider_delegates_to_the_inner_one() {
+        let req = || DecisionRequest {
+            chain: vec![],
+            action: "read".into(),
+            resource_type: ResourceType::CatalogItem,
+            resources: vec![("r1".into(), vec![])],
+        };
+        let shared: SharedDecisionProvider = Arc::new(DenyAll);
+        let d = shared.decide(req()).await.unwrap();
+        assert_eq!(d.get("r1"), Some(&false));
+        let d = shared.decide_dyn(req()).await.unwrap();
         assert_eq!(d.get("r1"), Some(&false));
     }
 
