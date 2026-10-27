@@ -241,11 +241,15 @@ pub(crate) async fn check_payloads<S: TagStore>(
 ///   stored`, then `metadata <hash> …`) and readable (`… manifest is
 ///   unreadable`);
 /// - the metadata policy holds only `uuid` and `body` (422 `metadata <hash>
-///   policy may only hold uuid and body`);
+///   policy may only hold uuid and body`), and its `uuid` is a non-empty
+///   string (422 `metadata <hash> policy has no uuid`);
 /// - its `payload.mimeType` is `CATALOG_ENTRY_MIME_TYPE` (422 `metadata
 ///   <hash> is not catalog metadata`);
 /// - its attributes, dissemination list and KAS are the recording's (422
-///   `metadata <hash> policy does not match payload <hash>`).
+///   `metadata <hash> policy does not match payload <hash>`);
+/// - no two metadata TDFs share a policy `uuid` (422 `metadata <hash> policy
+///   uuid duplicates metadata <hash>`): a viewer unwraps them all in one bulk
+///   rewrap, which refuses duplicate policy ids.
 async fn check_metadata<S: TagStore>(
     state: &ApiState<S>,
     entries: &[CreatorCatalogEntry],
@@ -278,6 +282,7 @@ async fn check_metadata<S: TagStore>(
         },
     )
     .await?;
+    let mut policy_ids: HashMap<&str, &str> = HashMap::new();
     for e in with_metadata {
         let Some(m) = &e.metadata else { continue };
         let (Some(payload), Some(meta)) = (manifests.get(&e.payload_hash), manifests.get(&m.hash))
@@ -289,6 +294,7 @@ async fn check_metadata<S: TagStore>(
                 MetadataRefusal::ExtraPolicyKeys => {
                     format!("metadata {} policy may only hold uuid and body", m.hash)
                 }
+                MetadataRefusal::NoPolicyId => format!("metadata {} policy has no uuid", m.hash),
                 MetadataRefusal::NotCatalogMetadata => {
                     format!("metadata {} is not catalog metadata", m.hash)
                 }
@@ -299,6 +305,17 @@ async fn check_metadata<S: TagStore>(
             };
             (StatusCode::UNPROCESSABLE_ENTITY, msg)
         })?;
+        if let Some(id) = meta.policy_id()
+            && let Some(first) = policy_ids.insert(id, &m.hash)
+        {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "metadata {} policy uuid duplicates metadata {first}",
+                    m.hash
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -1449,6 +1466,13 @@ mod tests {
         }
     }
 
+    /// `metadata_policy()` with another uuid.
+    fn metadata_policy_with_id(id: &str) -> serde_json::Value {
+        let mut p = metadata_policy();
+        p["uuid"] = serde_json::json!(id);
+        p
+    }
+
     #[tokio::test]
     async fn each_manifest_is_read_once_per_publish() {
         let h = harness(true);
@@ -1457,7 +1481,7 @@ mod tests {
             .ingest_with_manifest(
                 &meta(2),
                 METADATA_SIZE,
-                metadata_manifest(metadata_policy(), &[KAS]),
+                metadata_manifest(metadata_policy_with_id("other"), &[KAS]),
             )
             .await;
         // Two entries share one recording.
@@ -1475,6 +1499,42 @@ mod tests {
                 .manifest_reads
                 .load(std::sync::atomic::Ordering::Relaxed),
             3
+        );
+    }
+
+    #[tokio::test]
+    async fn each_metadata_policy_has_its_own_uuid() {
+        let h = harness(true);
+        ingest_pair(&h, 1, metadata_policy_with_id(""), &[KAS]).await;
+        assert_eq!(
+            refusal(&h, doc2()).await,
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("metadata {} policy has no uuid", meta(1))
+            )
+        );
+
+        // One bulk rewrap refuses duplicate policy ids, even across recordings.
+        let h = harness(true);
+        ingest_pair(&h, 1, metadata_policy(), &[KAS]).await;
+        ingest_pair(&h, 2, metadata_policy(), &[KAS]).await;
+        let body = catalog2(
+            SUB,
+            vec![
+                entry2("rec-1", &payload(1), &meta(1)),
+                entry2("rec-2", &payload(2), &meta(2)),
+            ],
+        );
+        assert_eq!(
+            refusal(&h, body).await,
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "metadata {} policy uuid duplicates metadata {}",
+                    meta(2),
+                    meta(1)
+                )
+            )
         );
     }
 

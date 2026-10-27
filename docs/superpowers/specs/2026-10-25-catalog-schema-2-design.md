@@ -2,7 +2,7 @@
 
 **Status:** proposal, 2026-10-25.
 **Issue:** tdf-iroh-s3#39, tracked in #38 (design and owner decisions there).
-**Read at:** `feat/pdp-publish-decisions` `cdaf6c5`. This branch is based on #36 (catalog blocks and `catalog_hidden` are used unchanged) and rebases onto `main` once #36 merges.
+**Read at:** `main` `bd97825` (rebased from `feat/pdp-publish-decisions` `cdaf6c5`; #36's catalog blocks and `catalog_hidden` are used unchanged).
 
 ## Problem
 
@@ -29,7 +29,7 @@ A creator's catalog is public. With no token, `GET /tags/catalog/<sub>` and then
 - `creator_catalog::parse` reads `schema` first, then parses the `/1` or the `/2` shape, each strict (unknown and duplicate keys rejected). Both yield one `CreatorCatalog` whose entries carry `content_id`, `version`, `payload_hash`, `payload_size` and, for `/2`, `metadata: Some { hash, size }`. Nothing on the node reads `/1`'s title, `publishedAt` or `attributeFQNs` beyond validating them.
 - `/2` entry rules, beyond `/1`'s for the shared fields:
   - `metadataHash`: 64 lowercase hex; unique within the document; never equal to any entry's `payloadHash`.
-  - `metadataSize`: an integer from 1 to `MAX_METADATA_SIZE` = 262 144 (proposed, D2). The FQNs appear twice, in the encrypted payload and base64-encoded in the clear policy, so a full metadata TDF can reach about 60 KiB; the cap only keeps a recording from standing in for metadata.
+  - `metadataSize`: an integer from 1 to `MAX_METADATA_SIZE` = 65 536 (D2), the iOS viewer's limit (arkavo-ios cfb048d), so the node accepts no entry the viewer would hide. The FQNs appear twice, in the encrypted payload and base64-encoded in the clear policy; an opentdf-rs metadata TDF at every entry limit (32 FQNs of 512 bytes, a 512-byte title of characters JSON escapes, a 256-byte contentID, one KAS) measures 43 042 bytes. The cap also keeps a recording from standing in for metadata.
 - **Size (D1).** A compact `/2` entry is about 290 bytes with a 36-byte contentID, so 1000 entries need about 290 000 bytes. `/2` documents may be up to **524 288** bytes. `/1` keeps 262 144, because `/1` readers in the field enforce it and a document the node accepts must never be one a viewer rejects. The upload body is read up to 524 288 and a `/1` document over 262 144 is refused with today's 413 `catalog too large`.
 - Error strings follow today's form, `invalid catalog: entries[<i>].<reason>`, e.g. `entries[3].metadataHash duplicates entries[1].metadataHash`, `entries[2].metadataHash equals entries[0].payloadHash`.
 
@@ -46,6 +46,7 @@ Run by `PUT /catalogs/{sub}`, `PUT /v2/catalogs/{sub}` and `PUT /tags/catalog/{s
    - `body.dataAttributes`: equal as sets of JSON values (order ignored, each entry compared whole, so the spec form and opentdf-rs's structured form are both compared exactly);
    - `body.dissem`: equal as sets (absent and `[]` are the same);
    - KAS: the sets of `encryptionInformation.keyAccess[].url` are equal.
+7. **Policy ids** (422 `metadata <hash> policy has no uuid`, `metadata <hash> policy uuid duplicates metadata <hash>`): each metadata policy's `uuid` is a non-empty string, unique within the document. A viewer unwraps a catalog's metadata in one bulk rewrap (`UnsignedRewrapRequest.requests`, one entry per policy); the platform's KAS skips an entry with no policy id and refuses duplicate ids (`service/kas/access/rewrap.go`, opentdf-platform 8f95f8de). A missing id is refused right after check 4, and duplicates after check 6, in entry order.
 
 Distinct hashes are looked up once, at most 16 at a time, as today. Storage failures are 502 `storage unavailable`. A new `TagStore::get_manifest` reads `manifests/<hash>`.
 
@@ -95,7 +96,7 @@ Rollout follows #38. **Before Creator pushes any `/2` metadata TDF,** the node w
 Everything here is the node's proposal, not yet in #38:
 
 - **D1. Size.** `/2` documents up to 524 288 bytes, `/1` stays at 262 144. A reader change for arkavo-ios#40.
-- **D2. Metadata size cap** 262 144 bytes.
+- **D2. Metadata size cap** 65 536 bytes, matching the iOS viewer (was 262 144).
 - **D3. Keeping metadata blobs out of `GET /catalog/{group}`:** decided 2026-10-25, (a) mimeType, a Creator#102 rule.
 - **D4. `optional` mode** verifies a presented token (401 when bad), as `/catalog/{group}` does today.
 - **D5. Purge** as a node subcommand, dry run by default, keeping documents a tag or pointer still names.

@@ -9,7 +9,9 @@
 //! `arkavo:classification` would repeat the recording's labels in the clear.
 //! Its `payload.mimeType` is [`CATALOG_ENTRY_MIME_TYPE`], which keeps it out
 //! of the group index (`catalog::derive_artifacts`) though it carries the
-//! recording's attributes.
+//! recording's attributes. Its policy `uuid` is a non-empty string: a viewer
+//! unwraps a catalog's metadata in one bulk rewrap, and the platform's KAS
+//! drops an entry without a policy id and refuses duplicate ids.
 //!
 //! Pure: no I/O.
 
@@ -38,6 +40,8 @@ pub struct ManifestPolicy {
 pub enum MetadataRefusal {
     /// The metadata policy has a top-level key besides `uuid` and `body`.
     ExtraPolicyKeys,
+    /// The metadata policy's `uuid` isn't a non-empty string.
+    NoPolicyId,
     /// The metadata TDF's `payload.mimeType` isn't [`CATALOG_ENTRY_MIME_TYPE`].
     NotCatalogMetadata,
     /// The attributes, dissemination list or KAS differ from the recording's.
@@ -71,12 +75,25 @@ pub fn read_manifest(bytes: &[u8]) -> Option<ManifestPolicy> {
     })
 }
 
+impl ManifestPolicy {
+    /// The policy's `uuid`, when it is a non-empty string.
+    pub fn policy_id(&self) -> Option<&str> {
+        self.policy
+            .get("uuid")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+    }
+}
+
 /// Whether `metadata` may stand for the recording `payload` in a catalog.
 pub fn check(payload: &ManifestPolicy, metadata: &ManifestPolicy) -> Result<(), MetadataRefusal> {
     let mut keys: Vec<&str> = metadata.policy.keys().map(String::as_str).collect();
     keys.sort_unstable();
     if keys != ["body", "uuid"] {
         return Err(MetadataRefusal::ExtraPolicyKeys);
+    }
+    if metadata.policy_id().is_none() {
+        return Err(MetadataRefusal::NoPolicyId);
     }
     if metadata.mime_type.as_deref() != Some(CATALOG_ENTRY_MIME_TYPE) {
         return Err(MetadataRefusal::NotCatalogMetadata);
@@ -207,6 +224,15 @@ mod tests {
             let mut p = metadata_policy();
             p.as_object_mut().unwrap().remove(key);
             assert_eq!(checked(p), Err(MetadataRefusal::ExtraPolicyKeys), "{key}");
+        }
+    }
+
+    #[test]
+    fn the_policy_id_is_a_non_empty_string() {
+        for id in [json!(""), json!(7), Value::Null] {
+            let mut p = metadata_policy();
+            p["uuid"] = id.clone();
+            assert_eq!(checked(p), Err(MetadataRefusal::NoPolicyId), "{id}");
         }
     }
 

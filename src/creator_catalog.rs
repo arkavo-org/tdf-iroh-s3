@@ -33,8 +33,10 @@ pub const MAX_VERSION: u64 = 9_007_199_254_740_991;
 /// 4 GiB − 1 (`u32::MAX`): the largest TDF a catalog may name, and the
 /// default `[validation] max_blob_bytes` (`config::DEFAULT_MAX_BLOB_BYTES`).
 pub const MAX_PAYLOAD_SIZE: u64 = 4_294_967_295;
-/// Largest metadata TDF a `/2` entry may name.
-pub const MAX_METADATA_SIZE: u64 = 262_144;
+/// Largest metadata TDF a `/2` entry may name: the iOS viewer's limit, so
+/// the node accepts no entry it would hide. A metadata TDF at every entry
+/// limit (32 FQNs of 512 bytes, a 512-byte title, one KAS) is about 43 KB.
+pub const MAX_METADATA_SIZE: u64 = 65_536;
 pub const MAX_TITLE_BYTES: usize = 512;
 pub const MAX_ATTRIBUTE_FQNS: usize = 32;
 pub const MAX_ATTRIBUTE_FQN_BYTES: usize = 512;
@@ -1050,21 +1052,21 @@ mod tests {
                 "{h}"
             );
         }
-        for ok in [json!(1), json!(262_144)] {
+        for ok in [json!(1), json!(65_536)] {
             assert!(
                 parse(&entry2_with(|e| e["metadataSize"] = ok.clone())).is_ok(),
                 "{ok}"
             );
         }
-        for bad in [json!(0), json!(262_145), json!(-1), json!(1.5), Value::Null] {
+        for bad in [json!(0), json!(65_537), json!(-1), json!(1.5), Value::Null] {
             assert!(
                 parse(&entry2_with(|e| e["metadataSize"] = bad.clone())).is_err(),
                 "{bad}"
             );
         }
         assert!(
-            reason(&entry2_with(|e| e["metadataSize"] = json!(262_145)))
-                .contains("metadataSize must be an integer from 1 to 262144")
+            reason(&entry2_with(|e| e["metadataSize"] = json!(65_537)))
+                .contains("metadataSize must be an integer from 1 to 65536")
         );
     }
 

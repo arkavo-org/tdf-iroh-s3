@@ -81,7 +81,7 @@ The document is UTF-8 JSON, at most **262 144 bytes**. The node stores the uploa
 
 ## Catalog document, `arkavo.creator-catalog/2`
 
-> **Proposed, not yet agreed (#38):** the `/2` limits (524 288 bytes per document, 262 144 per metadata TDF, pointer `catalogSize` up to 524 288) and `catalog_token = "optional"` verifying a presented token. Build against them, but expect changes until #38 records them.
+> **Proposed, not yet agreed (#38):** the `/2` limits (524 288 bytes per document, pointer `catalogSize` up to 524 288) and `catalog_token = "optional"` verifying a presented token. Build against them, but expect changes until #38 records them.
 
 Schema `/2` ([tdf-iroh-s3#39](https://github.com/arkavo-org/tdf-iroh-s3/issues/39), design in #38) protects what `/1` shows in the clear. An entry names only hashes and sizes. Its title, publish time and attributes are in a **metadata TDF**: a small standard ZTDF under the recording's own policy, so a viewer reads exactly the entries they could play. The node never decrypts it.
 
@@ -106,13 +106,13 @@ The document is UTF-8 JSON, at most **524 288 bytes** (a `/1` document stays at 
 
 - `schema` is exactly `"arkavo.creator-catalog/2"`. `owner` and `entries` follow the `/1` rules, and so do `contentID`, `version`, `payloadHash` and `payloadSize`.
 - `metadataHash`: 64 lowercase hex characters, the BLAKE3 hash of the metadata TDF. It is unique within the document and never equals any entry's `payloadHash` (`entries[<i>].metadataHash duplicates entries[<j>].metadataHash`, `entries[<i>].metadataHash equals entries[<j>].payloadHash`).
-- `metadataSize`: an integer from 1 to 262 144, the metadata TDF's size in bytes.
+- `metadataSize`: an integer from 1 to 65 536, the metadata TDF's size in bytes. This is the iOS viewer's limit. A metadata TDF at every entry limit (32 FQNs of 512 bytes, a 512-byte title, one KAS) is about 43 KB.
 - An entry has exactly these six keys. `title`, `publishedAt` and `attributeFQNs` are refused as unknown keys. The `/1` key rules apply.
 
 **The metadata TDF.**
 
 - Its payload is the UTF-8 JSON object `{"contentID", "version", "title", "publishedAt", "attributeFQNs"}`, each field with the `/1` entry's rules (`title` optional). `contentID` and `version` equal the entry's: a reader refuses metadata that names another entry.
-- Its policy has **only** the top-level keys `uuid` (fresh for each metadata TDF) and `body`. Every manifest can be read by anyone holding its hash, so the policy must not repeat the recording's `arkavo:classification`, `arkavo:components` or any other extension.
+- Its policy has **only** the top-level keys `uuid` and `body`. The `uuid` is a non-empty string, fresh for each metadata TDF: a viewer unwraps all of a catalog's metadata in one bulk rewrap, and the platform's KAS skips an entry with no policy id and refuses duplicate ids. Every manifest can be read by anyone holding its hash, so the policy must not repeat the recording's `arkavo:classification`, `arkavo:components` or any other extension.
 - Its manifest's `payload.mimeType` is `application/vnd.arkavo.catalog-entry+json`. The node indexes no blob of that type, so a metadata TDF never appears in `GET /catalog/{group}` although it carries the recording's attributes. The type tells a manifest's reader only that the blob is catalog metadata.
 - Its `body.dataAttributes` and `body.dissem` equal the recording's, each as a set, and its key access objects name the same KAS URLs.
 - It is pushed and ingested like a recording, in the same publish session.
@@ -142,11 +142,12 @@ The node checks the following in order. Each failure returns its own status.
 6. **Nothing is blocked:** no entry's `payloadHash` or `metadataHash`, and not the document's own BLAKE3 hash. Otherwise 403 `content is blocked`.
 7. **Every `payloadHash`, then every `metadataHash`, is an ingested blob.** Otherwise 422 `payload <hash> is not ingested` or `metadata <hash> is not ingested`, naming the first missing one in entry order.
 8. **Every entry's `payloadSize`, then every `metadataSize`, equals the ingested blob's size.** Otherwise 422 `payload <hash> size does not match` or `metadata <hash> size does not match`, naming the first mismatching entry in entry order. Each entry is checked, including entries that share a payload.
-   - For `/2`, steps 8a–8d compare each metadata TDF with its recording, on the manifests the node stored at ingest:
+   - For `/2`, steps 8a–8e compare each metadata TDF with its recording, on the manifests the node stored at ingest:
    - **8a.** Both manifests are stored and readable. Otherwise 422 `payload <hash> manifest is not stored`, `metadata <hash> manifest is not stored`, or `… manifest is unreadable`. A recording ingested before the node stored manifests has none: push it again.
-   - **8b.** The metadata policy has only `uuid` and `body`. Otherwise 422 `metadata <hash> policy may only hold uuid and body`.
+   - **8b.** The metadata policy has only `uuid` and `body`. Otherwise 422 `metadata <hash> policy may only hold uuid and body`. Its `uuid` is a non-empty string. Otherwise 422 `metadata <hash> policy has no uuid`.
    - **8c.** Its `payload.mimeType` is `application/vnd.arkavo.catalog-entry+json`. Otherwise 422 `metadata <hash> is not catalog metadata`.
    - **8d.** Its attributes, dissemination list and KAS are the recording's. Otherwise 422 `metadata <hash> policy does not match payload <hash>`.
+   - **8e.** No two metadata TDFs in the document share a policy `uuid`. Otherwise 422 `metadata <hash> policy uuid duplicates metadata <hash>`, naming the later entry, then the first one with that `uuid`.
 9. **The node stores the bytes and moves the tag.**
    - It stores the bytes at `catalog-documents/<blake3>` and points the tag `catalog/<sub>` at that hash.
    - 200 `{"name":"catalog/<sub>","hash":"<blake3 hex>","size":<bytes>}`.
@@ -188,7 +189,7 @@ This route needs the same token checks as `PUT /catalogs/{sub}`.
 - The body is `{"hash":"<hex>"}`.
 - The hash must not be blocked. Otherwise 403 `content is blocked`.
 - The hash must be a stored catalog document whose `owner` equals `{sub}`. Otherwise 422 `hash does not reference a catalog document of this subject`. A TDF blob's hash is refused this way.
-- The document must pass steps 5–8d of `PUT /catalogs/{sub}`: a schema still accepted, no payload or metadata blocked (403 `content is blocked`), every one ingested and of its size (422), and for `/2` every metadata TDF fitting its recording (422). So a rollback never brings back a recording blocked since that version was published, nor a `/1` catalog after the cutover.
+- The document must pass steps 5–8e of `PUT /catalogs/{sub}`: a schema still accepted, no payload or metadata blocked (403 `content is blocked`), every one ingested and of its size (422), and for `/2` every metadata TDF fitting its recording (422). So a rollback never brings back a recording blocked since that version was published, nor a `/1` catalog after the cutover.
 - Success returns **204**.
 
 ### `GET /blobs/{hash}`: confirm ingest
@@ -352,7 +353,7 @@ The node checks the following in order:
 | Verification steps 1–3 | 422 `invalid bundle: <reason>`; 502 `key set unavailable` |
 | The pointer names this document | 422 `invalid bundle: catalogHash or catalogSize does not match the document` |
 | A valid catalog whose `owner` is `{sub}` | 422 `invalid catalog: <reason>` |
-| A schema still accepted; nothing blocked; every payload and metadata TDF ingested at its size; for `/2`, each metadata TDF fitting its recording (as `PUT /catalogs`, steps 5–8d) | 403 / 422 |
+| A schema still accepted; nothing blocked; every payload and metadata TDF ingested at its size; for `/2`, each metadata TDF fitting its recording (as `PUT /catalogs`, steps 5–8e) | 403 / 422 |
 | The passkey credential is still the subject's, according to the IdP's status route | 403 `passkey credential unknown`, `… revoked` or `… belongs to another subject`; 502 `credential status unavailable` |
 | The stored pointer is the base named by `If-Match` or `If-None-Match`, if either is sent | 412 `catalog changed since it was read` |
 | `seq` is greater than the stored one | 409 `seq must be greater than <n>` |
