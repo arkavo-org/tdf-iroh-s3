@@ -225,7 +225,8 @@ Response: `{"group": "...", "decision": "evaluated|anonymous|unavailable",
 "items": [{"hash", "size", "attribute_fqns", "ingested_at", "entitled"}]}`.
 Each device CWT must have `aud=arkavo:devicecheck` and bind to the PE via
 `subject_id_bind` (strip a single leading `arkavo:` only; `apple:` and
-`client:` are not stripped). Empty listings return `items: []` without
+`client:` are not stripped). The node sends each one on to the PDP as the
+device's `token`, which the platform verifies. Empty listings return `items: []` without
 calling the PDP. The node appends its own observed environment entity.
 All failure modes degrade to `entitled: false`, never to access.
 

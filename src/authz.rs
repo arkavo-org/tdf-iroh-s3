@@ -56,8 +56,10 @@ pub enum EntityKind {
 #[derive(Debug, Clone)]
 pub struct ChainEntity {
     pub kind: EntityKind,
-    /// Bearer token (base64url) — used only in token mode, and only for
-    /// the subject.
+    /// Bearer token (base64url). The subject's is used only in token mode;
+    /// a device's (its DeviceCheck CWT) goes to the AuthZEN PDP, which
+    /// verifies it (arkavo-rs#97). `None` in a chain read back from a stored
+    /// publish session.
     pub token: Option<String>,
     /// Claims the node asserts for this entity. For the PE these are
     /// extracted from the verified CWT (patreon_user_id, email, sub); for
@@ -619,17 +621,12 @@ pub(crate) fn build_authzen_request(req: &DecisionRequest) -> Result<Value> {
     match devices.len() {
         0 => {}
         1 => {
-            context.insert("device".into(), allowlist_device(&devices[0].claims));
+            context.insert("device".into(), allowlist_device(devices[0]));
         }
         _ => {
             context.insert(
                 "devices".into(),
-                Value::Array(
-                    devices
-                        .iter()
-                        .map(|d| allowlist_device(&d.claims))
-                        .collect(),
-                ),
+                Value::Array(devices.iter().map(|d| allowlist_device(d)).collect()),
             );
         }
     }
@@ -679,13 +676,22 @@ fn insert_claim(out: &mut Map<String, Value>, claims: &Value, key: &str) {
     }
 }
 
-fn allowlist_device(claims: &Value) -> Value {
-    json!({
+/// A device as the PDP gets it: `sub`, `iss`, `aud` and `kid`, plus its
+/// DeviceCheck CWT as `token` when the chain holds one. arks verifies the
+/// token and forwards the device only with it (arkavo-rs#97); a device
+/// without one is dropped, never sent on as an unbound claims device.
+fn allowlist_device(device: &ChainEntity) -> Value {
+    let claims = &device.claims;
+    let mut out = json!({
         "sub": claims.get("sub").and_then(Value::as_str).unwrap_or(""),
         "iss": claims.get("iss").and_then(Value::as_str).unwrap_or(""),
         "aud": claims.get("aud").and_then(Value::as_str).unwrap_or(""),
         "kid": claims.get("kid").and_then(Value::as_str).unwrap_or(""),
-    })
+    });
+    if let Some(token) = &device.token {
+        out["token"] = Value::String(token.clone());
+    }
+    out
 }
 
 fn allowlist_environment(claims: &Value) -> Value {
@@ -1054,6 +1060,8 @@ mod tests {
         assert_eq!(devices.len(), 2);
         assert_eq!(devices[0]["kid"], "cGhvbmUta2lk");
         assert_eq!(devices[1]["kid"], "d2F0Y2gta2lk");
+        assert_eq!(devices[0]["token"], "device-cwt");
+        assert_eq!(devices[1]["token"], "device-cwt");
         assert!(devices[0].get("email").is_none());
         let env = body["context"]["environment"].as_object().unwrap();
         assert_eq!(env["region"], "us-east-1");
@@ -1080,6 +1088,25 @@ mod tests {
         let body = build_authzen_request(&req).unwrap();
         assert!(body["context"].get("devices").is_none());
         assert_eq!(body["context"]["device"]["kid"], "cGhvbmUta2lk");
+        assert_eq!(body["context"]["device"]["token"], "device-cwt");
+    }
+
+    /// A chain read back from a stored publish session has no tokens: its
+    /// devices go without one, and arks drops them (arkavo-rs#97).
+    #[test]
+    fn authzen_device_without_a_token_has_no_token_field() {
+        let mut stored = device("arkavo:u1", "cGhvbmUta2lk");
+        stored.token = None;
+        let req = DecisionRequest {
+            chain: vec![pe("pe-cwt"), stored],
+            action: "publish".into(),
+            resource_type: ResourceType::Publisher,
+            resources: vec![("arkavo:u1".into(), vec![])],
+        };
+        let body = build_authzen_request(&req).unwrap();
+        let device = body["context"]["device"].as_object().unwrap();
+        assert!(!device.contains_key("token"));
+        assert_eq!(device.len(), 4);
     }
 
     #[test]

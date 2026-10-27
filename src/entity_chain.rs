@@ -113,7 +113,8 @@ pub async fn verified_devices(
         };
         devices.push(ChainEntity {
             kind: EntityKind::Device,
-            token: Some(token.to_string()),
+            // Sent on to the PDP, which refuses surrounding whitespace.
+            token: Some(token.trim().to_string()),
             claims: serde_json::json!({
                 "sub": claims.sub,
                 "iss": claims.iss,
