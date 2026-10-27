@@ -7,7 +7,10 @@
 //! publish entitlement's attribute value, for the whole entity chain (the
 //! person, each attested device, the environment). The platform withholds
 //! that grant from a suspended account, and devices narrow it as its policy
-//! says.
+//! says. A push asks again with action `push` on the same resource, from the
+//! session's token-free chain: a device requirement on `publish` exempts
+//! `push` (opentdf-platform#66), so the device check is the session's, while
+//! a suspension still denies every push (tdf-iroh-s3#44).
 //!
 //! `[publishing] decisions` picks who decides:
 //! - `local`: this node, from the CWT's `arkavo_entitlements` (as before);
@@ -27,6 +30,12 @@ use crate::authz::{
     ChainEntity, DecisionRequest, EntityKind, ResourceType, SharedDecisionProvider,
 };
 pub use crate::config::PublishDecisions;
+
+/// The action asked when a session opens or an HTTP publish is decided.
+pub const PUBLISH_ACTION: &str = "publish";
+
+/// The action asked when a push is decided again from its session's chain.
+pub const PUSH_ACTION: &str = "push";
 
 /// How long a push re-decision is reused for the same stored chain.
 pub const PUSH_DECISION_TTL: Duration = Duration::from_secs(30);
@@ -141,6 +150,10 @@ impl PublishDecider {
 
     /// Ask the PDP whether `chain` may publish.
     pub async fn ask(&self, chain: &[ChainEntity]) -> Verdict {
+        self.decide(chain, PUBLISH_ACTION).await
+    }
+
+    async fn decide(&self, chain: &[ChainEntity], action: &'static str) -> Verdict {
         let Some(provider) = &self.provider else {
             return Verdict::Unavailable;
         };
@@ -154,7 +167,7 @@ impl PublishDecider {
         };
         let req = DecisionRequest {
             chain: chain.to_vec(),
-            action: "publish".into(),
+            action: action.into(),
             resource_type: ResourceType::Publisher,
             resources: vec![(sub.to_string(), vec![self.entitlement.clone()])],
         };
@@ -162,16 +175,17 @@ impl PublishDecider {
             Ok(d) if d.get(sub).copied().unwrap_or(false) => Verdict::Permit,
             Ok(_) => Verdict::Deny,
             Err(e) => {
-                warn!(%sub, error = %e, "Publish decision failed");
+                warn!(%sub, action, error = %e, "Publish decision failed");
                 Verdict::Unavailable
             }
         }
     }
 
-    /// Like [`ask`](Self::ask), reusing a Permit or Deny for the same
-    /// chain (not just the same subject: two sessions of one person can hold
-    /// different devices) for [`PUSH_DECISION_TTL`]. `Unavailable` is never
-    /// reused. Concurrent pushes on a miss share one PDP call.
+    /// Like [`ask`](Self::ask) with action [`PUSH_ACTION`], reusing a Permit
+    /// or Deny for the same chain (not just the same subject: two sessions of
+    /// one person can hold different devices) for [`PUSH_DECISION_TTL`].
+    /// `Unavailable` is never reused. Concurrent pushes on a miss share one
+    /// PDP call.
     pub async fn ask_for_push(&self, chain: &[ChainEntity]) -> Verdict {
         let key = chain_key(chain);
         if let Some(v) = self.cached_push(&key) {
@@ -188,7 +202,7 @@ impl PublishDecider {
         if let Some(v) = self.cached_push(&key) {
             return v;
         }
-        let v = self.ask(chain).await;
+        let v = self.decide(chain, PUSH_ACTION).await;
         if v != Verdict::Unavailable {
             let mut m = self.pushes.lock().unwrap_or_else(|e| e.into_inner());
             if m.len() >= MAX_CACHED_CHAINS {
@@ -319,6 +333,22 @@ mod tests {
         );
         assert_eq!(req.chain.len(), 2);
         assert_eq!(req.chain[1].kind, EntityKind::Device);
+    }
+
+    #[tokio::test]
+    async fn pushes_ask_the_push_action_on_the_same_resource() {
+        let s = stub(true, false);
+        assert_eq!(decider(&s).ask_for_push(&chain()).await, Verdict::Permit);
+        let req = s.seen.lock().unwrap().clone().unwrap();
+        assert_eq!(req.action, "push");
+        assert_eq!(req.resource_type, ResourceType::Publisher);
+        assert_eq!(
+            req.resources,
+            vec![(
+                "arkavo:u1".to_string(),
+                vec!["https://p.example/attr/arkavo-creator/value/publish".to_string()]
+            )]
+        );
     }
 
     #[tokio::test]
