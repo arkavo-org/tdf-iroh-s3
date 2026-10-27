@@ -511,11 +511,20 @@ fn envelope_attribute(document: &[u8], sub: &str) -> Result<String, &'static str
     })
 }
 
-/// A service CWT (`client:<id>` with role `service-account`), such as
-/// moderation's: it carries no campaign values, so it reads catalogs
-/// without a decision.
-fn is_service(claims: &crate::auth::VerifiedClaims) -> bool {
-    claims.sub.starts_with("client:")
+/// An operator's service CWT, admitted as the moderation API admits one
+/// (`PublishPolicy::operator`): `client:<id>` with role `service-account`,
+/// `aud` naming the client, and the client in `[publishing]
+/// operator_client_ids`. It carries no campaign values, so it reads
+/// catalogs without a decision. An ungated node admits none.
+fn is_operator<S: TagStore>(api: &ApiState<S>, claims: &crate::auth::VerifiedClaims) -> bool {
+    let Some(publishing) = &api.publishing else {
+        return false;
+    };
+    let Some(client) = claims.sub.strip_prefix("client:").filter(|c| !c.is_empty()) else {
+        return false;
+    };
+    publishing.policy.operator_client_ids.contains(client)
+        && claims.aud.contains(client)
         && claims
             .arkavo_roles
             .as_ref()
@@ -630,7 +639,7 @@ async fn get_pointer<S: TagStore>(
     let Some(attribute) = state.catalog_attribute(&catalog_hash).await? else {
         return Err(not_found());
     };
-    if !is_service(&claims) {
+    if !is_operator(api, &claims) {
         state
             .decide_reader(&claims, &headers, &catalog_hash, &attribute)
             .await?;
@@ -764,7 +773,7 @@ mod tests {
                     entitlement: Some(DEFAULT_PUBLISH_ENTITLEMENT.into()),
                     audience: Some("arkavo".into()),
                     session_ttl: Duration::from_secs(60),
-                    operator_client_ids: Default::default(),
+                    operator_client_ids: ["moderation".to_string()].into(),
                     decider: Default::default(),
                 }),
                 moderation: Arc::clone(&moderation),
@@ -796,13 +805,17 @@ mod tests {
     }
 
     fn token_with(sub: &str, extras: &[(&str, Value)]) -> String {
+        token_for(sub, "arkavo", extras)
+    }
+
+    fn token_for(sub: &str, aud: &str, extras: &[(&str, Value)]) -> String {
         let (sk, _) = keypair();
         mint_with_aud(
             &sk,
             b"kid-1",
             "https://identity.test",
             sub,
-            "arkavo",
+            aud,
             now_secs(),
             now_secs() + 3600,
             extras,
@@ -1076,20 +1089,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_service_token_reads_without_a_decision() {
+    async fn an_operator_token_reads_without_a_decision() {
         let h = ingested().await;
         assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
         *h.decider.answer.lock().unwrap() = Some(false);
         let roles = |r: &str| [("arkavo_roles", Value::Array(vec![Value::Text(r.into())]))];
-        let service = token_with("client:moderation", &roles("service-account"));
-        assert_eq!(get_as(&h, SUB, Some(&service)).await.status, StatusCode::OK);
-        assert!(h.decider.asked.lock().unwrap().is_empty());
-        // A client subject without the role is decided like a person.
-        let other = token_with("client:moderation", &roles("viewer"));
+        // As the moderation API admits an operator: allowlisted client, `aud`
+        // naming it, role service-account.
+        let operator = token_for("client:moderation", "moderation", &roles("service-account"));
         assert_eq!(
-            get_as(&h, SUB, Some(&other)).await.status,
-            StatusCode::FORBIDDEN
+            get_as(&h, SUB, Some(&operator)).await.status,
+            StatusCode::OK
         );
+        assert!(h.decider.asked.lock().unwrap().is_empty());
+        // Anything less is decided like a person.
+        for other in [
+            token_for("client:moderation", "arkavo", &roles("service-account")),
+            token_for("client:other", "other", &roles("service-account")),
+            token_for("client:moderation", "moderation", &roles("viewer")),
+        ] {
+            assert_eq!(
+                get_as(&h, SUB, Some(&other)).await.status,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(h.decider.asked.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]

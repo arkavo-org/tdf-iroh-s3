@@ -35,11 +35,13 @@ pub const CATALOG_ENTRY_MIME_TYPE: &str = "application/vnd.arkavo.catalog-entry+
 /// The envelope's `payload.mimeType`.
 pub const CATALOG_MIME_TYPE: &str = "application/vnd.arkavo.creator-catalog+json";
 
-/// A campaign attribute value: this prefix, then one or more of
-/// `[A-Za-z0-9_-]`.
+/// A campaign attribute value: this prefix, then the campaign id, one or
+/// more digits: the platform's Patreon entity resolution grants no other.
 pub const CAMPAIGN_FQN_PREFIX: &str = "https://patreon.arkavo.com/attr/campaign/value/";
 
-/// A creator attribute value: this prefix, then the creator's `sub`.
+/// A creator attribute value: this prefix, then the creator's `sub`, a bare
+/// lowercase account UUID: identity grants `creator/value/<account id>`,
+/// never an `arkavo:`-prefixed one.
 pub const CREATOR_FQN_PREFIX: &str = "https://arkavo.net/attr/creator/value/";
 
 /// The parts of a stored manifest the comparison reads.
@@ -128,7 +130,8 @@ impl ManifestPolicy {
 /// of `sub`: type [`CATALOG_MIME_TYPE`], a policy of only `uuid` (non-empty)
 /// and `body`, no `dissem`, and `body.dataAttributes` exactly one element
 /// whose `attribute` is a campaign value or `sub`'s creator value, byte for
-/// byte.
+/// byte. Either way an attribute the platform grants someone: a value it
+/// never grants would make a catalog nobody can open.
 pub fn check_envelope(envelope: &ManifestPolicy, sub: &str) -> Result<String, EnvelopeRefusal> {
     if envelope.mime_type.as_deref() != Some(CATALOG_MIME_TYPE) {
         return Err(EnvelopeRefusal::NotCatalog);
@@ -149,19 +152,23 @@ pub fn check_envelope(envelope: &ManifestPolicy, sub: &str) -> Result<String, En
         _ => None,
     };
     let campaign = |f: &str| {
-        f.strip_prefix(CAMPAIGN_FQN_PREFIX).is_some_and(|id| {
-            !id.is_empty()
-                && id
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-        })
+        f.strip_prefix(CAMPAIGN_FQN_PREFIX)
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
     };
+    let creator = |f: &str| f.strip_prefix(CREATOR_FQN_PREFIX) == Some(sub) && is_lower_uuid(sub);
     match fqn {
-        Some(f) if campaign(f) || f.strip_prefix(CREATOR_FQN_PREFIX) == Some(sub) => {
-            Ok(f.to_string())
-        }
+        Some(f) if campaign(f) || creator(f) => Ok(f.to_string()),
         _ => Err(EnvelopeRefusal::Policy),
     }
+}
+
+/// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` in lowercase hex.
+fn is_lower_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => matches!(b, b'0'..=b'9' | b'a'..=b'f'),
+        })
 }
 
 /// Whether `metadata` may stand for the recording `payload` in a catalog.
@@ -490,7 +497,7 @@ mod tests {
         let creator = format!("{CREATOR_FQN_PREFIX}{SUB}");
         for fqn in [
             CAMPAIGN,
-            "https://patreon.arkavo.com/attr/campaign/value/a_B-9",
+            "https://patreon.arkavo.com/attr/campaign/value/7",
             creator.as_str(),
         ] {
             assert_eq!(envelope(envelope_policy(fqn)), Ok(fqn.to_string()), "{fqn}");
@@ -501,6 +508,9 @@ mod tests {
             "https://patreon.arkavo.com/attr/campaign/value/",
             "https://patreon.arkavo.com/attr/campaign/value/12/34",
             "https://patreon.arkavo.com/attr/campaign/value/12.34",
+            "https://patreon.arkavo.com/attr/campaign/value/a_B-9",
+            "https://patreon.arkavo.com/attr/campaign/value/12a",
+            "https://patreon.arkavo.com/attr/campaign/value/-12",
             "https://patreon.arkavo.com/attr/tier/value/12345678",
             "https://PATREON.arkavo.com/attr/campaign/value/12345678",
             other_creator.as_str(),
@@ -511,6 +521,24 @@ mod tests {
                 envelope(envelope_policy(fqn)),
                 Err(EnvelopeRefusal::Policy),
                 "{fqn}"
+            );
+        }
+        // A creator value names a bare lowercase account UUID, whatever the
+        // subject's own spelling.
+        for sub in [
+            format!("arkavo:{SUB}"),
+            SUB.to_uppercase(),
+            "creator-1".to_string(),
+        ] {
+            let m = read_manifest(&envelope_manifest(
+                envelope_policy(&format!("{CREATOR_FQN_PREFIX}{sub}")),
+                &[KAS],
+            ))
+            .unwrap();
+            assert_eq!(
+                check_envelope(&m, &sub),
+                Err(EnvelopeRefusal::Policy),
+                "{sub}"
             );
         }
     }
