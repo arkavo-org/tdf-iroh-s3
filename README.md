@@ -225,7 +225,13 @@ curl https://iroh.arkavo.net/catalog/12345678 \
 ```
 
 Response: `{"group": "...", "decision": "evaluated|anonymous|unavailable",
-"items": [{"hash", "size", "attribute_fqns", "ingested_at", "entitled"}]}`.
+"items": [{"hash", "size", "attribute_fqns", "ingested_at", "entitled"}],
+"creator"?: "<account uuid>"}`. When groups are Patreon campaigns, `creator`
+names the campaign's creator, as recorded at their last catalog publish, so a
+viewer can find `GET /v2/catalogs/<creator>`. It is sent only to a reader the
+PDP entitles to the campaign attribute itself (asked with the items, as one
+more resource), and left out for anonymous readers, readers not entitled, an
+unknown creator, or a failed lookup.
 Each device CWT must have `aud=arkavo:devicecheck` and bind to the PE via
 `subject_id_bind` (strip a single leading `arkavo:` only; `apple:` and
 `client:` are not stripped). The node sends each one on to the PDP as the

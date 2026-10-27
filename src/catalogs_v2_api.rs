@@ -37,7 +37,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::authz::{DecisionProvider, DecisionRequest, ResourceType, SharedDecisionProvider};
-use crate::catalog_metadata::{self, EnvelopeRefusal};
+use crate::catalog_metadata::{self, CAMPAIGN_FQN_PREFIX, EnvelopeRefusal};
 use crate::catalog_v2::{self, Bundle, BundleError, Passkeys};
 use crate::catalogs_api::{check_payloads, is_json, owner_hidden};
 use crate::creator_catalog::{
@@ -363,6 +363,18 @@ async fn put_catalog<S: TagStore>(
     }
     let attribute = envelope_attribute(&document, &sub)
         .map_err(|why| reject(StatusCode::UNPROCESSABLE_ENTITY, why.into()))?;
+    // A campaign's catalog comes from its creator, as identity asserts it.
+    let campaign = attribute
+        .strip_prefix(CAMPAIGN_FQN_PREFIX)
+        .map(str::to_string);
+    if let Some(id) = &campaign
+        && !owns_campaign(&claims, id)
+    {
+        return Err(reject(
+            StatusCode::FORBIDDEN,
+            "catalog campaign is not the publisher's".into(),
+        ));
+    }
 
     // 5. The index: the entries the envelope holds, which the node can't
     //    read. Nothing blocked, every payload and metadata TDF ingested at
@@ -473,6 +485,12 @@ async fn put_catalog<S: TagStore>(
         )
         .await
         .map_err(|e| storage_unavailable("Catalog index write", e))?;
+    if let Some(id) = &campaign {
+        api.store
+            .put_campaign_creator(id, &sub)
+            .await
+            .map_err(|e| storage_unavailable("Campaign creator write", e))?;
+    }
     let bundle = serde_json::to_vec(&req.bundle).expect("bundle serializes");
     let written = api
         .store
@@ -508,6 +526,16 @@ fn envelope_attribute(document: &[u8], sub: &str) -> Result<String, &'static str
         EnvelopeRefusal::NotCatalog => "document is not a catalog",
         EnvelopeRefusal::NoPolicyId => "catalog policy has no uuid",
         EnvelopeRefusal::Policy => "catalog policy must be one campaign or the creator attribute",
+    })
+}
+
+/// Whether the token's `arkavo_patreon` names its subject the creator of
+/// campaign `id`: role `creator` and that `campaign_id`, which identity
+/// sets only for the campaign the account owns.
+fn owns_campaign(claims: &crate::auth::VerifiedClaims, id: &str) -> bool {
+    claims.arkavo_patreon.as_ref().is_some_and(|p| {
+        p.get("role").and_then(serde_json::Value::as_str) == Some("creator")
+            && p.get("campaign_id").and_then(serde_json::Value::as_str) == Some(id)
     })
 }
 
@@ -822,14 +850,30 @@ mod tests {
         )
     }
 
+    /// A publisher's token: entitled, and the creator of campaign
+    /// 12345678 (`CAMPAIGN`).
     fn token(sub: &str) -> String {
         token_with(
             sub,
-            &[(
-                "arkavo_entitlements",
-                Value::Array(vec![Value::Text(DEFAULT_PUBLISH_ENTITLEMENT.into())]),
-            )],
+            &publisher_claims(Some(patreon("creator", Some("12345678")))),
         )
+    }
+
+    fn patreon(role: &str, campaign_id: Option<&str>) -> Value {
+        let mut map = vec![(Value::Text("role".into()), Value::Text(role.into()))];
+        if let Some(id) = campaign_id {
+            map.push((Value::Text("campaign_id".into()), Value::Text(id.into())));
+        }
+        Value::Map(map)
+    }
+
+    fn publisher_claims(patreon: Option<Value>) -> Vec<(&'static str, Value)> {
+        let mut claims = vec![(
+            "arkavo_entitlements",
+            Value::Array(vec![Value::Text(DEFAULT_PUBLISH_ENTITLEMENT.into())]),
+        )];
+        claims.extend(patreon.map(|p| ("arkavo_patreon", p)));
+        claims
     }
 
     fn payload(n: u8) -> String {
@@ -1211,8 +1255,54 @@ mod tests {
         let r = publish(&h, 1, &document).await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
         assert_eq!(get(&h, SUB).await.status, StatusCode::OK);
+        assert!(h.store.campaign_creators.lock().await.is_empty());
         let asked = h.decider.asked.lock().unwrap();
         assert_eq!(asked[0].resources[0].1, vec![creator]);
+    }
+
+    #[tokio::test]
+    async fn a_campaign_catalog_comes_from_the_campaign_creator() {
+        let h = ingested().await;
+        let document = envelope(1);
+        let bundle = || body(&document, &v2::bundle(SUB, 1, &document));
+        for patreon in [
+            None,
+            Some(patreon("consumer", None)),
+            Some(patreon("creator", Some("99"))),
+            Some(patreon("consumer", Some("12345678"))),
+            Some(Value::Map(vec![
+                (Value::Text("role".into()), Value::Text("creator".into())),
+                (
+                    Value::Text("campaign_id".into()),
+                    Value::Integer(12345678.into()),
+                ),
+            ])),
+        ] {
+            let t = token_with(SUB, &publisher_claims(patreon.clone()));
+            let r = put(&h, SUB, &t, bundle()).await;
+            assert_eq!(
+                (r.status, r.error().as_str()),
+                (
+                    StatusCode::FORBIDDEN,
+                    "catalog campaign is not the publisher's"
+                ),
+                "{patreon:?}"
+            );
+        }
+        assert!(h.store.campaign_creators.lock().await.is_empty());
+
+        // The creator publishes, and is recorded as the campaign's.
+        let r = put(&h, SUB, &token(SUB), bundle()).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        assert_eq!(
+            h.store
+                .campaign_creators
+                .lock()
+                .await
+                .get("12345678")
+                .map(String::as_str),
+            Some(SUB)
+        );
     }
 
     #[tokio::test]
@@ -1254,7 +1344,15 @@ mod tests {
         // Every recording carries the envelope's attribute.
         let other = "https://patreon.arkavo.com/attr/campaign/value/99";
         let document = envelope_tdf(envelope_policy(other), CATALOG_MIME_TYPE, b"x");
-        let r = publish(&h, 1, &document).await;
+        let creator_of_99 =
+            token_with(SUB, &publisher_claims(Some(patreon("creator", Some("99")))));
+        let r = put(
+            &h,
+            SUB,
+            &creator_of_99,
+            body(&document, &v2::bundle(SUB, 1, &document)),
+        )
+        .await;
         assert_eq!(
             (r.status, r.error().as_str()),
             (

@@ -16,6 +16,11 @@
 //!
 //! Chain length is capped at `1 + D + E ≤ 8`. Empty listings skip the PDP.
 //!
+//! When groups are Patreon campaigns, the response names the campaign's
+//! creator (`creator`, their account UUID, recorded at their catalog
+//! publish) to a reader the PDP entitles to the campaign attribute, so the
+//! viewer can find `GET /v2/catalogs/{creator}`. Nobody else learns it.
+//!
 //! Decisions are delegated to the OpenTDF authorization service; this
 //! node never evaluates policy. Fail-closed everywhere: no credentials,
 //! verification failure handling aside (401), or an unreachable PDP all
@@ -44,9 +49,19 @@ pub trait CatalogStore: Send + Sync + 'static {
         &self,
         group: &str,
     ) -> impl Future<Output = anyhow::Result<Vec<CatalogEntry>>> + Send;
+    /// The creator recorded for a Patreon campaign
+    /// (`campaign-creators/<id>`), or `None`.
+    fn campaign_creator(
+        &self,
+        campaign_id: &str,
+    ) -> impl Future<Output = anyhow::Result<Option<String>>> + Send;
 }
 
 impl CatalogStore for crate::store::s3::S3Client {
+    async fn campaign_creator(&self, campaign_id: &str) -> anyhow::Result<Option<String>> {
+        self.get_campaign_creator(campaign_id).await
+    }
+
     async fn list_group(&self, group: &str) -> anyhow::Result<Vec<CatalogEntry>> {
         use futures::StreamExt;
         let hashes = self.list_catalog_hashes(group).await?;
@@ -77,6 +92,7 @@ impl CatalogStore for crate::store::s3::S3Client {
 }
 
 type CachedGroup = (Instant, Arc<Vec<CatalogEntry>>);
+type CachedCreator = (Instant, Option<String>);
 
 /// Bound on distinct cached groups — `/catalog/{group}` is a public GET,
 /// so without this an attacker enumerating group names grows the map
@@ -93,6 +109,8 @@ pub struct CatalogCache<S: CatalogStore> {
     ttl: Duration,
     groups: RwLock<HashMap<String, CachedGroup>>,
     refresh_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Campaign id → its recorded creator, for `ttl`; bounded like `groups`.
+    creators: RwLock<HashMap<String, CachedCreator>>,
 }
 
 impl<S: CatalogStore> CatalogCache<S> {
@@ -102,7 +120,28 @@ impl<S: CatalogStore> CatalogCache<S> {
             ttl,
             groups: RwLock::new(HashMap::new()),
             refresh_locks: tokio::sync::Mutex::new(HashMap::new()),
+            creators: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// The creator recorded for campaign `id`, cached for the TTL (an
+    /// unknown creator too). A failed read is not cached.
+    pub async fn creator(&self, id: &str) -> anyhow::Result<Option<String>> {
+        if let Some((at, creator)) = self.creators.read().await.get(id)
+            && at.elapsed() < self.ttl
+        {
+            return Ok(creator.clone());
+        }
+        let creator = self.store.campaign_creator(id).await?;
+        let mut creators = self.creators.write().await;
+        if creators.len() >= MAX_CACHED_GROUPS {
+            creators.retain(|_, (at, _)| at.elapsed() < self.ttl);
+            if creators.len() >= MAX_CACHED_GROUPS {
+                creators.clear();
+            }
+        }
+        creators.insert(id.to_string(), (Instant::now(), creator.clone()));
+        Ok(creator)
     }
 
     pub async fn entries(&self, group: &str) -> anyhow::Result<Arc<Vec<CatalogEntry>>> {
@@ -182,7 +221,14 @@ pub struct CatalogApiState<S: CatalogStore, D: DecisionProvider> {
     /// `[http] catalog_token`: `Required` refuses anonymous listings
     /// (tdf-iroh-s3#39).
     pub token: crate::config::CatalogToken,
+    /// Groups are Patreon campaign ids (`[catalog] group_attribute_fqn` is
+    /// the campaign attribute), so a listing may name its creator.
+    pub campaign_groups: bool,
 }
+
+/// The resource id the campaign itself is decided under, next to the
+/// items (whose ids are hashes, 64 hex characters).
+const CAMPAIGN_RESOURCE: &str = "campaign";
 
 #[derive(Serialize)]
 struct CatalogItem {
@@ -197,6 +243,9 @@ struct CatalogResponse {
     /// "evaluated" | "anonymous" | "unavailable"
     decision: &'static str,
     items: Vec<CatalogItem>,
+    /// The campaign's creator, only to a reader entitled to the campaign.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    creator: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -262,18 +311,40 @@ async fn get_catalog<S: CatalogStore, D: DecisionProvider>(
         Err(e) => return Err(e),
     };
 
+    // A campaign's creator is asked about with the items, as one more
+    // resource; a failed lookup only leaves it out.
+    let creator = match &chain {
+        Some(_) if state.campaign_groups && group.bytes().all(|b| b.is_ascii_digit()) => {
+            state.cache.creator(&group).await.unwrap_or_else(|e| {
+                warn!(%group, error = %e, "Campaign creator lookup failed; leaving it out");
+                None
+            })
+        }
+        _ => None,
+    };
+
     let (decision, verdicts) = match &chain {
         None => ("anonymous", HashMap::new()),
-        Some(_) if entries.is_empty() => ("evaluated", HashMap::new()),
+        Some(_) if entries.is_empty() && creator.is_none() => ("evaluated", HashMap::new()),
         Some(chain) => {
+            let mut resources: Vec<(String, Vec<String>)> = entries
+                .iter()
+                .map(|e| (e.hash.clone(), e.attribute_fqns.clone()))
+                .collect();
+            if creator.is_some() {
+                resources.push((
+                    CAMPAIGN_RESOURCE.to_string(),
+                    vec![format!(
+                        "{}{group}",
+                        crate::catalog_metadata::CAMPAIGN_FQN_PREFIX
+                    )],
+                ));
+            }
             let req = DecisionRequest {
                 chain: chain.clone(),
                 action: state.action.clone(),
                 resource_type: ResourceType::CatalogItem,
-                resources: entries
-                    .iter()
-                    .map(|e| (e.hash.clone(), e.attribute_fqns.clone()))
-                    .collect(),
+                resources,
             };
             match state.provider.decide(req).await {
                 Ok(verdicts) => ("evaluated", verdicts),
@@ -293,10 +364,12 @@ async fn get_catalog<S: CatalogStore, D: DecisionProvider>(
         })
         .collect();
 
+    let creator = creator.filter(|_| verdicts.get(CAMPAIGN_RESOURCE) == Some(&true));
     Ok(Json(CatalogResponse {
         group,
         decision,
         items,
+        creator,
     }))
 }
 
@@ -368,6 +441,9 @@ mod tests {
     struct MemCatalog {
         groups: HashMap<String, Vec<CatalogEntry>>,
         fail: std::sync::atomic::AtomicBool,
+        creators: std::sync::Mutex<HashMap<String, String>>,
+        creators_down: std::sync::atomic::AtomicBool,
+        creator_reads: std::sync::atomic::AtomicUsize,
     }
 
     impl MemCatalog {
@@ -375,6 +451,9 @@ mod tests {
             Self {
                 groups,
                 fail: std::sync::atomic::AtomicBool::new(false),
+                creators: Default::default(),
+                creators_down: Default::default(),
+                creator_reads: Default::default(),
             }
         }
     }
@@ -385,6 +464,15 @@ mod tests {
                 anyhow::bail!("simulated S3 outage");
             }
             Ok(self.groups.get(group).cloned().unwrap_or_default())
+        }
+
+        async fn campaign_creator(&self, id: &str) -> anyhow::Result<Option<String>> {
+            self.creator_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.creators_down.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("simulated S3 outage");
+            }
+            Ok(self.creators.lock().unwrap().get(id).cloned())
         }
     }
 
@@ -451,10 +539,18 @@ mod tests {
         token: crate::config::CatalogToken,
     ) -> Rig {
         let (sk, vk) = keypair();
-        let store = Arc::new(MemCatalog::new(HashMap::from([(
-            "camp1".to_string(),
-            vec![entry(&"aa".repeat(32)), entry(&"bb".repeat(32))],
-        )])));
+        let store = Arc::new(MemCatalog::new(HashMap::from([
+            (
+                "camp1".to_string(),
+                vec![entry(&"aa".repeat(32)), entry(&"bb".repeat(32))],
+            ),
+            (CAMPAIGN_ID.to_string(), vec![entry(&"cc".repeat(32))]),
+        ])));
+        store
+            .creators
+            .lock()
+            .unwrap()
+            .insert(CAMPAIGN_ID.to_string(), CREATOR.to_string());
         let state = Arc::new(CatalogApiState {
             cache: CatalogCache::new(store, Duration::from_secs(30)),
             provider: StubProvider {
@@ -469,6 +565,7 @@ mod tests {
             environment,
             moderation: None,
             token,
+            campaign_groups: true,
         });
         let token = mint(
             &sk,
@@ -504,6 +601,85 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
         (status, value)
+    }
+
+    const CAMPAIGN_ID: &str = "13167240";
+    const CREATOR: &str = "0715eaff-3d61-49e0-b553-c0cda78410b0";
+
+    fn bearer_for(r: &Rig) -> String {
+        format!("Bearer {}", r.token)
+    }
+
+    #[tokio::test]
+    async fn an_entitled_reader_learns_the_campaign_creator() {
+        let r = rig(vec!["cc".repeat(32), CAMPAIGN_RESOURCE.into()], None);
+        let uri = format!("/catalog/{CAMPAIGN_ID}");
+        let (status, body) = get_json(&r.router, &uri, &[("authorization", &bearer_for(&r))]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["creator"], CREATOR);
+        assert_eq!(body["items"][0]["entitled"], true);
+    }
+
+    #[tokio::test]
+    async fn the_creator_is_named_to_nobody_else() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let uri = format!("/catalog/{CAMPAIGN_ID}");
+        // Entitled to an item but not to the campaign.
+        let r = rig(vec!["cc".repeat(32)], None);
+        let (_, body) = get_json(&r.router, &uri, &[("authorization", &bearer_for(&r))]).await;
+        assert_eq!(body["decision"], "evaluated");
+        assert_eq!(body["items"][0]["entitled"], true);
+        assert!(body.get("creator").is_none(), "{body}");
+
+        // Anonymous: no lookup, no decision.
+        let r = rig(vec![CAMPAIGN_RESOURCE.into()], None);
+        let (_, body) = get_json(&r.router, &uri, &[]).await;
+        assert_eq!(body["decision"], "anonymous");
+        assert!(body.get("creator").is_none(), "{body}");
+        assert_eq!(r.state.cache.store.creator_reads.load(SeqCst), 0);
+
+        // A group that is no campaign id is never looked up.
+        let (_, body) = get_json(
+            &r.router,
+            "/catalog/camp1",
+            &[("authorization", &bearer_for(&r))],
+        )
+        .await;
+        assert!(body.get("creator").is_none(), "{body}");
+        assert_eq!(r.state.cache.store.creator_reads.load(SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_or_unreadable_creator_is_left_out() {
+        use std::sync::atomic::Ordering::SeqCst;
+        // No creator recorded and no items: the PDP isn't asked.
+        let r = rig(vec![CAMPAIGN_RESOURCE.into()], None);
+        let (status, body) = get_json(
+            &r.router,
+            "/catalog/99",
+            &[("authorization", &bearer_for(&r))],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("creator").is_none(), "{body}");
+        assert_eq!(r.state.provider.called.load(SeqCst), 0);
+
+        // A failed lookup still serves the listing, without the creator.
+        let uri = format!("/catalog/{CAMPAIGN_ID}");
+        let r = rig(vec![CAMPAIGN_RESOURCE.into()], None);
+        r.state.cache.store.creators_down.store(true, SeqCst);
+        let (status, body) = get_json(&r.router, &uri, &[("authorization", &bearer_for(&r))]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("creator").is_none(), "{body}");
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+
+        // A found creator is cached for the TTL.
+        let r = rig(vec![CAMPAIGN_RESOURCE.into()], None);
+        for _ in 0..3 {
+            let (_, body) = get_json(&r.router, &uri, &[("authorization", &bearer_for(&r))]).await;
+            assert_eq!(body["creator"], CREATOR);
+        }
+        assert_eq!(r.state.cache.store.creator_reads.load(SeqCst), 1);
     }
 
     #[tokio::test]
@@ -985,6 +1161,7 @@ mod tests {
             environment: None,
             moderation: Some(Arc::clone(&moderation)),
             token: Default::default(),
+            campaign_groups: false,
         });
         let app = router(state);
         let (_, body) = get_json(&app, "/catalog/camp1", &[]).await;

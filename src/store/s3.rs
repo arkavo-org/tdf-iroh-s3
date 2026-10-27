@@ -116,6 +116,12 @@ impl S3Client {
         format!("{}catalog-indexes/{}", self.prefix, hash_hex)
     }
 
+    /// The creator of a Patreon campaign, recorded at a v2 catalog publish
+    /// whose envelope is under that campaign.
+    pub fn campaign_creator_key(&self, campaign_id: &str) -> String {
+        format!("{}campaign-creators/{}", self.prefix, campaign_id)
+    }
+
     /// A creator's signed catalog pointer bundle (catalog v2).
     pub fn catalog_pointer_key(&self, sub: &str) -> String {
         format!("{}catalog-pointers/{}", self.prefix, sub)
@@ -635,6 +641,45 @@ impl S3Client {
                 e
             )),
         }
+    }
+
+    /// Record `creator` as the creator of `campaign_id`
+    /// (`campaign-creators/<id>`, `{"creator":"<sub>"}`).
+    pub async fn put_campaign_creator(&self, campaign_id: &str, creator: &str) -> Result<()> {
+        let body = serde_json::to_vec(&serde_json::json!({ "creator": creator }))?;
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.campaign_creator_key(campaign_id))
+            .content_type("application/json")
+            .body(Bytes::from(body).into())
+            .send()
+            .await
+            .context("Failed to PUT campaign creator to S3")?;
+        Ok(())
+    }
+
+    /// The recorded creator of `campaign_id`, or `None`.
+    pub async fn get_campaign_creator(&self, campaign_id: &str) -> Result<Option<String>> {
+        let body = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(self.campaign_creator_key(campaign_id))
+            .send()
+            .await
+        {
+            Ok(resp) => resp.body.collect().await?.into_bytes(),
+            Err(e) if e.as_service_error().is_some_and(|se| se.is_no_such_key()) => {
+                return Ok(None);
+            }
+            Err(e) => anyhow::bail!("Failed to GET campaign creator from S3: {e}"),
+        };
+        #[derive(serde::Deserialize)]
+        struct Record {
+            creator: String,
+        }
+        Ok(Some(serde_json::from_slice::<Record>(&body)?.creator))
     }
 
     /// Store a creator's pointer bundle only if the stored one is still

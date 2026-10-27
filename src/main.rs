@@ -277,6 +277,8 @@ async fn main() -> Result<()> {
                 Arc::clone(&node.s3_client),
                 std::time::Duration::from_secs(cat.cache_ttl_secs),
             );
+            let campaign_groups =
+                cat.group_attribute_prefix() == tdf_iroh_s3::catalog_metadata::CAMPAIGN_FQN_PREFIX;
             router = match &provider {
                 Some(provider) => router.merge(catalog_router(
                     cache,
@@ -286,6 +288,7 @@ async fn main() -> Result<()> {
                     environment.clone(),
                     moderation.clone(),
                     http_cfg.catalog_token,
+                    campaign_groups,
                 )),
                 None => {
                     tracing::warn!(
@@ -299,6 +302,7 @@ async fn main() -> Result<()> {
                         environment.clone(),
                         moderation.clone(),
                         http_cfg.catalog_token,
+                        campaign_groups,
                     ))
                 }
             };
@@ -485,6 +489,7 @@ async fn decision_provider(config: &Config) -> Result<Option<SharedDecisionProvi
     Ok(Some(provider))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn catalog_router<D: DecisionProvider>(
     cache: CatalogCache<tdf_iroh_s3::store::s3::S3Client>,
     provider: D,
@@ -493,6 +498,7 @@ fn catalog_router<D: DecisionProvider>(
     environment: Option<serde_json::Value>,
     moderation: Option<Arc<Moderation>>,
     token: tdf_iroh_s3::config::CatalogToken,
+    campaign_groups: bool,
 ) -> axum::Router {
     catalog_api::router(Arc::new(CatalogApiState {
         cache,
@@ -502,5 +508,6 @@ fn catalog_router<D: DecisionProvider>(
         environment,
         moderation,
         token,
+        campaign_groups,
     }))
 }

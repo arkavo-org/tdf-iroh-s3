@@ -286,6 +286,7 @@ The node checks the following in order:
 | Its `payload.mimeType` is `application/vnd.arkavo.creator-catalog+json` | 422 `document is not a catalog` |
 | Its policy has only `uuid` and `body`, no `dissem`, and exactly one campaign attribute or `{sub}`'s creator attribute ([The envelope](#the-envelope)) | 422 `catalog policy must be one campaign or the creator attribute` |
 | Its policy's `uuid` is a non-empty string | 422 `catalog policy has no uuid` |
+| For a campaign attribute: the token's `arkavo_patreon` has role `creator` and a `campaign_id` (a string) equal to the envelope's campaign id. Identity sets it only for the campaign the account owns. | 403 `catalog campaign is not the publisher's` |
 | `index` is an array of at most 1000 valid entries ([entry fields](#catalog-document-arkavocreator-catalog2)): unique `contentID`, each `metadataHash` unique and never a `payloadHash` | 422 `invalid index: <reason>`, e.g. `invalid index: entries[3].metadataHash duplicates entries[1].metadataHash` |
 | Nothing blocked: the envelope's hash, no entry's `payloadHash` or `metadataHash` | 403 `content is blocked` |
 | Every `payloadHash`, then every `metadataHash`, is an ingested blob | 422 `payload <hash> is not ingested` or `metadata <hash> is not ingested`, the first missing one in entry order |
@@ -300,7 +301,7 @@ The node checks the following in order:
 | The stored pointer is the base named by `If-Match` or `If-None-Match`, if either is sent | 412 `catalog changed since it was read` |
 | `seq` is greater than the stored one | 409 `seq must be greater than <n>` |
 
-The node then stores the envelope at `catalog-documents/<blake3>` with its BAO outboard at `catalog-outboards/<blake3>`, the index at `catalog-indexes/<blake3>` (never served), and then the bundle at `catalog-pointers/<sub>`. The pointer is written only if no other publish replaced it in the meantime; otherwise 409 `seq must be greater than the stored seq: another publish won`. Read the pointer again and retry.
+The node then stores the envelope at `catalog-documents/<blake3>` with its BAO outboard at `catalog-outboards/<blake3>`, the index at `catalog-indexes/<blake3>` (never served), for a campaign envelope the creator at `campaign-creators/<campaign id>`, and then the bundle at `catalog-pointers/<sub>`. `GET /catalog/<campaign id>` names that creator (`creator`) to a reader the decision service entitles to the campaign attribute, so a viewer can find `GET /v2/catalogs/<creator>`. The pointer is written only if no other publish replaced it in the meantime; otherwise 409 `seq must be greater than the stored seq: another publish won`. Read the pointer again and retry.
 
 200: `{"owner":"<sub>","seq":<n>,"hash":"<blake3 hex>","size":<bytes>}`.
 

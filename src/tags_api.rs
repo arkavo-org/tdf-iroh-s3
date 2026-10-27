@@ -65,6 +65,13 @@ pub trait TagStore: Send + Sync + 'static {
         &self,
         hash_hex: &str,
     ) -> impl Future<Output = anyhow::Result<Option<Bytes>>> + Send;
+    /// Record `creator` as the creator of the Patreon campaign
+    /// `campaign_id` (`campaign-creators/<id>`).
+    fn put_campaign_creator(
+        &self,
+        campaign_id: &str,
+        creator: &str,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
     /// A creator's stored catalog v2 pointer bundle.
     fn get_catalog_pointer(
         &self,
@@ -147,6 +154,10 @@ impl TagStore for crate::store::s3::S3Client {
 
     async fn get_catalog_index(&self, hash_hex: &str) -> anyhow::Result<Option<Bytes>> {
         Self::get_catalog_index(self, hash_hex).await
+    }
+
+    async fn put_campaign_creator(&self, campaign_id: &str, creator: &str) -> anyhow::Result<()> {
+        Self::put_campaign_creator(self, campaign_id, creator).await
     }
 
     async fn get_catalog_pointer(&self, sub: &str) -> anyhow::Result<Option<StoredPointer>> {
@@ -276,6 +287,8 @@ pub(crate) mod test_support {
         pub down: std::sync::atomic::AtomicBool,
         pub catalog_outboards: Mutex<HashMap<String, Bytes>>,
         pub catalog_indexes: Mutex<HashMap<String, Bytes>>,
+        /// campaign id → creator.
+        pub campaign_creators: Mutex<HashMap<String, String>>,
         /// sub → (bundle, version). The version stands in for S3's ETag.
         pub catalog_pointers: Mutex<HashMap<String, (Bytes, u64)>>,
         pub pointer_versions: std::sync::atomic::AtomicU64,
@@ -385,6 +398,18 @@ pub(crate) mod test_support {
         async fn get_catalog_index(&self, hash_hex: &str) -> anyhow::Result<Option<Bytes>> {
             self.up()?;
             Ok(self.catalog_indexes.lock().await.get(hash_hex).cloned())
+        }
+        async fn put_campaign_creator(
+            &self,
+            campaign_id: &str,
+            creator: &str,
+        ) -> anyhow::Result<()> {
+            self.up()?;
+            self.campaign_creators
+                .lock()
+                .await
+                .insert(campaign_id.to_string(), creator.to_string());
+            Ok(())
         }
         async fn get_catalog_pointer(&self, sub: &str) -> anyhow::Result<Option<StoredPointer>> {
             self.up()?;
