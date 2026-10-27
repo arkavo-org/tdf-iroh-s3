@@ -311,11 +311,11 @@ script writes that file from EC2 user-data when it does not exist.
 The AMI also runs the CloudWatch agent, which sends the journal of
 `tdf-iroh-s3` and `tdf-iroh-s3-cert-sync`, including systemd's lines about
 them (exits, restarts), to the CloudWatch Logs group `tdf-iroh-s3`, one
-stream per instance ID, so the logs outlive the instance. Create the group,
-with the retention you want, before the first boot, and give the instance
-role `logs:CreateLogStream`, `logs:PutLogEvents` and
-`logs:DescribeLogStreams` on it. Without them the node runs as before and
-the agent logs its own errors.
+stream per instance ID, so the logs outlive the instance. The agent creates
+the group with a 90-day retention, so the instance role needs
+`logs:CreateLogGroup`, `logs:PutRetentionPolicy`, `logs:CreateLogStream`,
+`logs:PutLogEvents` and `logs:DescribeLogStreams` on it. Without them the
+node runs as before and the agent logs its own errors.
 
 Everything the node serves lives in S3, so replacing an instance loses
 nothing, and several nodes can serve one bucket. The data volume only

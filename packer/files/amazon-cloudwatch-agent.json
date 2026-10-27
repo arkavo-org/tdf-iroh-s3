@@ -9,7 +9,8 @@
           {
             "log_group_name": "tdf-iroh-s3",
             "log_stream_name": "{instance_id}",
-            "units": ["tdf-iroh-s3", "tdf-iroh-s3-cert-sync"]
+            "units": ["tdf-iroh-s3", "tdf-iroh-s3-cert-sync"],
+            "retention_in_days": 90
           }
         ]
       }
