@@ -31,12 +31,12 @@ The node always authenticates the publisher (the checks above, except the entitl
 **The request.** The node sends one AuthZEN evaluation through the same client as the catalog: action `publish` (not the catalog's `[catalog.authz] action`) on a resource of type `publisher`, carrying `[publishing] entitlement` as its `attribute_value_fqns`. Per draft-arkavo-authzen-cwt-00, the entity chain is:
 
 1. the verified person;
-2. each device presented in repeated `X-Entity-Token` headers (DeviceCheck CWTs: `aud` `arkavo:devicecheck`, bound to the person). A device token that fails verification is 401 in `pdp`; in `shadow` it only means the decision service isn't asked (`Publish decision shadow: chain refused`); in `local` they are ignored;
+2. each device presented in repeated `X-Entity-Token` headers (DeviceCheck CWTs: `aud` `arkavo:devicecheck`, bound to the person), sent with its CWT as `token` for the platform to verify (arkavo-rs#97). A device token that fails verification is 401 in `pdp`; in `shadow` it only means the decision service isn't asked (`Publish decision shadow: chain refused`); in `local` they are ignored;
 3. the environment (`[catalog.authz] environment_region`).
 
 At most 8 entities. The platform withholds the grant from a suspended account, and devices narrow it as its policy says.
 
-**Pushes.** A session opened in `shadow` or `pdp` stores the chain it was decided with, never a token. A push asks again with it, reusing an answer for 30 s per chain (concurrent pushes share one request). So per push the platform re-checks its own live state, such as a suspension, but the chain's claims (the person's `arkavo_entitlements`, the devices) are those of the session's opening: a device revoked or an entitlement changed since then counts from the next session, at most `session_ttl_secs` later. A push is refused when:
+**Pushes.** A session opened in `shadow` or `pdp` stores the chain it was decided with, never a token. A push asks again with it, reusing an answer for 30 s per chain (concurrent pushes share one request). So per push the platform re-checks its own live state, such as a suspension, but the chain's claims (the person's `arkavo_entitlements`, the devices) are those of the session's opening: a device revoked or an entitlement changed since then counts from the next session, at most `session_ttl_secs` later. Having no tokens, the stored devices are dropped by arks, so a push is decided on the person and the environment. That holds only while no device requirement guards the publish grant; before one is configured, pushes need a new design (tdf-iroh-s3#44). A push is refused when:
 
 - the decision service denies it (`NotPermitted`);
 - it can't be asked (`DecisionUnavailable`);
