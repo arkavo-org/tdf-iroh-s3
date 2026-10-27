@@ -134,7 +134,10 @@ async fn main() -> Result<()> {
         Some(Arc::new(
             PublishGate::new(view)
                 .with_session_store(store)
-                .with_decider(Arc::clone(&decider)),
+                .with_decider(Arc::clone(&decider))
+                .with_session_ttl(std::time::Duration::from_secs(
+                    config.publishing.session_ttl_secs,
+                )),
         ))
     } else {
         tracing::warn!("[publishing] required = false: pushes and tag writes are open");

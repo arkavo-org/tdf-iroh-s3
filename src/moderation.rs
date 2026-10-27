@@ -36,10 +36,10 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::auth::{AuthError, CwtVerifier, VerifiedClaims, VerifyOpts, subject_id_bind};
-use crate::authz::ChainEntity;
+use crate::authz::{ChainEntity, EntityKind};
 use crate::entity_chain;
 use crate::publish_decision::{
-    PublishDecider, PublishDecisions, StoredEntity, Verdict, log_shadow, restore, strip_tokens,
+    PublishDecider, PublishDecisions, StoredEntity, Verdict, log_shadow, strip_tokens,
 };
 
 pub const DEFAULT_PUBLISH_ENTITLEMENT: &str =
@@ -209,9 +209,11 @@ struct SessionRecord {
     endpoint_id: String,
     subject: String,
     expires_at: i64,
-    /// The entity chain the session was decided with, without tokens, so a
-    /// push can be decided again (tdf-iroh-s3#35). Absent on records
-    /// written before it, and when decisions are local.
+    /// The entity chain the session was decided with, without tokens.
+    /// Present only when the decision service permitted the session, which
+    /// is what lets it push in `pdp` (tdf-iroh-s3#44). Absent on records
+    /// written before #35, when decisions are local, and when the decision
+    /// service denied or wasn't asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     chain: Option<Vec<StoredEntity>>,
 }
@@ -446,6 +448,9 @@ pub struct PublishGate {
     /// Endpoints whose last lookup found no live session, and when.
     misses: Mutex<HashMap<EndpointId, Instant>>,
     decider: Arc<PublishDecider>,
+    /// The longest a session read back from the store is held: a record's
+    /// `expiresAt` never extends it past what opening one grants.
+    session_ttl: Duration,
 }
 
 /// Why a push was refused.
@@ -454,11 +459,6 @@ pub enum PushRefusal {
     NoSession,
     Suspended,
     Blocked,
-    /// The decision service denied the session's subject.
-    NotPermitted,
-    /// The decision service couldn't be asked (`decisions = pdp` fails
-    /// closed).
-    DecisionUnavailable,
 }
 
 impl PublishGate {
@@ -471,7 +471,17 @@ impl PublishGate {
             lookups: tokio::sync::Semaphore::new(SESSION_LOOKUPS),
             misses: Mutex::new(HashMap::new()),
             decider: Arc::new(PublishDecider::default()),
+            session_ttl: Duration::from_secs(
+                crate::config::PublishingConfig::default().session_ttl_secs,
+            ),
         }
+    }
+
+    /// Cap sessions read back from the store at `ttl`, the TTL sessions are
+    /// opened with.
+    pub fn with_session_ttl(mut self, ttl: Duration) -> Self {
+        self.session_ttl = ttl;
+        self
     }
 
     /// Decide pushes with `decider` as well (tdf-iroh-s3#35).
@@ -608,7 +618,7 @@ impl PublishGate {
         self.open_session_with_chain(
             *endpoint,
             &record.subject,
-            Duration::from_secs(left as u64),
+            Duration::from_secs(left as u64).min(self.session_ttl),
             record.chain.clone(),
         );
         Some((canonical_subject(&record.subject).to_string(), record.chain))
@@ -634,57 +644,47 @@ impl PublishGate {
                 .await
                 .ok_or(PushRefusal::NoSession)?,
         };
-        // In `shadow` a suspension is refused after the decision is logged.
-        let suspended = self.moderation.is_suspended(&subject);
-        if suspended && self.decider.mode() != PublishDecisions::Shadow {
+        if self.moderation.is_suspended(&subject) {
             return Err(PushRefusal::Suspended);
         }
         if self.moderation.is_blocked(hash_hex) {
             return Err(PushRefusal::Blocked);
         }
-        self.decide_push(&subject, chain.as_deref(), !suspended)
-            .await?;
-        if suspended {
-            return Err(PushRefusal::Suspended);
-        }
+        self.decided_session(&subject, chain.as_deref())?;
         Ok((subject, endpoint))
     }
 
-    /// Ask the decision service again for a push, with the chain its session
-    /// was decided with (reused for 30 s per chain). So a suspension
-    /// stops pushes without waiting for the session to expire.
-    async fn decide_push(
+    /// A push is decided by its session (tdf-iroh-s3#44): the decision
+    /// service is not asked again. In `pdp` it permitted the session when it
+    /// opened, and that holds until the session expires, at most
+    /// `session_ttl_secs` later. So a suspension made at the platform stops
+    /// pushes from the next session; a local one stops them at once. Only a
+    /// session the decision service permitted stores a chain, and its person
+    /// is the session's subject.
+    fn decided_session(
         &self,
         subject: &str,
         chain: Option<&[StoredEntity]>,
-        local_permits: bool,
     ) -> Result<(), PushRefusal> {
-        let mode = self.decider.mode();
-        if mode == PublishDecisions::Local {
+        if self.decider.mode() != PublishDecisions::Pdp {
             return Ok(());
         }
         let Some(chain) = chain else {
-            // A session opened before decisions were asked, or by a node
-            // that decided locally, has nothing to ask with.
-            if mode == PublishDecisions::Pdp {
-                warn!(%subject, "Session has no stored chain; push refused");
-                return Err(PushRefusal::NoSession);
-            }
-            warn!(%subject, "Publish decision shadow: session has no stored chain");
-            return Ok(());
+            // Opened before decisions were asked, or by a node that decided
+            // locally: the decision service never permitted it.
+            warn!(%subject, "Session has no stored chain; push refused");
+            return Err(PushRefusal::NoSession);
         };
-        let verdict = self.decider.ask_for_push(&restore(chain)).await;
-        match mode {
-            PublishDecisions::Shadow => {
-                log_shadow("push", subject, local_permits, verdict);
-                Ok(())
-            }
-            _ => match verdict {
-                Verdict::Permit => Ok(()),
-                Verdict::Deny => Err(PushRefusal::NotPermitted),
-                Verdict::Unavailable => Err(PushRefusal::DecisionUnavailable),
-            },
+        let person = chain
+            .iter()
+            .find(|e| e.kind == EntityKind::Subject)
+            .and_then(|e| e.claims.get("sub"))
+            .and_then(serde_json::Value::as_str);
+        if person.is_none_or(|p| canonical_subject(p) != canonical_subject(subject)) {
+            warn!(%subject, "Session's stored chain is not its subject's; push refused");
+            return Err(PushRefusal::NoSession);
         }
+        Ok(())
     }
 }
 
@@ -799,7 +799,10 @@ impl PublishPolicy {
                 };
                 log_shadow("publisher", &claims.sub, local.is_ok(), verdict);
                 local.map_err(|(status, reason)| refuse(status, reason))?;
-                Ok((claims, chain.ok()))
+                // Only a session the decision service permitted keeps its
+                // chain: after a switch to `pdp`, the only kind a push takes.
+                let chain = chain.ok().filter(|_| verdict == Verdict::Permit);
+                Ok((claims, chain))
             }
             PublishDecisions::Pdp => {
                 let chain = self
@@ -1633,6 +1636,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pdp_pushes_need_a_stored_chain_whose_person_is_the_session_subject() {
+        let (h, _) = deciding(PublishDecisions::Pdp);
+        let ep = endpoint();
+        let other = other_instance(&h).with_decider(Arc::clone(&h.gate.decider));
+        other.connected(1, Some(ep));
+        let push = |chain: serde_json::Value| {
+            let record = serde_json::json!({
+                "endpointId": ep.to_string(),
+                "subject": "u1",
+                "expiresAt": now_secs() + 60,
+                "chain": chain,
+            });
+            h.store.records.lock().unwrap().insert(
+                format!("sessions/{ep}"),
+                Bytes::from(serde_json::to_vec(&record).unwrap()),
+            );
+            other.misses.lock().unwrap().clear();
+            other.sessions.lock().unwrap().clear();
+            other.authorize_push(1, "a")
+        };
+
+        for (chain, why) in [
+            (serde_json::json!([]), "empty"),
+            (
+                serde_json::json!([{ "kind": "device", "claims": { "sub": "u1" } }]),
+                "no person",
+            ),
+            (
+                serde_json::json!([{ "kind": "subject", "claims": { "sub": "arkavo:u2" } }]),
+                "another person's",
+            ),
+        ] {
+            assert_eq!(push(chain).await, Err(PushRefusal::NoSession), "{why}");
+        }
+        let own = serde_json::json!([{ "kind": "subject", "claims": { "sub": "arkavo:u1" } }]);
+        assert!(push(own).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_stored_session_is_held_no_longer_than_sessions_are_opened_for() {
+        let h = harness();
+        let ep = endpoint();
+        let record = serde_json::json!({
+            "endpointId": ep.to_string(),
+            "subject": "u1",
+            "expiresAt": now_secs() + 86_400,
+        });
+        h.store.records.lock().unwrap().insert(
+            format!("sessions/{ep}"),
+            Bytes::from(serde_json::to_vec(&record).unwrap()),
+        );
+        let other = other_instance(&h).with_session_ttl(Duration::from_secs(60));
+        other.connected(1, Some(ep));
+        assert!(other.authorize_push(1, &"a".repeat(64)).await.is_ok());
+        let expires = other.sessions.lock().unwrap()[&ep].expires;
+        assert!(expires <= Instant::now() + Duration::from_secs(60));
+    }
+
+    #[tokio::test]
     async fn a_missing_session_is_looked_up_once_then_refused_from_memory() {
         use std::sync::atomic::Ordering;
         let h = harness();
@@ -2105,7 +2167,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pdp_sessions_store_the_chain_without_tokens_and_pushes_are_decided_again() {
+    async fn pdp_sessions_store_the_chain_without_tokens_and_pushes_trust_the_session() {
         let (h, pdp) = deciding(PublishDecisions::Pdp);
         let sk = key();
         let ep = sk.public();
@@ -2125,23 +2187,19 @@ mod tests {
             ]
         );
 
-        // Another instance reads the session back and asks the PDP again.
+        // Another instance reads the session back; the PDP isn't asked again.
         let other = other_instance(&h).with_decider(Arc::clone(&h.gate.decider));
         other.connected(1, Some(ep));
         let before = pdp.calls.load(std::sync::atomic::Ordering::SeqCst);
         assert!(other.authorize_push(1, &"a".repeat(64)).await.is_ok());
-        assert_eq!(
-            pdp.calls.load(std::sync::atomic::Ordering::SeqCst),
-            before + 1
-        );
+        assert_eq!(pdp.calls.load(std::sync::atomic::Ordering::SeqCst), before);
     }
 
     #[tokio::test]
-    async fn pdp_pushes_are_refused_when_denied_unavailable_or_without_a_stored_chain() {
-        for (answer, want) in [
-            (DENY, PushRefusal::NotPermitted),
-            (DOWN, PushRefusal::DecisionUnavailable),
-        ] {
+    async fn pdp_pushes_hold_for_the_permitted_session_and_need_one() {
+        // The session's Permit holds whatever the PDP says later, until the
+        // session expires (tdf-iroh-s3#44).
+        for answer in [DENY, DOWN] {
             let (h, pdp) = deciding(PublishDecisions::Pdp);
             let sk = key();
             let tok = creator("arkavo:u1");
@@ -2150,11 +2208,12 @@ mod tests {
             assert_eq!(status, StatusCode::CREATED);
             set(&pdp, answer);
             h.gate.connected(1, Some(sk.public()));
-            assert_eq!(h.gate.authorize_push(1, &"a".repeat(64)).await, Err(want));
+            assert!(h.gate.authorize_push(1, &"a".repeat(64)).await.is_ok());
+            assert_eq!(pdp.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         }
 
-        // A session opened without a chain (before this change) has nothing
-        // to ask with.
+        // A session the PDP never permitted (opened while decisions were
+        // local) has no chain, and pushes on it are refused.
         let (h, _) = deciding(PublishDecisions::Pdp);
         let ep = endpoint();
         h.gate
@@ -2177,6 +2236,11 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED);
         h.gate.connected(1, Some(sk.public()));
         assert!(h.gate.authorize_push(1, &"a".repeat(64)).await.is_ok());
+        // The PDP denied it, so it keeps no chain: after a switch to `pdp`
+        // its pushes would be refused.
+        let raw = h.store.records.lock().unwrap()[&format!("sessions/{}", sk.public())].clone();
+        let stored: SessionRecord = serde_json::from_slice(&raw).unwrap();
+        assert!(stored.chain.is_none());
 
         // Not entitled locally, permitted by the PDP: refused.
         set(&pdp, PERMIT);
@@ -2272,13 +2336,14 @@ mod tests {
         assert_eq!(body["error"], "publishing suspended");
         assert_eq!(pdp.calls.load(Ordering::SeqCst), before + 1);
 
-        // So does a push on the session opened before the suspension.
+        // A push on the session opened before the suspension is refused
+        // without asking.
         h.gate.connected(1, Some(sk.public()));
         assert_eq!(
             h.gate.authorize_push(1, &"a".repeat(64)).await,
             Err(PushRefusal::Suspended)
         );
-        assert_eq!(pdp.calls.load(Ordering::SeqCst), before + 2);
+        assert_eq!(pdp.calls.load(Ordering::SeqCst), before + 1);
     }
 
     #[tokio::test]
