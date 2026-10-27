@@ -115,8 +115,8 @@ tag_prefix = "catalog/"
 passkey_rp_id = "identity.arkavo.net"
 passkey_status_url = "https://identity.arkavo.net/passkeys/credentials/{credentialId}/status"
 
-# Optional: HTTPS terminated by the node itself (rustls). The plain
-# listener above then binds to 127.0.0.1 only. On EC2,
+# Optional: HTTPS terminated by the node itself (rustls, TLS 1.3 only).
+# The plain listener above then binds to 127.0.0.1 only. On EC2,
 # tdf-iroh-s3-cert-sync exports the exportable ACM certificate into these
 # files at boot, right after the node starts, and then every 12h; the node
 # reloads them when they change.
@@ -277,7 +277,8 @@ On a node with `[publishing] required = false`, writes still need a token
 that verifies; the entitlement, service-token and suspension checks are
 skipped, and nothing is blocked.
 
-TLS terminates in the node when `[http.tls]` is set. The ACM certificate
+TLS terminates in the node when `[http.tls]` is set, and only TLS 1.3 is
+offered: a TLS 1.2 client is refused in the handshake. The ACM certificate
 must be requested with `--options Export=ENABLED`, and the instance role
 needs `acm:ExportCertificate` on it. The systemd unit grants
 `CAP_NET_BIND_SERVICE` so the service user can bind 443.

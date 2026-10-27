@@ -412,9 +412,9 @@ pub struct HttpConfig {
     pub passkey_status_url: String,
 }
 
-/// TLS for the HTTP API, terminated by the node (rustls). The PEM cert
-/// chain and key are read from disk and reloaded when either file changes;
-/// on EC2 `tdf-iroh-s3-cert-sync` keeps them current from ACM.
+/// TLS for the HTTP API, terminated by the node (rustls, TLS 1.3 only). The
+/// PEM cert chain and key are read from disk and reloaded when either file
+/// changes; on EC2 `tdf-iroh-s3-cert-sync` keeps them current from ACM.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TlsConfig {
     #[serde(default = "default_https_bind_port")]
