@@ -12,6 +12,8 @@ ExecStart=/usr/local/bin/tdf-iroh-s3 --config /etc/tdf-iroh-s3/config.toml
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
+# Plain log lines (no ANSI colors) in the journal and CloudWatch Logs.
+Environment=NO_COLOR=1
 
 # Bind 443 for the HTTPS API as the unprivileged service user.
 AmbientCapabilities=CAP_NET_BIND_SERVICE

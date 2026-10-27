@@ -308,6 +308,15 @@ for example from a `-var-file`. A systemd unit runs it with
 `--config /etc/tdf-iroh-s3/config.toml`; on first boot the bootstrap
 script writes that file from EC2 user-data when it does not exist.
 
+The AMI also runs the CloudWatch agent, which sends the journal of
+`tdf-iroh-s3` and `tdf-iroh-s3-cert-sync`, including systemd's lines about
+them (exits, restarts), to the CloudWatch Logs group `tdf-iroh-s3`, one
+stream per instance ID, so the logs outlive the instance. Create the group,
+with the retention you want, before the first boot, and give the instance
+role `logs:CreateLogStream`, `logs:PutLogEvents` and
+`logs:DescribeLogStreams` on it. Without them the node runs as before and
+the agent logs its own errors.
+
 Everything the node serves lives in S3, so replacing an instance loses
 nothing, and several nodes can serve one bucket. The data volume only
 stages pushes: keep at least (pushes expected at once +

@@ -88,6 +88,11 @@ build {
     destination = "/tmp/tdf-iroh-s3-cert-sync.timer"
   }
 
+  provisioner "file" {
+    source      = "files/amazon-cloudwatch-agent.json"
+    destination = "/tmp/amazon-cloudwatch-agent.json"
+  }
+
   provisioner "shell" {
     script          = "scripts/setup-user.sh"
     execute_command = "sudo bash '{{.Path}}'"
