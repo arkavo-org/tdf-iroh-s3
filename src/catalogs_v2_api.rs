@@ -5,7 +5,7 @@
 //!   The document is a ZTDF envelope whose payload is the
 //!   `arkavo.creator-catalog/2` document, under one attribute
 //!   (`catalog_metadata::check_envelope`); the node never decrypts it and
-//!   checks the entries through the index, which it stores at
+//!   checks the recordings it lists through the index, which it stores at
 //!   `catalog-indexes/<hash>` and never serves. The document is stored
 //!   under `catalog-documents/<blake3>` with its BAO outboard, so it is
 //!   served over iroh; the bundle replaces `catalog-pointers/<sub>` only
@@ -377,10 +377,10 @@ async fn put_catalog<S: TagStore>(
         ));
     }
 
-    // 5. The index: the entries the envelope holds, which the node can't
-    //    read. Nothing blocked, every payload and metadata TDF ingested at
-    //    its size, each metadata TDF fitting its recording, each recording
-    //    carrying the envelope's attribute.
+    // 5. The index: the recordings the envelope lists, which the node can't
+    //    read. Nothing blocked, every payload ingested at its size with a
+    //    stored manifest, each recording carrying the envelope's attribute.
+    //    The metadata TDFs inside the envelope are Creator's to check.
     let index = req.index.clone();
     let entries = creator_catalog::parse_index(req.index).map_err(|why| {
         reject(
