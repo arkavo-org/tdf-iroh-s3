@@ -485,12 +485,6 @@ async fn put_catalog<S: TagStore>(
         )
         .await
         .map_err(|e| storage_unavailable("Catalog index write", e))?;
-    if let Some(id) = &campaign {
-        api.store
-            .put_campaign_creator(id, &sub)
-            .await
-            .map_err(|e| storage_unavailable("Campaign creator write", e))?;
-    }
     let bundle = serde_json::to_vec(&req.bundle).expect("bundle serializes");
     let written = api
         .store
@@ -502,6 +496,14 @@ async fn put_catalog<S: TagStore>(
             StatusCode::CONFLICT,
             "seq must be greater than the stored seq: another publish won".into(),
         ));
+    }
+    // Only a publish that took effect names the campaign's creator. The
+    // catalog is live either way, so a failed write only leaves the creator
+    // out of listings until the next publish.
+    if let Some(id) = &campaign
+        && let Err(e) = api.store.put_campaign_creator(id, &sub).await
+    {
+        warn!(%sub, campaign = %id, error = %e, "Recording the campaign's creator failed");
     }
 
     info!(%sub, seq = pointer.seq, %hash, size, entries, %attribute, "Catalog v2 published");
@@ -1538,6 +1540,8 @@ mod tests {
         assert_eq!(r.status, StatusCode::CONFLICT);
         assert!(r.error().contains("another publish won"));
         assert!(h.store.catalog_pointers.lock().await.is_empty());
+        // A publish that didn't take effect names no creator.
+        assert!(h.store.campaign_creators.lock().await.is_empty());
     }
 
     #[tokio::test]

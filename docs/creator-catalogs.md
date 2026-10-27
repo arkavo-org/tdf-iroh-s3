@@ -301,7 +301,7 @@ The node checks the following in order:
 | The stored pointer is the base named by `If-Match` or `If-None-Match`, if either is sent | 412 `catalog changed since it was read` |
 | `seq` is greater than the stored one | 409 `seq must be greater than <n>` |
 
-The node then stores the envelope at `catalog-documents/<blake3>` with its BAO outboard at `catalog-outboards/<blake3>`, the index at `catalog-indexes/<blake3>` (never served), for a campaign envelope the creator at `campaign-creators/<campaign id>`, and then the bundle at `catalog-pointers/<sub>`. `GET /catalog/<campaign id>` names that creator (`creator`) to a reader the decision service entitles to the campaign attribute, so a viewer can find `GET /v2/catalogs/<creator>`. The pointer is written only if no other publish replaced it in the meantime; otherwise 409 `seq must be greater than the stored seq: another publish won`. Read the pointer again and retry.
+The node then stores the envelope at `catalog-documents/<blake3>` with its BAO outboard at `catalog-outboards/<blake3>`, the index at `catalog-indexes/<blake3>` (never served), then the bundle at `catalog-pointers/<sub>`, and, once that has taken effect, for a campaign envelope the creator at `campaign-creators/<campaign id>`. `GET /catalog/<campaign id>` names that creator (`creator`) to a reader the decision service entitles to the campaign attribute, so a viewer can find `GET /v2/catalogs/<creator>`. The pointer is written only if no other publish replaced it in the meantime; otherwise 409 `seq must be greater than the stored seq: another publish won`. Read the pointer again and retry.
 
 200: `{"owner":"<sub>","seq":<n>,"hash":"<blake3 hex>","size":<bytes>}`.
 
