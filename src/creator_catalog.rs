@@ -2,13 +2,13 @@
 //! /v2/catalogs/{sub}` (tdf-iroh-s3#39).
 //!
 //! The catalog document itself, `arkavo.creator-catalog/2`, is the payload
-//! of a ZTDF envelope (`catalog_envelope`) the node never decrypts, so the
-//! node checks the entries it can't read through the index the publisher
-//! sends with it: the same entry objects, held to the same rules as the
-//! document's (`docs/creator-catalogs.md`). Each entry names a recording by
-//! hash and size and its metadata TDF (title, publish time, attributes) by
-//! `metadataHash`. Strict, because readers apply the same rules to the
-//! document: unknown and duplicate keys are refused.
+//! of a ZTDF envelope (`catalog_metadata::check_envelope`) the node never
+//! decrypts, so the node checks the recordings it lists through the index
+//! the publisher sends with it (`docs/creator-catalogs.md`). Each document
+//! entry names a recording by hash and size and carries its metadata TDF
+//! (title, publish time, attributes) inline; an index entry is the same
+//! entry without the metadata, which only Creator and the viewer read.
+//! Strict: unknown and duplicate keys are refused.
 //!
 //! Pure: no I/O, so every rule is a plain unit test.
 
@@ -17,8 +17,9 @@ use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-/// Largest catalog document (the envelope ZTDF), in bytes.
-pub const MAX_CATALOG_BYTES: usize = 524_288;
+/// Largest catalog document (the envelope ZTDF), in bytes: 4 MiB, room for
+/// 1000 entries with their metadata TDFs inline.
+pub const MAX_CATALOG_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_ENTRIES: usize = 1000;
 pub const MAX_OWNER_BYTES: usize = 248;
 pub const MAX_CONTENT_ID_BYTES: usize = 256;
@@ -27,44 +28,20 @@ pub const MAX_VERSION: u64 = 9_007_199_254_740_991;
 /// 4 GiB − 1 (`u32::MAX`): the largest TDF a catalog may name, and the
 /// default `[validation] max_blob_bytes` (`config::DEFAULT_MAX_BLOB_BYTES`).
 pub const MAX_PAYLOAD_SIZE: u64 = 4_294_967_295;
-/// Largest metadata TDF an entry may name: the iOS viewer's limit, so the
-/// node accepts no entry it would hide. A metadata TDF at every entry limit
-/// (32 FQNs of 512 bytes, a 512-byte title, one KAS) is about 43 KB.
-pub const MAX_METADATA_SIZE: u64 = 65_536;
-
 /// One published recording: what the node checks at publish.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CreatorCatalogEntry {
+    #[serde(rename = "contentID")]
     pub content_id: String,
     pub version: u64,
     /// BLAKE3 hash of the TDF bytes, 64 lowercase hex characters.
     pub payload_hash: String,
     pub payload_size: u64,
-    pub metadata: EntryMetadata,
-}
-
-/// An entry's metadata TDF.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EntryMetadata {
-    pub hash: String,
-    pub size: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct Entry {
-    #[serde(rename = "contentID")]
-    content_id: String,
-    version: u64,
-    payload_hash: String,
-    payload_size: u64,
-    metadata_hash: String,
-    metadata_size: u64,
 }
 
 /// Parse and validate an index: an array of at most [`MAX_ENTRIES`] entries
-/// with unique `contentID`s, each `metadataHash` unique and never any
-/// entry's `payloadHash`. The caller has already refused duplicate keys
+/// with unique `contentID`s. The caller has already refused duplicate keys
 /// ([`NoDuplicateKeys`]) in the bytes it came from. The error is the reason
 /// the HTTP layer reports as `invalid index: <reason>`.
 pub fn parse_index(index: serde_json::Value) -> Result<Vec<CreatorCatalogEntry>, String> {
@@ -85,12 +62,11 @@ pub fn parse_index(index: serde_json::Value) -> Result<Vec<CreatorCatalogEntry>,
         }
         entries.push(e);
     }
-    validate_metadata_hashes(&entries)?;
     Ok(entries)
 }
 
 fn entry(raw: serde_json::Value) -> Result<CreatorCatalogEntry, String> {
-    let e: Entry = serde_json::from_value(raw).map_err(|e| e.to_string())?;
+    let e: CreatorCatalogEntry = serde_json::from_value(raw).map_err(|e| e.to_string())?;
     if !valid_identifier(&e.content_id, MAX_CONTENT_ID_BYTES) {
         return Err(format!(
             "contentID must be 1-{MAX_CONTENT_ID_BYTES} bytes of [A-Za-z0-9:._@-] without \"..\""
@@ -109,50 +85,7 @@ fn entry(raw: serde_json::Value) -> Result<CreatorCatalogEntry, String> {
             "payloadSize must be an integer from 1 to {MAX_PAYLOAD_SIZE}"
         ));
     }
-    if !is_lower_hex_hash(&e.metadata_hash) {
-        return Err("metadataHash must be 64 lowercase hex characters".to_string());
-    }
-    if !(1..=MAX_METADATA_SIZE).contains(&e.metadata_size) {
-        return Err(format!(
-            "metadataSize must be an integer from 1 to {MAX_METADATA_SIZE}"
-        ));
-    }
-    Ok(CreatorCatalogEntry {
-        content_id: e.content_id,
-        version: e.version,
-        payload_hash: e.payload_hash,
-        payload_size: e.payload_size,
-        metadata: EntryMetadata {
-            hash: e.metadata_hash,
-            size: e.metadata_size,
-        },
-    })
-}
-
-/// Each `metadataHash` is unique and never any entry's `payloadHash`, so
-/// one TDF is never both a recording and metadata.
-fn validate_metadata_hashes(entries: &[CreatorCatalogEntry]) -> Result<(), String> {
-    let payloads: HashMap<&str, usize> = entries
-        .iter()
-        .enumerate()
-        .rev()
-        .map(|(i, e)| (e.payload_hash.as_str(), i))
-        .collect();
-    let mut seen: HashMap<&str, usize> = HashMap::with_capacity(entries.len());
-    for (i, e) in entries.iter().enumerate() {
-        let m = &e.metadata;
-        if let Some(first) = seen.insert(m.hash.as_str(), i) {
-            return Err(format!(
-                "entries[{i}].metadataHash duplicates entries[{first}].metadataHash"
-            ));
-        }
-        if let Some(j) = payloads.get(m.hash.as_str()) {
-            return Err(format!(
-                "entries[{i}].metadataHash equals entries[{j}].payloadHash"
-            ));
-        }
-    }
-    Ok(())
+    Ok(e)
 }
 
 /// `owner` and `contentID`: `[A-Za-z0-9:._@-]{1,max}`, never `.` and never
@@ -267,8 +200,8 @@ impl<'de> Visitor<'de> for NoDuplicateKeysVisitor {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    /// ArkavoKit's shared catalog vectors of `kind` (ArkavoCatalog 0.9.0,
-    /// `Tests/ArkavoCatalogTests/Vectors/catalog-vectors.json`), so the node
+    /// ArkavoKit's shared catalog vectors of `kind`
+    /// (`Tests/ArkavoCatalogTests/Vectors/catalog-vectors.json`), so the node
     /// and the Swift readers agree: (name, valid, bytes).
     pub fn vectors(kind: &str) -> Vec<(String, bool, Vec<u8>)> {
         use base64::Engine as _;
@@ -300,20 +233,16 @@ pub(crate) mod test_support {
         vectors
     }
 
-    /// The `metadataSize` of [`entry`].
-    pub const METADATA_SIZE: u64 = 2148;
     /// The `payloadSize` of [`entry`].
     pub const PAYLOAD_SIZE: u64 = 7_342_067;
 
-    /// A valid index entry for `payload` and `metadata`, as a JSON value.
-    pub fn entry(content_id: &str, payload: &str, metadata: &str) -> serde_json::Value {
+    /// A valid index entry for `payload`, as a JSON value.
+    pub fn entry(content_id: &str, payload: &str) -> serde_json::Value {
         serde_json::json!({
             "contentID": content_id,
             "version": 1,
             "payloadHash": payload,
             "payloadSize": PAYLOAD_SIZE,
-            "metadataHash": metadata,
-            "metadataSize": METADATA_SIZE,
         })
     }
 }
@@ -328,10 +257,6 @@ mod tests {
         "4f".repeat(32)
     }
 
-    fn meta() -> String {
-        "6d".repeat(32)
-    }
-
     /// As the route parses it: duplicate keys refused in the bytes, then
     /// the value.
     fn parse(bytes: &[u8]) -> Result<Vec<CreatorCatalogEntry>, String> {
@@ -344,7 +269,7 @@ mod tests {
     }
 
     fn entry_with(f: impl FnOnce(&mut Value)) -> Vec<u8> {
-        let mut e = entry("rec-1", &hash(), &meta());
+        let mut e = entry("rec-1", &hash());
         f(&mut e);
         index(vec![e])
     }
@@ -357,19 +282,17 @@ mod tests {
     fn the_contract_example_is_valid() {
         let entries = parse(
             br#"[ { "contentID": "rec-2b9c4f1e0d8a4c7f", "version": 2,
-                 "payloadHash": "4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a", "payloadSize": 7342067,
-                 "metadataHash": "6d0e6d0e6d0e6d0e6d0e6d0e6d0e6d0e6d0e6d0e6d0e6d0e6d0e6d0e6d0e6d0e", "metadataSize": 2148 } ]"#,
+                 "payloadHash": "4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a4f8a", "payloadSize": 7342067 } ]"#,
         )
         .unwrap();
-        assert_eq!(entries[0].content_id, "rec-2b9c4f1e0d8a4c7f");
-        assert_eq!(entries[0].version, 2);
-        assert_eq!(entries[0].payload_size, 7_342_067);
         assert_eq!(
-            entries[0].metadata,
-            EntryMetadata {
-                hash: "6d0e".repeat(16),
-                size: 2148
-            }
+            entries,
+            vec![CreatorCatalogEntry {
+                content_id: "rec-2b9c4f1e0d8a4c7f".into(),
+                version: 2,
+                payload_hash: "4f8a".repeat(16),
+                payload_size: 7_342_067,
+            }]
         );
     }
 
@@ -392,8 +315,13 @@ mod tests {
 
     #[test]
     fn an_entry_has_exactly_its_own_keys() {
-        // `/1`'s display fields are in the metadata TDF.
+        // The metadata stays in the envelope; neither its TDF nor a hash of
+        // it, nor `/1`'s display fields, belongs in the index.
         for (key, value) in [
+            ("metadata", json!("AAAA")),
+            ("metadataHash", json!("6d".repeat(32))),
+            ("metadataSize", json!(2148)),
+            ("metadataManifest", json!("e30")),
             ("title", json!("Studio session")),
             ("publishedAt", json!("2026-10-16T14:30:00Z")),
             ("attributeFQNs", json!([])),
@@ -402,14 +330,7 @@ mod tests {
             let r = reason(&entry_with(|e| e[key] = value.clone()));
             assert!(r.contains("unknown field"), "{key}: {r}");
         }
-        for key in [
-            "contentID",
-            "version",
-            "payloadHash",
-            "payloadSize",
-            "metadataHash",
-            "metadataSize",
-        ] {
+        for key in ["contentID", "version", "payloadHash", "payloadSize"] {
             let r = reason(&entry_with(|e| {
                 e.as_object_mut().unwrap().remove(key);
             }));
@@ -425,14 +346,14 @@ mod tests {
 
     #[test]
     fn duplicate_keys_are_refused() {
-        let (h, m) = (hash(), meta());
+        let h = hash();
         let repeated = format!(
-            r#"[{{"contentID":"x","version":1,"version":2,"payloadHash":"{h}","payloadSize":1,"metadataHash":"{m}","metadataSize":1}}]"#
+            r#"[{{"contentID":"x","version":1,"version":2,"payloadHash":"{h}","payloadSize":1}}]"#
         );
         assert!(reason(repeated.as_bytes()).contains("duplicate key `version`"));
         // An escaped spelling of the same key is the same key.
         let escaped = format!(
-            r#"[{{"contentID":"x","\u0063ontentID":"y","version":1,"payloadHash":"{h}","payloadSize":1,"metadataHash":"{m}","metadataSize":1}}]"#
+            r#"[{{"contentID":"x","contentID":"y","version":1,"payloadHash":"{h}","payloadSize":1}}]"#
         );
         assert!(reason(escaped.as_bytes()).contains("duplicate key `contentID`"));
     }
@@ -440,8 +361,8 @@ mod tests {
     #[test]
     fn content_ids_are_unique_and_well_formed() {
         let bytes = index(vec![
-            entry("rec-1", &hash(), &meta()),
-            entry("rec-1", &"5a".repeat(32), &"7b".repeat(32)),
+            entry("rec-1", &hash()),
+            entry("rec-1", &"5a".repeat(32)),
         ]);
         assert!(reason(&bytes).contains("entries[1].contentID duplicates entries[0]"));
         for id in ["", ".", "a..b", "a/b", &"c".repeat(257)] {
@@ -452,6 +373,9 @@ mod tests {
             );
         }
         assert!(parse(&entry_with(|e| e["contentID"] = json!("c".repeat(256)))).is_ok());
+        // Two entries may name one recording.
+        let bytes = index(vec![entry("rec-1", &hash()), entry("rec-2", &hash())]);
+        assert!(parse(&bytes).is_ok());
     }
 
     #[test]
@@ -495,77 +419,10 @@ mod tests {
     }
 
     #[test]
-    fn metadata_hash_and_size_are_checked() {
-        for h in ["6D".repeat(32), "6d".repeat(31), String::new()] {
-            assert!(
-                reason(&entry_with(|e| e["metadataHash"] = json!(h))).contains("metadataHash"),
-                "{h}"
-            );
-        }
-        for ok in [json!(1), json!(65_536)] {
-            assert!(
-                parse(&entry_with(|e| e["metadataSize"] = ok.clone())).is_ok(),
-                "{ok}"
-            );
-        }
-        for bad in [json!(0), json!(65_537), json!(-1), json!(1.5), Value::Null] {
-            assert!(
-                parse(&entry_with(|e| e["metadataSize"] = bad.clone())).is_err(),
-                "{bad}"
-            );
-        }
-        assert!(
-            reason(&entry_with(|e| e["metadataSize"] = json!(65_537)))
-                .contains("metadataSize must be an integer from 1 to 65536")
-        );
-    }
-
-    #[test]
-    fn metadata_hashes_are_unique_and_never_a_payload() {
-        let (p1, p2) = ("4f".repeat(32), "5a".repeat(32));
-        let bytes = index(vec![
-            entry("rec-1", &p1, &meta()),
-            entry("rec-2", &p2, &meta()),
-        ]);
-        assert_eq!(
-            reason(&bytes),
-            "entries[1].metadataHash duplicates entries[0].metadataHash"
-        );
-        // Its own payload, or another entry's.
-        let bytes = index(vec![entry("rec-1", &p1, &p1)]);
-        assert_eq!(
-            reason(&bytes),
-            "entries[0].metadataHash equals entries[0].payloadHash"
-        );
-        let bytes = index(vec![entry("rec-1", &p1, &meta()), entry("rec-2", &p2, &p1)]);
-        assert_eq!(
-            reason(&bytes),
-            "entries[1].metadataHash equals entries[0].payloadHash"
-        );
-        let bytes = index(vec![entry("rec-1", &p1, &p2), entry("rec-2", &p2, &meta())]);
-        assert_eq!(
-            reason(&bytes),
-            "entries[0].metadataHash equals entries[1].payloadHash"
-        );
-        // Two entries may name one payload, each with its own metadata.
-        let bytes = index(vec![
-            entry("rec-1", &p1, &meta()),
-            entry("rec-2", &p1, &"7b".repeat(32)),
-        ]);
-        assert!(parse(&bytes).is_ok());
-    }
-
-    #[test]
     fn at_most_a_thousand_entries() {
         let entries = |n: usize| -> Vec<Value> {
             (0..n)
-                .map(|i| {
-                    entry(
-                        &format!("rec-{i:032x}"),
-                        &format!("{i:064x}"),
-                        &format!("{:064x}", i + 1_000_000),
-                    )
-                })
+                .map(|i| entry(&format!("rec-{i:032x}"), &format!("{i:064x}")))
                 .collect()
         };
         assert_eq!(parse(&index(entries(1000))).unwrap().len(), 1000);

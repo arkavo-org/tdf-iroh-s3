@@ -16,7 +16,7 @@ It covers four things: how a creator's recordings are published, how a viewer fi
   - Whether a viewer may play it is decided by the TDF's key access, not by the node.
 - **A creator's catalog is one `arkavo.creator-catalog/2` document listing their published recordings, encrypted as the payload of one ZTDF, the envelope.**
   - The envelope's policy names one attribute: the creator's Patreon campaign. So anyone who can play any of the creator's recordings can open the list, and nobody else.
-  - Each entry names a recording and its **metadata TDF**, which holds the title, publish time and attributes under the recording's own policy. So a viewer reads exactly the entries they could play.
+  - Each entry names a recording and carries its **metadata TDF** inline, which holds the title, publish time and attributes under the recording's own policy. So a viewer reads exactly the entries they could play, from one fetch.
   - The node stores each envelope by the BLAKE3 hash of its exact bytes and never decrypts it.
 - **The creator signs a pointer to the current envelope with their passkey** (catalog v2, below). The node serves the pointer only to a reader the platform entitles to the envelope's attribute.
 - **Readers never trust a catalog because of where it came from.** They check the signed pointer, the envelope's hash and size, and, once they decrypt it, that the document's `owner` is the creator they asked for.
@@ -34,7 +34,7 @@ The format and design are tdf-iroh-s3#38 and #39 (amended 2026-10-27). Catalog `
 
 ## Catalog document, `arkavo.creator-catalog/2`
 
-The document is UTF-8 JSON. It is the envelope's payload, so only a reader who can open the envelope sees it. The node never reads it: it checks the entries through the [index](#the-index) the publisher sends alongside.
+The document is UTF-8 JSON. It is the envelope's payload, so only a reader who can open the envelope sees it. The node never reads it: it checks the recordings it lists through the [index](#the-index) the publisher sends alongside.
 
 ```json
 {
@@ -46,8 +46,7 @@ The document is UTF-8 JSON. It is the envelope's payload, so only a reader who c
       "version": 2,
       "payloadHash": "4f8a…64 lowercase hex…",
       "payloadSize": 7342067,
-      "metadataHash": "6d0e…64 lowercase hex…",
-      "metadataSize": 2148
+      "metadata": "<base64url of the metadata ZTDF's bytes>"
     }
   ]
 }
@@ -69,21 +68,20 @@ The document is UTF-8 JSON. It is the envelope's payload, so only a reader who c
 | `version` | An integer from 1 to 9007199254740991 (2⁵³−1). A republish with different bytes uses a larger version. |
 | `payloadHash` | 64 lowercase hex characters: the BLAKE3 hash of the recording's TDF bytes. At publish, it must name a blob the node has ingested and not blocked. |
 | `payloadSize` | An integer from 1 to 4294967295 (4 GiB − 1, the viewer's limit): the TDF's size in bytes. At publish, it must equal the size `GET /blobs/<payloadHash>` reports. |
-| `metadataHash` | 64 lowercase hex characters, the BLAKE3 hash of the metadata TDF. It is unique within the document and never equals any entry's `payloadHash`. |
-| `metadataSize` | An integer from 1 to 65 536, the metadata TDF's size in bytes. This is the iOS viewer's limit. A metadata TDF at every limit (32 FQNs of 512 bytes, a 512-byte title, one KAS) is about 43 KB. |
+| `metadata` | The entry's [metadata TDF](#the-metadata-tdf): its ZTDF bytes, unpadded base64url. At most 65 536 bytes before encoding (a TDF at every limit, 32 FQNs of 512 bytes and a 512-byte title, is about 43 KB; a typical one 3–4 KB). Moderation identifies it by the BLAKE3 hash of those bytes. |
 
 **Rules for keys**
 
-- An entry has exactly these six keys. Unknown keys are rejected, at the top level and in entries, including `/1`'s `title`, `publishedAt` and `attributeFQNs`.
+- An entry has exactly these five keys. Unknown keys are rejected, at the top level and in entries, including `/1`'s `title`, `publishedAt` and `attributeFQNs`.
 - A key that appears twice in one JSON object is rejected.
 - Integers are JSON integers: `1.0` and `1e0` are rejected.
 - Entry order carries no meaning. Readers sort.
 
-The rules for the decrypted document and the metadata payload are implemented once, for Creator and the iOS viewer, in ArkavoKit's ArkavoCatalog (0.9.0). Its shared vectors (`Tests/ArkavoCatalogTests/Vectors/catalog-vectors.json`) run against the node's index and pointer parsers in this repository's tests (`tests/fixtures/arkavo-catalog-vectors.json`).
+The rules for the decrypted document, the metadata TDF and its payload are implemented once, for Creator and the iOS viewer, in ArkavoKit's ArkavoCatalog. The node never sees them.
 
 ## The envelope
 
-The catalog document is the payload of one ZTDF, the envelope. The pointer's `catalogHash` and `catalogSize` are over the envelope's bytes, and so are `GET /catalog-documents/<hash>` and the iroh fetch.
+The catalog document is the payload of one ZTDF, the envelope, at most **4 194 304 bytes** (4 MiB): room for 1000 entries with their metadata TDFs inline. The pointer's `catalogHash` and `catalogSize` are over the envelope's bytes, and so are `GET /catalog-documents/<hash>` and the iroh fetch.
 
 - Its manifest's `payload.mimeType` is exactly `application/vnd.arkavo.creator-catalog+json`.
 - Its policy has **only** the top-level keys `uuid` and `body`. The `uuid` is a non-empty string, fresh for each envelope. `body.dissem` is empty or absent.
@@ -94,21 +92,25 @@ The catalog document is the payload of one ZTDF, the envelope. The pointer's `ca
 - Its key access objects name a KAS the viewer rewraps with, normally the recordings'. The node doesn't check which.
 - **Every entry's recording policy names the envelope's attribute.** A viewer who can open an entry can always open the catalog that lists it.
 
-What stays in the clear is the envelope's manifest (one attribute, the KAS, a uuid) and each metadata TDF's manifest. Entry count, hashes, `contentID`s and per-entry attributes are not readable by someone holding a catalog hash. A hash is still a capability to fetch bytes, but the bytes are ciphertext.
+What stays in the clear is the envelope's manifest (one attribute, the KAS, a uuid). Entry count, hashes, `contentID`s, metadata and per-entry attributes are inside it, not readable by someone holding a catalog hash. A hash is still a capability to fetch bytes, but the bytes are ciphertext.
 
 ## The metadata TDF
 
-- Its payload holds the entry's title, publish time and attributes, as ArkavoCatalog defines it. Its `contentID` and `version` equal the entry's: a reader refuses metadata that names another entry.
-- Its policy has **only** the top-level keys `uuid` and `body`. The `uuid` is a non-empty string, fresh for each metadata TDF and never the envelope's: a viewer unwraps all of a catalog's metadata in one bulk rewrap, and the platform's KAS skips an entry with no policy id and refuses duplicate ids. Every manifest can be read by anyone holding its hash, so the policy must not repeat the recording's `arkavo:classification`, `arkavo:components` or any other extension.
-- Its manifest's `payload.mimeType` is `application/vnd.arkavo.catalog-entry+json`. The node indexes no blob of that type, so a metadata TDF never appears in `GET /catalog/{group}` although it carries the recording's attributes. The type tells a manifest's reader only that the blob is catalog metadata.
+Each entry's metadata TDF travels inside the envelope, in its entry's `metadata`. It is never pushed to the node, and **the node never checks it: Creator does**, with ArkavoCatalog's pre-publish check on the actual bytes, before every publish. The rules:
+
+- Its payload holds the entry's title, publish time and attributes, as ArkavoCatalog defines it. Its `contentID`, `version` and `payloadHash` equal the entry's: a reader refuses metadata that names another entry.
+- Its policy has **only** the top-level keys `uuid` and `body`. The `uuid` is a non-empty string, fresh for each metadata TDF, unique in the document, and never the recording's or the envelope's: a viewer unwraps all of a catalog's metadata in one bulk rewrap, and the platform's KAS skips an entry with no policy id and refuses duplicate ids. The policy must not repeat the recording's `arkavo:classification`, `arkavo:components` or any other extension.
+- Its manifest's `payload.mimeType` is `application/vnd.arkavo.catalog-entry+json`. Should one ever be pushed like a recording, the node indexes no blob of that type, so it never appears in `GET /catalog/{group}`.
 - Its `body.dataAttributes` and `body.dissem` equal the recording's, each as a set, and its key access objects name the same KAS URLs.
-- It is pushed and ingested like a recording, in the same publish session.
+- It is at most 65 536 bytes.
+
+A creator whose metadata TDF had a weaker policy than its recording would show that entry's title to more of their own patrons. It touches neither other creators' content nor the recordings, which keep their own policies.
 
 ## The index
 
-The node can't decrypt the envelope, so the publisher sends the document's entries in the clear alongside it, as `index` in `PUT /v2/catalogs/{sub}`: a JSON array of the same entry objects, at most 1000, held to the same rules. The node checks the entries against what it has ingested, stores the index at `catalog-indexes/<hash>` and **never serves it**. Moderation reads it to find an entry's hashes from its `contentID`.
+The node can't decrypt the envelope, so the publisher sends the document's entries in the clear alongside it, as `index` in `PUT /v2/catalogs/{sub}`: a JSON array of at most 1000 entries, each exactly `{"contentID", "version", "payloadHash", "payloadSize"}`, the document's entry without its `metadata`, held to the same rules. The node checks the recordings against what it has ingested, stores the index at `catalog-indexes/<hash>` and **never serves it**. Moderation reads it to find a recording's hash from its `contentID`.
 
-The index and the encrypted document are bound only by the creator's honesty. An entry left out of the index can only hide the creator's own entry from moderation, so reports carry `payloadHash` and `metadataHash`, not just a `contentID`.
+The index and the encrypted document are bound only by the creator's honesty. An entry left out of the index can only hide the creator's own entry from moderation, so reports carry the `payloadHash`, not just a `contentID`.
 
 ## HTTP routes
 
@@ -161,13 +163,12 @@ Creator reads the node to push to from this route. The iOS viewer does not. The 
 4. **Confirm ingest.** Poll `GET /blobs/<hash>` until it returns 200 with the expected size.
    - Wait at most 120 s.
    - A 404 after that means the node refused the push or the archive.
-   - Steps 3–4 also push and confirm the entry's [metadata TDF](#the-metadata-tdf).
 5. **Read the current catalog.**
    - `GET /v2/catalogs/<sub>` with the creator's token, keeping its `ETag`, then fetch the envelope by `catalogHash` and decrypt it. The creator holds their campaign's attribute, so they can open their own envelope.
    - A 404 means there is no catalog yet.
 6. **Merge the entry.** Find it by `contentID`.
    - If the payload hash is unchanged, keep the entry as it is.
-   - Otherwise write the new payload and metadata hashes and sizes, with `version` one higher than the old entry's, inside the metadata as well.
+   - Otherwise write the new payload hash and size and a new [metadata TDF](#the-metadata-tdf), with `version` one higher than the old entry's, inside the metadata as well.
 7. **Publish the catalog** with `PUT /v2/catalogs/<sub>` (see [Publishing (Creator)](#publishing-creator)): a new envelope, its signed pointer and the index.
 
 To remove a recording, Creator publishes the catalog without its entry. The TDF stays on the node, but no catalog lists it.
@@ -179,7 +180,7 @@ To remove a recording, Creator publishes the catalog without its entry. The TDF 
    - Verify the bundle ([Verification](#verification)), then fetch `catalogHash` over iroh with a limit of `catalogSize`, or `GET /catalog-documents/<hash>`. Fetches by hash need no token.
    - The BLAKE3 hash of the bytes must equal `catalogHash`.
    - Rewrap the envelope, decrypt it, and check the payload is a valid `/2` document whose `owner` is `<sub>`.
-   - Fetch every entry's `metadataHash` over iroh (reject one larger than `metadataSize`) and unwrap them in one bulk rewrap: at most 1000 policies per rewrap, split by size as well (arks refuses an HTTP/3 body over 2 MiB). Treat a missing per-entry result as refused. Refuse metadata whose `contentID` or `version` differs from its entry's, and show only the entries that decrypt.
+   - Unwrap every entry's inline metadata TDF in one bulk rewrap: at most 1000 policies per rewrap, split by size as well (arks refuses an HTTP/3 body over 2 MiB). Treat a missing per-entry result as refused. Refuse metadata whose `contentID`, `version` or `payloadHash` differs from its entry's, and show only the entries that decrypt.
 3. **Download a recording.** Fetch `payloadHash` over iroh, from the endpoint ID compiled into the viewer.
    - Reject the download if it is larger than `payloadSize`.
    - Verify the BLAKE3 hash before using the file.
@@ -217,7 +218,7 @@ The exact UTF-8 bytes of one JSON object. It is carried base64url-encoded and is
 | `owner` | the publisher's `sub`, byte for byte (the same rules as a catalog's `owner`) |
 | `seq` | integer, 1 to 9 007 199 254 740 991 |
 | `catalogHash` | BLAKE3 of the envelope's bytes, 64 lowercase hex characters |
-| `catalogSize` | the envelope's length in bytes, 1 to 524 288 |
+| `catalogSize` | the envelope's length in bytes, 1 to 4 194 304 |
 | `issuedAt` | `YYYY-MM-DDTHH:MM:SSZ` |
 
 The object holds exactly these keys, with no key repeated and nothing after it, and is at most 1024 bytes.
@@ -261,7 +262,7 @@ The node checks this on publish and readers check it on read. The rules are the 
 
 ### `PUT /v2/catalogs/{sub}`: publish
 
-This is the only route that publishes a catalog. The request needs `Authorization: Bearer <Arkavo CWT>` and `Content-Type: application/json`. Its body is `{"document": "<base64url envelope bytes>", "bundle": {…}, "index": [ … ]}`, at most 2 MiB: an envelope of 524 288 bytes is about 700 KiB in base64url, and an index of 1000 entries up to about 500 KiB.
+This is the only route that publishes a catalog. The request needs `Authorization: Bearer <Arkavo CWT>` and `Content-Type: application/json`. Its body is `{"document": "<base64url envelope bytes>", "bundle": {…}, "index": [ … ]}`, at most 10 MiB (10 485 760 bytes): a 4 MiB envelope is about 5.6 MiB in base64url, and an index of 1000 entries up to about 400 KiB.
 
 The request should name the base the client merged its document from, with a standard conditional header (RFC 9110). Without one, a publish signed while another device saved can replace that device's catalog.
 
@@ -277,9 +278,9 @@ The node checks the following in order:
 | The token passes the publishing checks in [publishing-and-moderation.md](publishing-and-moderation.md): the audience, the entitlement, a person rather than a service, a subject that isn't suspended. On a node with `[publishing] required = false` the token still has to verify. | 401 missing or invalid; 403 |
 | `{sub}` equals the token's `sub` | 403 `catalog does not match token subject` |
 | `Content-Type` is `application/json` (case-insensitive, parameters allowed) | 415 `content type must be application/json` |
-| The body is at most 2 MiB | 413 `request too large` |
+| The body is at most 10 MiB | 413 `request too large` |
 | The body is JSON with exactly `document`, `bundle` and `index`, and no key repeated anywhere in it | 400 `invalid request: <reason>` |
-| `document` is 1–524 288 bytes of unpadded base64url | 422 `invalid request: …` |
+| `document` is 1–4 194 304 bytes of unpadded base64url | 422 `invalid request: …` |
 | Verification steps 1–3 | 422 `invalid bundle: <reason>`; 502 `key set unavailable` |
 | The pointer names this document | 422 `invalid bundle: catalogHash or catalogSize does not match the document` |
 | `document` is a ZTDF archive (manifest and payload member, as [ingest accepts](#archive-layout-accepted-at-ingest)) | 422 `document is not a TDF` |
@@ -287,15 +288,11 @@ The node checks the following in order:
 | Its policy has only `uuid` and `body`, no `dissem`, and exactly one campaign attribute or `{sub}`'s creator attribute ([The envelope](#the-envelope)) | 422 `catalog policy must be one campaign or the creator attribute` |
 | Its policy's `uuid` is a non-empty string | 422 `catalog policy has no uuid` |
 | For a campaign attribute: the token's `arkavo_patreon` has role `creator` and a `campaign_id` (a string) equal to the envelope's campaign id. Identity sets it only for the campaign the account owns. | 403 `catalog campaign is not the publisher's` |
-| `index` is an array of at most 1000 valid entries ([entry fields](#catalog-document-arkavocreator-catalog2)): unique `contentID`, each `metadataHash` unique and never a `payloadHash` | 422 `invalid index: <reason>`, e.g. `invalid index: entries[3].metadataHash duplicates entries[1].metadataHash` |
-| Nothing blocked: the envelope's hash, no entry's `payloadHash` or `metadataHash` | 403 `content is blocked` |
-| Every `payloadHash`, then every `metadataHash`, is an ingested blob | 422 `payload <hash> is not ingested` or `metadata <hash> is not ingested`, the first missing one in entry order |
-| Every entry's `payloadSize`, then every `metadataSize`, equals the ingested blob's size, each entry checked, also entries that share a payload | 422 `payload <hash> size does not match` or `metadata <hash> size does not match` |
-| Both manifests of each entry are stored (at ingest) and readable. A recording ingested before the node stored manifests has none: push it again. | 422 `payload <hash> manifest is not stored`, `metadata <hash> manifest is not stored` or `… manifest is unreadable` |
-| The metadata policy has only `uuid` and `body`, and its `uuid` is a non-empty string | 422 `metadata <hash> policy may only hold uuid and body`; `metadata <hash> policy has no uuid` |
-| The metadata `payload.mimeType` is `application/vnd.arkavo.catalog-entry+json` | 422 `metadata <hash> is not catalog metadata` |
-| The metadata's attributes, dissemination list and KAS are the recording's | 422 `metadata <hash> policy does not match payload <hash>` |
-| No two metadata TDFs share a policy `uuid` | 422 `metadata <hash> policy uuid duplicates metadata <hash>`, the later entry, then the first with that `uuid` |
+| `index` is an array of at most 1000 valid [index entries](#the-index) with unique `contentID`s | 422 `invalid index: <reason>`, e.g. `invalid index: entries[3].contentID duplicates entries[1].contentID` |
+| Nothing blocked: the envelope's hash, no entry's `payloadHash` | 403 `content is blocked` |
+| Every `payloadHash` is an ingested blob | 422 `payload <hash> is not ingested`, the first missing one in entry order |
+| Every entry's `payloadSize` equals the ingested blob's size, each entry checked, also entries that share a payload | 422 `payload <hash> size does not match` |
+| Every recording's manifest is stored (at ingest) and readable. A recording ingested before the node stored manifests has none: push it again. | 422 `payload <hash> manifest is not stored` or `… manifest is unreadable` |
 | Every entry's recording policy names the envelope's attribute | 422 `entry <contentID> policy does not include the catalog attribute` |
 | The passkey credential is still the subject's, according to the IdP's status route | 403 `passkey credential unknown`, `… revoked` or `… belongs to another subject`; 502 `credential status unavailable` |
 | The stored pointer is the base named by `If-Match` or `If-None-Match`, if either is sent | 412 `catalog changed since it was read` |

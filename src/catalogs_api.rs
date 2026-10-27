@@ -7,7 +7,7 @@
 //!   ingested, unblocked TDF.
 //!
 //! [`check_payloads`] holds the per-entry publish checks `PUT
-//! /v2/catalogs/{sub}` runs on a catalog's index. On an ungated node
+//! /v2/catalogs/{sub}` runs on a catalog's index: the recordings it lists. On an ungated node
 //! (`[publishing] required = false`) nothing is blocked (moderation records
 //! are only loaded when gated).
 
@@ -22,7 +22,7 @@ use std::future::Future;
 use std::sync::Arc;
 use tracing::warn;
 
-use crate::catalog_metadata::{self, MetadataRefusal};
+use crate::catalog_metadata;
 use crate::creator_catalog::{CreatorCatalogEntry, is_lower_hex_hash};
 use crate::tags_api::{ApiState, TagStore, is_blocked};
 
@@ -48,15 +48,18 @@ pub fn router<S: TagStore>(state: Arc<ApiState<S>>) -> Router {
 }
 
 /// The checks for a catalog's index entries, in the contract's order:
-/// - no payload or metadata TDF blocked (403 `content is blocked`);
-/// - every one ingested (422 `payload <hash> is not ingested`, then
-///   `metadata <hash> is not ingested`, the first missing one in entry
-///   order);
-/// - every entry's sizes equal to those blobs' (422 `payload <hash> size
-///   does not match`, then `metadata <hash> size does not match`);
-/// - each metadata TDF fits its recording, and each recording carries the
-///   catalog's `attribute` (see [`check_metadata`]).
+/// - no recording blocked (403 `content is blocked`);
+/// - every one ingested (422 `payload <hash> is not ingested`, the first
+///   missing one in entry order);
+/// - every entry's size equal to that blob's (422 `payload <hash> size does
+///   not match`);
+/// - every recording's manifest stored at ingest (422 `payload <hash>
+///   manifest is not stored`) and readable (`… manifest is unreadable`);
+/// - every recording's policy names `attribute`, the envelope's (422 `entry
+///   <contentID> policy does not include the catalog attribute`): a viewer
+///   who can open an entry can open the catalog.
 ///
+/// Each entry's metadata TDF is inside the envelope; Creator checks it.
 /// Each distinct hash is looked up once, at most
 /// [`INGEST_CHECK_CONCURRENCY`] at a time.
 pub(crate) async fn check_payloads<S: TagStore>(
@@ -64,19 +67,16 @@ pub(crate) async fn check_payloads<S: TagStore>(
     entries: &[CreatorCatalogEntry],
     attribute: &str,
 ) -> Result<(), (StatusCode, String)> {
-    let metadata = || entries.iter().map(|e| &e.metadata);
-    if entries.iter().any(|e| is_blocked(state, &e.payload_hash))
-        || metadata().any(|m| is_blocked(state, &m.hash))
-    {
+    if entries.iter().any(|e| is_blocked(state, &e.payload_hash)) {
         return Err((StatusCode::FORBIDDEN, "content is blocked".to_string()));
     }
 
-    let sizes = look_up(state, hashes(entries), |store, kind, hash| async move {
+    let sizes = look_up(state, hashes(entries), |store, hash| async move {
         match store.blob_size(&hash).await {
             Ok(Some(size)) => Ok(size),
             Ok(None) => Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
-                format!("{kind} {hash} is not ingested"),
+                format!("payload {hash} is not ingested"),
             )),
             Err(e) => {
                 warn!(error = %e, "Payload ingest check failed");
@@ -97,52 +97,18 @@ pub(crate) async fn check_payloads<S: TagStore>(
             format!("payload {} size does not match", e.payload_hash),
         ));
     }
-    if let Some(m) = metadata().find(|m| sizes.get(&m.hash) != Some(&m.size)) {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("metadata {} size does not match", m.hash),
-        ));
-    }
-    check_metadata(state, entries, attribute).await
-}
 
-/// Each metadata TDF fits its recording, compared on the manifests ingest
-/// stored (`catalog_metadata`). In order:
-/// - both manifests are stored (422 `payload <hash> manifest is not
-///   stored`, then `metadata <hash> …`) and readable (`… manifest is
-///   unreadable`);
-/// - the metadata policy holds only `uuid` and `body` (422 `metadata <hash>
-///   policy may only hold uuid and body`), and its `uuid` is a non-empty
-///   string (422 `metadata <hash> policy has no uuid`);
-/// - its `payload.mimeType` is `CATALOG_ENTRY_MIME_TYPE` (422 `metadata
-///   <hash> is not catalog metadata`);
-/// - its attributes, dissemination list and KAS are the recording's (422
-///   `metadata <hash> policy does not match payload <hash>`);
-/// - no two metadata TDFs share a policy `uuid` (422 `metadata <hash> policy
-///   uuid duplicates metadata <hash>`): a viewer unwraps them all in one bulk
-///   rewrap, which refuses duplicate policy ids;
-/// - then every entry's recording policy names `attribute`, the envelope's
-///   (422 `entry <contentID> policy does not include the catalog
-///   attribute`): a viewer who can open an entry can open the catalog.
-async fn check_metadata<S: TagStore>(
-    state: &ApiState<S>,
-    entries: &[CreatorCatalogEntry],
-    attribute: &str,
-) -> Result<(), (StatusCode, String)> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-    let manifests = look_up(state, hashes(entries), |store, kind, hash| async move {
+    let manifests = look_up(state, hashes(entries), |store, hash| async move {
         match store.get_manifest(&hash).await {
             Ok(Some(bytes)) => catalog_metadata::read_manifest(&bytes).ok_or_else(|| {
                 (
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("{kind} {hash} manifest is unreadable"),
+                    format!("payload {hash} manifest is unreadable"),
                 )
             }),
             Ok(None) => Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
-                format!("{kind} {hash} manifest is not stored"),
+                format!("payload {hash} manifest is not stored"),
             )),
             Err(e) => {
                 warn!(error = %e, "Manifest read failed");
@@ -151,41 +117,6 @@ async fn check_metadata<S: TagStore>(
         }
     })
     .await?;
-    let mut policy_ids: HashMap<&str, &str> = HashMap::new();
-    for e in entries {
-        let m = &e.metadata;
-        let (Some(payload), Some(meta)) = (manifests.get(&e.payload_hash), manifests.get(&m.hash))
-        else {
-            continue;
-        };
-        catalog_metadata::check(payload, meta).map_err(|why| {
-            let msg = match why {
-                MetadataRefusal::ExtraPolicyKeys => {
-                    format!("metadata {} policy may only hold uuid and body", m.hash)
-                }
-                MetadataRefusal::NoPolicyId => format!("metadata {} policy has no uuid", m.hash),
-                MetadataRefusal::NotCatalogMetadata => {
-                    format!("metadata {} is not catalog metadata", m.hash)
-                }
-                MetadataRefusal::PolicyMismatch => format!(
-                    "metadata {} policy does not match payload {}",
-                    m.hash, e.payload_hash
-                ),
-            };
-            (StatusCode::UNPROCESSABLE_ENTITY, msg)
-        })?;
-        if let Some(id) = meta.policy_id()
-            && let Some(first) = policy_ids.insert(id, &m.hash)
-        {
-            return Err((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!(
-                    "metadata {} policy uuid duplicates metadata {first}",
-                    m.hash
-                ),
-            ));
-        }
-    }
     if let Some(e) = entries.iter().find(|e| {
         !manifests
             .get(&e.payload_hash)
@@ -202,40 +133,14 @@ async fn check_metadata<S: TagStore>(
     Ok(())
 }
 
-/// What a hash in a catalog entry names.
-#[derive(Debug, Clone, Copy)]
-enum Kind {
-    Payload,
-    Metadata,
-}
-
-impl std::fmt::Display for Kind {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(match self {
-            Kind::Payload => "payload",
-            Kind::Metadata => "metadata",
-        })
-    }
-}
-
-/// The distinct hashes `entries` name, each with what it is: every
-/// payload, then every metadata TDF, in entry order. An index never names
-/// one hash as both.
-fn hashes<'a>(
-    entries: impl IntoIterator<Item = &'a CreatorCatalogEntry> + Clone,
-) -> Vec<(Kind, String)> {
+/// The distinct recording hashes `entries` name, in entry order.
+fn hashes(entries: &[CreatorCatalogEntry]) -> Vec<String> {
     let mut seen = HashSet::new();
-    let payloads = entries
-        .clone()
-        .into_iter()
-        .map(|e| (Kind::Payload, e.payload_hash.as_str()));
-    let metadata = entries
-        .into_iter()
-        .map(|e| (Kind::Metadata, e.metadata.hash.as_str()));
-    payloads
-        .chain(metadata)
-        .filter(|(_, h)| seen.insert(*h))
-        .map(|(kind, h)| (kind, h.to_string()))
+    entries
+        .iter()
+        .map(|e| e.payload_hash.as_str())
+        .filter(|h| seen.insert(*h))
+        .map(str::to_string)
         .collect()
 }
 
@@ -243,18 +148,18 @@ fn hashes<'a>(
 /// and stop at the first refusal in `hashes` order.
 async fn look_up<S, T, F, Fut>(
     state: &ApiState<S>,
-    hashes: Vec<(Kind, String)>,
+    hashes: Vec<String>,
     f: F,
 ) -> Result<HashMap<String, T>, (StatusCode, String)>
 where
     S: TagStore,
-    F: Fn(Arc<S>, Kind, String) -> Fut,
+    F: Fn(Arc<S>, String) -> Fut,
     Fut: Future<Output = Result<T, (StatusCode, String)>>,
 {
     let mut found = HashMap::with_capacity(hashes.len());
     let mut checks = futures::stream::iter(hashes)
-        .map(|(kind, hash)| {
-            let lookup = f(Arc::clone(&state.store), kind, hash.clone());
+        .map(|hash| {
+            let lookup = f(Arc::clone(&state.store), hash.clone());
             async move { (hash, lookup.await) }
         })
         .buffered(INGEST_CHECK_CONCURRENCY);
@@ -373,10 +278,8 @@ mod tests {
     use super::*;
     use crate::auth::CwtVerifier;
     use crate::auth::test_support::keypair;
-    use crate::catalog_metadata::test_support::{
-        CAMPAIGN, KAS, manifest, metadata_manifest, metadata_policy, recording_policy,
-    };
-    use crate::creator_catalog::test_support::{METADATA_SIZE, PAYLOAD_SIZE, entry};
+    use crate::catalog_metadata::test_support::{CAMPAIGN, KAS, manifest, recording_policy};
+    use crate::creator_catalog::test_support::{PAYLOAD_SIZE, entry};
     use crate::creator_catalog::{self, CreatorCatalogEntry};
     use crate::moderation::{DEFAULT_PUBLISH_ENTITLEMENT, Moderation, PublishPolicy};
     use crate::tags_api::test_support::MemStore;
@@ -427,13 +330,8 @@ mod tests {
         format!("{n:02x}").repeat(32)
     }
 
-    fn meta(n: u8) -> String {
-        format!("{:02x}", 0x80 + n).repeat(32)
-    }
-
-    /// Ingest payload(n) (a recording) and meta(n) (its metadata TDF), each
-    /// with a stored manifest.
-    async fn ingest_pair(h: &Harness, n: u8, meta_policy: serde_json::Value, kas: &[&str]) {
+    /// Ingest payload(n), a campaign recording, with its stored manifest.
+    async fn ingest(h: &Harness, n: u8) {
         h.store
             .ingest_with_manifest(
                 &payload(n),
@@ -441,25 +339,15 @@ mod tests {
                 manifest(recording_policy(), &[KAS]),
             )
             .await;
-        h.store
-            .ingest_with_manifest(&meta(n), METADATA_SIZE, metadata_manifest(meta_policy, kas))
-            .await;
-    }
-
-    /// `metadata_policy()` with another uuid.
-    fn metadata_policy_with_id(id: &str) -> serde_json::Value {
-        let mut p = metadata_policy();
-        p["uuid"] = json!(id);
-        p
     }
 
     fn index(entries: Vec<serde_json::Value>) -> Vec<CreatorCatalogEntry> {
         creator_catalog::parse_index(json!(entries)).unwrap()
     }
 
-    /// One entry: rec-1, payload(1), meta(1).
+    /// One entry: rec-1, payload(1).
     fn one() -> Vec<CreatorCatalogEntry> {
-        index(vec![entry("rec-1", &payload(1), &meta(1))])
+        index(vec![entry("rec-1", &payload(1))])
     }
 
     async fn check(
@@ -526,27 +414,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_index_whose_metadata_fits_passes() {
+    async fn an_index_of_ingested_campaign_recordings_passes() {
         let h = harness(true);
-        ingest_pair(&h, 1, metadata_policy(), &[KAS]).await;
+        ingest(&h, 1).await;
         assert_eq!(check(&h, &one()).await, Ok(()));
         assert_eq!(check(&h, &[]).await, Ok(()));
     }
 
     #[tokio::test]
     async fn blocked_content_is_refused_before_the_ingest_check() {
-        let blocked = Err((StatusCode::FORBIDDEN, "content is blocked".to_string()));
         // payload(1) blocked and never ingested: the block answers.
         let h = harness(true);
         h.moderation.block_for_test(&payload(1));
-        assert_eq!(check(&h, &one()).await, blocked);
-        let h = harness(true);
-        ingest_pair(&h, 1, metadata_policy(), &[KAS]).await;
-        h.moderation.block_for_test(&meta(1));
-        assert_eq!(check(&h, &one()).await, blocked);
+        assert_eq!(
+            check(&h, &one()).await,
+            Err((StatusCode::FORBIDDEN, "content is blocked".to_string()))
+        );
         // An ungated node blocks nothing.
         let h = harness(false);
-        ingest_pair(&h, 1, metadata_policy(), &[KAS]).await;
+        ingest(&h, 1).await;
         h.moderation.block_for_test(&payload(1));
         assert_eq!(check(&h, &one()).await, Ok(()));
     }
@@ -555,12 +441,12 @@ mod tests {
     async fn every_payload_must_be_ingested() {
         let h = harness(true);
         for n in [1, 3] {
-            ingest_pair(&h, n, metadata_policy_with_id(&format!("u{n}")), &[KAS]).await;
+            ingest(&h, n).await;
         }
         let entries = index(vec![
-            entry("rec-1", &payload(1), &meta(1)),
-            entry("rec-2", &payload(2), &meta(2)),
-            entry("rec-3", &payload(3), &meta(3)),
+            entry("rec-1", &payload(1)),
+            entry("rec-2", &payload(2)),
+            entry("rec-3", &payload(3)),
         ]);
         assert_eq!(
             check(&h, &entries).await,
@@ -572,32 +458,32 @@ mod tests {
     async fn every_size_must_match_the_stored_blob() {
         let h = harness(true);
         for n in 1..=3 {
-            ingest_pair(&h, n, metadata_policy_with_id(&format!("u{n}")), &[KAS]).await;
+            ingest(&h, n).await;
         }
         h.store.ingest(&payload(2), PAYLOAD_SIZE - 1).await;
         h.store.ingest(&payload(3), PAYLOAD_SIZE + 1).await;
         // The first mismatching entry, in entry order, is reported.
         let entries = index(vec![
-            entry("rec-1", &payload(1), &meta(1)),
-            entry("rec-3", &payload(3), &meta(3)),
-            entry("rec-2", &payload(2), &meta(2)),
+            entry("rec-1", &payload(1)),
+            entry("rec-3", &payload(3)),
+            entry("rec-2", &payload(2)),
         ]);
         assert_eq!(
             check(&h, &entries).await,
             unprocessable(format!("payload {} size does not match", payload(3)))
         );
         // Two entries naming one payload are each checked.
-        let mut wrong = entry("rec-1b", &payload(1), &meta(2));
+        let mut wrong = entry("rec-1b", &payload(1));
         wrong["payloadSize"] = json!(PAYLOAD_SIZE + 1);
-        let entries = index(vec![entry("rec-1", &payload(1), &meta(1)), wrong]);
+        let entries = index(vec![entry("rec-1", &payload(1)), wrong]);
         assert_eq!(
             check(&h, &entries).await,
             unprocessable(format!("payload {} size does not match", payload(1)))
         );
         // An ingest failure is reported before any size mismatch.
         let entries = index(vec![
-            entry("rec-3", &payload(3), &meta(3)),
-            entry("rec-4", &payload(4), &meta(4)),
+            entry("rec-3", &payload(3)),
+            entry("rec-4", &payload(4)),
         ]);
         assert_eq!(
             check(&h, &entries).await,
@@ -609,88 +495,32 @@ mod tests {
     async fn each_distinct_hash_is_looked_up_once() {
         use std::sync::atomic::Ordering::Relaxed;
         let h = harness(true);
-        ingest_pair(&h, 1, metadata_policy(), &[KAS]).await;
-        h.store
-            .ingest_with_manifest(
-                &meta(2),
-                METADATA_SIZE,
-                metadata_manifest(metadata_policy_with_id("other"), &[KAS]),
-            )
-            .await;
-        // Two entries share one recording.
+        ingest(&h, 1).await;
+        ingest(&h, 2).await;
         let entries = index(vec![
-            entry("rec-1", &payload(1), &meta(1)),
-            entry("rec-2", &payload(1), &meta(2)),
+            entry("rec-1", &payload(1)),
+            entry("rec-1b", &payload(1)),
+            entry("rec-2", &payload(2)),
         ]);
         assert_eq!(check(&h, &entries).await, Ok(()));
-        assert_eq!(h.store.blob_lookups.load(Relaxed), 3);
-        assert_eq!(h.store.manifest_reads.load(Relaxed), 3);
+        assert_eq!(h.store.blob_lookups.load(Relaxed), 2);
+        assert_eq!(h.store.manifest_reads.load(Relaxed), 2);
     }
 
     #[tokio::test]
-    async fn metadata_must_be_ingested_unblocked_and_of_its_size() {
-        let h = harness(true);
-        h.store
-            .ingest_with_manifest(
-                &payload(1),
-                PAYLOAD_SIZE,
-                manifest(recording_policy(), &[KAS]),
-            )
-            .await;
-        assert_eq!(
-            check(&h, &one()).await,
-            unprocessable(format!("metadata {} is not ingested", meta(1)))
-        );
-        h.store
-            .ingest_with_manifest(
-                &meta(1),
-                METADATA_SIZE + 1,
-                metadata_manifest(metadata_policy(), &[KAS]),
-            )
-            .await;
-        assert_eq!(
-            check(&h, &one()).await,
-            unprocessable(format!("metadata {} size does not match", meta(1)))
-        );
-    }
-
-    #[tokio::test]
-    async fn a_missing_payload_is_reported_before_missing_metadata() {
-        let h = harness(true);
-        assert_eq!(
-            check(&h, &one()).await,
-            unprocessable(format!("payload {} is not ingested", payload(1)))
-        );
-    }
-
-    #[tokio::test]
-    async fn both_manifests_must_be_stored_and_readable() {
+    async fn every_manifest_must_be_stored_and_readable() {
         let h = harness(true);
         h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
-        h.store
-            .ingest_with_manifest(
-                &meta(1),
-                METADATA_SIZE,
-                metadata_manifest(metadata_policy(), &[KAS]),
-            )
-            .await;
         assert_eq!(
             check(&h, &one()).await,
             unprocessable(format!("payload {} manifest is not stored", payload(1)))
         );
         h.store
-            .ingest_with_manifest(
-                &payload(1),
-                PAYLOAD_SIZE,
-                manifest(recording_policy(), &[KAS]),
-            )
-            .await;
-        h.store
-            .ingest_with_manifest(&meta(1), METADATA_SIZE, b"not a manifest".to_vec())
+            .ingest_with_manifest(&payload(1), PAYLOAD_SIZE, b"not a manifest".to_vec())
             .await;
         assert_eq!(
             check(&h, &one()).await,
-            unprocessable(format!("metadata {} manifest is unreadable", meta(1)))
+            unprocessable(format!("payload {} manifest is unreadable", payload(1)))
         );
         h.store
             .down
@@ -702,114 +532,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_metadata_policy_is_minimal_and_matches_the_recording() {
-        let mut classified = metadata_policy();
-        classified["arkavo:classification"] = json!("flagged");
-        let h = harness(true);
-        ingest_pair(&h, 1, classified, &[KAS]).await;
-        assert_eq!(
-            check(&h, &one()).await,
-            unprocessable(format!(
-                "metadata {} policy may only hold uuid and body",
-                meta(1)
-            ))
-        );
-
-        // A recording's manifest, not a metadata TDF's.
-        let h = harness(true);
-        h.store
-            .ingest_with_manifest(
-                &payload(1),
-                PAYLOAD_SIZE,
-                manifest(recording_policy(), &[KAS]),
-            )
-            .await;
-        h.store
-            .ingest_with_manifest(&meta(1), METADATA_SIZE, manifest(metadata_policy(), &[KAS]))
-            .await;
-        assert_eq!(
-            check(&h, &one()).await,
-            unprocessable(format!("metadata {} is not catalog metadata", meta(1)))
-        );
-
-        let other_campaign = json!({ "uuid": "u", "body": {
-            "dataAttributes": [{ "attribute": CAMPAIGN.replace("12345678", "1") }], "dissem": [] } });
-        let open = json!({ "uuid": "u", "body": { "dataAttributes": [], "dissem": [] } });
-        for (policy, kas) in [
-            (other_campaign, &[KAS][..]),
-            (open, &[KAS][..]),
-            (metadata_policy(), &["https://other.example/kas"][..]),
-        ] {
-            let h = harness(true);
-            ingest_pair(&h, 1, policy.clone(), kas).await;
-            assert_eq!(
-                check(&h, &one()).await,
-                unprocessable(format!(
-                    "metadata {} policy does not match payload {}",
-                    meta(1),
-                    payload(1)
-                )),
-                "{policy} {kas:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn each_metadata_policy_has_its_own_uuid() {
-        let h = harness(true);
-        ingest_pair(&h, 1, metadata_policy_with_id(""), &[KAS]).await;
-        assert_eq!(
-            check(&h, &one()).await,
-            unprocessable(format!("metadata {} policy has no uuid", meta(1)))
-        );
-
-        // One bulk rewrap refuses duplicate policy ids, even across recordings.
-        let h = harness(true);
-        ingest_pair(&h, 1, metadata_policy(), &[KAS]).await;
-        ingest_pair(&h, 2, metadata_policy(), &[KAS]).await;
-        let entries = index(vec![
-            entry("rec-1", &payload(1), &meta(1)),
-            entry("rec-2", &payload(2), &meta(2)),
-        ]);
-        assert_eq!(
-            check(&h, &entries).await,
-            unprocessable(format!(
-                "metadata {} policy uuid duplicates metadata {}",
-                meta(2),
-                meta(1)
-            ))
-        );
-    }
-
-    #[tokio::test]
     async fn every_recording_carries_the_catalog_attribute() {
         let h = harness(true);
-        ingest_pair(&h, 1, metadata_policy(), &[KAS]).await;
+        ingest(&h, 1).await;
         let other = "https://patreon.arkavo.com/attr/campaign/value/99";
         assert_eq!(
             check_payloads(&h.state, &one(), other).await,
             unprocessable("entry rec-1 policy does not include the catalog attribute".into())
         );
 
-        // The first entry whose recording lacks it is named, after every
-        // metadata check passed.
+        // The first entry whose recording lacks it is named.
         let other_policy = json!({ "uuid": "r2", "body": {
             "dataAttributes": [{ "attribute": other }], "dissem": [] } });
         h.store
-            .ingest_with_manifest(
-                &payload(2),
-                PAYLOAD_SIZE,
-                manifest(other_policy.clone(), &[KAS]),
-            )
-            .await;
-        let mut meta2 = other_policy;
-        meta2["uuid"] = json!("m2");
-        h.store
-            .ingest_with_manifest(&meta(2), METADATA_SIZE, metadata_manifest(meta2, &[KAS]))
+            .ingest_with_manifest(&payload(2), PAYLOAD_SIZE, manifest(other_policy, &[KAS]))
             .await;
         let entries = index(vec![
-            entry("rec-1", &payload(1), &meta(1)),
-            entry("rec-2", &payload(2), &meta(2)),
+            entry("rec-1", &payload(1)),
+            entry("rec-2", &payload(2)),
         ]);
         assert_eq!(
             check(&h, &entries).await,

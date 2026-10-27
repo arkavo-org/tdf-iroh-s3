@@ -63,10 +63,11 @@ fn storage_unavailable(what: &str, e: anyhow::Error) -> ApiError {
 /// caller may reuse it, unlike a catalog document fetched by hash.
 pub const CATALOG_POINTER_CACHE_CONTROL: &str = "private, max-age=300";
 
-/// Largest publish body: a 512 KiB envelope in base64url (about 700 KiB),
-/// an index of 1000 entries (about 300 KiB, up to 500 KiB with the longest
-/// contentIDs) and a bundle of a few KiB.
-pub const MAX_PUT_BYTES: usize = 2 * 1024 * 1024;
+/// Largest publish body: a 4 MiB envelope (its entries' metadata TDFs
+/// inline) in base64url, about 5.6 MiB, an index of 1000 entries (up to
+/// about 400 KiB with the longest contentIDs) and a bundle of a few KiB,
+/// with room to spare.
+pub const MAX_PUT_BYTES: usize = 10 * 1024 * 1024;
 
 /// How many catalogs' attributes a node remembers; the map is cleared when
 /// it reaches this many. A stored catalog's attribute never changes.
@@ -721,11 +722,10 @@ mod tests {
     use crate::authz::Decisions;
     use crate::catalog_metadata::CATALOG_MIME_TYPE;
     use crate::catalog_metadata::test_support::{
-        CAMPAIGN, KAS, envelope_policy, envelope_tdf, manifest, metadata_manifest, metadata_policy,
-        recording_policy,
+        CAMPAIGN, KAS, envelope_policy, envelope_tdf, manifest, recording_policy,
     };
     use crate::catalog_v2::test_support as v2;
-    use crate::creator_catalog::test_support::{METADATA_SIZE, PAYLOAD_SIZE, entry};
+    use crate::creator_catalog::test_support::{PAYLOAD_SIZE, entry};
     use crate::moderation::{DEFAULT_PUBLISH_ENTITLEMENT, Moderation, PublishPolicy};
     use crate::tags_api::TagPublishing;
     use crate::tags_api::test_support::MemStore;
@@ -882,18 +882,14 @@ mod tests {
         format!("{n:02x}").repeat(32)
     }
 
-    fn meta(n: u8) -> String {
-        format!("{:02x}", 0x80 + n).repeat(32)
-    }
-
     /// A campaign envelope; `n` varies the bytes (and so the hash).
     fn envelope(n: u8) -> Vec<u8> {
         envelope_tdf(envelope_policy(CAMPAIGN), CATALOG_MIME_TYPE, &[n; 64])
     }
 
-    /// The index naming payload(1) and meta(1).
+    /// The index naming payload(1).
     fn index() -> serde_json::Value {
-        json!([entry("rec-1", &payload(1), &meta(1))])
+        json!([entry("rec-1", &payload(1))])
     }
 
     fn body_with(document: &[u8], bundle: &Bundle, index: serde_json::Value) -> Vec<u8> {
@@ -1000,9 +996,8 @@ mod tests {
         get_as(h, sub, Some(&token(READER))).await
     }
 
-    /// payload(n) (a campaign recording) and meta(n) (its metadata TDF),
-    /// each with a stored manifest.
-    async fn ingest_pair(h: &Harness, n: u8) {
+    /// payload(n), a campaign recording, with its stored manifest.
+    async fn ingest(h: &Harness, n: u8) {
         h.store
             .ingest_with_manifest(
                 &payload(n),
@@ -1010,16 +1005,11 @@ mod tests {
                 manifest(recording_policy(), &[KAS]),
             )
             .await;
-        let mut policy = metadata_policy();
-        policy["uuid"] = json!(format!("meta-{n}"));
-        h.store
-            .ingest_with_manifest(&meta(n), METADATA_SIZE, metadata_manifest(policy, &[KAS]))
-            .await;
     }
 
     async fn ingested() -> Harness {
         let h = harness();
-        ingest_pair(&h, 1).await;
+        ingest(&h, 1).await;
         h
     }
 
@@ -1125,7 +1115,7 @@ mod tests {
     #[tokio::test]
     async fn without_a_decision_service_reads_fail_closed() {
         let h = harness_with(false);
-        ingest_pair(&h, 1).await;
+        ingest(&h, 1).await;
         assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
         let r = get(&h, SUB).await;
         assert_eq!(
@@ -1242,16 +1232,7 @@ mod tests {
         let policy = json!({ "uuid": "r", "body": {
             "dataAttributes": [{ "attribute": creator }], "dissem": [] } });
         h.store
-            .ingest_with_manifest(&payload(1), PAYLOAD_SIZE, manifest(policy.clone(), &[KAS]))
-            .await;
-        let mut meta_policy = policy;
-        meta_policy["uuid"] = json!("m");
-        h.store
-            .ingest_with_manifest(
-                &meta(1),
-                METADATA_SIZE,
-                metadata_manifest(meta_policy, &[KAS]),
-            )
+            .ingest_with_manifest(&payload(1), PAYLOAD_SIZE, manifest(policy, &[KAS]))
             .await;
         let document = envelope_tdf(envelope_policy(&creator), CATALOG_MIME_TYPE, b"x");
         let r = publish(&h, 1, &document).await;
@@ -1318,7 +1299,7 @@ mod tests {
                 "invalid index: must be an array of at most 1000 entries"
             )
         );
-        let mut v1 = entry("rec-1", &payload(1), &meta(1));
+        let mut v1 = entry("rec-1", &payload(1));
         v1["title"] = json!("Studio session");
         let r = publish_index(&h, 1, &envelope(1), json!([v1])).await;
         assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1328,13 +1309,7 @@ mod tests {
             r.error()
         );
 
-        let r = publish_index(
-            &h,
-            1,
-            &envelope(1),
-            json!([entry("rec-2", &payload(2), &meta(2))]),
-        )
-        .await;
+        let r = publish_index(&h, 1, &envelope(1), json!([entry("rec-2", &payload(2))])).await;
         assert_eq!(
             (r.status, r.error()),
             (
@@ -1382,6 +1357,35 @@ mod tests {
                 .outboard_size();
         assert_eq!(outboard.len() as u64, want);
         assert!(want > 0);
+    }
+
+    #[tokio::test]
+    async fn an_envelope_of_up_to_4_mib_publishes() {
+        let h = ingested().await;
+        // Metadata TDFs travel inside the envelope, so it may hold megabytes.
+        let big = envelope_tdf(
+            envelope_policy(CAMPAIGN),
+            CATALOG_MIME_TYPE,
+            &vec![7; MAX_CATALOG_BYTES - 4096],
+        );
+        assert!(big.len() > 2 * 1024 * 1024 && big.len() <= MAX_CATALOG_BYTES);
+        let r = publish(&h, 1, &big).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+
+        let over = envelope_tdf(
+            envelope_policy(CAMPAIGN),
+            CATALOG_MIME_TYPE,
+            &vec![7; MAX_CATALOG_BYTES],
+        );
+        let r = publish(&h, 2, &over).await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(r.error().contains("1-4194304 bytes"), "{}", r.error());
+
+        let r = put(&h, SUB, &token(SUB), vec![b' '; MAX_PUT_BYTES + 1]).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::PAYLOAD_TOO_LARGE, "request too large")
+        );
     }
 
     #[tokio::test]

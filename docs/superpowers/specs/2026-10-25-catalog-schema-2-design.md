@@ -4,6 +4,16 @@
 **Issue:** tdf-iroh-s3#39, tracked in #38 (design and owner decisions there).
 **Read at:** `main` `bd97825`.
 
+## Second amendment, 2026-10-27 (owner, confirmed in the node session)
+
+**Metadata TDFs travel inside the envelope.** A document entry is `{contentID, version, payloadHash, payloadSize, metadata}`, `metadata` being the base64url of the entry's metadata ZTDF (at most 65 536 bytes). There are no metadata blobs: the node ingests none, and `metadataHash`/`metadataSize` and their rules are gone. A viewer reads a catalog with one fetch instead of 1 + N.
+
+**The metadata check moves to Creator.** The node never sees a metadata TDF, so it can't check its policy against the recording's; Creator runs ArkavoCatalog's pre-publish check on the actual bytes. A creator who got it wrong would only show their own entry's title to more of their own patrons. The index is exactly `{contentID, version, payloadHash, payloadSize}` per entry, and the node checks only the recordings: not blocked, ingested at size, manifest stored, and the envelope's attribute in each policy.
+
+**Caps.** The envelope and the pointer's `catalogSize` are 1–4 194 304 bytes (4 MiB), room for 1000 entries with typical 3–4 KB metadata TDFs; the `PUT /v2/catalogs` body is at most 10 MiB (a 4 MiB envelope is about 5.6 MiB in base64url). The pointer stays `arkavo.catalog-pointer/1`: it still names bytes by hash and size.
+
+Supersedes, below: the per-entry metadata checks, D2 (`metadataSize`), D3 (metadata blobs kept out of `GET /catalog/{group}`; ingest still skips that type) and the 524 288 and 2 MiB limits.
+
 ## Amendment, 2026-10-27
 
 **The catalog document is itself a TDF.** The `/2` document is the payload of one ZTDF, the envelope, under exactly one attribute: the creator's Patreon campaign value, or for a creator without a campaign `https://arkavo.net/attr/creator/value/<sub>`. Every entry's recording policy names that attribute, so a viewer who can open an entry can open the catalog. The pointer's `catalogHash`/`catalogSize` are over the envelope's bytes.
