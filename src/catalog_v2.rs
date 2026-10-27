@@ -630,6 +630,14 @@ mod tests {
         b
     }
 
+    #[test]
+    fn arkavo_kit_pointer_vectors_agree() {
+        for (name, valid, bytes) in crate::creator_catalog::test_support::vectors("pointer") {
+            let parsed = parse_pointer(&bytes);
+            assert_eq!(parsed.is_ok(), valid, "{name}: {:?}", parsed.err());
+        }
+    }
+
     #[tokio::test]
     async fn a_valid_chain_verifies() {
         let v = verify(&bundle("u1", 7, DOC)).await.unwrap();

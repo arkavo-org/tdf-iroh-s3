@@ -53,7 +53,6 @@ futures = "0.3"
 bao-tree = { version = "0.16", features = ["tokio_fsm", "validate"] }
 iroh-io = "0.6"
 serde_json = "1"
-url = "2.5"
 # Reading TDF archives from a file at ingest (the version opentdf uses)
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

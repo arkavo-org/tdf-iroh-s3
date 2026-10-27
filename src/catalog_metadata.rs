@@ -1,4 +1,6 @@
-//! A catalog `/2` entry's metadata TDF against its recording (tdf-iroh-s3#39).
+//! A catalog `/2`'s TDFs, checked on their clear manifests
+//! (tdf-iroh-s3#39): each entry's metadata TDF against its recording, and
+//! the envelope that holds the catalog document.
 //!
 //! The node never decrypts. It compares the two clear manifests, as stored
 //! at ingest under `manifests/<hash>`: the metadata TDF must carry the
@@ -13,6 +15,12 @@
 //! unwraps a catalog's metadata in one bulk rewrap, and the platform's KAS
 //! drops an entry without a policy id and refuses duplicate ids.
 //!
+//! The envelope is the ZTDF whose payload is the catalog document. Its
+//! `payload.mimeType` is [`CATALOG_MIME_TYPE`] and its policy names exactly
+//! one attribute: the creator's Patreon campaign, or for a creator without
+//! one their own creator attribute. Every entry's recording carries that
+//! attribute, so a viewer who can open an entry can open the catalog.
+//!
 //! Pure: no I/O.
 
 use base64::Engine as _;
@@ -23,6 +31,16 @@ use std::collections::BTreeSet;
 /// A metadata TDF's `payload.mimeType`. Ingest doesn't index a blob of this
 /// type under `catalog-index/`, and a `/2` entry's metadata must have it.
 pub const CATALOG_ENTRY_MIME_TYPE: &str = "application/vnd.arkavo.catalog-entry+json";
+
+/// The envelope's `payload.mimeType`.
+pub const CATALOG_MIME_TYPE: &str = "application/vnd.arkavo.creator-catalog+json";
+
+/// A campaign attribute value: this prefix, then one or more of
+/// `[A-Za-z0-9_-]`.
+pub const CAMPAIGN_FQN_PREFIX: &str = "https://patreon.arkavo.com/attr/campaign/value/";
+
+/// A creator attribute value: this prefix, then the creator's `sub`.
+pub const CREATOR_FQN_PREFIX: &str = "https://arkavo.net/attr/creator/value/";
 
 /// The parts of a stored manifest the comparison reads.
 #[derive(Debug, Clone, PartialEq)]
@@ -46,6 +64,18 @@ pub enum MetadataRefusal {
     NotCatalogMetadata,
     /// The attributes, dissemination list or KAS differ from the recording's.
     PolicyMismatch,
+}
+
+/// Why an envelope is not a catalog of its subject.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvelopeRefusal {
+    /// `payload.mimeType` isn't [`CATALOG_MIME_TYPE`].
+    NotCatalog,
+    /// The policy's `uuid` isn't a non-empty string.
+    NoPolicyId,
+    /// Any other key than `uuid` and `body`, a `dissem` list, or anything
+    /// but exactly one campaign or the subject's creator attribute.
+    Policy,
 }
 
 /// Read a stored manifest (`manifests/<hash>`). `None` when it is not a
@@ -82,6 +112,55 @@ impl ManifestPolicy {
             .get("uuid")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
+    }
+
+    /// Whether the policy names `fqn`, in the spec form or opentdf-rs's
+    /// structured form (`catalog::extract_attribute_fqns`).
+    pub fn has_attribute(&self, fqn: &str) -> bool {
+        serde_json::to_string(&self.policy)
+            .ok()
+            .and_then(|json| crate::catalog::extract_attribute_fqns(&json).ok())
+            .is_some_and(|fqns| fqns.iter().any(|f| f == fqn))
+    }
+}
+
+/// The envelope's one attribute, when `envelope` (its manifest) is a catalog
+/// of `sub`: type [`CATALOG_MIME_TYPE`], a policy of only `uuid` (non-empty)
+/// and `body`, no `dissem`, and `body.dataAttributes` exactly one element
+/// whose `attribute` is a campaign value or `sub`'s creator value, byte for
+/// byte.
+pub fn check_envelope(envelope: &ManifestPolicy, sub: &str) -> Result<String, EnvelopeRefusal> {
+    if envelope.mime_type.as_deref() != Some(CATALOG_MIME_TYPE) {
+        return Err(EnvelopeRefusal::NotCatalog);
+    }
+    let mut keys: Vec<&str> = envelope.policy.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    if keys != ["body", "uuid"] {
+        return Err(EnvelopeRefusal::Policy);
+    }
+    if envelope.policy_id().is_none() {
+        return Err(EnvelopeRefusal::NoPolicyId);
+    }
+    if !list(&envelope.policy, "dissem").is_some_and(<[Value]>::is_empty) {
+        return Err(EnvelopeRefusal::Policy);
+    }
+    let fqn = match list(&envelope.policy, "dataAttributes") {
+        Some([one]) => one.get("attribute").and_then(Value::as_str),
+        _ => None,
+    };
+    let campaign = |f: &str| {
+        f.strip_prefix(CAMPAIGN_FQN_PREFIX).is_some_and(|id| {
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        })
+    };
+    match fqn {
+        Some(f) if campaign(f) || f.strip_prefix(CREATOR_FQN_PREFIX) == Some(sub) => {
+            Ok(f.to_string())
+        }
+        _ => Err(EnvelopeRefusal::Policy),
     }
 }
 
@@ -141,6 +220,41 @@ pub(crate) mod test_support {
     /// per KAS.
     pub fn manifest(policy: Value, kas: &[&str]) -> Vec<u8> {
         manifest_of_type(policy, kas, "application/octet-stream")
+    }
+
+    /// A catalog envelope's manifest.
+    pub fn envelope_manifest(policy: Value, kas: &[&str]) -> Vec<u8> {
+        manifest_of_type(policy, kas, CATALOG_MIME_TYPE)
+    }
+
+    /// A catalog envelope ZTDF: `manifest.json` with `policy`, type
+    /// `mime_type` and one key access object at [`KAS`], and a stored
+    /// `0.payload` of `payload` (standing in for the encrypted document).
+    pub fn envelope_tdf(policy: Value, mime_type: &str, payload: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut m = opentdf::TdfManifest::new("0.payload".into(), KAS.into());
+        m.payload.mime_type = Some(mime_type.into());
+        m.encryption_information.policy = STANDARD.encode(serde_json::to_vec(&policy).unwrap());
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            w.start_file("manifest.json", stored).unwrap();
+            w.write_all(m.to_json().unwrap().as_bytes()).unwrap();
+            w.start_file("0.payload", stored).unwrap();
+            w.write_all(payload).unwrap();
+            w.finish().unwrap();
+        }
+        buf
+    }
+
+    /// An envelope policy naming only `fqn`.
+    pub fn envelope_policy(fqn: &str) -> Value {
+        json!({
+            "uuid": "0b0e6f7c-0000-4000-8000-0000000000e0",
+            "body": { "dataAttributes": [{ "attribute": fqn }], "dissem": [] },
+        })
     }
 
     /// A metadata TDF's stored manifest.
@@ -360,6 +474,107 @@ mod tests {
         let no_url = json!({ "encryptionInformation": {
             "policy": STANDARD.encode("{}"), "keyAccess": [{ "type": "wrapped" }] } });
         assert!(read_manifest(&serde_json::to_vec(&no_url).unwrap()).is_none());
+    }
+
+    fn envelope(policy: Value) -> Result<String, EnvelopeRefusal> {
+        check_envelope(
+            &read_manifest(&envelope_manifest(policy, &[KAS])).unwrap(),
+            SUB,
+        )
+    }
+
+    const SUB: &str = "5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10";
+
+    #[test]
+    fn an_envelope_names_one_campaign_or_its_creator() {
+        let creator = format!("{CREATOR_FQN_PREFIX}{SUB}");
+        for fqn in [
+            CAMPAIGN,
+            "https://patreon.arkavo.com/attr/campaign/value/a_B-9",
+            creator.as_str(),
+        ] {
+            assert_eq!(envelope(envelope_policy(fqn)), Ok(fqn.to_string()), "{fqn}");
+        }
+        let other_creator = format!("{CREATOR_FQN_PREFIX}someone-else");
+        let prefixed_creator = format!("{creator}x");
+        for fqn in [
+            "https://patreon.arkavo.com/attr/campaign/value/",
+            "https://patreon.arkavo.com/attr/campaign/value/12/34",
+            "https://patreon.arkavo.com/attr/campaign/value/12.34",
+            "https://patreon.arkavo.com/attr/tier/value/12345678",
+            "https://PATREON.arkavo.com/attr/campaign/value/12345678",
+            other_creator.as_str(),
+            prefixed_creator.as_str(),
+            CREATOR_FQN_PREFIX,
+        ] {
+            assert_eq!(
+                envelope(envelope_policy(fqn)),
+                Err(EnvelopeRefusal::Policy),
+                "{fqn}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_envelope_policy_is_exactly_one_attribute() {
+        let two = json!({ "uuid": "u", "body": { "dataAttributes": [
+            { "attribute": CAMPAIGN },
+            { "attribute": format!("{CREATOR_FQN_PREFIX}{SUB}") } ] } });
+        let none = json!({ "uuid": "u", "body": { "dataAttributes": [] } });
+        let absent = json!({ "uuid": "u", "body": {} });
+        // opentdf-rs's structured form names the attribute by namespace and
+        // name: an envelope's element must be the spec form.
+        let structured = json!({ "uuid": "u", "body": { "dataAttributes": [
+            { "attribute": { "namespace": "patreon.arkavo.com", "name": "campaign" },
+              "operator": "equals", "value": "12345678" } ] } });
+        let dissem = json!({ "uuid": "u", "body": {
+            "dataAttributes": [{ "attribute": CAMPAIGN }], "dissem": ["a@example.com"] } });
+        let mut classified = envelope_policy(CAMPAIGN);
+        classified["arkavo:classification"] = json!("general");
+        for policy in [two, none, absent, structured, dissem, classified] {
+            assert_eq!(
+                envelope(policy.clone()),
+                Err(EnvelopeRefusal::Policy),
+                "{policy}"
+            );
+        }
+        // `dissem` may be absent.
+        let no_dissem =
+            json!({ "uuid": "u", "body": { "dataAttributes": [{ "attribute": CAMPAIGN }] } });
+        assert!(envelope(no_dissem).is_ok());
+        for id in [json!(""), json!(1), Value::Null] {
+            let mut p = envelope_policy(CAMPAIGN);
+            p["uuid"] = id.clone();
+            assert_eq!(envelope(p), Err(EnvelopeRefusal::NoPolicyId), "{id}");
+        }
+    }
+
+    #[test]
+    fn an_envelope_has_the_catalog_type() {
+        for mime in [CATALOG_ENTRY_MIME_TYPE, "application/json", ""] {
+            let m =
+                read_manifest(&manifest_of_type(envelope_policy(CAMPAIGN), &[KAS], mime)).unwrap();
+            assert_eq!(
+                check_envelope(&m, SUB),
+                Err(EnvelopeRefusal::NotCatalog),
+                "{mime}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recording_names_an_attribute_in_either_form() {
+        let spec = read(recording_policy(), &[KAS]);
+        assert!(spec.has_attribute(CAMPAIGN));
+        assert!(!spec.has_attribute("https://patreon.arkavo.com/attr/campaign/value/1"));
+        let structured = read(
+            json!({ "uuid": "u", "body": { "dataAttributes": [
+                { "attribute": { "namespace": "patreon.arkavo.com", "name": "campaign" },
+                  "operator": "equals", "value": "12345678" } ] } }),
+            &[KAS],
+        );
+        assert!(structured.has_attribute(CAMPAIGN));
+        assert!(!read(json!({ "uuid": "u", "body": {} }), &[KAS]).has_attribute(CAMPAIGN));
     }
 
     #[test]

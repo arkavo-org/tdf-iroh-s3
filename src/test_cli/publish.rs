@@ -154,31 +154,6 @@ pub async fn publish_file(
     Ok(hash)
 }
 
-/// `PUT /catalogs/{sub}` with a catalog document's exact bytes.
-pub async fn put_catalog(
-    base_url: &str,
-    token: &str,
-    sub: &str,
-    catalog_path: &Path,
-) -> Result<serde_json::Value> {
-    let body = std::fs::read(catalog_path)
-        .with_context(|| format!("Failed to read {}", catalog_path.display()))?;
-    let res = http()?
-        .put(url(base_url, &format!("/catalogs/{sub}")))
-        .bearer_auth(token)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .send()
-        .await
-        .context("PUT /catalogs failed")?;
-    let status = res.status();
-    let text = res.text().await.unwrap_or_default();
-    if status != StatusCode::OK {
-        bail!("PUT /catalogs/{sub} answered {status}: {text}");
-    }
-    serde_json::from_str(&text).context("Unreadable catalog response")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

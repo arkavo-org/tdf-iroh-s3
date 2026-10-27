@@ -1,8 +1,28 @@
 # Catalog schema `/2`: per-entry TDF metadata, token-gated name resolution
 
-**Status:** proposal, 2026-10-25.
+**Status:** amended 2026-10-27 (owner, tdf-iroh-s3#38 and #39 comments of that day); implemented in tdf-iroh-s3#49. The amendment below supersedes the 2026-10-25 design where they differ; the rest stands.
 **Issue:** tdf-iroh-s3#39, tracked in #38 (design and owner decisions there).
-**Read at:** `main` `bd97825` (rebased from `feat/pdp-publish-decisions` `cdaf6c5`; #36's catalog blocks and `catalog_hidden` are used unchanged).
+**Read at:** `main` `bd97825`.
+
+## Amendment, 2026-10-27
+
+**The catalog document is itself a TDF.** The `/2` document is the payload of one ZTDF, the envelope, under exactly one attribute: the creator's Patreon campaign value, or for a creator without a campaign `https://arkavo.net/attr/creator/value/<sub>`. Every entry's recording policy names that attribute, so a viewer who can open an entry can open the catalog. The pointer's `catalogHash`/`catalogSize` are over the envelope's bytes.
+
+**The node checks what it can't read through an index.** `PUT /v2/catalogs/{sub}` takes `{document, bundle, index}`; `index` is the clear entry list, checked with the per-entry checks of the 2026-10-25 design plus the invariant, stored at `catalog-indexes/<hash>` and never served. Moderation reads it.
+
+**Resolution asks for a decision.** `GET /v2/catalogs/{sub}` verifies the token, then asks the `[catalog.authz]` decision service whether the subject may open the envelope's attribute (one `catalog_item` resource, id the catalog hash, action `read`): 403 `not entitled to catalog` on deny, 502 `decision unavailable` without an answer. Service CWTs skip the decision.
+
+**`/1` is removed outright** (owner, 2026-10-27): no dual-write or staged cutover, since only TestFlight users exist. `PUT /catalogs/{sub}` and the tag routes go with it, and so do `accept_catalog_schema_1`, `tag_prefix` and `purge-catalogs-1`.
+
+Decided in the implementation, each recorded in `docs/creator-catalogs.md`:
+
+- **No token, no catalog, in either `catalog_token` mode.** The decision needs a subject; serving a request without a token would let any client skip the 403 by dropping it. `catalog_token` now applies only to `GET /catalog/{group}`, which is unchanged.
+- **The request may be 2 MiB,** not 1: the index repeats the document's entries, so a 524 288-byte envelope (about 700 KiB in base64url) plus a 1000-entry index (up to about 500 KiB) doesn't fit in 1 MiB.
+- **A pointer at a catalog with no index record reads as none.** Pointers stored before envelopes name `/1` documents. `GET` answers 404 for them, and `PUT` treats them as no stored pointer for `seq` and preconditions, so a creator's first envelope may start at any `seq`; the conditional write still replaces exactly that pointer. Deleting the old `/1` objects is then hygiene, not a cutover step.
+- **The envelope rules match ArkavoKit's ArkavoCatalog 0.9.0,** so a Creator publish its local check passes isn't refused: the campaign value is one or more of `[A-Za-z0-9_-]`, the creator value is the subject byte for byte, the one `dataAttributes` element is read by its `attribute` string (opentdf-rs's structured form is refused), the policy `uuid` is non-empty and `dissem` empty or absent. The invariant reads each recording's attributes in either form.
+- **`metadataSize` is at most 65 536** (D2), the iOS viewer's limit.
+- **Each metadata policy `uuid` is non-empty and unique within the document:** the viewer unwraps every metadata TDF in one bulk rewrap, and the platform's KAS skips an entry without a policy id and refuses duplicates.
+- **Shared vectors.** ArkavoKit's `index` and `pointer` vectors run against the node's parsers (`tests/fixtures/arkavo-catalog-vectors.json`).
 
 ## Problem
 

@@ -99,9 +99,8 @@ max_concurrent_ingests = 1
 enabled = false
 trusted_public_keys = []
 
-# HTTP API: tags, creator catalogs, ingest confirmation, node identity.
-# GET routes are public; writes need an Arkavo CWT whose subject owns the
-# name ("<tag_prefix><sub>").
+# HTTP API: creator catalogs, ingest confirmation, node identity. Catalog
+# writes need an Arkavo CWT whose subject is the catalog's.
 [http]
 enabled = true
 # 127.0.0.1 behind a TLS proxy on the same host (default 0.0.0.0).
@@ -109,17 +108,13 @@ bind_address = "127.0.0.1"
 bind_port = 8090
 cose_keys_url = "https://identity.arkavo.net/.well-known/cose-keys"
 expected_issuer = "https://identity.arkavo.net"
-tag_prefix = "catalog/"
 # Catalog v2: the WebAuthn RP creators sign pointers with, and the IdP's
 # passkey credential status route ("" skips the check; development only).
 passkey_rp_id = "identity.arkavo.net"
 passkey_status_url = "https://identity.arkavo.net/passkeys/credentials/{credentialId}/status"
-# Resolving a creator's catalog (GET /tags/catalog, /v2/catalogs,
-# /catalog/{group}): "optional" verifies a presented token, "required"
-# refuses none (tdf-iroh-s3#39).
+# GET /catalog/{group}: "optional" verifies a presented token, "required"
+# refuses none (tdf-iroh-s3#39). GET /v2/catalogs always needs one.
 catalog_token = "optional"
-# false after the cutover to arkavo.creator-catalog/2.
-accept_catalog_schema_1 = true
 
 # Optional: HTTPS terminated by the node itself (rustls, TLS 1.3 only).
 # The plain listener above then binds to 127.0.0.1 only. On EC2,
@@ -257,26 +252,16 @@ specified in [docs/creator-catalogs.md](docs/creator-catalogs.md).
 | `GET /healthz` | public | Liveness. |
 | `GET /node` | public | `{"endpointId","relayUrl","directAddresses","maxBlobBytes"}`: the iroh endpoint publishers push to, and the largest archive ingest accepts. |
 | `GET /blobs/{hash}` | public | `{"hash","size"}` once a pushed TDF is ingested and servable; 404 until then, or if refused or blocked. |
-| `PUT /catalogs/{sub}` | publisher CWT | Publish a `arkavo.creator-catalog/1` document; moves `catalog/<sub>`. |
-| `GET /catalog-documents/{hash}` | public | A stored catalog document, byte for byte (`ETag`, cached 5 minutes, `If-None-Match` → 304). |
-| `GET /tags/{name}` | public | Resolve a tag, e.g. `catalog/<sub>`. A catalog tag that names no stored catalog document (an older tag naming a TDF blob) is 404. |
-| `PUT /tags/catalog/{sub}` | publisher CWT | Roll the tag back to an earlier catalog document of the same subject; its payloads are checked again. New catalogs go through `PUT /catalogs/{sub}`. |
-| `PUT /v2/catalogs/{sub}` | publisher CWT + passkey | Catalog v2: publish a document with its passkey-signed pointer bundle ([docs/creator-catalogs.md](docs/creator-catalogs.md#catalog-v2-passkey-signed-catalogs-over-iroh)). |
-| `GET /v2/catalogs/{sub}` | public | Catalog v2: the creator's signed pointer bundle; the document is then fetched over iroh by hash. |
+| `GET /catalog-documents/{hash}` | public | A stored catalog envelope (a ZTDF), byte for byte (`ETag`, cached 5 minutes, `If-None-Match` → 304). |
+| `PUT /v2/catalogs/{sub}` | publisher CWT + passkey | Publish a catalog: the envelope, its passkey-signed pointer bundle and its clear index ([docs/creator-catalogs.md](docs/creator-catalogs.md#catalog-v2-passkey-signed-catalogs-over-iroh)). |
+| `GET /v2/catalogs/{sub}` | any Arkavo CWT | The creator's signed pointer bundle, if the decision service entitles the reader to the envelope's attribute (403 otherwise); the envelope is then fetched over iroh by hash. |
 | `POST /publish/sessions` | publisher CWT | Gated nodes only (404, empty body, when ungated); see below. |
 
 ```bash
-# Resolve a creator's catalog, then read it (public)
-curl https://iroh.arkavo.net/tags/catalog/<sub>
-# -> {"name":"catalog/<sub>","hash":"<blake3-hex>"}
-curl https://iroh.arkavo.net/catalog-documents/<blake3-hex>
-
-# Publish a catalog (the document's exact bytes)
-curl -X PUT https://iroh.arkavo.net/catalogs/<sub> \
-  -H "Authorization: Bearer <cwt>" \
-  -H "Content-Type: application/json" \
-  --data-binary @catalog.json
-# -> {"name":"catalog/<sub>","hash":"<blake3-hex>","size":<bytes>}
+# Resolve a creator's catalog (the signed pointer bundle), then fetch the
+# envelope it names
+curl -H "Authorization: Bearer <cwt>" https://iroh.arkavo.net/v2/catalogs/<sub>
+curl https://iroh.arkavo.net/catalog-documents/<catalogHash>
 ```
 
 `<sub>` is the CWT's `sub` exactly as minted; the node never canonicalizes
@@ -348,7 +333,7 @@ The test CLI drives a running node:
 
 ```bash
 cargo run --bin tdf-iroh-s3-test -- --help
-# create-tdf, push, push-raw, fetch, publish-session, publish, put-catalog
+# create-tdf, push, push-raw, fetch, publish-session, publish
 
 # Creator's flow against a node: session (if gated), push, wait for ingest
 cargo run --bin tdf-iroh-s3-test -- publish -n <endpointId> --addr <ip:port> \

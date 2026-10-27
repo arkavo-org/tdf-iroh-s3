@@ -4,7 +4,6 @@ pub mod authz;
 pub mod catalog;
 pub mod catalog_api;
 pub mod catalog_metadata;
-pub mod catalog_purge;
 pub mod catalog_v2;
 pub mod catalogs_api;
 pub mod catalogs_v2_api;

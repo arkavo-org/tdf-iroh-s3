@@ -1,6 +1,7 @@
 //! The entity chain a decision is asked about (draft-arkavo-authzen-cwt-00):
 //! the verified person, each attested device, then the environment this node
-//! observes. Shared by `GET /catalog/{group}` and the publishing decision.
+//! observes. Shared by `GET /catalog/{group}`, `GET /v2/catalogs/{sub}` and
+//! the publishing decision.
 //!
 //! - Person: claims from a CWT this node verified.
 //! - Devices: zero or more repeated `X-Entity-Token: <DeviceCheck CWT>`
@@ -124,6 +125,28 @@ pub async fn verified_devices(
         });
     }
     Ok(devices)
+}
+
+/// The chain for a person this node verified from `pe_token`: the person,
+/// each `X-Entity-Token` device bound to them, then the environment, if
+/// this node asserts one. A chain over [`MAX_CHAIN_ENTITIES`] is 400; a
+/// device that fails is 401 ([`verified_devices`]).
+pub async fn person_chain(
+    verifier: &CwtVerifier,
+    pe: &VerifiedClaims,
+    pe_token: &str,
+    headers: &HeaderMap,
+    environment: Option<&Value>,
+    now: i64,
+) -> Result<Vec<ChainEntity>, (StatusCode, &'static str)> {
+    let npe_tokens = entity_tokens(headers);
+    check_length(npe_tokens.len(), environment.is_some())?;
+    let mut chain = vec![subject_entity(pe, Some(pe_token))];
+    chain.extend(verified_devices(verifier, &npe_tokens, &pe.sub, now).await?);
+    if let Some(env) = environment {
+        chain.push(environment_entity(env));
+    }
+    Ok(chain)
 }
 
 /// The environment entity: asserted by this node, never client-supplied.

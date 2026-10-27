@@ -93,25 +93,6 @@ enum Commands {
         timeout_secs: u64,
     },
 
-    /// Publish a catalog document (PUT /catalogs/{sub})
-    PutCatalog {
-        /// Base URL of the node's HTTP API, e.g. http://127.0.0.1:8090
-        #[arg(long)]
-        url: String,
-
-        /// File holding the publisher's Arkavo CWT
-        #[arg(long)]
-        token_file: PathBuf,
-
-        /// The token's subject, exactly as minted
-        #[arg(long)]
-        sub: String,
-
-        /// The arkavo.creator-catalog/1 JSON document, sent byte for byte
-        #[arg(long)]
-        catalog: PathBuf,
-    },
-
     /// Create a TDF and push it to a remote node
     Push {
         /// Remote node Endpoint ID
@@ -232,16 +213,6 @@ async fn main() -> Result<()> {
                 std::time::Duration::from_secs(timeout_secs),
             )
             .await?;
-        }
-        Commands::PutCatalog {
-            url,
-            token_file,
-            sub,
-            catalog,
-        } => {
-            let token = publish::read_token(&token_file)?;
-            let body = publish::put_catalog(&url, &token, &sub, &catalog).await?;
-            println!("{body}");
         }
         Commands::Push {
             node,

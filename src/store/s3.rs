@@ -92,10 +92,6 @@ impl S3Client {
         format!("{}outboards/{}", self.prefix, hash_hex)
     }
 
-    pub fn tag_key(&self, tag_name: &str) -> String {
-        format!("{}tags/{}", self.prefix, tag_name)
-    }
-
     pub fn manifest_key(&self, hash_hex: &str) -> String {
         format!("{}manifests/{}", self.prefix, hash_hex)
     }
@@ -112,6 +108,12 @@ impl S3Client {
     /// `outboards/` as the document is kept apart from `blobs/`.
     pub fn catalog_outboard_key(&self, hash_hex: &str) -> String {
         format!("{}catalog-outboards/{}", self.prefix, hash_hex)
+    }
+
+    /// A catalog's clear entry list and envelope attribute, as checked at
+    /// publish. Never served: moderation reads it.
+    pub fn catalog_index_key(&self, hash_hex: &str) -> String {
+        format!("{}catalog-indexes/{}", self.prefix, hash_hex)
     }
 
     /// A creator's signed catalog pointer bundle (catalog v2).
@@ -418,7 +420,7 @@ impl S3Client {
             .put_object()
             .bucket(&self.bucket)
             .key(self.catalog_document_key(hash_hex))
-            .content_type("application/json")
+            .content_type("application/zip")
             .metadata(CATALOG_OWNER_METADATA, owner)
             .body(body.into())
             .send()
@@ -601,6 +603,40 @@ impl S3Client {
         }
     }
 
+    /// Store a catalog's index record under `catalog-indexes/<hash>`.
+    pub async fn put_catalog_index(&self, hash_hex: &str, body: Bytes) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_index_key(hash_hex))
+            .content_type("application/json")
+            .body(body.into())
+            .send()
+            .await
+            .context("Failed to PUT catalog index to S3")?;
+        Ok(())
+    }
+
+    /// A catalog's index record, or `None` (a catalog published before
+    /// envelopes has none).
+    pub async fn get_catalog_index(&self, hash_hex: &str) -> Result<Option<Bytes>> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_index_key(hash_hex))
+            .send()
+            .await
+        {
+            Ok(resp) => Ok(Some(resp.body.collect().await?.into_bytes())),
+            Err(e) if e.as_service_error().is_some_and(|se| se.is_no_such_key()) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!(
+                "Failed to GET catalog index from S3: {}",
+                e
+            )),
+        }
+    }
+
     /// Store a creator's pointer bundle only if the stored one is still
     /// `expected` (its ETag), or, with `None`, only if there is none.
     /// `false` when another write got there first.
@@ -638,58 +674,6 @@ impl S3Client {
         }
     }
 
-    /// The names of every object under `{prefix}<rel_prefix>`, with that
-    /// prefix taken off, paginating as needed.
-    pub async fn list_names(&self, rel_prefix: &str) -> Result<Vec<String>> {
-        let prefix = format!("{}{}", self.prefix, rel_prefix);
-        let mut names = Vec::new();
-        let mut continuation: Option<String> = None;
-        loop {
-            let mut req = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(&prefix);
-            if let Some(token) = &continuation {
-                req = req.continuation_token(token);
-            }
-            let resp = req
-                .send()
-                .await
-                .with_context(|| format!("Failed to LIST {rel_prefix} in S3"))?;
-            names.extend(
-                resp.contents()
-                    .iter()
-                    .filter_map(|obj| obj.key()?.strip_prefix(&prefix).map(str::to_string)),
-            );
-            match resp.next_continuation_token() {
-                Some(token) => continuation = Some(token.to_string()),
-                None => break,
-            }
-        }
-        Ok(names)
-    }
-
-    /// Delete a catalog document and its outboard (a `/1` document may have
-    /// none; deleting a missing key succeeds).
-    pub async fn delete_catalog_document(&self, hash_hex: &str) -> Result<()> {
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(self.catalog_outboard_key(hash_hex))
-            .send()
-            .await
-            .context("Failed to DELETE catalog outboard from S3")?;
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(self.catalog_document_key(hash_hex))
-            .send()
-            .await
-            .context("Failed to DELETE catalog document from S3")?;
-        Ok(())
-    }
-
     pub async fn delete_blob(&self, hash_hex: &str) -> Result<()> {
         self.client
             .delete_object()
@@ -705,53 +689,6 @@ impl S3Client {
             .send()
             .await
             .context("Failed to DELETE outboard from S3")?;
-        Ok(())
-    }
-
-    pub async fn put_tag(&self, tag_name: &str, hash_hex: &str) -> Result<()> {
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(self.tag_key(tag_name))
-            .body(Bytes::from(hash_hex.to_string()).into())
-            .send()
-            .await
-            .context("Failed to PUT tag to S3")?;
-        Ok(())
-    }
-
-    pub async fn get_tag(&self, tag_name: &str) -> Result<Option<String>> {
-        match self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(self.tag_key(tag_name))
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let data = resp.body.collect().await?;
-                let hash_hex = String::from_utf8(data.into_bytes().to_vec())?;
-                Ok(Some(hash_hex))
-            }
-            Err(e) => {
-                if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
-                    Ok(None)
-                } else {
-                    Err(anyhow::anyhow!("Failed to GET tag from S3: {}", e))
-                }
-            }
-        }
-    }
-
-    pub async fn delete_tag(&self, tag_name: &str) -> Result<()> {
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(self.tag_key(tag_name))
-            .send()
-            .await
-            .context("Failed to DELETE tag from S3")?;
         Ok(())
     }
 
