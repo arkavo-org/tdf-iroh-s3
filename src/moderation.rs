@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::auth::{AuthError, CwtVerifier, VerifiedClaims, VerifyOpts, subject_id_bind};
-use crate::authz::ChainEntity;
+use crate::authz::{ChainEntity, EntityKind};
 use crate::entity_chain;
 use crate::publish_decision::{
     PublishDecider, PublishDecisions, StoredEntity, Verdict, log_shadow, strip_tokens,
@@ -209,9 +209,11 @@ struct SessionRecord {
     endpoint_id: String,
     subject: String,
     expires_at: i64,
-    /// The entity chain the session was decided with, without tokens, so a
-    /// push can be decided again (tdf-iroh-s3#35). Absent on records
-    /// written before it, and when decisions are local.
+    /// The entity chain the session was decided with, without tokens.
+    /// Present only when the decision service permitted the session, which
+    /// is what lets it push in `pdp` (tdf-iroh-s3#44). Absent on records
+    /// written before #35, when decisions are local, and when the decision
+    /// service denied or wasn't asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     chain: Option<Vec<StoredEntity>>,
 }
@@ -446,6 +448,9 @@ pub struct PublishGate {
     /// Endpoints whose last lookup found no live session, and when.
     misses: Mutex<HashMap<EndpointId, Instant>>,
     decider: Arc<PublishDecider>,
+    /// The longest a session read back from the store is held: a record's
+    /// `expiresAt` never extends it past what opening one grants.
+    session_ttl: Duration,
 }
 
 /// Why a push was refused.
@@ -466,7 +471,17 @@ impl PublishGate {
             lookups: tokio::sync::Semaphore::new(SESSION_LOOKUPS),
             misses: Mutex::new(HashMap::new()),
             decider: Arc::new(PublishDecider::default()),
+            session_ttl: Duration::from_secs(
+                crate::config::PublishingConfig::default().session_ttl_secs,
+            ),
         }
+    }
+
+    /// Cap sessions read back from the store at `ttl`, the TTL sessions are
+    /// opened with.
+    pub fn with_session_ttl(mut self, ttl: Duration) -> Self {
+        self.session_ttl = ttl;
+        self
     }
 
     /// Decide pushes with `decider` as well (tdf-iroh-s3#35).
@@ -603,7 +618,7 @@ impl PublishGate {
         self.open_session_with_chain(
             *endpoint,
             &record.subject,
-            Duration::from_secs(left as u64),
+            Duration::from_secs(left as u64).min(self.session_ttl),
             record.chain.clone(),
         );
         Some((canonical_subject(&record.subject).to_string(), record.chain))
@@ -644,16 +659,29 @@ impl PublishGate {
     /// opened, and that holds until the session expires, at most
     /// `session_ttl_secs` later. So a suspension made at the platform stops
     /// pushes from the next session; a local one stops them at once. Only a
-    /// session the decision service permitted stores a chain.
+    /// session the decision service permitted stores a chain, and its person
+    /// is the session's subject.
     fn decided_session(
         &self,
         subject: &str,
         chain: Option<&[StoredEntity]>,
     ) -> Result<(), PushRefusal> {
-        if self.decider.mode() == PublishDecisions::Pdp && chain.is_none() {
+        if self.decider.mode() != PublishDecisions::Pdp {
+            return Ok(());
+        }
+        let Some(chain) = chain else {
             // Opened before decisions were asked, or by a node that decided
             // locally: the decision service never permitted it.
             warn!(%subject, "Session has no stored chain; push refused");
+            return Err(PushRefusal::NoSession);
+        };
+        let person = chain
+            .iter()
+            .find(|e| e.kind == EntityKind::Subject)
+            .and_then(|e| e.claims.get("sub"))
+            .and_then(serde_json::Value::as_str);
+        if person.is_none_or(|p| canonical_subject(p) != canonical_subject(subject)) {
+            warn!(%subject, "Session's stored chain is not its subject's; push refused");
             return Err(PushRefusal::NoSession);
         }
         Ok(())
@@ -1605,6 +1633,65 @@ mod tests {
             h.gate.authorize_push(2, &"a".repeat(64)).await,
             Err(PushRefusal::NoSession)
         );
+    }
+
+    #[tokio::test]
+    async fn pdp_pushes_need_a_stored_chain_whose_person_is_the_session_subject() {
+        let (h, _) = deciding(PublishDecisions::Pdp);
+        let ep = endpoint();
+        let other = other_instance(&h).with_decider(Arc::clone(&h.gate.decider));
+        other.connected(1, Some(ep));
+        let push = |chain: serde_json::Value| {
+            let record = serde_json::json!({
+                "endpointId": ep.to_string(),
+                "subject": "u1",
+                "expiresAt": now_secs() + 60,
+                "chain": chain,
+            });
+            h.store.records.lock().unwrap().insert(
+                format!("sessions/{ep}"),
+                Bytes::from(serde_json::to_vec(&record).unwrap()),
+            );
+            other.misses.lock().unwrap().clear();
+            other.sessions.lock().unwrap().clear();
+            other.authorize_push(1, "a")
+        };
+
+        for (chain, why) in [
+            (serde_json::json!([]), "empty"),
+            (
+                serde_json::json!([{ "kind": "device", "claims": { "sub": "u1" } }]),
+                "no person",
+            ),
+            (
+                serde_json::json!([{ "kind": "subject", "claims": { "sub": "arkavo:u2" } }]),
+                "another person's",
+            ),
+        ] {
+            assert_eq!(push(chain).await, Err(PushRefusal::NoSession), "{why}");
+        }
+        let own = serde_json::json!([{ "kind": "subject", "claims": { "sub": "arkavo:u1" } }]);
+        assert!(push(own).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_stored_session_is_held_no_longer_than_sessions_are_opened_for() {
+        let h = harness();
+        let ep = endpoint();
+        let record = serde_json::json!({
+            "endpointId": ep.to_string(),
+            "subject": "u1",
+            "expiresAt": now_secs() + 86_400,
+        });
+        h.store.records.lock().unwrap().insert(
+            format!("sessions/{ep}"),
+            Bytes::from(serde_json::to_vec(&record).unwrap()),
+        );
+        let other = other_instance(&h).with_session_ttl(Duration::from_secs(60));
+        other.connected(1, Some(ep));
+        assert!(other.authorize_push(1, &"a".repeat(64)).await.is_ok());
+        let expires = other.sessions.lock().unwrap()[&ep].expires;
+        assert!(expires <= Instant::now() + Duration::from_secs(60));
     }
 
     #[tokio::test]
