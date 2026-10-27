@@ -37,14 +37,21 @@ fn free_port() -> u16 {
         .port()
 }
 
-async fn get_healthz(port: u16, trusted_pem: &str) -> reqwest::Result<String> {
-    let client = reqwest::Client::builder()
+fn client(port: u16, trusted_pem: &str) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(trusted_pem.as_bytes()).unwrap())
         .tls_built_in_root_certs(false)
         .resolve("localhost", ([127, 0, 0, 1], port).into())
-        .build()
-        .unwrap();
+}
+
+async fn get_healthz(port: u16, trusted_pem: &str) -> reqwest::Result<String> {
+    get_healthz_with(client(port, trusted_pem), port).await
+}
+
+async fn get_healthz_with(client: reqwest::ClientBuilder, port: u16) -> reqwest::Result<String> {
     client
+        .build()
+        .unwrap()
         .get(format!("https://localhost:{port}/healthz"))
         .send()
         .await?
@@ -95,6 +102,39 @@ async fn https_serves_and_reloads_renewed_cert() {
         "renewed certificate was never picked up"
     );
     assert!(get_healthz(port, &first).await.is_err());
+}
+
+#[tokio::test]
+async fn https_offers_only_tls13() {
+    install_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let pem = write_self_signed(dir.path());
+    let port = free_port();
+    let cfg = TlsConfig {
+        bind_port: port,
+        cert_path: dir.path().join("fullchain.pem"),
+        key_path: dir.path().join("privkey.pem"),
+        acm_certificate_arn: String::new(),
+        reload_check_secs: 1,
+    };
+    let router = Router::new().route("/healthz", get(|| async { "ok" }));
+    tokio::spawn(async move { serve_https(&cfg, router).await });
+
+    let tls13 = || client(port, &pem).min_tls_version(reqwest::tls::Version::TLS_1_3);
+    assert!(
+        wait_for(|| async {
+            get_healthz_with(tls13(), port)
+                .await
+                .is_ok_and(|b| b == "ok")
+        })
+        .await,
+        "HTTPS never answered a TLS 1.3 client"
+    );
+    let tls12 = client(port, &pem).max_tls_version(reqwest::tls::Version::TLS_1_2);
+    assert!(
+        get_healthz_with(tls12, port).await.is_err(),
+        "a TLS 1.2 client must be refused"
+    );
 }
 
 #[tokio::test]

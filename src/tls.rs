@@ -2,15 +2,20 @@
 //! PEM cert chain and key on disk. Nothing in here talks to ACM: on EC2 the
 //! `tdf-iroh-s3-cert-sync` job exports the certificate into those files, and
 //! this module reloads them when either one changes, so a renewal never needs
-//! a restart.
+//! a restart. Only TLS 1.3 is offered; a TLS 1.2 client gets a
+//! protocol-version alert.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use axum::Router;
 use axum_server::tls_rustls::RustlsConfig;
+use rustls::ServerConfig;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::{info, warn};
 
 use crate::config::TlsConfig;
@@ -52,14 +57,12 @@ async fn load_when_ready(cert_path: &Path, key_path: &Path) -> (RustlsConfig, Mt
     loop {
         let before = mtimes(cert_path, key_path);
         let res = if cert_path.exists() && key_path.exists() {
-            RustlsConfig::from_pem_file(cert_path, key_path)
-                .await
-                .map_err(|e| e.to_string())
+            load_pair(cert_path, key_path).await
         } else {
             Err("cert or key file missing".to_string())
         };
         match res {
-            Ok(config) => return (config, before),
+            Ok(config) => return (RustlsConfig::from_config(config), before),
             Err(e) => {
                 if e != last_err {
                     warn!(
@@ -93,14 +96,51 @@ async fn reload_on_change(
         }
         // Same idea as at startup: record `now` before reading, so a write
         // racing this reload is caught on the next tick.
-        match config.reload_from_pem_file(&cert_path, &key_path).await {
-            Ok(()) => {
+        match load_pair(&cert_path, &key_path).await {
+            Ok(new) => {
+                config.reload_from_config(new);
                 info!("TLS certificate reloaded from {}", cert_path.display());
                 loaded = now;
             }
             Err(e) => warn!("TLS certificate reload failed, keeping the old one: {e}"),
         }
     }
+}
+
+/// Read the pair and build the listener's config from it.
+async fn load_pair(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConfig>, String> {
+    let cert = read_file(cert_path).await?;
+    let key = read_file(key_path).await?;
+    server_config(&cert, &key).map(Arc::new)
+}
+
+async fn read_file(path: &Path) -> Result<Vec<u8>, String> {
+    tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The listener's rustls config: TLS 1.3 only, with the provider named
+/// explicitly rather than taken from the process default, and ALPN for h2
+/// and HTTP/1.1 (what axum-server's own PEM loader sets).
+fn server_config(cert_pem: &[u8], key_pem: &[u8]) -> Result<ServerConfig, String> {
+    let certs = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("certificate chain: {e}"))?;
+    if certs.is_empty() {
+        return Err("certificate chain: no certificates".to_string());
+    }
+    let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| format!("private key: {e}"))?;
+    let mut config = ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .map_err(|e| e.to_string())?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .map_err(|e| e.to_string())?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
 }
 
 fn mtimes(cert: &Path, key: &Path) -> Mtimes {
