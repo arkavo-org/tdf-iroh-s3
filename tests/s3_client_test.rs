@@ -14,10 +14,6 @@ async fn test_s3_key_generation() {
         format!("catalog-indexes/{}", hash_hex)
     );
     assert_eq!(
-        client.campaign_creator_key("13167240"),
-        "campaign-creators/13167240"
-    );
-    assert_eq!(
         client.catalog_document_key(hash_hex),
         format!("catalog-documents/{}", hash_hex)
     );

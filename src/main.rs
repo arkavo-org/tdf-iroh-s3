@@ -58,9 +58,8 @@ async fn main() -> Result<()> {
     );
     info!("Assertion check: {}", config.validation.assertion.enabled);
 
-    // One decision service client, shared by the catalog v2 reads, the
-    // campaign lookup (both HTTP) and the publishing decisions
-    // (tdf-iroh-s3#35). Built only when one of them uses it, since building
+    // One decision service client, shared by the catalog v2 reads (HTTP)
+    // and the publishing decisions (tdf-iroh-s3#35). Built only when one of them uses it, since building
     // it may read a secret from SSM.
     let provider = if config.http.enabled || config.publishing.decisions != PublishDecisions::Local
     {
@@ -203,7 +202,7 @@ async fn main() -> Result<()> {
         );
         if provider.is_none() {
             tracing::warn!(
-                "[catalog.authz] endpoint unset — GET /v2/catalogs and /v2/campaigns answer 502 decision unavailable"
+                "[catalog.authz] endpoint unset — GET /v2/catalogs answers 502 decision unavailable"
             );
         }
         let mut router = tags_api::router(Arc::clone(&state))

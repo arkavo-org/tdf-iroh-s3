@@ -95,7 +95,7 @@ fn default_moderation_refresh_secs() -> u64 {
 }
 
 /// `[catalog]`: holds only `[catalog.authz]`, the decision service the
-/// catalog v2 reads, the campaign lookup and the publish decisions ask. The
+/// catalog v2 reads and the publish decisions ask. The
 /// ingest-time campaign listing it once configured is gone; its keys
 /// (`enabled`, `group_attribute_fqn`, `attributes_url`, `attributes_file`,
 /// `cache_ttl_secs`) are ignored.

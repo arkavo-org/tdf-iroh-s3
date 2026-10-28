@@ -124,8 +124,8 @@ cert_path = "/etc/tdf-iroh-s3/tls/fullchain.pem"
 key_path = "/etc/tdf-iroh-s3/tls/privkey.pem"
 acm_certificate_arn = "arn:aws:acm:us-east-1:<account>:certificate/<id>"
 
-# OpenTDF authorization service: catalog and campaign reads ask it, and so
-# do [publishing] decisions = "pdp". Empty endpoint = fail closed (reads
+# OpenTDF authorization service: catalog reads ask it, and so do
+# [publishing] decisions = "pdp". Empty endpoint = fail closed (reads
 # answer 502 decision unavailable).
 #
 # The platform REQUIRES an authenticated caller. Production: register a
@@ -199,7 +199,6 @@ specified in [docs/creator-catalogs.md](docs/creator-catalogs.md).
 | `GET /catalog-documents/{hash}` | public | A stored catalog envelope (a ZTDF), byte for byte (`ETag`, cached 5 minutes, `If-None-Match` → 304). |
 | `PUT /v2/catalogs/{sub}` | publisher CWT + passkey | Publish a catalog: the envelope, its passkey-signed pointer bundle and its clear index ([docs/creator-catalogs.md](docs/creator-catalogs.md#catalog-v2-passkey-signed-catalogs-over-iroh)). |
 | `GET /v2/catalogs/{sub}` | any Arkavo CWT | The creator's signed pointer bundle, if the decision service entitles the reader to the envelope's attribute (403 otherwise); the envelope is then fetched over iroh by hash. |
-| `GET /v2/campaigns/{id}` | any Arkavo CWT | `{"creator"}`: the Patreon campaign's creator, if the decision service entitles the reader to the campaign (403 otherwise). |
 | `POST /publish/sessions` | publisher CWT | Gated nodes only (404, empty body, when ungated); see below. |
 
 ```bash
