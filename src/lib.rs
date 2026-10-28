@@ -1,8 +1,5 @@
-pub mod attributes;
 pub mod auth;
 pub mod authz;
-pub mod catalog;
-pub mod catalog_api;
 pub mod catalog_metadata;
 pub mod catalog_v2;
 pub mod catalogs_api;

@@ -16,6 +16,10 @@
 //!   the reader may open the envelope's attribute (403 otherwise). The
 //!   stored bundle, with `ETag: "<seq>"`, which readers verify themselves
 //!   before fetching the document over iroh by hash.
+//! - `GET /v2/campaigns/{id}` — a token, then the same decision on the
+//!   campaign's attribute (403 otherwise), then the creator recorded for the
+//!   campaign at its owner's publish (`campaign-creators/<id>`), so a viewer
+//!   who holds the campaign but follows nobody finds its catalog.
 //!
 //! Publishing takes the publishing token checks (`authorize_publisher`).
 
@@ -180,9 +184,9 @@ pub struct V2State<S: TagStore> {
     attributes: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
-/// How `GET /v2/catalogs/{sub}` decides whether a reader may open a
-/// catalog: the `[catalog.authz]` decision service, asked as `GET
-/// /catalog/{group}` asks it.
+/// How `GET /v2/catalogs/{sub}` and `GET /v2/campaigns/{id}` decide whether
+/// a reader may open a catalog or campaign: the `[catalog.authz]` decision
+/// service.
 pub struct Readers {
     /// `None` (no decision service configured): every person is refused
     /// with 502 `decision unavailable`.
@@ -207,6 +211,7 @@ pub fn router<S: TagStore>(state: Arc<V2State<S>>) -> Router {
             "/v2/catalogs/{sub}",
             get(get_pointer::<S>).put(put_catalog::<S>),
         )
+        .route("/v2/campaigns/{id}", get(get_campaign::<S>))
         .with_state(state)
 }
 
@@ -594,15 +599,16 @@ impl<S: TagStore> V2State<S> {
         self.attributes.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Whether the reader of `headers` may open the catalog `hash`, whose
-    /// envelope is under `attribute`: Permit, or 403 `not entitled to
-    /// catalog`; 502 `decision unavailable` without an answer.
+    /// Whether the reader of `headers` may open the resource `id` (a catalog
+    /// hash or a campaign id), which is under `attribute`: Permit, or 403
+    /// `refusal`; 502 `decision unavailable` without an answer.
     async fn decide_reader(
         &self,
         claims: &crate::auth::VerifiedClaims,
         headers: &HeaderMap,
-        hash: &str,
+        id: &str,
         attribute: &str,
+        refusal: &str,
     ) -> Result<(), ApiError> {
         let unavailable = || fail(StatusCode::BAD_GATEWAY, "decision unavailable");
         let Some(provider) = &self.readers.provider else {
@@ -623,16 +629,16 @@ impl<S: TagStore> V2State<S> {
             chain,
             action: self.readers.action.clone(),
             resource_type: ResourceType::CatalogItem,
-            resources: vec![(hash.to_string(), vec![attribute.to_string()])],
+            resources: vec![(id.to_string(), vec![attribute.to_string()])],
         };
         match provider.decide(req).await {
-            Ok(verdicts) if verdicts.get(hash) == Some(&true) => Ok(()),
+            Ok(verdicts) if verdicts.get(id) == Some(&true) => Ok(()),
             Ok(_) => {
-                info!(sub = %claims.sub, %hash, %attribute, "Catalog read not entitled");
-                Err(fail(StatusCode::FORBIDDEN, "not entitled to catalog"))
+                info!(sub = %claims.sub, %id, %attribute, "Catalog read not entitled");
+                Err(fail(StatusCode::FORBIDDEN, refusal))
             }
             Err(e) => {
-                warn!(%hash, error = %e, "Catalog read decision failed; failing closed");
+                warn!(%id, error = %e, "Catalog read decision failed; failing closed");
                 Err(unavailable())
             }
         }
@@ -672,7 +678,13 @@ async fn get_pointer<S: TagStore>(
     };
     if !is_operator(api, &claims) {
         state
-            .decide_reader(&claims, &headers, &catalog_hash, &attribute)
+            .decide_reader(
+                &claims,
+                &headers,
+                &catalog_hash,
+                &attribute,
+                "not entitled to catalog",
+            )
             .await?;
     }
     Ok((
@@ -685,6 +697,56 @@ async fn get_pointer<S: TagStore>(
             (header::ETAG, pointer_etag(seq)),
         ],
         stored.body,
+    )
+        .into_response())
+}
+
+/// The longest campaign id `GET /v2/campaigns/{id}` takes.
+const MAX_CAMPAIGN_ID_DIGITS: usize = 20;
+
+/// `GET /v2/campaigns/{id}`: the campaign's creator, to a reader entitled to
+/// the campaign. The decision comes before the lookup, so nobody else learns
+/// whether a campaign has one.
+async fn get_campaign<S: TagStore>(
+    State(state): State<Arc<V2State<S>>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let api = &state.api;
+    let claims = authorize_catalog_reader(&api.verifier, &headers)
+        .await
+        .map_err(|(status, msg)| fail(status, msg))?;
+    if id.is_empty() || id.len() > MAX_CAMPAIGN_ID_DIGITS || !id.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(fail(StatusCode::BAD_REQUEST, "invalid campaign"));
+    }
+    if !is_operator(api, &claims) {
+        let attribute = format!("{CAMPAIGN_FQN_PREFIX}{id}");
+        state
+            .decide_reader(
+                &claims,
+                &headers,
+                &id,
+                &attribute,
+                "not entitled to campaign",
+            )
+            .await?;
+    }
+    let not_found = || fail(StatusCode::NOT_FOUND, "campaign not found");
+    let creator = match api.store.get_campaign_creator(&id).await {
+        Ok(Some(creator)) => creator,
+        Ok(None) => return Err(not_found()),
+        Err(e) => return Err(storage_unavailable("Campaign creator read", e)),
+    };
+    if owner_hidden(api, Some(&creator)) {
+        return Err(not_found());
+    }
+    Ok((
+        [(
+            header::CACHE_CONTROL,
+            CATALOG_POINTER_CACHE_CONTROL.to_string(),
+        )],
+        Json(serde_json::json!({ "creator": creator })),
     )
         .into_response())
 }
@@ -1644,6 +1706,119 @@ mod tests {
             (StatusCode::NOT_FOUND, "catalog not found")
         );
         assert_eq!(get(&h, "a..b").await.status, StatusCode::BAD_REQUEST);
+    }
+
+    async fn campaign_as(h: &Harness, id: &str, bearer: Option<&str>) -> Reply {
+        let mut req = Request::get(format!("/v2/campaigns/{id}"));
+        if let Some(t) = bearer {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        send(&h.app, req.body(Body::empty()).unwrap()).await
+    }
+
+    async fn campaign(h: &Harness, id: &str) -> Reply {
+        campaign_as(h, id, Some(&token(READER))).await
+    }
+
+    #[tokio::test]
+    async fn a_campaign_names_its_creator_to_an_entitled_reader() {
+        let h = ingested().await;
+        assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
+
+        let r = campaign(&h, "12345678").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        assert_eq!(r.json(), json!({ "creator": SUB }));
+        assert_eq!(
+            r.headers[header::CACHE_CONTROL],
+            CATALOG_POINTER_CACHE_CONTROL
+        );
+        {
+            let asked = h.decider.asked.lock().unwrap();
+            let req = &asked[0];
+            assert_eq!(req.action, "read");
+            assert_eq!(req.resource_type, ResourceType::CatalogItem);
+            assert_eq!(
+                req.resources,
+                vec![("12345678".to_string(), vec![CAMPAIGN.to_string()])]
+            );
+            assert_eq!(req.chain[0].claims["sub"], READER);
+        }
+
+        *h.decider.answer.lock().unwrap() = Some(false);
+        let r = campaign(&h, "12345678").await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::FORBIDDEN, "not entitled to campaign")
+        );
+        // Decided before the lookup: an unknown campaign answers the same.
+        assert_eq!(campaign(&h, "99").await.status, StatusCode::FORBIDDEN);
+        *h.decider.answer.lock().unwrap() = None;
+        let r = campaign(&h, "12345678").await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::BAD_GATEWAY, "decision unavailable")
+        );
+
+        *h.decider.answer.lock().unwrap() = Some(true);
+        let r = campaign(&h, "99").await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::NOT_FOUND, "campaign not found")
+        );
+    }
+
+    #[tokio::test]
+    async fn campaign_lookups_need_a_token_and_a_campaign_id() {
+        let h = harness();
+        let r = campaign_as(&h, "12345678", None).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::UNAUTHORIZED, "token required")
+        );
+        let r = campaign_as(&h, "12345678", Some("not-a-cwt")).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::UNAUTHORIZED, "invalid token")
+        );
+        for id in ["abc", "12a", "-1", "123456789012345678901"] {
+            let r = campaign(&h, id).await;
+            assert_eq!(
+                (r.status, r.error().as_str()),
+                (StatusCode::BAD_REQUEST, "invalid campaign"),
+                "{id}"
+            );
+        }
+        assert!(h.decider.asked.lock().unwrap().is_empty());
+        // 20 digits is a campaign id.
+        let r = campaign(&h, "12345678901234567890").await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_campaign_lookup_skips_the_decision_for_an_operator() {
+        let h = ingested().await;
+        assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
+        *h.decider.answer.lock().unwrap() = Some(false);
+        let roles = [(
+            "arkavo_roles",
+            Value::Array(vec![Value::Text("service-account".into())]),
+        )];
+        let operator = token_for("client:moderation", "moderation", &roles);
+        let r = campaign_as(&h, "12345678", Some(&operator)).await;
+        assert_eq!(r.json(), json!({ "creator": SUB }));
+        assert!(h.decider.asked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_hidden_creator_has_no_campaign() {
+        let h = ingested().await;
+        assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
+        h.moderation.suspend_for_test(SUB, true);
+        let r = campaign(&h, "12345678").await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::NOT_FOUND, "campaign not found")
+        );
     }
 
     #[tokio::test]

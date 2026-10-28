@@ -6,13 +6,10 @@ use tracing_subscriber::EnvFilter;
 
 use std::sync::Arc;
 
-use tdf_iroh_s3::attributes::{self, AttributeSet};
 use tdf_iroh_s3::auth::CwtVerifier;
 use tdf_iroh_s3::authz::{
-    AuthZenClient, AuthzProtocol, ConnectAuthzClient, DecisionProvider, DenyAll,
-    SharedDecisionProvider,
+    AuthZenClient, AuthzProtocol, ConnectAuthzClient, SharedDecisionProvider,
 };
-use tdf_iroh_s3::catalog_api::{self, CatalogApiState, CatalogCache};
 use tdf_iroh_s3::catalogs_api;
 use tdf_iroh_s3::catalogs_v2_api;
 use tdf_iroh_s3::config::{AuthzConfig, Config, PublishDecisions};
@@ -61,15 +58,16 @@ async fn main() -> Result<()> {
     );
     info!("Assertion check: {}", config.validation.assertion.enabled);
 
-    // One decision service client, shared by the entitled catalog and the
-    // publishing decisions (tdf-iroh-s3#35). Built only when one of them
-    // uses it, since building it may read a secret from SSM.
-    let provider =
-        if config.catalog.enabled || config.publishing.decisions != PublishDecisions::Local {
-            decision_provider(&config).await?
-        } else {
-            None
-        };
+    // One decision service client, shared by the catalog v2 reads, the
+    // campaign lookup (both HTTP) and the publishing decisions
+    // (tdf-iroh-s3#35). Built only when one of them uses it, since building
+    // it may read a secret from SSM.
+    let provider = if config.http.enabled || config.publishing.decisions != PublishDecisions::Local
+    {
+        decision_provider(&config).await?
+    } else {
+        None
+    };
     // A chain read back from a publish session carries no token, so the
     // OpenTDF client's token mode could never decide a push: every push
     // would be refused.
@@ -143,7 +141,6 @@ async fn main() -> Result<()> {
         tracing::warn!("[publishing] required = false: pushes and tag writes are open");
         None
     };
-    let moderation = gate.as_ref().map(|g| Arc::clone(&g.moderation));
 
     let node = TdfIrohNode::spawn_with_gate(config, gate.clone()).await?;
     let addr = node.addr();
@@ -206,7 +203,7 @@ async fn main() -> Result<()> {
         );
         if provider.is_none() {
             tracing::warn!(
-                "[catalog.authz] endpoint unset — GET /v2/catalogs answers 502 decision unavailable"
+                "[catalog.authz] endpoint unset — GET /v2/catalogs and /v2/campaigns answer 502 decision unavailable"
             );
         }
         let mut router = tags_api::router(Arc::clone(&state))
@@ -229,87 +226,6 @@ async fn main() -> Result<()> {
                 gate: Arc::clone(g),
                 policy: Arc::clone(&policy),
             })));
-        }
-
-        // Catalog: public attribute definitions + the entitled-catalog
-        // endpoint. Attributes are never hardcoded — the definitions
-        // artifact is the source of truth, and the grouping attribute must
-        // be defined in it.
-        let cat = &node.config.catalog;
-        if cat.enabled {
-            anyhow::ensure!(
-                cat.attributes_url.is_empty() != cat.attributes_file.is_empty(),
-                "[catalog] enabled requires exactly one of attributes_url (platform single source) or attributes_file (local artifact, node serves it)"
-            );
-            if !cat.attributes_url.is_empty() {
-                // Single source of truth: the platform serves definitions
-                // from the snapshot the PDP evaluates; this node only
-                // validates its grouping attribute against it at startup.
-                let fqns = attributes::fetch_attribute_fqns(&cat.attributes_url).await?;
-                anyhow::ensure!(
-                    fqns.iter().any(|f| f == &cat.group_attribute_fqn),
-                    "[catalog] group_attribute_fqn {} is not defined at {}",
-                    cat.group_attribute_fqn,
-                    cat.attributes_url
-                );
-                info!(
-                    "Attribute definitions validated against {} ({} attributes); definitions are served by the platform, not this node",
-                    cat.attributes_url,
-                    fqns.len()
-                );
-            } else {
-                let set = AttributeSet::load(&cat.attributes_file)?;
-                anyhow::ensure!(
-                    set.attribute_by_fqn(&cat.group_attribute_fqn).is_some(),
-                    "[catalog] group_attribute_fqn {} is not defined in {}",
-                    cat.group_attribute_fqn,
-                    cat.attributes_file
-                );
-                info!(
-                    "Attribute definitions loaded: namespace {} ({} attributes)",
-                    set.namespace.fqn,
-                    set.attributes.len()
-                );
-                router = router.merge(attributes::router(Arc::new(set)));
-            }
-
-            let cache = CatalogCache::new(
-                Arc::clone(&node.s3_client),
-                std::time::Duration::from_secs(cat.cache_ttl_secs),
-            );
-            let campaign_groups =
-                cat.group_attribute_prefix() == tdf_iroh_s3::catalog_metadata::CAMPAIGN_FQN_PREFIX;
-            router = match &provider {
-                Some(provider) => router.merge(catalog_router(
-                    cache,
-                    Arc::clone(provider),
-                    Arc::clone(&verifier),
-                    cat.authz.action.clone(),
-                    environment.clone(),
-                    moderation.clone(),
-                    http_cfg.catalog_token,
-                    campaign_groups,
-                )),
-                None => {
-                    tracing::warn!(
-                        "[catalog.authz] endpoint unset — catalog decisions fail closed (nothing entitled)"
-                    );
-                    router.merge(catalog_router(
-                        cache,
-                        DenyAll,
-                        Arc::clone(&verifier),
-                        cat.authz.action.clone(),
-                        environment.clone(),
-                        moderation.clone(),
-                        http_cfg.catalog_token,
-                        campaign_groups,
-                    ))
-                }
-            };
-            info!(
-                "Catalog endpoint enabled (group attribute {})",
-                cat.group_attribute_fqn
-            );
         }
 
         if let Some(tls_cfg) = &http_cfg.tls {
@@ -487,27 +403,4 @@ async fn decision_provider(config: &Config) -> Result<Option<SharedDecisionProvi
         }
     };
     Ok(Some(provider))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn catalog_router<D: DecisionProvider>(
-    cache: CatalogCache<tdf_iroh_s3::store::s3::S3Client>,
-    provider: D,
-    verifier: Arc<CwtVerifier>,
-    action: String,
-    environment: Option<serde_json::Value>,
-    moderation: Option<Arc<Moderation>>,
-    token: tdf_iroh_s3::config::CatalogToken,
-    campaign_groups: bool,
-) -> axum::Router {
-    catalog_api::router(Arc::new(CatalogApiState {
-        cache,
-        provider,
-        verifier,
-        action,
-        environment,
-        moderation,
-        token,
-        campaign_groups,
-    }))
 }

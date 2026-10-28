@@ -114,6 +114,35 @@ client_id = "catalog-node"
 }
 
 #[test]
+fn test_retired_catalog_listing_keys_still_parse() {
+    // A config from before the campaign listing was removed: its `[catalog]`
+    // and `[http]` keys are ignored, and `[catalog.authz]` is still read.
+    let toml_str = r#"
+[s3]
+bucket = "b"
+region = "us-east-1"
+
+[http]
+enabled = true
+catalog_token = "required"
+
+[catalog]
+enabled = true
+group_attribute_fqn = "https://patreon.arkavo.com/attr/campaign"
+attributes_url = "https://platform.arkavo.net/attributes"
+cache_ttl_secs = 30
+
+[catalog.authz]
+endpoint = "https://platform.arkavo.net"
+client_id = "catalog-node"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert!(config.http.enabled);
+    assert_eq!(config.catalog.authz.endpoint, "https://platform.arkavo.net");
+    assert_eq!(config.catalog.authz.client_id, "catalog-node");
+}
+
+#[test]
 fn test_authz_client_secret_param_override() {
     let toml_str = r#"
 [s3]

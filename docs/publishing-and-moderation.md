@@ -95,7 +95,7 @@ The authnz-rs `client_credentials` grant mints such tokens. If the list is empty
 |---|---|
 | `PUT /moderation/suspensions/{subject}` `{"reason","reportId"?,"hideCatalog"?}` | Refuses the subject's sessions, pushes and catalog publishes. With `hideCatalog`, `GET /v2/catalogs/{subject}` and `GET /catalog-documents/{hash}` for the subject's documents return 404. |
 | `DELETE /moderation/suspensions/{subject}` | Lifts the suspension. |
-| `PUT /moderation/blocks/{hash}` `{"reason","reportId"?}` | Takedown: iroh pushes of the hash are refused, and so are iroh get and get-many requests for it (a get-many that names it among other hashes is refused whole). Observe requests are always refused. It is left out of `/catalog/{group}` listings, no tag may point at it, and a tag already pointing at it returns 404. |
+| `PUT /moderation/blocks/{hash}` `{"reason","reportId"?}` | Takedown: iroh pushes of the hash are refused, and so are iroh get and get-many requests for it (a get-many that names it among other hashes is refused whole). Observe requests are always refused. No catalog may list it (403 `content is blocked` on `PUT /v2/catalogs`), and a blocked catalog envelope reads as no catalog (404). |
 | `DELETE /moderation/blocks/{hash}` | Lifts the block. |
 | `PUT /moderation/blocks/catalogs/{subject}` `{"reason","reportId"?}` | Blocks the creator's catalog: `GET /v2/catalogs/{subject}` returns 404, and so does `GET /catalog-documents/{hash}` for any document the subject owns; iroh fetches of those documents are refused. The moderation client writes one when it suspends a creator (tdf-iroh-s3#35). Stored at `moderation/catalog-blocks/<subject>`. |
 | `DELETE /moderation/blocks/catalogs/{subject}` | Lifts the catalog block. |

@@ -94,80 +94,19 @@ fn default_moderation_refresh_secs() -> u64 {
     30
 }
 
-/// Catalog (see tdf-iroh-s3#5). When enabled, every ingested blob gets a
-/// `catalog-index/<group>/<hash>` entry per value of the grouping attribute
-/// found in its policy, and the HTTP listener serves `GET /catalog/{group}`.
-/// The extracted manifest is written to `manifests/<hash>` regardless, so
-/// future indexing never has to re-download content blobs.
-///
-/// Attributes are never hardcoded: `attributes_file` points at the
-/// OpenTDF-shaped definitions artifact (served publicly on `/attributes`
-/// and FQN-resolving `/attr/...` routes), and `group_attribute_fqn` must
-/// name an attribute defined in it.
-#[derive(Debug, Deserialize)]
+/// `[catalog]`: holds only `[catalog.authz]`, the decision service the
+/// catalog v2 reads, the campaign lookup and the publish decisions ask. The
+/// ingest-time campaign listing it once configured is gone; its keys
+/// (`enabled`, `group_attribute_fqn`, `attributes_url`, `attributes_file`,
+/// `cache_ttl_secs`) are ignored.
+#[derive(Debug, Default, Deserialize)]
 pub struct CatalogConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    /// FQN of the attribute whose values become catalog groups (without
-    /// `/value/...`), e.g. the Patreon campaign attribute: items labeled
-    /// with campaign X are indexed under group X.
-    #[serde(default = "default_group_attribute_fqn")]
-    pub group_attribute_fqn: String,
-    /// URL of the platform's public attributes endpoint (e.g.
-    /// "https://platform.arkavo.net/attributes") — the single source of
-    /// truth, served from the same policy snapshot the PDP evaluates.
-    /// When set, the node validates `group_attribute_fqn` against it at
-    /// startup and does NOT serve attribute routes itself.
-    #[serde(default)]
-    pub attributes_url: String,
-    /// Local attribute definitions artifact (JSON). Offline/test
-    /// alternative to `attributes_url`: the node serves the definitions
-    /// itself on /attributes and /attr/... routes. Exactly one of
-    /// `attributes_url` / `attributes_file` is required when `enabled`.
-    #[serde(default)]
-    pub attributes_file: String,
-    /// How long `/catalog/{group}` responses may serve a cached index
-    /// listing before re-reading S3.
-    #[serde(default = "default_catalog_cache_ttl_secs")]
-    pub cache_ttl_secs: u64,
     #[serde(default)]
     pub authz: AuthzConfig,
 }
 
-impl CatalogConfig {
-    /// The FQN prefix that group values are extracted from at ingest.
-    pub fn group_attribute_prefix(&self) -> String {
-        if self.group_attribute_fqn.is_empty() {
-            String::new()
-        } else {
-            format!("{}/value/", self.group_attribute_fqn.trim_end_matches('/'))
-        }
-    }
-}
-
-impl Default for CatalogConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            group_attribute_fqn: default_group_attribute_fqn(),
-            attributes_url: String::new(),
-            attributes_file: String::new(),
-            cache_ttl_secs: default_catalog_cache_ttl_secs(),
-            authz: AuthzConfig::default(),
-        }
-    }
-}
-
-fn default_group_attribute_fqn() -> String {
-    "https://patreon.arkavo.com/attr/campaign".to_string()
-}
-
-fn default_catalog_cache_ttl_secs() -> u64 {
-    30
-}
-
-/// OpenTDF authorization service used for per-item catalog decisions.
-/// Empty endpoint ⇒ fail closed (catalog lists, nothing entitled).
+/// OpenTDF authorization service used for catalog and publish decisions.
+/// Empty endpoint ⇒ fail closed (nothing entitled).
 #[derive(Debug, Deserialize)]
 pub struct AuthzConfig {
     /// Base URL of the platform, e.g. "https://platform.arkavo.net".
@@ -408,22 +347,6 @@ pub struct HttpConfig {
     /// only).
     #[serde(default = "default_passkey_status_url")]
     pub passkey_status_url: String,
-    /// Whether `GET /catalog/{group}` needs a token (tdf-iroh-s3#39). `GET
-    /// /v2/catalogs/{sub}` always does: it asks whether the reader may open
-    /// the catalog.
-    #[serde(default)]
-    pub catalog_token: CatalogToken,
-}
-
-/// `[http] catalog_token`, on `GET /catalog/{group}`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CatalogToken {
-    /// No token is served; a presented one must verify.
-    #[default]
-    Optional,
-    /// No token is 401.
-    Required,
 }
 
 /// TLS for the HTTP API, terminated by the node (rustls, TLS 1.3 only). The
@@ -462,7 +385,6 @@ impl Default for HttpConfig {
             tls: None,
             passkey_rp_id: default_passkey_rp_id(),
             passkey_status_url: default_passkey_status_url(),
-            catalog_token: CatalogToken::default(),
         }
     }
 }

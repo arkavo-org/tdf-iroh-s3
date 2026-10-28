@@ -58,115 +58,6 @@ fn create_tdf_with_attribute(attr_fqn: &str) -> Vec<u8> {
 }
 
 #[test]
-fn derive_artifacts_produces_manifest_and_group_entries() {
-    use tdf_iroh_s3::catalog::{CatalogEntry, derive_artifacts};
-    use tdf_iroh_s3::config::CatalogConfig;
-    use tdf_iroh_s3::validation::validate_blob;
-
-    // End-to-end from real TDF bytes: validate → derive. The grouping
-    // attribute value becomes the catalog group; the entry carries every
-    // policy FQN; the manifest sidecar is standalone-parseable JSON.
-    let tdf = create_tdf_with_attribute("https://patreon.arkavo.com/attr/campaign/value/12345678");
-    let manifest = validate_blob(&tdf, &ValidationConfig::default()).unwrap();
-
-    let config = CatalogConfig {
-        enabled: true,
-        ..CatalogConfig::default()
-    };
-    let derived = derive_artifacts(&manifest, &"ab".repeat(32), tdf.len() as u64, 42, &config)
-        .expect("derivation succeeds");
-
-    let parsed: serde_json::Value =
-        serde_json::from_str(&derived.manifest_json).expect("extracted manifest is valid JSON");
-    assert!(parsed.get("encryptionInformation").is_some());
-
-    assert_eq!(derived.entries.len(), 1, "one group entry expected");
-    let (group, entry_json) = &derived.entries[0];
-    assert_eq!(group, "12345678");
-    let entry: CatalogEntry = serde_json::from_slice(entry_json).unwrap();
-    assert_eq!(entry.hash, "ab".repeat(32));
-    assert_eq!(entry.ingested_at, 42);
-    assert!(
-        entry
-            .attribute_fqns
-            .contains(&"https://patreon.arkavo.com/attr/campaign/value/12345678".to_string()),
-        "entry FQNs: {:?}",
-        entry.attribute_fqns
-    );
-}
-
-#[test]
-fn derive_artifacts_indexes_no_catalog_metadata_or_envelope() {
-    use opentdf::prelude::*;
-    use tdf_iroh_s3::catalog::derive_artifacts;
-    use tdf_iroh_s3::catalog_metadata::{
-        CATALOG_ENTRY_MIME_TYPE, CATALOG_MIME_TYPE, read_manifest,
-    };
-    use tdf_iroh_s3::config::CatalogConfig;
-    use tdf_iroh_s3::validation::validate_blob;
-
-    // A catalog `/2` metadata TDF carries its recording's campaign but is in
-    // no group; its manifest is still stored for the publish check (#39). A
-    // catalog envelope pushed like a recording is in no group either.
-    for mime_type in [CATALOG_ENTRY_MIME_TYPE, CATALOG_MIME_TYPE] {
-        let policy = PolicyBuilder::new()
-            .id_auto()
-            .attribute_fqn("https://patreon.arkavo.com/attr/campaign/value/12345678")
-            .unwrap()
-            .build()
-            .unwrap();
-        let tdf = Tdf::encrypt(br#"{"title":"t"}"#)
-            .kas_url("https://kas.example.com")
-            .policy(policy)
-            .mime_type(mime_type)
-            .to_bytes()
-            .unwrap();
-        let manifest = validate_blob(&tdf, &ValidationConfig::default()).unwrap();
-        let config = CatalogConfig {
-            enabled: true,
-            ..CatalogConfig::default()
-        };
-        let derived = derive_artifacts(&manifest, &"ef".repeat(32), 1, 0, &config).unwrap();
-        assert!(derived.entries.is_empty(), "{mime_type}");
-        assert!(read_manifest(derived.manifest_json.as_bytes()).is_some());
-    }
-}
-
-#[test]
-fn derive_artifacts_with_catalog_disabled_still_extracts_manifest() {
-    use tdf_iroh_s3::catalog::derive_artifacts;
-    use tdf_iroh_s3::config::CatalogConfig;
-    use tdf_iroh_s3::validation::validate_blob;
-
-    let tdf = create_tdf_with_attribute("https://patreon.arkavo.com/attr/campaign/value/1");
-    let manifest = validate_blob(&tdf, &ValidationConfig::default()).unwrap();
-    let derived =
-        derive_artifacts(&manifest, &"cd".repeat(32), 1, 0, &CatalogConfig::default()).unwrap();
-    assert!(!derived.manifest_json.is_empty());
-    assert!(
-        derived.entries.is_empty(),
-        "disabled catalog indexes nothing"
-    );
-}
-
-#[test]
-fn derive_artifacts_ungrouped_policy_yields_no_entries() {
-    use tdf_iroh_s3::catalog::derive_artifacts;
-    use tdf_iroh_s3::config::CatalogConfig;
-    use tdf_iroh_s3::validation::validate_blob;
-
-    // No grouping attribute → in no catalog (curation = labeling).
-    let tdf = create_tdf_with_attribute("https://example.com/attr/storage/value/permanent");
-    let manifest = validate_blob(&tdf, &ValidationConfig::default()).unwrap();
-    let config = CatalogConfig {
-        enabled: true,
-        ..CatalogConfig::default()
-    };
-    let derived = derive_artifacts(&manifest, &"ee".repeat(32), 1, 0, &config).unwrap();
-    assert!(derived.entries.is_empty());
-}
-
-#[test]
 fn blobs_over_max_blob_bytes_are_refused() {
     let tdf = create_tdf_with_attribute("https://example.com/attr/storage/value/permanent");
     let at_limit = ValidationConfig {
@@ -188,7 +79,6 @@ fn blobs_over_max_blob_bytes_are_refused() {
 #[tokio::test]
 async fn ingest_from_store_refuses_an_oversize_blob() {
     use iroh_blobs::store::fs::FsStore;
-    use tdf_iroh_s3::config::CatalogConfig;
     use tdf_iroh_s3::ingest::{IngestError, ingest_from_store, prepare_scratch_dir};
     use tdf_iroh_s3::store::s3::S3Client;
 
@@ -207,15 +97,7 @@ async fn ingest_from_store_refuses_an_oversize_blob() {
         ..Default::default()
     };
 
-    let result = ingest_from_store(
-        hash,
-        &store,
-        &config,
-        &CatalogConfig::default(),
-        &s3,
-        &scratch,
-    )
-    .await;
+    let result = ingest_from_store(hash, &store, &config, &s3, &scratch).await;
     match result {
         Err(IngestError::Refused(e)) => {
             assert!(format!("{e:#}").contains("max_blob_bytes"), "{e:#}")
@@ -282,7 +164,7 @@ async fn assert_scratch_empty(scratch: &std::path::Path) {
 #[tokio::test(flavor = "current_thread")]
 async fn ingest_from_store_streams_a_valid_blob_to_s3() {
     use iroh_blobs::store::fs::FsStore;
-    use tdf_iroh_s3::config::{CatalogConfig, S3Config};
+    use tdf_iroh_s3::config::S3Config;
     use tdf_iroh_s3::ingest::{ingest_from_store, prepare_scratch_dir};
     use tdf_iroh_s3::store::s3::S3Client;
 
@@ -323,17 +205,10 @@ async fn ingest_from_store_streams_a_valid_blob_to_s3() {
     };
     let hash = store.add_slice(&tdf).await.unwrap().hash;
 
-    let result = ingest_from_store(
-        hash,
-        &store,
-        &ValidationConfig::default(),
-        &CatalogConfig::default(),
-        &s3,
-        &scratch,
-    )
-    .await
-    .unwrap()
-    .expect("a complete blob is ingested");
+    let result = ingest_from_store(hash, &store, &ValidationConfig::default(), &s3, &scratch)
+        .await
+        .unwrap()
+        .expect("a complete blob is ingested");
     assert_eq!(result.hash_hex, hash.to_hex().to_string());
     assert_eq!(result.size, tdf.len() as u64);
 
@@ -384,7 +259,6 @@ async fn ingest_from_store_streams_a_valid_blob_to_s3() {
         small_hash,
         &store,
         &ValidationConfig::default(),
-        &CatalogConfig::default(),
         &s3,
         &scratch,
     )
@@ -407,15 +281,7 @@ async fn ingest_from_store_streams_a_valid_blob_to_s3() {
     // Garbage is refused from its file, and its copy removed too.
     let garbage = vec![0xEEu8; 40_000];
     let hash = store.add_slice(&garbage).await.unwrap().hash;
-    let result = ingest_from_store(
-        hash,
-        &store,
-        &ValidationConfig::default(),
-        &CatalogConfig::default(),
-        &s3,
-        &scratch,
-    )
-    .await;
+    let result = ingest_from_store(hash, &store, &ValidationConfig::default(), &s3, &scratch).await;
     assert!(
         matches!(result, Err(tdf_iroh_s3::ingest::IngestError::Refused(_))),
         "garbage is refused"
