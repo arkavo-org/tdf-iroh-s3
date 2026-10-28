@@ -525,7 +525,7 @@ async fn ingest_stored(hash: iroh_blobs::Hash, pending: PendingPush, ingester: &
     };
     let mut retries = UPLOAD_RETRIES.iter();
     loop {
-        match ingest::upload(&validated, &config.catalog, &ingester.s3_client).await {
+        match ingest::upload(&validated, &ingester.s3_client).await {
             Ok(result) => {
                 info!(hash = %result.hash_hex, size = result.size, "Blob ingested successfully");
                 return true;

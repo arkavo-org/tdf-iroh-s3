@@ -11,18 +11,18 @@
 //! catalog.
 //!
 //! Each entry's metadata TDF travels inside the envelope, so the node never
-//! sees it: Creator checks it against its recording before publishing. Its
-//! type, [`CATALOG_ENTRY_MIME_TYPE`], stays out of the group index
-//! (`catalog::derive_artifacts`), should one ever be pushed like a recording.
+//! sees it: Creator checks it against its recording before publishing.
 //!
 //! Pure: no I/O.
 
+use anyhow::{Context, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use opentdf::{AttributePolicy, AttributeValue, LogicalOperator};
 use serde_json::{Map, Value};
 
-/// A metadata TDF's `payload.mimeType`. Ingest doesn't index a blob of this
-/// type under `catalog-index/`.
+/// A metadata TDF's `payload.mimeType`, which Creator checks; the node only
+/// refuses it as an envelope's.
 pub const CATALOG_ENTRY_MIME_TYPE: &str = "application/vnd.arkavo.catalog-entry+json";
 
 /// The envelope's `payload.mimeType`.
@@ -93,12 +93,90 @@ impl ManifestPolicy {
     }
 
     /// Whether the policy names `fqn`, in the spec form or opentdf-rs's
-    /// structured form (`catalog::extract_attribute_fqns`).
+    /// structured form ([`extract_attribute_fqns`]).
     pub fn has_attribute(&self, fqn: &str) -> bool {
         serde_json::to_string(&self.policy)
             .ok()
-            .and_then(|json| crate::catalog::extract_attribute_fqns(&json).ok())
+            .and_then(|json| extract_attribute_fqns(&json).ok())
             .is_some_and(|fqns| fqns.iter().any(|f| f == fqn))
+    }
+}
+
+/// Extract every attribute-value FQN referenced by a TDF policy
+/// (`https://<namespace>/attr/<name>/value/<value>`; value-less conditions
+/// such as `Present` yield `https://<namespace>/attr/<name>`). The result
+/// is deduplicated and sorted for deterministic index entries.
+///
+/// `body.dataAttributes` entries come in two shapes, and a policy may mix
+/// them:
+/// - the OpenTDF spec form, `{"attribute": "<FQN>"}`, which the Creator app
+///   and the other SDKs write;
+/// - the structured condition form opentdf-rs writes
+///   (`{"attribute": {"namespace", "name"}, "operator", "value"}`, or a
+///   logical operator over such conditions).
+///
+/// Keys outside `body` (for example Arkavo's `arkavo:*` extensions) are
+/// ignored.
+pub fn extract_attribute_fqns(policy_json: &str) -> Result<Vec<String>> {
+    let policy: serde_json::Value =
+        serde_json::from_str(policy_json).context("Failed to parse TDF policy JSON")?;
+    let body = policy.get("body").context("TDF policy has no body")?;
+    let attributes = match body.get("dataAttributes") {
+        None | Some(serde_json::Value::Null) => &[][..],
+        Some(serde_json::Value::Array(a)) => a.as_slice(),
+        Some(_) => anyhow::bail!("TDF policy dataAttributes is not an array"),
+    };
+
+    let mut fqns = Vec::new();
+    for attribute in attributes {
+        if let Some(fqn) = attribute.get("attribute").and_then(|a| a.as_str()) {
+            fqns.push(fqn.to_string());
+            continue;
+        }
+        let attr_policy: AttributePolicy = serde_json::from_value(attribute.clone())
+            .context("Failed to parse TDF policy data attribute")?;
+        collect_fqns(&attr_policy, &mut fqns);
+    }
+    fqns.sort();
+    fqns.dedup();
+    Ok(fqns)
+}
+
+fn collect_fqns(policy: &AttributePolicy, out: &mut Vec<String>) {
+    match policy {
+        AttributePolicy::Condition(cond) => {
+            let base = format!(
+                "https://{}/attr/{}",
+                cond.attribute.namespace, cond.attribute.name
+            );
+            match &cond.value {
+                Some(AttributeValue::String(s)) => out.push(format!("{base}/value/{s}")),
+                Some(AttributeValue::StringArray(values)) => {
+                    for s in values {
+                        out.push(format!("{base}/value/{s}"));
+                    }
+                }
+                Some(AttributeValue::Number(n)) => out.push(format!("{base}/value/{n}")),
+                Some(AttributeValue::Boolean(b)) => out.push(format!("{base}/value/{b}")),
+                Some(AttributeValue::DateTime(dt)) => {
+                    out.push(format!("{base}/value/{}", dt.to_rfc3339()));
+                }
+                Some(AttributeValue::NumberArray(values)) => {
+                    for n in values {
+                        out.push(format!("{base}/value/{n}"));
+                    }
+                }
+                None => out.push(base),
+            }
+        }
+        AttributePolicy::Logical(op) => match op {
+            LogicalOperator::AND { conditions } | LogicalOperator::OR { conditions } => {
+                for c in conditions {
+                    collect_fqns(c, out);
+                }
+            }
+            LogicalOperator::NOT { condition } => collect_fqns(condition, out),
+        },
     }
 }
 
@@ -245,6 +323,87 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use serde_json::json;
+
+    fn policy_json(fqns: &[&str]) -> String {
+        use opentdf::prelude::*;
+        let mut builder = PolicyBuilder::new().id_auto().dissemination(["t@test"]);
+        for fqn in fqns {
+            builder = builder.attribute_fqn(fqn).unwrap();
+        }
+        serde_json::to_string(&builder.build().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn extracts_fqns_from_policy() {
+        let json = policy_json(&[
+            "https://patreon.arkavo.com/attr/campaign/value/12345678",
+            "https://patreon.arkavo.com/attr/tier/value/gold",
+        ]);
+        let fqns = extract_attribute_fqns(&json).unwrap();
+        assert!(
+            fqns.contains(&"https://patreon.arkavo.com/attr/campaign/value/12345678".to_string()),
+            "campaign FQN missing: {fqns:?}"
+        );
+        assert!(
+            fqns.contains(&"https://patreon.arkavo.com/attr/tier/value/gold".to_string()),
+            "tier FQN missing: {fqns:?}"
+        );
+    }
+
+    #[test]
+    fn fqns_are_deduped_and_sorted() {
+        let json = policy_json(&[
+            "https://b.example/attr/x/value/1",
+            "https://a.example/attr/x/value/1",
+            "https://a.example/attr/x/value/1",
+        ]);
+        let fqns = extract_attribute_fqns(&json).unwrap();
+        let mut sorted = fqns.clone();
+        sorted.sort();
+        assert_eq!(fqns, sorted);
+        assert_eq!(
+            fqns.iter()
+                .filter(|f| f.as_str() == "https://a.example/attr/x/value/1")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn extracts_fqns_from_spec_form_policy() {
+        // The shape Creator writes: `{"attribute": "<FQN>"}` entries, plus
+        // `arkavo:*` keys outside `body`.
+        let json = r#"{
+            "arkavo:fpsProfile": "urn:arkavo:fairplay:key-envelope:1",
+            "body": {
+                "dataAttributes": [
+                    {"attribute": "https://patreon.arkavo.com/attr/campaign/value/12345678"},
+                    {"attribute": "https://patreon.arkavo.com/attr/campaign-tier/value/12345678_free"}
+                ],
+                "dissem": []
+            },
+            "uuid": "00000000-0000-4000-8000-000000000001"
+        }"#;
+        assert_eq!(
+            extract_attribute_fqns(json).unwrap(),
+            vec![
+                "https://patreon.arkavo.com/attr/campaign-tier/value/12345678_free".to_string(),
+                "https://patreon.arkavo.com/attr/campaign/value/12345678".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_or_null_data_attributes_yield_nothing() {
+        for json in [
+            r#"{"body":{"dataAttributes":null,"dissem":null},"uuid":"u"}"#,
+            r#"{"body":{"dissem":[]},"uuid":"u"}"#,
+        ] {
+            assert!(extract_attribute_fqns(json).unwrap().is_empty(), "{json}");
+        }
+        assert!(extract_attribute_fqns(r#"{"uuid":"u"}"#).is_err());
+        assert!(extract_attribute_fqns(r#"{"body":{"dataAttributes":{}}}"#).is_err());
+    }
 
     fn read(policy: Value, kas: &[&str]) -> ManifestPolicy {
         read_manifest(&manifest(policy, kas)).expect("readable manifest")

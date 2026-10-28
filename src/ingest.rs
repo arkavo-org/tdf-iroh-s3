@@ -23,8 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{info, warn};
 
-use crate::catalog;
-use crate::config::{CatalogConfig, ValidationConfig};
+use crate::config::ValidationConfig;
 use crate::store::s3::S3Client;
 use crate::validation;
 
@@ -152,12 +151,10 @@ pub async fn validate_from_store(
 }
 
 /// Upload a validated blob to S3, streaming from its scratch file, and
-/// write the derived artifacts (extracted manifest + catalog index
-/// entries). It can be retried; the scratch file goes when `validated` is
-/// dropped.
+/// write its extracted manifest. It can be retried; the scratch file goes
+/// when `validated` is dropped.
 pub async fn upload(
     validated: &Validated,
-    catalog_config: &CatalogConfig,
     s3_client: &S3Client,
 ) -> Result<IngestResult, IngestError> {
     let Validated {
@@ -179,7 +176,7 @@ pub async fn upload(
         .context("Failed to upload outboard to S3")
         .map_err(IngestError::Failed)?;
 
-    // Upload the blob unless already present. Derived artifacts below are
+    // Upload the blob unless already present. The manifest below is
     // written even for duplicate blobs, so a push retried after a partial
     // failure (or content predating the index) self-repairs.
     let present = s3_client
@@ -196,38 +193,19 @@ pub async fn upload(
             .context("Failed to upload blob to S3")
             .map_err(IngestError::Failed)?;
     }
-    // Derived artifacts (extracted manifest + catalog index entries).
-    // Best-effort: the content blob is already durably stored, so a
-    // manifest/index write failure must not mask a successful ingest — it
-    // is loudly logged, and re-pushing the same content rewrites the
-    // artifacts (self-repair). Note: the index prefixes (`manifests/`,
-    // `catalog-index/`) need the same S3 write permissions as `blobs/`.
-    match catalog::derive_artifacts(manifest, &hash_hex, size, unix_now(), catalog_config) {
-        Ok(derived) => {
-            if let Err(e) = s3_client
-                .put_manifest(&hash_hex, Bytes::from(derived.manifest_json))
-                .await
-            {
+    // The extracted manifest, which the catalog publish checks read
+    // (`catalogs_api::check_payloads`). Best-effort: the content blob is
+    // already durably stored, so a manifest write failure must not mask a
+    // successful ingest. It is loudly logged, and re-pushing the same
+    // content rewrites it (self-repair).
+    match manifest.to_json() {
+        Ok(json) => {
+            if let Err(e) = s3_client.put_manifest(&hash_hex, Bytes::from(json)).await {
                 warn!(hash = %hash_hex, error = %e,
                     "Failed to store extracted manifest — blob remains available; re-push to repair");
             }
-            if catalog_config.enabled && derived.entries.is_empty() {
-                info!(hash = %hash_hex, "No grouping attribute in policy; not cataloged");
-            }
-            for (group, entry_json) in derived.entries {
-                match s3_client
-                    .put_catalog_entry(&group, &hash_hex, Bytes::from(entry_json))
-                    .await
-                {
-                    Ok(()) => info!(hash = %hash_hex, %group, "Catalog index entry written"),
-                    Err(e) => warn!(hash = %hash_hex, %group, error = %e,
-                        "Failed to store catalog entry — blob remains available; re-push to repair"),
-                }
-            }
         }
-        Err(e) => {
-            warn!(hash = %hash_hex, error = %e, "Failed to derive catalog artifacts");
-        }
+        Err(e) => warn!(hash = %hash_hex, error = %e, "Failed to serialize the manifest"),
     }
 
     info!(hash = %hash_hex, size, "Blob ingested and stored to S3");
@@ -240,14 +218,11 @@ pub async fn ingest_from_store(
     hash: Hash,
     store: &FsStore,
     validation_config: &ValidationConfig,
-    catalog_config: &CatalogConfig,
     s3_client: &S3Client,
     scratch_dir: &Path,
 ) -> Result<Option<IngestResult>, IngestError> {
     match validate_from_store(hash, store, validation_config, scratch_dir).await? {
-        Some(validated) => upload(&validated, catalog_config, s3_client)
-            .await
-            .map(Some),
+        Some(validated) => upload(&validated, s3_client).await.map(Some),
         None => Ok(None),
     }
 }
@@ -267,13 +242,6 @@ pub async fn prepare_scratch_dir(data_dir: &str) -> anyhow::Result<PathBuf> {
         .await
         .with_context(|| format!("Failed to create {}", dir.display()))?;
     Ok(dir)
-}
-
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// A blob's scratch copy. Removed when dropped, off the runtime's worker

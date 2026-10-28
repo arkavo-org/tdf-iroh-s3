@@ -48,10 +48,10 @@ A blob ingested before outboards were stored has none. The first fetch of it
 is answered `ERR_LIMIT` while the node computes the outboard by streaming the
 blob from S3 once and stores it; the next fetch is served.
 
-Creators publish a catalog of their recordings as a JSON document the node
-stores by hash, behind the tag `catalog/<sub>`. The contract between the
-node, the Creator app and the iOS viewer is
-[docs/creator-catalogs.md](docs/creator-catalogs.md).
+Creators publish a catalog of their recordings as an encrypted document
+(a ZTDF envelope) the node stores by hash, behind the creator's
+passkey-signed pointer. The contract between the node, the Creator app and
+the iOS viewer is [docs/creator-catalogs.md](docs/creator-catalogs.md).
 
 ## Build
 
@@ -112,9 +112,6 @@ expected_issuer = "https://identity.arkavo.net"
 # passkey credential status route ("" skips the check; development only).
 passkey_rp_id = "identity.arkavo.net"
 passkey_status_url = "https://identity.arkavo.net/passkeys/credentials/{credentialId}/status"
-# GET /catalog/{group}: "optional" verifies a presented token, "required"
-# refuses none (tdf-iroh-s3#39). GET /v2/catalogs always needs one.
-catalog_token = "optional"
 
 # Optional: HTTPS terminated by the node itself (rustls, TLS 1.3 only).
 # The plain listener above then binds to 127.0.0.1 only. On EC2,
@@ -127,27 +124,9 @@ cert_path = "/etc/tdf-iroh-s3/tls/fullchain.pem"
 key_path = "/etc/tdf-iroh-s3/tls/privkey.pem"
 acm_certificate_arn = "arn:aws:acm:us-east-1:<account>:certificate/<id>"
 
-# Optional: ingest-time catalog index (see issue #5). Each ingested blob
-# gets a catalog-index/<group>/<hash> entry per value of the grouping
-# attribute in its TDF policy; the extracted manifest.json is stored at
-# manifests/<hash> so indexing/UIs never re-download content blobs.
-[catalog]
-enabled = true
-# Grouping attribute (must be defined in the attribute source). Items
-# labeled with campaign X are indexed and served under /catalog/X.
-group_attribute_fqn = "https://patreon.arkavo.com/attr/campaign"
-# Attribute definitions: exactly one of the following.
-# Production — the platform's public attributes endpoint is the single
-# source of truth (served from the snapshot the PDP evaluates); this node
-# validates group_attribute_fqn against it at startup and serves nothing:
-attributes_url = "https://platform.arkavo.net/attributes"
-# Offline/test alternative — local artifact, served by this node on
-# /attributes and FQN-resolving /attr/... routes:
-# attributes_file = "/etc/tdf-iroh-s3/attributes.json"
-cache_ttl_secs = 30
-
-# OpenTDF authorization service for per-item catalog decisions. Empty
-# endpoint = fail closed (catalog lists, nothing entitled).
+# OpenTDF authorization service: catalog and campaign reads ask it, and so
+# do [publishing] decisions = "pdp". Empty endpoint = fail closed (reads
+# answer 502 decision unavailable).
 #
 # The platform REQUIRES an authenticated caller. Production: register a
 # confidential OIDC client on the IdP and configure client_credentials —
@@ -192,9 +171,9 @@ entity_mode = "claims"
 
 The IAM role needs read and write on `blobs/` and `outboards/` (fetches
 read both; ingest writes both). It needs the same S3 write permissions on
-`manifests/` and `catalog-index/` as on `blobs/` — derived-artifact writes are best-effort
-(a failure is logged and never masks a successful blob ingest; re-pushing
-the content repairs the index). Creator catalogs need `s3:PutObject` and
+`manifests/` as on `blobs/`: the manifest write is best-effort (a failure
+is logged and never masks a successful blob ingest; re-pushing the content
+repairs it). Creator catalogs need `s3:PutObject` and
 `s3:GetObject` on `catalog-documents/`, and for catalog v2 also on
 `catalog-outboards/` and `catalog-pointers/` (pointer writes are
 conditional: `If-Match` / `If-None-Match`). It needs `s3:PutObject`,
@@ -202,50 +181,6 @@ conditional: `If-Match` / `If-None-Match`). It needs `s3:PutObject`,
 needs `s3:ListBucket` on the bucket itself, without a prefix condition:
 without it S3 answers a missing key with 403, and the node reports unknown
 hashes as 502 `storage unavailable` instead of 404.
-
-## Entitled catalog
-
-`GET /catalog/{group}` lists the group's ingested items, each annotated
-with whether the requesting entity chain is entitled to it. Catalog
-envelopes and metadata TDFs (`payload.mimeType`
-`application/vnd.arkavo.creator-catalog+json` or
-`application/vnd.arkavo.catalog-entry+json`), should one be pushed like a
-recording, are not items and are never listed:
-
-```bash
-# Anonymous: full listing, nothing entitled (public storefront)
-curl https://iroh.arkavo.net/catalog/12345678
-
-# With a person entity (Arkavo CWT) — decisions come from AuthZEN
-# /access/v1/evaluations on platform.arkavo.net (catalog-node service CWT
-# is the PEP Bearer; the PE CWT is SARC subject). Repeat X-Entity-Token
-# once per DeviceCheck CWT (not comma-separated):
-curl https://iroh.arkavo.net/catalog/12345678 \
-  -H "Authorization: Bearer <pe-cwt>" \
-  -H "X-Entity-Token: <devicecheck-cwt>" \
-  -H "X-Entity-Token: <second-devicecheck-cwt>"
-```
-
-Response: `{"group": "...", "decision": "evaluated|anonymous|unavailable",
-"items": [{"hash", "size", "attribute_fqns", "ingested_at", "entitled"}],
-"creator"?: "<account uuid>"}`. When groups are Patreon campaigns, `creator`
-names the campaign's creator, as recorded at their last catalog publish, so a
-viewer can find `GET /v2/catalogs/<creator>`. It is sent only to a reader the
-PDP entitles to the campaign attribute itself (asked with the items, as one
-more resource), and left out for anonymous readers, readers not entitled, an
-unknown creator, or a failed lookup.
-Each device CWT must have `aud=arkavo:devicecheck` and bind to the PE via
-`subject_id_bind` (strip a single leading `arkavo:` only; `apple:` and
-`client:` are not stripped). The node sends each one on to the PDP as the
-device's `token`, which the platform verifies. Empty listings return `items: []` without
-calling the PDP. The node appends its own observed environment entity.
-All failure modes degrade to `entitled: false`, never to access.
-
-Attribute definitions resolve as URLs: `GET /attributes` (the full set),
-`GET /attr/tier`, `GET /attr/tier/value/supporter` — so an FQN like
-`https://patreon.arkavo.com/attr/tier/value/supporter` dereferences when
-the namespace host points at this node. See
-`attributes/patreon.arkavo.com.json` for the example artifact.
 
 ## HTTP API
 
@@ -263,6 +198,7 @@ specified in [docs/creator-catalogs.md](docs/creator-catalogs.md).
 | `GET /catalog-documents/{hash}` | public | A stored catalog envelope (a ZTDF), byte for byte (`ETag`, cached 5 minutes, `If-None-Match` → 304). |
 | `PUT /v2/catalogs/{sub}` | publisher CWT + passkey | Publish a catalog: the envelope, its passkey-signed pointer bundle and its clear index ([docs/creator-catalogs.md](docs/creator-catalogs.md#catalog-v2-passkey-signed-catalogs-over-iroh)). |
 | `GET /v2/catalogs/{sub}` | any Arkavo CWT | The creator's signed pointer bundle, if the decision service entitles the reader to the envelope's attribute (403 otherwise); the envelope is then fetched over iroh by hash. |
+| `GET /v2/campaigns/{id}` | any Arkavo CWT | `{"creator"}`: the Patreon campaign's creator, if the decision service entitles the reader to the campaign (403 otherwise). |
 | `POST /publish/sessions` | publisher CWT | Gated nodes only (404, empty body, when ungated); see below. |
 
 ```bash

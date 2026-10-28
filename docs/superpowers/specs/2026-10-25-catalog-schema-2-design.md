@@ -4,7 +4,10 @@
 **Issue:** tdf-iroh-s3#39, tracked in #38 (design and owner decisions there).
 **Read at:** `main` `bd97825`.
 
-## Second amendment, 2026-10-27 (owner, confirmed in the node session)
+## Third amendment, 2026-10-27 (owner; Creator and arkavo-ios agreed)
+
+**The clear campaign listing is gone.** `GET /catalog/{group}` listed every recording pushed under a campaign attribute, from any publisher, ignored the creator's catalog (an entry taken out stayed listed) and had no titles. It, its `catalog-index/` and `[http] catalog_token` are removed. The `creator` it returned to entitled readers moves to `GET /v2/campaigns/{id}` → `{"creator"}`: a token, then the decision on the campaign's FQN (before the lookup), then `campaign-creators/<id>`, which only the campaign's own creator's publish writes. A viewer that holds a campaign reads its recordings from the creator's catalog. `docs/creator-catalogs.md` has the contract.
+
 
 **Metadata TDFs travel inside the envelope.** A document entry is `{contentID, version, payloadHash, payloadSize, metadata}`, `metadata` being the base64url of the entry's metadata ZTDF (at most 65 536 bytes). There are no metadata blobs: the node ingests none, and `metadataHash`/`metadataSize` and their rules are gone. A viewer reads a catalog with one fetch instead of 1 + N.
 

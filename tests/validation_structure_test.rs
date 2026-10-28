@@ -139,20 +139,16 @@ fn manifest_missing_a_required_field_is_rejected() {
 }
 
 #[test]
-fn fairplay_policy_groups_by_campaign() {
-    use tdf_iroh_s3::catalog::derive_artifacts;
-    use tdf_iroh_s3::config::CatalogConfig;
+fn fairplay_policy_names_its_campaign() {
+    use tdf_iroh_s3::catalog_metadata::read_manifest;
 
+    // The spec-form policy, as ingest stores it under `manifests/<hash>`,
+    // names its campaign for the catalog publish check.
     let bytes = fairplay_layout(FAIRPLAY_MANIFEST, "0.payload");
     let manifest = validate_tdf_structure(&bytes).unwrap();
-    let config = CatalogConfig {
-        enabled: true,
-        ..CatalogConfig::default()
-    };
-    let derived = derive_artifacts(&manifest, &"ab".repeat(32), bytes.len() as u64, 0, &config)
-        .expect("spec-form policy derives");
-    let groups: Vec<&str> = derived.entries.iter().map(|(g, _)| g.as_str()).collect();
-    assert_eq!(groups, ["12345678"]);
+    let stored = manifest.to_json().unwrap();
+    let policy = read_manifest(stored.as_bytes()).expect("stored manifest reads back");
+    assert!(policy.has_attribute("https://patreon.arkavo.com/attr/campaign/value/12345678"));
 }
 
 /// The manifest is read with a bound: a crafted archive cannot inflate one

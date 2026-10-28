@@ -28,7 +28,8 @@
 //!   (`skipEnvironmentEntities=true`); NPE device/environment entities are
 //!   forwarded for forward-compatibility but do not affect decisions yet.
 //!
-//! Unconfigured ⇒ `DenyAll`: the catalog still lists, nothing is entitled.
+//! Unconfigured ⇒ no provider: catalog and campaign reads answer 502
+//! `decision unavailable`, and `pdp` publish decisions fail closed.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -76,7 +77,8 @@ impl ChainEntity {
 /// The AuthZEN `resource.type` a decision is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceType {
-    /// An item of `GET /catalog/{group}`.
+    /// A catalog (`GET /v2/catalogs/{sub}`) or a campaign (`GET
+    /// /v2/campaigns/{id}`), decided on its one attribute.
     CatalogItem,
     /// The right to publish (tdf-iroh-s3#35).
     Publisher,
@@ -133,19 +135,6 @@ impl DecisionProvider for SharedDecisionProvider {
         // `self.decide_dyn` would be the blanket impl on the Arc itself,
         // which comes back here: call the provider inside the Arc.
         (**self).decide_dyn(req).await
-    }
-}
-
-/// Fail-closed provider used when no authorization endpoint is configured.
-pub struct DenyAll;
-
-impl DecisionProvider for DenyAll {
-    async fn decide(&self, req: DecisionRequest) -> Result<Decisions> {
-        Ok(req
-            .resources
-            .into_iter()
-            .map(|(id, _)| (id, false))
-            .collect())
     }
 }
 
@@ -783,6 +772,19 @@ fn map_evaluations(
 mod tests {
     use super::*;
 
+    /// Denies every resource.
+    struct DenyAll;
+
+    impl DecisionProvider for DenyAll {
+        async fn decide(&self, req: DecisionRequest) -> Result<Decisions> {
+            Ok(req
+                .resources
+                .into_iter()
+                .map(|(id, _)| (id, false))
+                .collect())
+        }
+    }
+
     fn pe(token: &str) -> ChainEntity {
         ChainEntity {
             kind: EntityKind::Subject,
@@ -793,18 +795,6 @@ mod tests {
                 "iss": "https://identity.test",
             }),
         }
-    }
-
-    #[tokio::test]
-    async fn deny_all_denies_everything() {
-        let req = DecisionRequest {
-            chain: vec![],
-            action: "read".into(),
-            resource_type: ResourceType::CatalogItem,
-            resources: vec![("r1".into(), vec![])],
-        };
-        let d = DenyAll.decide(req).await.unwrap();
-        assert_eq!(d.get("r1"), Some(&false));
     }
 
     /// The shared provider reaches the provider inside it, by either trait

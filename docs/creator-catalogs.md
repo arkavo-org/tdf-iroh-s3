@@ -21,7 +21,7 @@ It covers four things: how a creator's recordings are published, how a viewer fi
 - **The creator signs a pointer to the current envelope with their passkey** (catalog v2, below). The node serves the pointer only to a reader the platform entitles to the envelope's attribute.
 - **Readers never trust a catalog because of where it came from.** They check the signed pointer, the envelope's hash and size, and, once they decrypt it, that the document's `owner` is the creator they asked for.
 
-The format and design are tdf-iroh-s3#38 and #39 (amended 2026-10-27). Catalog `/1`, a plaintext document found through the tag `catalog/<sub>`, was removed on 2026-10-27, together with `PUT /catalogs/{sub}` and the tag routes `GET`/`PUT /tags/{name}`.
+The format and design are tdf-iroh-s3#38 and #39 (amended 2026-10-27). Catalog `/1`, a plaintext document found through the tag `catalog/<sub>`, was removed on 2026-10-27, together with `PUT /catalogs/{sub}` and the tag routes `GET`/`PUT /tags/{name}`. So was the clear campaign listing `GET /catalog/{group}` ([below](#removed-the-campaign-listing-2026-10-27)).
 
 ## Subjects
 
@@ -100,7 +100,7 @@ Each entry's metadata TDF travels inside the envelope, in its entry's `metadata`
 
 - Its payload holds the entry's title, publish time and attributes, as ArkavoCatalog defines it. Its `contentID`, `version` and `payloadHash` equal the entry's: a reader refuses metadata that names another entry.
 - Its policy has **only** the top-level keys `uuid` and `body`. The `uuid` is a non-empty string, fresh for each metadata TDF, unique in the document, and never the recording's or the envelope's: a viewer unwraps all of a catalog's metadata in one bulk rewrap, and the platform's KAS skips an entry with no policy id and refuses duplicate ids. The policy must not repeat the recording's `arkavo:classification`, `arkavo:components` or any other extension.
-- Its manifest's `payload.mimeType` is `application/vnd.arkavo.catalog-entry+json`. Should one ever be pushed like a recording, the node indexes no blob of that type, so it never appears in `GET /catalog/{group}`.
+- Its manifest's `payload.mimeType` is `application/vnd.arkavo.catalog-entry+json`.
 - Its `body.dataAttributes` and `body.dissem` equal the recording's, each as a set, and its key access objects name the same KAS URLs.
 - It is at most 65 536 bytes.
 
@@ -175,7 +175,7 @@ To remove a recording, Creator publishes the catalog without its entry. The TDF 
 
 ## Reading a catalog and downloading (viewer)
 
-1. **Find the current catalog.** `GET https://iroh.arkavo.net/v2/catalogs/<sub>` with `Authorization: Bearer <Arkavo CWT>` (see [`GET /v2/catalogs/{sub}`](#get-v2catalogssub-read-the-pointer)). A 403 `not entitled to catalog` means the viewer doesn't hold the creator's campaign: prompt them to follow it on Patreon.
+1. **Find the current catalog.** `GET https://iroh.arkavo.net/v2/catalogs/<sub>` with `Authorization: Bearer <Arkavo CWT>` (see [`GET /v2/catalogs/{sub}`](#get-v2catalogssub-read-the-pointer)). A 403 `not entitled to catalog` means the viewer doesn't hold the creator's campaign: prompt them to follow it on Patreon. A viewer that knows only a campaign id, from the campaigns in its token, first asks [`GET /v2/campaigns/<id>`](#get-v2campaignsid-find-a-campaigns-creator) for its creator.
 2. **Fetch and verify it.**
    - Verify the bundle ([Verification](#verification)), then fetch `catalogHash` over iroh with a limit of `catalogSize`, or `GET /catalog-documents/<hash>`. Fetches by hash need no token.
    - The BLAKE3 hash of the bytes must equal `catalogHash`.
@@ -298,13 +298,13 @@ The node checks the following in order:
 | The stored pointer is the base named by `If-Match` or `If-None-Match`, if either is sent | 412 `catalog changed since it was read` |
 | `seq` is greater than the stored one | 409 `seq must be greater than <n>` |
 
-The node then stores the envelope at `catalog-documents/<blake3>` with its BAO outboard at `catalog-outboards/<blake3>`, the index at `catalog-indexes/<blake3>` (never served), then the bundle at `catalog-pointers/<sub>`, and, once that has taken effect, for a campaign envelope the creator at `campaign-creators/<campaign id>`. `GET /catalog/<campaign id>` names that creator (`creator`) to a reader the decision service entitles to the campaign attribute, so a viewer can find `GET /v2/catalogs/<creator>`. The pointer is written only if no other publish replaced it in the meantime; otherwise 409 `seq must be greater than the stored seq: another publish won`. Read the pointer again and retry.
+The node then stores the envelope at `catalog-documents/<blake3>` with its BAO outboard at `catalog-outboards/<blake3>`, the index at `catalog-indexes/<blake3>` (never served), then the bundle at `catalog-pointers/<sub>`, and, once that has taken effect, for a campaign envelope the creator at `campaign-creators/<campaign id>`. [`GET /v2/campaigns/<campaign id>`](#get-v2campaignsid-find-a-campaigns-creator) names that creator to a reader entitled to the campaign, so a viewer can find `GET /v2/catalogs/<creator>`. The pointer is written only if no other publish replaced it in the meantime; otherwise 409 `seq must be greater than the stored seq: another publish won`. Read the pointer again and retry.
 
 200: `{"owner":"<sub>","seq":<n>,"hash":"<blake3 hex>","size":<bytes>}`.
 
 ### `GET /v2/catalogs/{sub}`: read the pointer
 
-The request needs `Authorization: Bearer <Arkavo CWT>`, checked before anything else, so a caller without one learns nothing about which creators have a catalog: 401 `token required` without it, 401 `invalid token` when it doesn't verify. Any Arkavo CWT the node verifies counts. Then the node asks the platform's decision service (`[catalog.authz]`, as `GET /catalog/{group}` does) whether the token's subject may open the envelope's one attribute: action `read`, one resource of type `catalog_item` whose id is the catalog's hash and whose `attribute_value_fqns` is that attribute, with the `X-Entity-Token` devices and the node's environment in the chain. An operator's service CWT, admitted as the moderation API admits one (`client:<id>` with role `service-account`, `aud` naming the client, and the client in `[publishing] operator_client_ids`), skips the decision.
+The request needs `Authorization: Bearer <Arkavo CWT>`, checked before anything else, so a caller without one learns nothing about which creators have a catalog: 401 `token required` without it, 401 `invalid token` when it doesn't verify. Any Arkavo CWT the node verifies counts. Then the node asks the platform's decision service (`[catalog.authz]`) whether the token's subject may open the envelope's one attribute: action `read`, one resource of type `catalog_item` whose id is the catalog's hash and whose `attribute_value_fqns` is that attribute, with the `X-Entity-Token` devices and the node's environment in the chain. An operator's service CWT, admitted as the moderation API admits one (`client:<id>` with role `service-account`, `aud` naming the client, and the client in `[publishing] operator_client_ids`), skips the decision.
 
 - **200:** the stored bundle JSON, with `ETag: "<seq>"` and `Cache-Control: private, max-age=300`: it is decided per reader, so only the caller reuses it. A publisher reads past caches, and sends the `ETag` back as `If-Match`.
 - **400:** `invalid subject`; `too many entities` for a chain over 8.
@@ -312,6 +312,19 @@ The request needs `Authorization: Bearer <Arkavo CWT>`, checked before anything 
 - **403:** `not entitled to catalog`: the reader doesn't hold the attribute. Prompt them to follow the creator's campaign. Distinct from 404.
 - **404:** `catalog not found`. There is no catalog, the creator is suspended with `hideCatalog`, the catalog is blocked, or the pointer names a catalog from before envelopes. Only this 404 means "no catalog".
 - **502:** `decision unavailable` when the decision service doesn't answer or isn't configured; `key set unavailable`; `storage unavailable`.
+
+### `GET /v2/campaigns/{id}`: find a campaign's creator
+
+For a viewer who holds a Patreon campaign but follows no creator: the campaign's creator, whose catalog is then read with `GET /v2/catalogs/<creator>`. The creator is the account recorded at that campaign's last catalog publish, which only the campaign's own creator can make (`arkavo_patreon` role `creator` with that `campaign_id`).
+
+The token is checked first, as on `GET /v2/catalogs/{sub}`. Then `id`, 1 to 20 ASCII digits. Then the decision service is asked whether the token's subject holds the campaign: action `read`, one resource of type `catalog_item` whose id is the campaign id and whose `attribute_value_fqns` is `https://patreon.arkavo.com/attr/campaign/value/<id>`, with the same chain. The decision comes before the lookup, so a reader who doesn't hold the campaign can't tell whether it has a creator. An operator's service CWT skips it.
+
+- **200:** `{"creator":"<sub>"}`, with `Cache-Control: private, max-age=300`.
+- **400:** `invalid campaign`; `too many entities` for a chain over 8.
+- **401:** `token required`, `invalid token`, or an `X-Entity-Token` that doesn't verify or isn't bound to the bearer.
+- **403:** `not entitled to campaign`.
+- **404:** `campaign not found`. No catalog was ever published under the campaign, or its creator is suspended with `hideCatalog`.
+- **502:** `decision unavailable`; `key set unavailable`; `storage unavailable`.
 
 ### Fetching the document over iroh
 
@@ -332,8 +345,15 @@ Fetch `catalogHash` from the pinned node, with a size limit of `catalogSize`. Th
 ## Removed with `/1` (2026-10-27)
 
 - `PUT /catalogs/{sub}`, `GET /tags/{name}` and `PUT /tags/{name}`: a catalog is published with `PUT /v2/catalogs/{sub}` and found with `GET /v2/catalogs/{sub}`.
-- `[http] accept_catalog_schema_1`, `[http] tag_prefix` and the `purge-catalogs-1` subcommand. `[http] catalog_token` now applies only to `GET /catalog/{group}`.
+- `[http] accept_catalog_schema_1`, `[http] tag_prefix` and the `purge-catalogs-1` subcommand.
 - A v2 pointer stored before envelopes names a `/1` document and has no index record: `GET /v2/catalogs/{sub}` answers 404 for it, and the creator's next publish replaces it at any `seq`.
+
+## Removed: the campaign listing (2026-10-27)
+
+- `GET /catalog/{group}`, the clear, ingest-time listing of every recording pushed under a campaign attribute. It ignored a creator's catalog: a recording taken out of the catalog stayed listed, any publisher could add one under another creator's campaign, and it had no titles. A campaign's recordings are its creator's catalog: `GET /v2/campaigns/{id}`, then `GET /v2/catalogs/<creator>`.
+- Its index under `catalog-index/`, and the public attribute definitions on `/attributes` and `/attr/...`.
+- `[http] catalog_token` and the `[catalog]` keys `enabled`, `group_attribute_fqn`, `attributes_url`, `attributes_file` and `cache_ttl_secs`. They are ignored if still set; `[catalog.authz]` stays, the decision service for catalog and campaign reads and for publish decisions.
+- Ingest still stores each recording's manifest at `manifests/<hash>`, which the publish checks read.
 
 ## Archive layout accepted at ingest
 

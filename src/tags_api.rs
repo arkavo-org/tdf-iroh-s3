@@ -72,6 +72,12 @@ pub trait TagStore: Send + Sync + 'static {
         campaign_id: &str,
         creator: &str,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    /// The creator recorded for the Patreon campaign `campaign_id`, or
+    /// `None`.
+    fn get_campaign_creator(
+        &self,
+        campaign_id: &str,
+    ) -> impl Future<Output = anyhow::Result<Option<String>>> + Send;
     /// A creator's stored catalog v2 pointer bundle.
     fn get_catalog_pointer(
         &self,
@@ -158,6 +164,10 @@ impl TagStore for crate::store::s3::S3Client {
 
     async fn put_campaign_creator(&self, campaign_id: &str, creator: &str) -> anyhow::Result<()> {
         Self::put_campaign_creator(self, campaign_id, creator).await
+    }
+
+    async fn get_campaign_creator(&self, campaign_id: &str) -> anyhow::Result<Option<String>> {
+        Self::get_campaign_creator(self, campaign_id).await
     }
 
     async fn get_catalog_pointer(&self, sub: &str) -> anyhow::Result<Option<StoredPointer>> {
@@ -410,6 +420,15 @@ pub(crate) mod test_support {
                 .await
                 .insert(campaign_id.to_string(), creator.to_string());
             Ok(())
+        }
+        async fn get_campaign_creator(&self, campaign_id: &str) -> anyhow::Result<Option<String>> {
+            self.up()?;
+            Ok(self
+                .campaign_creators
+                .lock()
+                .await
+                .get(campaign_id)
+                .cloned())
         }
         async fn get_catalog_pointer(&self, sub: &str) -> anyhow::Result<Option<StoredPointer>> {
             self.up()?;
