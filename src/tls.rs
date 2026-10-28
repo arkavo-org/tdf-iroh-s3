@@ -20,6 +20,13 @@ use tracing::{info, warn};
 
 use crate::config::TlsConfig;
 
+/// The largest header list an HTTP/2 client may send, in bytes (hyper's
+/// default is 16 KiB). An Arkavo CWT names every active Patreon membership
+/// with its campaign and tiers, and travels with DeviceCheck CWTs, so a
+/// heavy patron's headers outgrow 16 KiB. HTTP/1.1 already allows hyper's
+/// ~400 KiB read buffer.
+pub const MAX_HEADER_LIST_BYTES: u32 = 64 * 1024;
+
 /// How often a missing or unloadable cert/key pair is retried at startup.
 const LOAD_RETRY: Duration = Duration::from_secs(10);
 
@@ -42,7 +49,12 @@ pub async fn serve_https(cfg: &TlsConfig, router: Router) -> anyhow::Result<()> 
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.bind_port));
     info!("HTTPS API listening on port {}", cfg.bind_port);
-    axum_server::bind_rustls(addr, config)
+    let mut server = axum_server::bind_rustls(addr, config);
+    server
+        .http_builder()
+        .http2()
+        .max_header_list_size(MAX_HEADER_LIST_BYTES);
+    server
         .serve(router.into_make_service())
         .await
         .with_context(|| format!("HTTPS listener on port {}", cfg.bind_port))

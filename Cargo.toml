@@ -72,6 +72,8 @@ tempfile = "3"
 zip = "2.2"
 tower = { version = "0.5", features = ["util"] }
 rcgen = "0.14.10"
+# HTTP/2 for the HTTPS tests only; the node's own clients stay as configured above.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 
 [[bin]]
 name = "tdf-iroh-s3-test"
