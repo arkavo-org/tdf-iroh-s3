@@ -42,9 +42,12 @@ pub fn check_length(devices: usize, environment: bool) -> Result<(), (StatusCode
 }
 
 /// The person entity, from claims this node extracted from the *verified*
-/// CWT. The whole `arkavo_patreon` claim is forwarded (the AuthZEN client
-/// allowlists its fields), `iss` so the platform can pin the issuer, and
-/// `patreon_user_id` / `email` as the ERS's lookup keys. `token` is kept
+/// CWT. `arkavo_entitlements` is forwarded as it is, when there are any: the
+/// platform derives the subject's entitlements from it (opentdf-platform#69,
+/// tdf-iroh-s3#51). The whole `arkavo_patreon` claim is forwarded too, for
+/// the transition (the AuthZEN client allowlists its fields), `iss` so the
+/// platform can pin the issuer, and `patreon_user_id` / `email` as the ERS's
+/// lookup keys. `token` is kept
 /// only for the OpenTDF client's token mode; it is never stored.
 pub fn subject_entity(pe: &VerifiedClaims, token: Option<&str>) -> ChainEntity {
     let mut claims = serde_json::Map::new();
@@ -68,8 +71,11 @@ pub fn subject_entity(pe: &VerifiedClaims, token: Option<&str>) -> ChainEntity {
     if let Some(roles) = &pe.arkavo_roles {
         claims.insert("arkavo_roles".into(), roles.clone().into());
     }
-    if let Some(ents) = &pe.arkavo_entitlements {
-        claims.insert("arkavo_entitlements".into(), ents.clone().into());
+    if !pe.arkavo_entitlements.is_empty() {
+        claims.insert(
+            "arkavo_entitlements".into(),
+            pe.arkavo_entitlements.clone().into(),
+        );
     }
     if let Some(id) = &pe.client_id {
         claims.insert("client_id".into(), id.clone().into());

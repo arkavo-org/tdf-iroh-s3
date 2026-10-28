@@ -154,9 +154,10 @@ client_id = "catalog-node"
 environment_region = "us-east-1"
 # Entity presentation, contract-verified against the platform source:
 # "claims" (default) sends an entityChain of claims-bearing entities built
-# from claims this node extracts from verified CWTs (arkavo_patreon.
-# patreon_user_id, email) — the platform PDP resolves every chain entity
-# through the ERS, and the Patreon ERS resolves exactly those claims.
+# from claims this node extracts from verified CWTs (arkavo_entitlements,
+# then arkavo_patreon, patreon_user_id and email) — the platform PDP
+# resolves every chain entity through the ERS, which derives the subject's
+# entitlements from arkavo_entitlements (opentdf-platform#69).
 # "token" sends entityIdentifier.token, which only works for JWT IdPs
 # (the ERS token parser rejects CWTs). Environment entities are filtered
 # by the platform's decision flow today; they are forwarded for

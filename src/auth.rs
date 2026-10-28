@@ -127,7 +127,12 @@ pub struct VerifiedClaims {
     pub idp: Option<String>,
     pub arkavo_account_id: Option<String>,
     pub arkavo_roles: Option<Vec<String>>,
-    pub arkavo_entitlements: Option<Vec<String>>,
+    /// The entitlements identity derived for the subject (campaign and tier
+    /// values, the publish entitlement), forwarded to the decision service
+    /// as they are. Empty when the token carries none, or a malformed list
+    /// ([`MAX_ENTITLEMENTS`], [`MAX_ENTITLEMENT_BYTES`]): the token still
+    /// verifies, with no entitlements (tdf-iroh-s3#51).
+    pub arkavo_entitlements: Vec<String>,
     pub client_id: Option<String>,
     /// The full verified `arkavo_patreon` claim as JSON (role,
     /// patreon_user_id, campaign_id, memberships[…]), so the catalog node
@@ -466,7 +471,7 @@ fn parse_claims(payload: &[u8]) -> Result<VerifiedClaims, AuthError> {
     let mut idp = None;
     let mut arkavo_account_id = None;
     let mut arkavo_roles = None;
-    let mut arkavo_entitlements = None;
+    let mut arkavo_entitlements = Vec::new();
     let mut client_id = None;
     let mut arkavo_patreon = None;
     for (k, v) in entries {
@@ -523,7 +528,7 @@ fn parse_claims(payload: &[u8]) -> Result<VerifiedClaims, AuthError> {
                 ("client_id", Value::Text(s)) => client_id = Some(s),
                 ("arkavo_roles", Value::Array(a)) => arkavo_roles = Some(text_array(a)?),
                 ("arkavo_entitlements", Value::Array(a)) => {
-                    arkavo_entitlements = Some(text_array(a)?);
+                    arkavo_entitlements = entitlements(a);
                 }
                 ("arkavo_patreon", patreon @ Value::Map(_)) => {
                     // Keep the whole claim as JSON for forwarding, and pull
@@ -569,6 +574,28 @@ fn parse_claims(payload: &[u8]) -> Result<VerifiedClaims, AuthError> {
         client_id,
         arkavo_patreon,
     })
+}
+
+/// The most `arkavo_entitlements` values a token may carry.
+pub const MAX_ENTITLEMENTS: usize = 500;
+
+/// The longest `arkavo_entitlements` value, in bytes.
+pub const MAX_ENTITLEMENT_BYTES: usize = 256;
+
+/// `arkavo_entitlements`, or none when the list is longer than
+/// [`MAX_ENTITLEMENTS`] or holds anything but text of at most
+/// [`MAX_ENTITLEMENT_BYTES`].
+fn entitlements(a: Vec<Value>) -> Vec<String> {
+    if a.len() > MAX_ENTITLEMENTS {
+        return Vec::new();
+    }
+    a.into_iter()
+        .map(|v| match v {
+            Value::Text(s) if s.len() <= MAX_ENTITLEMENT_BYTES => Some(s),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
 }
 
 fn text_array(a: Vec<Value>) -> Result<Vec<String>, AuthError> {
@@ -886,6 +913,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(claims.sub, "arkavo:u1");
+    }
+
+    /// `arkavo_entitlements` is a text array of at most 500 values of at
+    /// most 256 bytes; anything else reads as none, and the token still
+    /// verifies (tdf-iroh-s3#51).
+    #[tokio::test]
+    async fn malformed_entitlements_read_as_none() {
+        let (sk, vk) = keypair();
+        let claims_with = |entitlements: Value| {
+            let token = test_support::mint_with_extras(
+                &sk,
+                b"kid-1",
+                "https://identity.test",
+                "arkavo:u1",
+                NOW,
+                NOW + 3600,
+                &[("arkavo_entitlements", entitlements)],
+            );
+            let verifier = verifier(b"kid-1", vk);
+            async move { verifier.verify(&token, NOW).await.unwrap() }
+        };
+        let text = |s: String| Value::Text(s);
+        let fqn = "https://patreon.arkavo.com/attr/campaign/value/1".to_string();
+
+        let at_caps = Value::Array(
+            (0..MAX_ENTITLEMENTS)
+                .map(|i| text(format!("{i:0>width$}", width = MAX_ENTITLEMENT_BYTES)))
+                .collect(),
+        );
+        assert_eq!(
+            claims_with(at_caps).await.arkavo_entitlements.len(),
+            MAX_ENTITLEMENTS
+        );
+        assert_eq!(
+            claims_with(Value::Array(vec![text(fqn.clone())]))
+                .await
+                .arkavo_entitlements,
+            vec![fqn.clone()]
+        );
+        for malformed in [
+            Value::Array(vec![text(fqn.clone()); MAX_ENTITLEMENTS + 1]),
+            Value::Array(vec![
+                text(fqn.clone()),
+                text("x".repeat(MAX_ENTITLEMENT_BYTES + 1)),
+            ]),
+            Value::Array(vec![text(fqn.clone()), Value::Integer(1.into())]),
+            Value::Text(fqn.clone()),
+            Value::Map(vec![]),
+        ] {
+            assert!(claims_with(malformed).await.arkavo_entitlements.is_empty());
+        }
     }
 
     #[tokio::test]
