@@ -1,7 +1,7 @@
 //! The entity chain a decision is asked about (draft-arkavo-authzen-cwt-00):
 //! the verified person, each attested device, then the environment this node
-//! observes. Shared by `GET /v2/catalogs/{sub}`, `GET /v2/campaigns/{id}`
-//! and the publishing decision.
+//! observes. Shared by `GET /v2/catalogs/{sub}` and the publishing
+//! decision.
 //!
 //! - Person: claims from a CWT this node verified.
 //! - Devices: zero or more repeated `X-Entity-Token: <DeviceCheck CWT>`

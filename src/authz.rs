@@ -28,7 +28,7 @@
 //!   (`skipEnvironmentEntities=true`); NPE device/environment entities are
 //!   forwarded for forward-compatibility but do not affect decisions yet.
 //!
-//! Unconfigured ⇒ no provider: catalog and campaign reads answer 502
+//! Unconfigured ⇒ no provider: catalog reads answer 502
 //! `decision unavailable`, and `pdp` publish decisions fail closed.
 
 use anyhow::{Context, Result};
@@ -77,8 +77,8 @@ impl ChainEntity {
 /// The AuthZEN `resource.type` a decision is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceType {
-    /// A catalog (`GET /v2/catalogs/{sub}`) or a campaign (`GET
-    /// /v2/campaigns/{id}`), decided on its one attribute.
+    /// A catalog (`GET /v2/catalogs/{sub}`), decided on its envelope's one
+    /// attribute.
     CatalogItem,
     /// The right to publish (tdf-iroh-s3#35).
     Publisher,
