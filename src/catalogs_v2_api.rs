@@ -1742,6 +1742,11 @@ mod tests {
                 vec![("12345678".to_string(), vec![CAMPAIGN.to_string()])]
             );
             assert_eq!(req.chain[0].claims["sub"], READER);
+            // The reader's entitlements travel with the decision (#51).
+            assert_eq!(
+                req.chain[0].claims["arkavo_entitlements"],
+                json!([DEFAULT_PUBLISH_ENTITLEMENT])
+            );
         }
 
         *h.decider.answer.lock().unwrap() = Some(false);

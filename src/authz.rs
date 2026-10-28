@@ -1260,6 +1260,49 @@ mod tests {
         assert!(!same_origin("not a url", "https://p.test"));
     }
 
+    /// The subject's `arkavo_entitlements` reach the decision as they are,
+    /// next to the allowlisted `arkavo_patreon` (tdf-iroh-s3#51): the
+    /// platform derives its entitlements from them (opentdf-platform#69).
+    #[test]
+    fn authzen_subject_forwards_the_entitlements_verbatim() {
+        let entitlements = json!([
+            "https://patreon.arkavo.com/attr/campaign/value/11111111",
+            "https://patreon.arkavo.com/attr/campaign-tier/value/11111111_tier-42",
+            "https://patreon.arkavo.com/attr/campaign-tier/value/11111111_gold",
+            "https://patreon.arkavo.com/attr/arkavo-creator/value/publish",
+        ]);
+        let mut subject = pe("pe-cwt");
+        subject.claims["arkavo_entitlements"] = entitlements.clone();
+        subject.claims["arkavo_patreon"] = json!({
+            "role": "creator",
+            "campaign_id": "11111111",
+            "access_token": "secret",
+        });
+        let req = DecisionRequest {
+            chain: vec![subject],
+            action: "read".into(),
+            resource_type: ResourceType::CatalogItem,
+            resources: vec![("r1".into(), vec![])],
+        };
+        let body = build_authzen_request(&req).unwrap();
+        let properties = &body["subject"]["properties"];
+        assert_eq!(properties["arkavo_entitlements"], entitlements);
+        assert_eq!(properties["arkavo_patreon"]["campaign_id"], "11111111");
+        assert!(properties["arkavo_patreon"].get("access_token").is_none());
+
+        // A subject without the claim sends none.
+        let req = DecisionRequest {
+            chain: vec![pe("pe-cwt")],
+            ..req
+        };
+        let body = build_authzen_request(&req).unwrap();
+        assert!(
+            body["subject"]["properties"]
+                .get("arkavo_entitlements")
+                .is_none()
+        );
+    }
+
     #[test]
     fn patreon_claim_is_allowlisted() {
         let p = json!({

@@ -771,12 +771,7 @@ impl PublishPolicy {
         }
         let local = match &self.entitlement {
             _ if suspended => Err((StatusCode::FORBIDDEN, "publishing suspended")),
-            Some(want)
-                if !claims
-                    .arkavo_entitlements
-                    .as_ref()
-                    .is_some_and(|e| e.iter().any(|x| x == want)) =>
-            {
+            Some(want) if !claims.arkavo_entitlements.iter().any(|x| x == want) => {
                 Err((StatusCode::FORBIDDEN, "publishing entitlement required"))
             }
             _ => Ok(()),
