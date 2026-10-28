@@ -137,6 +137,51 @@ async fn https_offers_only_tls13() {
     );
 }
 
+/// An HTTP/2 request carries a bearer token far past hyper's default 16 KiB
+/// header list: a patron's CWT with many Patreon memberships, plus device
+/// tokens. Headers past `MAX_HEADER_LIST_BYTES` are still refused.
+#[tokio::test]
+async fn https_takes_large_headers_over_h2() {
+    use tdf_iroh_s3::tls::MAX_HEADER_LIST_BYTES;
+
+    install_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let pem = write_self_signed(dir.path());
+    let port = free_port();
+    let cfg = TlsConfig {
+        bind_port: port,
+        cert_path: dir.path().join("fullchain.pem"),
+        key_path: dir.path().join("privkey.pem"),
+        acm_certificate_arn: String::new(),
+        reload_check_secs: 1,
+    };
+    let router = Router::new().route("/healthz", get(|| async { "ok" }));
+    tokio::spawn(async move { serve_https(&cfg, router).await });
+    assert!(
+        wait_for(|| async { get_healthz(port, &pem).await.is_ok() }).await,
+        "HTTPS never answered"
+    );
+
+    let h2 = client(port, &pem).http2_prior_knowledge().build().unwrap();
+    let send = |bearer_bytes: usize| {
+        h2.get(format!("https://localhost:{port}/healthz"))
+            .header(
+                "authorization",
+                format!("Bearer {}", "a".repeat(bearer_bytes)),
+            )
+            .header("x-entity-token", "b".repeat(2048))
+            .send()
+    };
+    let r = send(48 * 1024).await.expect("a 48 KiB bearer is accepted");
+    assert_eq!(r.version(), reqwest::Version::HTTP_2);
+    assert_eq!(r.status(), reqwest::StatusCode::OK);
+    let over = send(MAX_HEADER_LIST_BYTES as usize).await;
+    assert!(
+        over.is_err() || !over.unwrap().status().is_success(),
+        "headers over the limit must be refused"
+    );
+}
+
 #[tokio::test]
 async fn https_waits_for_missing_cert() {
     install_provider();

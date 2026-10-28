@@ -216,7 +216,9 @@ that verifies; the entitlement, service-token and suspension checks are
 skipped, and nothing is blocked.
 
 TLS terminates in the node when `[http.tls]` is set, and only TLS 1.3 is
-offered: a TLS 1.2 client is refused in the handshake. The ACM certificate
+offered: a TLS 1.2 client is refused in the handshake. HTTP/2 requests may
+carry up to 64 KiB of headers (hyper's default is 16 KiB), room for a CWT
+naming many Patreon memberships plus its device tokens. The ACM certificate
 must be requested with `--options Export=ENABLED`, and the instance role
 needs `acm:ExportCertificate` on it. The systemd unit grants
 `CAP_NET_BIND_SERVICE` so the service user can bind 443.
