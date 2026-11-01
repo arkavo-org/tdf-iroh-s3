@@ -1,8 +1,16 @@
 # tdf-iroh-s3
 
+[![CI](https://github.com/arkavo-org/tdf-iroh-s3/actions/workflows/ci.yml/badge.svg)](https://github.com/arkavo-org/tdf-iroh-s3/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 A persistent Iroh peer node that validates incoming blobs as OpenTDF files
 and stores them in Amazon S3. Serves stored blobs back to any requesting
 peer, straight from S3.
+
+**Status:** Arkavo runs this node in production (`iroh.arkavo.net`). It is
+pre-1.0 and is not published to crates.io. The HTTP API and configuration can
+change between commits; the creator catalog contract is
+[docs/creator-catalogs.md](docs/creator-catalogs.md).
 
 ## How It Works
 
@@ -275,6 +283,18 @@ repository (`production/` is gitignored).
 cargo test
 ```
 
+CI runs these on every pull request and push to `main`; run them before
+opening a pull request:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo audit            # ignores, each with its reason, are in .cargo/audit.toml
+```
+
+The minimum supported Rust version is 1.91 (`rust-version` in `Cargo.toml`).
+
 The test CLI drives a running node:
 
 ```bash
@@ -291,3 +311,30 @@ same endpoint key, which a gated node's publish session requires.
 `examples/mint_test_idp.rs` emits a local key set and creator token for
 running against a node with `cose_keys_url` pointed at it, and
 `[s3] endpoint_url` + `force_path_style` run the node against LocalStack.
+
+## Contributing
+
+Issues and pull requests are welcome. Keep a pull request to one change, with
+tests, and make sure the checks under [Test](#test) pass. Interfaces other
+apps depend on are specified in [docs/](docs/); a change to one updates its
+document in the same pull request.
+
+## Security
+
+Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
