@@ -55,7 +55,7 @@ futures = "0.3"
 # Same version iroh-blobs uses: outboards and BAO encoding for serving from S3.
 bao-tree = { version = "0.16", features = ["tokio_fsm", "validate"] }
 iroh-io = "0.6"
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 # Reading TDF archives from a file at ingest (the version opentdf uses)
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

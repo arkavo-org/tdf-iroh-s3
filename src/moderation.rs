@@ -18,7 +18,9 @@
 //!
 //! Publish sessions are also written to `moderation/sessions/<endpoint>`,
 //! so a push finds its session on any instance, or after a restart, and
-//! not only on the one that opened it (tdf-iroh-s3#32).
+//! not only on the one that opened it (tdf-iroh-s3#32). Each record carries
+//! a tag keyed from the node's secret key, so only the node can write one a
+//! push accepts, not anyone who can write the session store (#46).
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -31,7 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -216,6 +218,46 @@ struct SessionRecord {
     /// service denied or wasn't asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     chain: Option<Vec<StoredEntity>>,
+}
+
+/// What `moderation/sessions/<endpoint>` holds: a [`SessionRecord`] as the
+/// exact bytes that were tagged, the tag and the ID of its key. The tag is
+/// checked over those bytes before the record is parsed, so nothing is
+/// re-serialized to verify it.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedRecord<'a> {
+    kid: String,
+    #[serde(borrow)]
+    record: &'a serde_json::value::RawValue,
+    /// Hex keyed BLAKE3 of `record`.
+    tag: String,
+}
+
+/// Derives the session record key from the node's secret key.
+const RECORD_KEY_CONTEXT: &str = "tdf-iroh-s3 2026-11-01 publish-session record tag v1";
+
+/// The key that tags stored session records (tdf-iroh-s3#46). It is
+/// derived from the node's secret key, which every instance loads from the
+/// same SSM parameter and which is never written to the session store, so
+/// write access to the store cannot make a session a push accepts.
+struct RecordKey {
+    key: [u8; 32],
+    /// The first 8 bytes of the key's BLAKE3 hash, in hex: tells a record
+    /// tagged by another key from a forged one.
+    kid: String,
+}
+
+impl RecordKey {
+    fn derive(secret: &iroh::SecretKey) -> Self {
+        let key = blake3::derive_key(RECORD_KEY_CONTEXT, &secret.to_bytes());
+        let kid = hex::encode(&blake3::hash(&key).as_bytes()[..8]);
+        Self { key, kid }
+    }
+
+    fn tag(&self, record: &[u8]) -> blake3::Hash {
+        blake3::keyed_hash(&self.key, record)
+    }
 }
 
 /// The in-memory view every gate reads: active suspensions and blocks.
@@ -451,6 +493,9 @@ pub struct PublishGate {
     /// The longest a session read back from the store is held: a record's
     /// `expiresAt` never extends it past what opening one grants.
     session_ttl: Duration,
+    /// Tags session records; set from the endpoint's key once it is bound.
+    /// Until then no record is stored or accepted.
+    record_key: OnceLock<RecordKey>,
 }
 
 /// Why a push was refused.
@@ -474,7 +519,61 @@ impl PublishGate {
             session_ttl: Duration::from_secs(
                 crate::config::PublishingConfig::default().session_ttl_secs,
             ),
+            record_key: OnceLock::new(),
         }
+    }
+
+    /// Key session records with the node's secret key (tdf-iroh-s3#46). The
+    /// node calls this as soon as its endpoint is bound, before it accepts a
+    /// connection or the HTTP API starts. Only the first call counts.
+    pub fn set_session_key(&self, secret: &iroh::SecretKey) {
+        let _ = self.record_key.set(RecordKey::derive(secret));
+    }
+
+    /// The bytes to store for `record`, or `None` before the key is set.
+    fn seal(&self, record: &SessionRecord) -> Option<Bytes> {
+        let raw = serde_json::value::to_raw_value(record).expect("session record serializes");
+        self.seal_raw(&raw)
+    }
+
+    fn seal_raw(&self, record: &serde_json::value::RawValue) -> Option<Bytes> {
+        let key = self.record_key.get()?;
+        let sealed = SealedRecord {
+            kid: key.kid.clone(),
+            record,
+            tag: key.tag(record.get().as_bytes()).to_hex().to_string(),
+        };
+        Some(Bytes::from(
+            serde_json::to_vec(&sealed).expect("sealed record serializes"),
+        ))
+    }
+
+    /// The record in `body` if its tag is this node's, else `None`. A
+    /// refusal logs the endpoint only: the record's contents are untrusted.
+    fn unseal(&self, endpoint: &EndpointId, body: &[u8]) -> Option<SessionRecord> {
+        let Some(key) = self.record_key.get() else {
+            warn!(%endpoint, "No session record key yet; stored session refused");
+            return None;
+        };
+        let Ok(sealed) = serde_json::from_slice::<SealedRecord>(body) else {
+            warn!(%endpoint, "Session record unreadable or untagged; refused");
+            return None;
+        };
+        if sealed.kid != key.kid {
+            warn!(%endpoint, "Session record tagged by another key; refused");
+            return None;
+        }
+        // `blake3::Hash` compares in constant time.
+        match blake3::Hash::from_hex(sealed.tag.as_bytes()) {
+            Ok(tag) if tag == key.tag(sealed.record.get().as_bytes()) => {}
+            _ => {
+                warn!(%endpoint, "Session record fails its tag; refused");
+                return None;
+            }
+        }
+        serde_json::from_str(sealed.record.get())
+            .inspect_err(|e| warn!(%endpoint, error = %e, "Unreadable session record"))
+            .ok()
     }
 
     /// Cap sessions read back from the store at `ttl`, the TTL sessions are
@@ -607,9 +706,7 @@ impl PublishGate {
                 return None;
             }
         };
-        let record: SessionRecord = serde_json::from_slice(&body)
-            .inspect_err(|e| warn!(%endpoint, error = %e, "Unreadable session record"))
-            .ok()?;
+        let record = self.unseal(endpoint, &body)?;
         let left = record.expires_at - now_secs();
         if record.endpoint_id != key || left <= 0 {
             return None;
@@ -990,21 +1087,27 @@ async fn open_session<S: ModerationStore>(
     let token = bearer(&headers).unwrap_or_default();
     verify_possession(&endpoint, token, body.timestamp, &body.signature).map_err(refuse)?;
     let expires_at = now_secs() + s.policy.session_ttl.as_secs() as i64;
-    // Stored so that any instance finds it (#32). Without it the session
-    // still works on this instance, as before.
+    // Stored, tagged by the node (#46), so that any instance finds it
+    // (#32). Without it the session still works on this instance.
     let record = SessionRecord {
         endpoint_id: endpoint.to_string(),
         subject: claims.sub.clone(),
         expires_at,
         chain: chain.clone(),
     };
-    let body = Bytes::from(serde_json::to_vec(&record).expect("session record serializes"));
-    if let Err(e) = s
-        .store
-        .put_record(SESSIONS, &record.endpoint_id, body)
-        .await
-    {
-        warn!(sub = %claims.sub, %endpoint, error = %e, "Publish session not stored; it holds on this instance only");
+    match s.gate.seal(&record) {
+        Some(body) => {
+            if let Err(e) = s
+                .store
+                .put_record(SESSIONS, &record.endpoint_id, body)
+                .await
+            {
+                warn!(sub = %claims.sub, %endpoint, error = %e, "Publish session not stored; it holds on this instance only");
+            }
+        }
+        None => {
+            warn!(sub = %claims.sub, %endpoint, "No session record key; publish session holds on this instance only");
+        }
     }
     s.gate
         .open_session_with_chain(endpoint, &claims.sub, s.policy.session_ttl, chain);
@@ -1439,6 +1542,7 @@ mod tests {
         let gate = Arc::new(
             PublishGate::new(Arc::new(Moderation::default())).with_decider(Arc::clone(&decider)),
         );
+        gate.set_session_key(&node_key());
         let api = Arc::new(ModerationApi {
             store: store.clone(),
             verifier: Arc::new(CwtVerifier::with_static_keys(vec![(KID.to_vec(), vk)])),
@@ -1505,6 +1609,24 @@ mod tests {
         key().public()
     }
 
+    /// The secret key of the node every test instance shares, as instances
+    /// share the one in SSM.
+    fn node_key() -> iroh::SecretKey {
+        iroh::SecretKey::from_bytes(&[0xee; 32])
+    }
+
+    /// `record` as the node stores it: tagged by `gate`'s key.
+    fn sealed(gate: &PublishGate, record: &serde_json::Value) -> Bytes {
+        gate.seal_raw(&serde_json::value::to_raw_value(record).unwrap())
+            .expect("gate has a session key")
+    }
+
+    /// The session record stored for `ep`, checked against `gate`'s key.
+    fn stored(h: &Harness, ep: &EndpointId) -> SessionRecord {
+        let raw = h.store.records.lock().unwrap()[&format!("sessions/{ep}")].clone();
+        h.gate.unseal(ep, &raw).expect("record tagged by the node")
+    }
+
     /// A session request signed by `sk` for `bearer`.
     fn signed(sk: &iroh::SecretKey, bearer: &str) -> Option<serde_json::Value> {
         let ep = sk.public();
@@ -1545,8 +1667,10 @@ mod tests {
     /// Another instance's gate: the same moderation view and session store,
     /// none of this gate's sessions.
     fn other_instance(h: &Harness) -> PublishGate {
-        PublishGate::new(Arc::clone(&h.gate.moderation))
-            .with_session_store(Arc::clone(&h.store) as Arc<dyn SessionStore>)
+        let gate = PublishGate::new(Arc::clone(&h.gate.moderation))
+            .with_session_store(Arc::clone(&h.store) as Arc<dyn SessionStore>);
+        gate.set_session_key(&node_key());
+        gate
     }
 
     #[tokio::test]
@@ -1558,9 +1682,7 @@ mod tests {
         let (status, body) =
             call(&h.app, "POST", "/publish/sessions", &tok, signed(&sk, &tok)).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
-        let stored: SessionRecord =
-            serde_json::from_slice(&h.store.records.lock().unwrap()[&format!("sessions/{ep}")])
-                .unwrap();
+        let stored = stored(&h, &ep);
         assert_eq!(stored.endpoint_id, ep.to_string());
         assert_eq!(stored.subject, "arkavo:u1");
         assert_eq!(stored.expires_at, body["expiresAt"].as_i64().unwrap());
@@ -1584,7 +1706,7 @@ mod tests {
                 .records
                 .lock()
                 .unwrap()
-                .insert(format!("sessions/{ep}"), Bytes::from(record.to_string()));
+                .insert(format!("sessions/{ep}"), sealed(&h.gate, &record));
         };
         let other = other_instance(&h);
         other.connected(1, Some(ep));
@@ -1613,6 +1735,12 @@ mod tests {
             .unwrap()
             .insert(format!("sessions/{ep}"), Bytes::from_static(b"{"));
         assert_eq!(refused().await, Err(PushRefusal::NoSession), "unreadable");
+        put(serde_json::json!({"endpointId": ep.to_string()}));
+        assert_eq!(
+            refused().await,
+            Err(PushRefusal::NoSession),
+            "tagged but no session"
+        );
 
         put(
             serde_json::json!({"endpointId": ep.to_string(), "subject": "u1", "expiresAt": now_secs() + 60}),
@@ -1643,10 +1771,11 @@ mod tests {
                 "expiresAt": now_secs() + 60,
                 "chain": chain,
             });
-            h.store.records.lock().unwrap().insert(
-                format!("sessions/{ep}"),
-                Bytes::from(serde_json::to_vec(&record).unwrap()),
-            );
+            h.store
+                .records
+                .lock()
+                .unwrap()
+                .insert(format!("sessions/{ep}"), sealed(&h.gate, &record));
             other.misses.lock().unwrap().clear();
             other.sessions.lock().unwrap().clear();
             other.authorize_push(1, "a")
@@ -1678,15 +1807,104 @@ mod tests {
             "subject": "u1",
             "expiresAt": now_secs() + 86_400,
         });
-        h.store.records.lock().unwrap().insert(
-            format!("sessions/{ep}"),
-            Bytes::from(serde_json::to_vec(&record).unwrap()),
-        );
+        h.store
+            .records
+            .lock()
+            .unwrap()
+            .insert(format!("sessions/{ep}"), sealed(&h.gate, &record));
         let other = other_instance(&h).with_session_ttl(Duration::from_secs(60));
         other.connected(1, Some(ep));
         assert!(other.authorize_push(1, &"a".repeat(64)).await.is_ok());
         let expires = other.sessions.lock().unwrap()[&ep].expires;
         assert!(expires <= Instant::now() + Duration::from_secs(60));
+    }
+
+    /// Write access to the session store is not enough to make a session
+    /// (tdf-iroh-s3#46): a record counts only with this node's tag over its
+    /// exact bytes, and a refusal is remembered like any other miss.
+    #[tokio::test]
+    async fn a_stored_session_counts_only_with_the_nodes_tag() {
+        let h = harness();
+        let ep = endpoint();
+        let record = serde_json::json!({
+            "endpointId": ep.to_string(),
+            "subject": "u1",
+            "expiresAt": now_secs() + 60,
+            "chain": [{ "kind": "subject", "claims": { "sub": "arkavo:u1" } }],
+        });
+        let good = sealed(&h.gate, &record);
+        let other = other_instance(&h);
+        other.connected(1, Some(ep));
+        let push = |body: Bytes| {
+            h.store
+                .records
+                .lock()
+                .unwrap()
+                .insert(format!("sessions/{ep}"), body);
+            other.misses.lock().unwrap().clear();
+            other.sessions.lock().unwrap().clear();
+            other.authorize_push(1, "a")
+        };
+        // `body` with the first `from` replaced by `to`, every other byte kept.
+        let swap = |body: &Bytes, from: &str, to: &str| {
+            let text = std::str::from_utf8(body).unwrap();
+            assert!(text.contains(from), "{from} not in {text}");
+            Bytes::from(text.replacen(from, to, 1))
+        };
+        let forger = PublishGate::new(Arc::new(Moderation::default()));
+        forger.set_session_key(&key());
+        let forged = sealed(&forger, &record);
+        let node_kid = &other.record_key.get().unwrap().kid;
+        let forger_kid = &forger.record_key.get().unwrap().kid;
+        let tag = serde_json::from_slice::<serde_json::Value>(&good).unwrap()["tag"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let expires = record["expiresAt"].to_string();
+
+        assert!(push(good.clone()).await.is_ok(), "tagged by the node");
+        for (body, why) in [
+            (Bytes::from(record.to_string()), "untagged, as before #46"),
+            (
+                swap(&good, r#""subject":"u1""#, r#""subject":"u2""#),
+                "subject edited",
+            ),
+            (
+                swap(
+                    &good,
+                    &format!(r#""expiresAt":{expires}"#),
+                    &format!(r#""expiresAt":{}"#, now_secs() + 600),
+                ),
+                "expiry edited",
+            ),
+            (
+                swap(&good, r#""sub":"arkavo:u1""#, r#""sub":"arkavo:u2""#),
+                "chain edited",
+            ),
+            (swap(&good, &tag, &"00".repeat(32)), "tag replaced"),
+            (forged.clone(), "another key's"),
+            (
+                swap(&forged, forger_kid, node_kid),
+                "another key's under this kid",
+            ),
+        ] {
+            assert_eq!(push(body).await, Err(PushRefusal::NoSession), "{why}");
+            assert!(other.recently_missed(&ep), "{why}: remembered as a miss");
+        }
+
+        // A gate whose key isn't set yet accepts no stored record.
+        let keyless = PublishGate::new(Arc::clone(&h.gate.moderation))
+            .with_session_store(Arc::clone(&h.store) as Arc<dyn SessionStore>);
+        h.store
+            .records
+            .lock()
+            .unwrap()
+            .insert(format!("sessions/{ep}"), good);
+        keyless.connected(1, Some(ep));
+        assert_eq!(
+            keyless.authorize_push(1, "a").await,
+            Err(PushRefusal::NoSession)
+        );
     }
 
     #[tokio::test]
@@ -2172,7 +2390,7 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED, "{body}");
         let raw = h.store.records.lock().unwrap()[&format!("sessions/{ep}")].clone();
         assert!(!String::from_utf8_lossy(&raw).contains(&tok));
-        let stored: SessionRecord = serde_json::from_slice(&raw).unwrap();
+        let stored: SessionRecord = h.gate.unseal(&ep, &raw).unwrap();
         let chain = stored.chain.expect("chain stored");
         assert_eq!(
             chain.iter().map(|e| e.kind).collect::<Vec<_>>(),
@@ -2234,7 +2452,7 @@ mod tests {
         // The PDP denied it, so it keeps no chain: after a switch to `pdp`
         // its pushes would be refused.
         let raw = h.store.records.lock().unwrap()[&format!("sessions/{}", sk.public())].clone();
-        let stored: SessionRecord = serde_json::from_slice(&raw).unwrap();
+        let stored: SessionRecord = h.gate.unseal(&sk.public(), &raw).unwrap();
         assert!(stored.chain.is_none());
 
         // Not entitled locally, permitted by the PDP: refused.
