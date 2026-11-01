@@ -15,8 +15,8 @@ opentdf = { version = "0.16.0", default-features = false }
 
 # AWS S3
 aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1"
-aws-sdk-ssm = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-ssm = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -69,7 +69,7 @@ rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs
 
 [dev-dependencies]
 tempfile = "3"
-zip = "2.2"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 tower = { version = "0.5", features = ["util"] }
 rcgen = "0.14.10"
 # HTTP/2 for the HTTPS tests only; the node's own clients stay as configured above.
