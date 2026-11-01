@@ -38,7 +38,8 @@ pub struct Staging {
     /// The node's runtime: the collector runs on the store's own runtime,
     /// so its store requests run here instead.
     runtime: tokio::runtime::Handle,
-    /// When the collector last started a run (called the protect callback).
+    /// When the collector last started a run (called the protect callback),
+    /// or the store was attached.
     last_run: Mutex<tokio::time::Instant>,
 }
 
@@ -56,9 +57,12 @@ impl Staging {
         })
     }
 
-    /// Give staging the store its collector deletes from.
+    /// Give staging the store its collector deletes from. The collector
+    /// starts with the store, so its liveness clock starts here, not at
+    /// [`Staging::new`]: the store's load time is not silence.
     pub fn attach(&self, store: Store) {
         let _ = self.store.set(store);
+        *lock(&self.last_run) = tokio::time::Instant::now();
     }
 
     /// The garbage collector configuration that deletes every blob no
@@ -245,6 +249,25 @@ mod tests {
             .await
             .expect("reported once the push ended");
         assert!(start.elapsed() >= Duration::from_millis(500) + dead_after);
+        store.shutdown().await.unwrap();
+    }
+
+    /// The collector starts with the store, so its liveness clock starts
+    /// when the store is attached: a slow store load is not silence.
+    #[tokio::test(start_paused = true)]
+    async fn the_liveness_clock_starts_when_the_store_is_attached() {
+        let staging = Staging::new();
+        // The store takes longer to load than the collector may stay silent.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let store = iroh_blobs::store::mem::MemStore::new();
+        staging.attach(store.clone().into());
+        let watch = staging.collector_stopped(Duration::from_secs(5), Duration::from_millis(100));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(4), watch)
+                .await
+                .is_err(),
+            "reported before the collector could have run"
+        );
         store.shutdown().await.unwrap();
     }
 
