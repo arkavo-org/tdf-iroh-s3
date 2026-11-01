@@ -79,7 +79,7 @@ BlobsHandler → S3Server: blocked? → HEAD blobs/<hash> and outboards/<hash>
 
 ### Key Dependencies
 
-- `iroh` 1.3 / `iroh-blobs` 0.103.1 — P2P networking
+- `iroh` 1.4 / `iroh-blobs` 0.103.1 — P2P networking
 - `opentdf` 0.16 (crates.io, `default-features = false`) — TDF parsing/validation
 - `aws-sdk-s3` — Blob storage
 - `axum` 0.8 — HTTP API
