@@ -3,6 +3,9 @@ name = "tdf-iroh-s3"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.91"
+description = "Persistent Iroh peer node that validates incoming OpenTDF blobs and stores them in S3"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/arkavo-org/tdf-iroh-s3"
 
 [dependencies]
 # Iroh networking and blobs
