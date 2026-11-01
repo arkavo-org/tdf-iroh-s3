@@ -54,5 +54,5 @@ binary/crate (e.g. `tdf-transparency`) rather than growing `main.rs`:
 - Extract `auth.rs`, `authz.rs`, `catalog.rs`, `catalog_api.rs`, and `attributes.rs`
   into workspace crates so both binaries share them.
 - Replace URL-based key/FQN refresh with a pluggable source (file/KMS) for offline use.
-- Keep any new crate on the same iroh line this repo builds against (iroh 1.3 /
+- Keep any new crate on the same iroh line this repo builds against (iroh 1.4 /
   iroh-blobs 0.103.1).

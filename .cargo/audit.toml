@@ -1,0 +1,18 @@
+# cargo audit configuration. CI fails on any advisory not listed here.
+# Each ignore names why the node is not affected and what lifts it; remove
+# the entry once that upstream release lands.
+
+[advisories]
+ignore = [
+    # zip 2.x: extract() can set SUID bits / follow escaping symlinks.
+    # The node never extracts: validation reads members through
+    # ZipArchive::new (src/validation/structure.rs) and writes with
+    # ZipWriter. Fixed in zip 9, which waits on opentdf moving off zip 2.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    # crypto-bigint 0.5 timing side channel, via p256 0.13. The node only
+    # verifies ES256 signatures (public inputs); signing keys appear only in
+    # tests and examples. Lifted by p256 0.14.
+    "RUSTSEC-2026-0387",
+]
