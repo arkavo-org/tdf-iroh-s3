@@ -99,6 +99,14 @@ impl TdfIrohNode {
             .bind()
             .await
             .context("Failed to bind Iroh endpoint")?;
+        // Stored publish sessions are tagged with a key derived from the
+        // node's secret key (#46). Set before the blobs handler is
+        // registered and before the HTTP API starts, so no push or session
+        // can come first. An endpoint without `secret_key_param` has a new
+        // key each start, so its stored sessions don't survive a restart.
+        if let Some(g) = &gate {
+            g.set_session_key(endpoint.secret_key());
+        }
 
         info!("Iroh endpoint bound on port {}", config.iroh.bind_port);
         endpoint.online().await;
