@@ -11,6 +11,10 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    # zip 2.x: extract() aborts the process on a symlink entry with a large
+    # declared size. Same function, same reason as above; opentdf 0.16 does
+    # not call it either.
+    "RUSTSEC-2026-0429",
     # crypto-bigint 0.5 timing side channel, via p256 0.13. The node only
     # verifies ES256 signatures (public inputs); signing keys appear only in
     # tests and examples. Lifted by p256 0.14.
