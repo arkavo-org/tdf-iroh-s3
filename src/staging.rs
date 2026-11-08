@@ -17,7 +17,7 @@
 //! finds the blob incomplete, and the publisher pushes again.
 //!
 //! The collector is the only cleanup, and iroh-blobs ends its loop for good
-//! after a run fails. Each run starts with the protect callback, so
+//! after a run fails (iroh-blobs#291). Each run starts with the protect callback, so
 //! [`Staging::collector_stopped`] notices when the callback stops being
 //! called; the node then restarts (once no push is pending) to get a fresh
 //! collector, rather than letting staged pushes fill the disk.
