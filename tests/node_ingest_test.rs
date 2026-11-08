@@ -408,7 +408,7 @@ fn staged_files(data_dir: &std::path::Path) -> Vec<String> {
 /// collector deleted every staged copy, data and outboards included.
 ///
 /// One file may outlive that: `<hash>.bitfield`, for a hash in `hashes`
-/// that the store no longer holds. iroh-blobs 0.103.1 writes a partial
+/// that the store no longer holds. iroh-blobs (0.104.1 too) writes a partial
 /// entry's bitfield when the entry unloads (`store/fs.rs`, `on_shutdown` ->
 /// `persist`), and `delete` doesn't tell a loaded entry. So when the
 /// collector deletes an aborted push before its entry unloads, the bitfield

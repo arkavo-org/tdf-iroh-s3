@@ -10,7 +10,7 @@ repository = "https://github.com/arkavo-org/tdf-iroh-s3"
 [dependencies]
 # Iroh networking and blobs
 iroh = "1.4.1"
-iroh-blobs = "0.103.1"
+iroh-blobs = "0.104.1"
 irpc = "0.17"
 
 # OpenTDF validation
@@ -53,7 +53,7 @@ axum = "0.8"
 http-body-util = "0.1"
 futures = "0.3"
 # Same version iroh-blobs uses: outboards and BAO encoding for serving from S3.
-bao-tree = { version = "0.16", features = ["tokio_fsm", "validate"] }
+bao-tree = { version = "0.17", features = ["tokio_fsm", "validate"] }
 iroh-io = "0.6"
 serde_json = { version = "1", features = ["raw_value"] }
 # Reading TDF archives from a file at ingest (the version opentdf uses)
