@@ -404,10 +404,22 @@ fn staged_files(data_dir: &std::path::Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Wait until the store holds none of `hashes` and no blob files at all:
-/// the collector deleted every staged copy, outboards included.
+/// Wait until the store holds none of `hashes` and no blob files: the
+/// collector deleted every staged copy, data and outboards included.
+///
+/// One file may outlive that: `<hash>.bitfield`, for a hash in `hashes`
+/// that the store no longer holds. iroh-blobs 0.103.1 writes a partial
+/// entry's bitfield when the entry unloads (`store/fs.rs`, `on_shutdown` ->
+/// `persist`), and `delete` doesn't tell a loaded entry. So when the
+/// collector deletes an aborted push before its entry unloads, the bitfield
+/// is written again afterwards, with nothing in the store referring to it.
+/// It holds a few bytes and is never read. Any other leftover file fails.
 async fn wait_for_empty_staging(node: &TdfIrohNode, data_dir: &std::path::Path, hashes: &[Hash]) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let orphan_bitfields: Vec<String> = hashes
+        .iter()
+        .map(|h| format!("{}.bitfield", h.to_hex()))
+        .collect();
     loop {
         node.store().sync_db().await.unwrap();
         let mut held = Vec::new();
@@ -416,7 +428,10 @@ async fn wait_for_empty_staging(node: &TdfIrohNode, data_dir: &std::path::Path, 
                 held.push(*hash);
             }
         }
-        let files = staged_files(data_dir);
+        let mut files = staged_files(data_dir);
+        if held.is_empty() {
+            files.retain(|f| !orphan_bitfields.contains(f));
+        }
         if held.is_empty() && files.is_empty() {
             return;
         }
