@@ -14,7 +14,7 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::IntoResponse;
 use iroh_blobs::Hash;
 use iroh_blobs::api::blobs::BlobStatus;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tdf_iroh_s3::config::{
@@ -22,7 +22,7 @@ use tdf_iroh_s3::config::{
 };
 use tdf_iroh_s3::moderation::{Moderation, PublishGate};
 use tdf_iroh_s3::node::TdfIrohNode;
-use tdf_iroh_s3::test_cli::iroh_client::IrohTestClient;
+use tdf_iroh_s3::test_cli::iroh_client::{IrohTestClient, build_endpoint_addr};
 
 const BUCKET: &str = "test-bucket";
 const INGEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -370,6 +370,20 @@ async fn spawn_node_on(
     (node, s3, data_dir)
 }
 
+/// The address a test client dials: the node's ID and its loopback socket.
+/// With a direct address, connecting needs no address lookup (n0's DNS and
+/// pkarr service), which made these tests fail whenever that lookup did.
+fn dial_addr(node: &TdfIrohNode) -> iroh::EndpointAddr {
+    let port = node
+        .endpoint()
+        .bound_sockets()
+        .into_iter()
+        .find(SocketAddr::is_ipv4)
+        .expect("the node binds an IPv4 socket")
+        .port();
+    build_endpoint_addr(node.addr().id, Some((Ipv4Addr::LOCALHOST, port).into()))
+}
+
 fn blob_key(hash: Hash) -> String {
     format!("blobs/{}", hash.to_hex())
 }
@@ -428,7 +442,7 @@ async fn assert_push_not_taken(node: &TdfIrohNode, s3: &FakeS3, hash: Hash) {
     assert!(
         tokio::time::timeout(
             Duration::from_secs(5),
-            probe.fetch_from_node(node.addr().id, hash)
+            probe.fetch_from_node(dial_addr(node), hash)
         )
         .await
         .is_ok_and(|r| r.is_err()),
@@ -467,11 +481,11 @@ fn assert_refused_for_permission<T: std::fmt::Debug>(result: anyhow::Result<T>, 
 #[tokio::test(flavor = "current_thread")]
 async fn test_ungated_push_is_ingested_and_served() {
     let (node, s3, _data_dir) = spawn_node(None).await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
 
     let tdf = create_test_tdf();
     let pusher = IrohTestClient::new().await.unwrap();
-    let hash = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    let hash = pusher.push_to_node(node_addr.clone(), &tdf).await.unwrap();
     assert!(
         s3.wait_for_put(&blob_key(hash)).await,
         "an ungated push must be ingested"
@@ -479,7 +493,10 @@ async fn test_ungated_push_is_ingested_and_served() {
     assert!(s3.has_put(&format!("manifests/{}", hash.to_hex())));
 
     let viewer = IrohTestClient::new().await.unwrap();
-    let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
+    let fetched = viewer
+        .fetch_from_node(node_addr.clone(), hash)
+        .await
+        .unwrap();
     assert_eq!(fetched.as_ref(), tdf.as_slice());
 
     for c in [pusher, viewer] {
@@ -495,31 +512,40 @@ async fn test_ungated_push_is_ingested_and_served() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_staged_pushes_are_deleted_once_ingested_or_refused() {
     let (node, s3, data_dir) = spawn_node(None).await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
 
     // Both larger than the store inlines (16 KiB), so each is files on disk,
     // an outboard among them.
     let pusher = IrohTestClient::new().await.unwrap();
     let tdf = create_large_test_tdf(64 * 1024);
-    let kept = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    let kept = pusher.push_to_node(node_addr.clone(), &tdf).await.unwrap();
     assert!(s3.wait_for_put(&blob_key(kept)).await);
     assert!(
         s3.has_put(&outboard_key(kept)),
         "the outboard is stored before the blob"
     );
     let garbage = vec![0xDEu8; 64 * 1024];
-    let refused = pusher.push_to_node(node_id, &garbage).await.unwrap();
+    let refused = pusher
+        .push_to_node(node_addr.clone(), &garbage)
+        .await
+        .unwrap();
 
     wait_for_empty_staging(&node, data_dir.path(), &[kept, refused]).await;
     assert!(!s3.has_put(&blob_key(refused)));
     let viewer = IrohTestClient::new().await.unwrap();
-    assert_refused_for_permission(viewer.fetch_from_node(node_id, refused).await, "get");
-    let fetched = viewer.fetch_from_node(node_id, kept).await.unwrap();
+    assert_refused_for_permission(
+        viewer.fetch_from_node(node_addr.clone(), refused).await,
+        "get",
+    );
+    let fetched = viewer
+        .fetch_from_node(node_addr.clone(), kept)
+        .await
+        .unwrap();
     assert!(fetched.as_ref() == tdf.as_slice());
 
     // The ingest loop survives the refusal: the next TDF is ingested.
     let next = create_test_tdf();
-    let hash = pusher.push_to_node(node_id, &next).await.unwrap();
+    let hash = pusher.push_to_node(node_addr.clone(), &next).await.unwrap();
     assert!(s3.wait_for_put(&blob_key(hash)).await);
 
     for c in [pusher, viewer] {
@@ -534,13 +560,13 @@ async fn test_staged_pushes_are_deleted_once_ingested_or_refused() {
 async fn test_gated_push_needs_a_session() {
     let gate = Arc::new(PublishGate::new(Arc::new(Moderation::default())));
     let (node, s3, _data_dir) = spawn_node(Some(Arc::clone(&gate))).await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
 
     // No session: the push is refused and nothing is stored. (The pusher
     // may not see the refusal; the node simply never takes the blob.)
     let stranger = IrohTestClient::new().await.unwrap();
     let refused = create_test_tdf();
-    let _ = stranger.push_to_node(node_id, &refused).await;
+    let _ = stranger.push_to_node(node_addr.clone(), &refused).await;
     assert_push_not_taken(&node, &s3, Hash::new(&refused)).await;
 
     // A session for this endpoint: the push is ingested, its publisher is
@@ -553,7 +579,7 @@ async fn test_gated_push_needs_a_session() {
     );
     let accepted = create_test_tdf();
     let hash = creator
-        .push_to_node(node_id, &accepted)
+        .push_to_node(node_addr.clone(), &accepted)
         .await
         .map_err(|e| format!("{e:#}"))
         .unwrap();
@@ -567,13 +593,16 @@ async fn test_gated_push_needs_a_session() {
         "the publisher of an ingested push must be recorded"
     );
     let viewer = IrohTestClient::new().await.unwrap();
-    let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
+    let fetched = viewer
+        .fetch_from_node(node_addr.clone(), hash)
+        .await
+        .unwrap();
     assert_eq!(fetched.as_ref(), accepted.as_slice());
 
     // A suspended subject: refused although the session is live.
     gate.moderation.suspend_for_test("arkavo:creator-1", false);
     let suspended = create_test_tdf();
-    let _ = creator.push_to_node(node_id, &suspended).await;
+    let _ = creator.push_to_node(node_addr.clone(), &suspended).await;
     assert_push_not_taken(&node, &s3, Hash::new(&suspended)).await;
 
     for c in [stranger, creator, viewer] {
@@ -588,7 +617,7 @@ async fn test_gated_push_needs_a_session() {
 async fn test_gated_node_refuses_blocked_hashes() {
     let gate = Arc::new(PublishGate::new(Arc::new(Moderation::default())));
     let (node, s3, _data_dir) = spawn_node(Some(Arc::clone(&gate))).await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
 
     let creator = IrohTestClient::new().await.unwrap();
     gate.open_session(
@@ -598,42 +627,70 @@ async fn test_gated_node_refuses_blocked_hashes() {
     );
     // TDFs, so both validate and are served until one is blocked.
     let (blocked_bytes, open_bytes) = (create_test_tdf(), create_test_tdf());
-    let blocked = creator.push_to_node(node_id, &blocked_bytes).await.unwrap();
-    let open = creator.push_to_node(node_id, &open_bytes).await.unwrap();
+    let blocked = creator
+        .push_to_node(node_addr.clone(), &blocked_bytes)
+        .await
+        .unwrap();
+    let open = creator
+        .push_to_node(node_addr.clone(), &open_bytes)
+        .await
+        .unwrap();
     assert!(s3.wait_for_put(&blob_key(blocked)).await);
     assert!(s3.wait_for_put(&blob_key(open)).await);
 
     // Served before the block.
     let viewer = IrohTestClient::new().await.unwrap();
-    let fetched = viewer.fetch_from_node(node_id, blocked).await.unwrap();
+    let fetched = viewer
+        .fetch_from_node(node_addr.clone(), blocked)
+        .await
+        .unwrap();
     assert_eq!(fetched.as_ref(), blocked_bytes.as_slice());
 
     gate.moderation.block_for_test(&blocked.to_hex());
 
     // get
     let client = IrohTestClient::new().await.unwrap();
-    let fetched = client.fetch_from_node(node_id, open).await.unwrap();
+    let fetched = client
+        .fetch_from_node(node_addr.clone(), open)
+        .await
+        .unwrap();
     assert_eq!(fetched.as_ref(), open_bytes.as_slice());
-    assert_refused_for_permission(client.fetch_from_node(node_id, blocked).await, "get");
+    assert_refused_for_permission(
+        client.fetch_from_node(node_addr.clone(), blocked).await,
+        "get",
+    );
 
     // get_many: refused when any of its hashes is blocked.
     let client = IrohTestClient::new().await.unwrap();
-    let fetched = client.get_many_from_node(node_id, &[open]).await.unwrap();
+    let fetched = client
+        .get_many_from_node(node_addr.clone(), &[open])
+        .await
+        .unwrap();
     assert_eq!(fetched, vec![Bytes::from(open_bytes.clone())]);
     assert_refused_for_permission(
-        client.get_many_from_node(node_id, &[blocked]).await,
+        client
+            .get_many_from_node(node_addr.clone(), &[blocked])
+            .await,
         "get_many",
     );
     assert_refused_for_permission(
-        client.get_many_from_node(node_id, &[open, blocked]).await,
+        client
+            .get_many_from_node(node_addr.clone(), &[open, blocked])
+            .await,
         "get_many with a blocked hash among others",
     );
 
     // observe: refused for every hash, blocked or not; the node holds no
     // copy to observe.
     let client = IrohTestClient::new().await.unwrap();
-    assert_refused_for_permission(client.observe_on_node(node_id, open).await, "observe");
-    assert_refused_for_permission(client.observe_on_node(node_id, blocked).await, "observe");
+    assert_refused_for_permission(
+        client.observe_on_node(node_addr.clone(), open).await,
+        "observe",
+    );
+    assert_refused_for_permission(
+        client.observe_on_node(node_addr.clone(), blocked).await,
+        "observe",
+    );
 
     for c in [creator, viewer] {
         c.shutdown().await.unwrap();
@@ -723,29 +780,35 @@ fn create_large_test_tdf(payload: usize) -> Vec<u8> {
 #[tokio::test(flavor = "current_thread")]
 async fn test_an_abandoned_re_push_changes_nothing() {
     let (node, s3, data_dir) = spawn_node(None).await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
 
     let tdf = create_large_test_tdf(20 * 1024 * 1024);
     let owner = IrohTestClient::new().await.unwrap();
-    let held = owner.push_to_node(node_id, &tdf).await.unwrap();
+    let held = owner.push_to_node(node_addr.clone(), &tdf).await.unwrap();
     assert!(s3.wait_for_put(&blob_key(held)).await);
     wait_for_empty_staging(&node, data_dir.path(), &[held]).await;
 
     let attacker = IrohTestClient::new().await.unwrap();
     let pushed = attacker
-        .push_to_node_abandoned(node_id, &tdf, Duration::from_millis(150))
+        .push_to_node_abandoned(node_addr.clone(), &tdf, Duration::from_millis(150))
         .await
         .unwrap();
     assert_eq!(pushed, held);
 
     let viewer = IrohTestClient::new().await.unwrap();
-    let fetched = viewer.fetch_from_node(node_id, held).await.unwrap();
+    let fetched = viewer
+        .fetch_from_node(node_addr.clone(), held)
+        .await
+        .unwrap();
     assert!(fetched.as_ref() == tdf.as_slice());
 
     wait_for_empty_staging(&node, data_dir.path(), &[held]).await;
     assert!(s3.body(&blob_key(held)).unwrap().as_ref() == tdf.as_slice());
     let viewer = IrohTestClient::new().await.unwrap();
-    let fetched = viewer.fetch_from_node(node_id, held).await.unwrap();
+    let fetched = viewer
+        .fetch_from_node(node_addr.clone(), held)
+        .await
+        .unwrap();
     assert!(fetched.as_ref() == tdf.as_slice());
 
     for c in [owner, attacker, viewer] {
@@ -761,12 +824,12 @@ async fn test_an_abandoned_re_push_changes_nothing() {
 async fn test_an_oversize_push_is_stopped_mid_transfer() {
     let (node, s3, data_dir) =
         spawn_node_with(None, |c| c.validation.max_blob_bytes = 1024 * 1024).await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
 
     let oversize = vec![0x5Au8; 50 * 1024 * 1024];
     let hash = Hash::new(&oversize);
     let pusher = IrohTestClient::new().await.unwrap();
-    let result = pusher.push_to_node(node_id, &oversize).await;
+    let result = pusher.push_to_node(node_addr.clone(), &oversize).await;
     let error = format!("{:#}", result.expect_err("the node stops the push"));
     assert!(error.contains("max_blob_bytes"), "{error}");
 
@@ -779,7 +842,7 @@ async fn test_an_oversize_push_is_stopped_mid_transfer() {
 
     // A push within the limit still goes through.
     let tdf = create_test_tdf();
-    let hash = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    let hash = pusher.push_to_node(node_addr.clone(), &tdf).await.unwrap();
     assert!(s3.wait_for_put(&blob_key(hash)).await);
 
     pusher.shutdown().await.unwrap();
@@ -792,13 +855,15 @@ async fn test_an_oversize_push_is_stopped_mid_transfer() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_hash_sequence_requests_are_refused() {
     let (node, s3, _data_dir) = spawn_node(None).await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
 
     // The pusher may see a refused push succeed (it finishes writing
     // before it reads the reset), so check what the node took.
     let child = vec![0xC4u8; 64 * 1024];
     let pusher = IrohTestClient::new().await.unwrap();
-    let _ = pusher.push_hash_seq_to_node(node_id, &[&child]).await;
+    let _ = pusher
+        .push_hash_seq_to_node(node_addr.clone(), &[&child])
+        .await;
     let root = Hash::new(iroh_blobs::hashseq::HashSeq::from_iter([Hash::new(&child)]).into_inner());
     node.store().sync_db().await.unwrap();
     for hash in [root, Hash::new(&child)] {
@@ -807,14 +872,17 @@ async fn test_hash_sequence_requests_are_refused() {
 
     // A served TDF is served as a blob, not as a hash sequence.
     let tdf = create_test_tdf();
-    let hash = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    let hash = pusher.push_to_node(node_addr.clone(), &tdf).await.unwrap();
     assert!(s3.wait_for_put(&blob_key(hash)).await);
     let viewer = IrohTestClient::new().await.unwrap();
     assert_refused_for_permission(
-        viewer.get_hash_seq_from_node(node_id, hash).await,
+        viewer.get_hash_seq_from_node(node_addr.clone(), hash).await,
         "hash-sequence get",
     );
-    let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
+    let fetched = viewer
+        .fetch_from_node(node_addr.clone(), hash)
+        .await
+        .unwrap();
     assert_eq!(fetched.as_ref(), tdf.as_slice());
 
     for c in [pusher, viewer] {
@@ -851,19 +919,28 @@ async fn test_an_old_store_is_cleared_and_old_blobs_get_an_outboard() {
     let (s3, endpoint_url) = FakeS3::start().await;
     s3.put_object(&blob_key(ingested), &tdf);
     let (node, s3, data_dir) = spawn_node_on(data_dir, s3, endpoint_url, None, |_| {}).await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
 
     let viewer = IrohTestClient::new().await.unwrap();
-    assert_refused_as_rate_limited(viewer.fetch_from_node(node_id, ingested).await, "get");
+    assert_refused_as_rate_limited(
+        viewer.fetch_from_node(node_addr.clone(), ingested).await,
+        "get",
+    );
     assert!(
         s3.wait_for_put(&outboard_key(ingested)).await,
         "the outboard is computed from S3 and stored"
     );
-    let fetched = viewer.fetch_from_node(node_id, ingested).await.unwrap();
+    let fetched = viewer
+        .fetch_from_node(node_addr.clone(), ingested)
+        .await
+        .unwrap();
     assert!(fetched.as_ref() == tdf.as_slice());
 
     // Stored but never in S3: not served.
-    assert_refused_for_permission(viewer.fetch_from_node(node_id, never).await, "get");
+    assert_refused_for_permission(
+        viewer.fetch_from_node(node_addr.clone(), never).await,
+        "get",
+    );
 
     wait_for_empty_staging(&node, data_dir.path(), &[ingested, never]).await;
     viewer.shutdown().await.unwrap();
@@ -878,7 +955,7 @@ async fn test_an_old_store_is_cleared_and_old_blobs_get_an_outboard() {
 async fn test_catalog_documents_are_served_over_iroh() {
     let gate = Arc::new(PublishGate::new(Arc::new(Moderation::default())));
     let (node, s3, _data_dir) = spawn_node(Some(Arc::clone(&gate))).await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
     let owner = "5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10";
     let meta = [("x-amz-meta-owner", owner)];
 
@@ -897,7 +974,10 @@ async fn test_catalog_documents_are_served_over_iroh() {
     s3.put_object(&format!("catalog-outboards/{hex}"), &outboard);
 
     let viewer = IrohTestClient::new().await.unwrap();
-    let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
+    let fetched = viewer
+        .fetch_from_node(node_addr.clone(), hash)
+        .await
+        .unwrap();
     assert!(fetched.as_ref() == document.as_slice());
 
     // One stored without its outboard gets one computed into
@@ -906,20 +986,26 @@ async fn test_catalog_documents_are_served_over_iroh() {
     let second_hash = Hash::new(&second);
     let second_hex = second_hash.to_hex();
     s3.put_object_with_meta(&format!("catalog-documents/{second_hex}"), &second, &meta);
-    assert_refused_as_rate_limited(viewer.fetch_from_node(node_id, second_hash).await, "get");
+    assert_refused_as_rate_limited(
+        viewer.fetch_from_node(node_addr.clone(), second_hash).await,
+        "get",
+    );
     assert!(
         s3.wait_for_put(&format!("catalog-outboards/{second_hex}"))
             .await,
         "the outboard is computed into catalog-outboards/"
     );
     assert!(!s3.has_put(&outboard_key(second_hash)));
-    let fetched = viewer.fetch_from_node(node_id, second_hash).await.unwrap();
+    let fetched = viewer
+        .fetch_from_node(node_addr.clone(), second_hash)
+        .await
+        .unwrap();
     assert!(fetched.as_ref() == second.as_slice());
 
     // A blocked creator catalog: refused on every fetch from then on.
     gate.moderation.block_catalog_for_test(owner);
     let client = IrohTestClient::new().await.unwrap();
-    assert_refused_for_permission(client.fetch_from_node(node_id, hash).await, "get");
+    assert_refused_for_permission(client.fetch_from_node(node_addr.clone(), hash).await, "get");
 
     for c in [viewer, client] {
         c.shutdown().await.unwrap();
@@ -933,22 +1019,33 @@ async fn test_catalog_documents_are_served_over_iroh() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_a_fetch_naming_a_missing_hash_is_refused() {
     let (node, s3, _data_dir) = spawn_node(None).await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
     let tdf = create_test_tdf();
     let pusher = IrohTestClient::new().await.unwrap();
-    let held = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    let held = pusher.push_to_node(node_addr.clone(), &tdf).await.unwrap();
     assert!(s3.wait_for_put(&blob_key(held)).await);
 
     let viewer = IrohTestClient::new().await.unwrap();
     let missing = Hash::new(b"not on the node");
-    assert_refused_for_permission(viewer.fetch_from_node(node_id, missing).await, "get");
     assert_refused_for_permission(
-        viewer.get_many_from_node(node_id, &[held, missing]).await,
+        viewer.fetch_from_node(node_addr.clone(), missing).await,
+        "get",
+    );
+    assert_refused_for_permission(
+        viewer
+            .get_many_from_node(node_addr.clone(), &[held, missing])
+            .await,
         "get_many",
     );
-    assert_refused_for_permission(viewer.observe_on_node(node_id, missing).await, "observe");
+    assert_refused_for_permission(
+        viewer.observe_on_node(node_addr.clone(), missing).await,
+        "observe",
+    );
     // The held blob alone is served.
-    let fetched = viewer.fetch_from_node(node_id, held).await.unwrap();
+    let fetched = viewer
+        .fetch_from_node(node_addr.clone(), held)
+        .await
+        .unwrap();
     assert_eq!(fetched.as_ref(), tdf.as_slice());
 
     for c in [pusher, viewer] {
@@ -962,23 +1059,26 @@ async fn test_a_fetch_naming_a_missing_hash_is_refused() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_a_fetcher_dropping_mid_transfer_changes_nothing() {
     let (node, s3, _data_dir) = spawn_node(None).await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
     let tdf = create_large_test_tdf(20 * 1024 * 1024);
     let pusher = IrohTestClient::new().await.unwrap();
-    let hash = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    let hash = pusher.push_to_node(node_addr.clone(), &tdf).await.unwrap();
     assert!(s3.wait_for_put(&blob_key(hash)).await);
 
     for _ in 0..3 {
         let flaky = IrohTestClient::new().await.unwrap();
         let _ = tokio::time::timeout(
             Duration::from_millis(30),
-            flaky.fetch_from_node(node_id, hash),
+            flaky.fetch_from_node(node_addr.clone(), hash),
         )
         .await;
         flaky.shutdown().await.unwrap();
     }
     let viewer = IrohTestClient::new().await.unwrap();
-    let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
+    let fetched = viewer
+        .fetch_from_node(node_addr.clone(), hash)
+        .await
+        .unwrap();
     assert!(fetched.as_ref() == tdf.as_slice());
 
     for c in [pusher, viewer] {
@@ -993,11 +1093,11 @@ async fn test_a_fetcher_dropping_mid_transfer_changes_nothing() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_a_stalled_push_is_closed() {
     let (node, s3, data_dir) = spawn_node_with(None, |c| c.iroh.push_stall_secs = 2).await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
     let tdf = create_large_test_tdf(20 * 1024 * 1024);
     let pusher = IrohTestClient::new().await.unwrap();
     let (hash, stalled) = pusher
-        .push_to_node_stalled(node_id, &tdf, Duration::from_millis(150))
+        .push_to_node_stalled(node_addr.clone(), &tdf, Duration::from_millis(150))
         .await
         .unwrap();
     wait_for_empty_staging(&node, data_dir.path(), &[hash]).await;
@@ -1012,11 +1112,11 @@ async fn test_a_stalled_push_is_closed() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_a_huge_get_many_is_refused() {
     let (node, _s3, _data_dir) = spawn_node(None).await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
     let viewer = IrohTestClient::new().await.unwrap();
     let hashes: Vec<Hash> = (0u32..65).map(|i| Hash::new(i.to_le_bytes())).collect();
     assert_refused_for_permission(
-        viewer.get_many_from_node(node_id, &hashes).await,
+        viewer.get_many_from_node(node_addr.clone(), &hashes).await,
         "get_many",
     );
     viewer.shutdown().await.unwrap();
@@ -1051,11 +1151,11 @@ async fn test_a_stalled_re_push_of_a_whole_blob_validates_it() {
         c.iroh.gc_interval_secs = 5;
     })
     .await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
 
     let pusher = IrohTestClient::new().await.unwrap();
     let (pushed, stalled) = pusher
-        .push_to_node_stalled(node_id, &tdf, Duration::from_millis(150))
+        .push_to_node_stalled(node_addr.clone(), &tdf, Duration::from_millis(150))
         .await
         .unwrap();
     assert_eq!(pushed, hash);
@@ -1065,7 +1165,10 @@ async fn test_a_stalled_re_push_of_a_whole_blob_validates_it() {
     );
     wait_for_empty_staging(&node, data_dir.path(), &[hash]).await;
     let viewer = IrohTestClient::new().await.unwrap();
-    let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
+    let fetched = viewer
+        .fetch_from_node(node_addr.clone(), hash)
+        .await
+        .unwrap();
     assert!(fetched.as_ref() == tdf.as_slice());
 
     drop(stalled);
@@ -1083,10 +1186,10 @@ async fn test_a_partial_range_get_is_served_from_s3() {
     use bao_tree::{ChunkNum, ChunkRanges};
 
     let (node, s3, _data_dir) = spawn_node(None).await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
     let tdf = create_large_test_tdf(1024 * 1024);
     let pusher = IrohTestClient::new().await.unwrap();
-    let hash = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    let hash = pusher.push_to_node(node_addr.clone(), &tdf).await.unwrap();
     assert!(s3.wait_for_put(&blob_key(hash)).await);
 
     let len = tdf.len() as u64;
@@ -1096,7 +1199,7 @@ async fn test_a_partial_range_get_is_served_from_s3() {
         let bytes = (first * 1024)..(end * 1024).min(len);
         let fetched = viewer
             .get_ranges_from_node(
-                node_id,
+                node_addr.clone(),
                 hash,
                 ChunkRanges::from(ChunkNum(first)..ChunkNum(end)),
                 bytes.clone(),
@@ -1119,21 +1222,24 @@ async fn test_a_partial_range_get_is_served_from_s3() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_s3_failing_mid_transfer_is_try_again() {
     let (node, s3, _data_dir) = spawn_node(None).await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
     let tdf = create_large_test_tdf(1024 * 1024);
     let pusher = IrohTestClient::new().await.unwrap();
-    let hash = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    let hash = pusher.push_to_node(node_addr.clone(), &tdf).await.unwrap();
     assert!(s3.wait_for_put(&blob_key(hash)).await);
 
     // The outboard (about 4 KiB) is still sent whole; the blob breaks.
     *s3.fail_get_after.lock().unwrap() = Some(100 * 1024);
     let viewer = IrohTestClient::new().await.unwrap();
-    assert_refused_as_rate_limited(viewer.fetch_from_node(node_id, hash).await, "get");
+    assert_refused_as_rate_limited(viewer.fetch_from_node(node_addr.clone(), hash).await, "get");
     viewer.shutdown().await.unwrap();
 
     *s3.fail_get_after.lock().unwrap() = None;
     let viewer = IrohTestClient::new().await.unwrap();
-    let fetched = viewer.fetch_from_node(node_id, hash).await.unwrap();
+    let fetched = viewer
+        .fetch_from_node(node_addr.clone(), hash)
+        .await
+        .unwrap();
     assert!(fetched.as_ref() == tdf.as_slice());
 
     for c in [pusher, viewer] {
@@ -1148,19 +1254,22 @@ async fn test_s3_failing_mid_transfer_is_try_again() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_a_blob_deleted_from_s3_is_refused_for_good() {
     let (node, s3, _data_dir) = spawn_node(None).await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
     let tdf = create_large_test_tdf(64 * 1024);
     let pusher = IrohTestClient::new().await.unwrap();
-    let hash = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    let hash = pusher.push_to_node(node_addr.clone(), &tdf).await.unwrap();
     assert!(s3.wait_for_put(&blob_key(hash)).await);
     let viewer = IrohTestClient::new().await.unwrap();
-    viewer.fetch_from_node(node_id, hash).await.unwrap();
+    viewer
+        .fetch_from_node(node_addr.clone(), hash)
+        .await
+        .unwrap();
     viewer.shutdown().await.unwrap();
 
     s3.delete_object(&blob_key(hash));
     let viewer = IrohTestClient::new().await.unwrap();
-    assert_refused_as_rate_limited(viewer.fetch_from_node(node_id, hash).await, "get");
-    assert_refused_for_permission(viewer.fetch_from_node(node_id, hash).await, "get");
+    assert_refused_as_rate_limited(viewer.fetch_from_node(node_addr.clone(), hash).await, "get");
+    assert_refused_for_permission(viewer.fetch_from_node(node_addr.clone(), hash).await, "get");
 
     for c in [pusher, viewer] {
         c.shutdown().await.unwrap();
@@ -1175,10 +1284,10 @@ async fn test_a_blob_deleted_from_s3_is_refused_for_good() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_a_corrupt_s3_object_is_not_served() {
     let (node, s3, _data_dir) = spawn_node(None).await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
     let tdf = create_large_test_tdf(256 * 1024);
     let pusher = IrohTestClient::new().await.unwrap();
-    let hash = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    let hash = pusher.push_to_node(node_addr.clone(), &tdf).await.unwrap();
     assert!(s3.wait_for_put(&blob_key(hash)).await);
 
     let mut corrupt = tdf.clone();
@@ -1186,8 +1295,8 @@ async fn test_a_corrupt_s3_object_is_not_served() {
     s3.put_object(&blob_key(hash), &corrupt);
     let viewer = IrohTestClient::new().await.unwrap();
     // Reset by the node (ERR_LIMIT), not caught by the client's own check.
-    assert_refused_as_rate_limited(viewer.fetch_from_node(node_id, hash).await, "get");
-    assert_refused_for_permission(viewer.fetch_from_node(node_id, hash).await, "get");
+    assert_refused_as_rate_limited(viewer.fetch_from_node(node_addr.clone(), hash).await, "get");
+    assert_refused_for_permission(viewer.fetch_from_node(node_addr.clone(), hash).await, "get");
 
     for c in [pusher, viewer] {
         c.shutdown().await.unwrap();
@@ -1470,11 +1579,11 @@ fn test_fake_s3_decodes_aws_chunked_bodies() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_a_node_uploaded_blob_is_stored_byte_for_byte() {
     let (node, s3, _data_dir) = spawn_node(None).await;
-    let node_id = node.addr().id;
+    let node_addr = dial_addr(&node);
 
     let tdf = create_large_test_tdf(300_000);
     let pusher = IrohTestClient::new().await.unwrap();
-    let hash = pusher.push_to_node(node_id, &tdf).await.unwrap();
+    let hash = pusher.push_to_node(node_addr.clone(), &tdf).await.unwrap();
     assert!(s3.wait_for_put(&blob_key(hash)).await);
 
     let stored = s3.body(&blob_key(hash)).expect("the blob is stored");
