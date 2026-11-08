@@ -66,8 +66,9 @@ impl TdfIrohNode {
             // outboard into its database when an import completes but leaves
             // the `.obao4` file the import wrote, and deleting the blob later
             // never removes that file, so every staged push of 16 KiB to
-            // 4 MiB would leave up to 16 KiB on disk. Data stays inlined: a
-            // blob that small has no outboard and leaves nothing behind.
+            // 4 MiB would leave up to 16 KiB on disk (iroh-blobs#292, fixed
+            // upstream after 0.103.1). Data stays inlined: a blob that small
+            // has no outboard and leaves nothing behind.
             let options = Options {
                 gc: Some(
                     staging.gc_config(Duration::from_secs(config.iroh.gc_interval_secs.max(1))),

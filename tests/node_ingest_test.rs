@@ -414,6 +414,8 @@ fn staged_files(data_dir: &std::path::Path) -> Vec<String> {
 /// collector deletes an aborted push before its entry unloads, the bitfield
 /// is written again afterwards, with nothing in the store referring to it.
 /// It holds a few bytes and is never read. Any other leftover file fails.
+/// Reported upstream as n0-computer/iroh-blobs#350; drop this exception
+/// once a release fixes it.
 async fn wait_for_empty_staging(node: &TdfIrohNode, data_dir: &std::path::Path, hashes: &[Hash]) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let orphan_bitfields: Vec<String> = hashes
