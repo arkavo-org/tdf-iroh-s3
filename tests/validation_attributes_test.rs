@@ -36,6 +36,19 @@ fn test_missing_attribute_fails() {
     );
 }
 
+#[test]
+fn test_another_value_with_the_same_prefix_fails() {
+    // Every part of the required FQN appears in this policy as a substring.
+    let tdf_bytes = create_tdf_with_attribute("https://example.com/attr/storage/value/permanently");
+    let manifest = parse_manifest(&tdf_bytes);
+    let required = vec!["https://example.com/attr/storage/value/permanent".to_string()];
+    let result = validate_attributes(&manifest, &required);
+    assert!(
+        result.is_err(),
+        "a TDF for another value must not satisfy the required attribute"
+    );
+}
+
 fn create_tdf_with_attribute(attr_fqn: &str) -> Vec<u8> {
     use opentdf::prelude::*;
 
