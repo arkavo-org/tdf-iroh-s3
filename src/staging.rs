@@ -12,15 +12,18 @@
 //! before and after listing the store, and iroh-blobs itself protects
 //! anything written once the run has started. So disk holds the pushes in
 //! flight and, for up to one collector interval, the copies of pushes
-//! already ingested. A push that starts and writes all its data between
-//! the last read and the collector's start can lose it; its ingest then
-//! finds the blob incomplete, and the publisher pushes again.
+//! already ingested. iroh-blobs calls the protect callback after its mark
+//! phase, just before the sweep (iroh-blobs#240, since 0.104.1), so both
+//! reads come after the run started: a push accepted after the second read
+//! writes only after the start, and one accepted before is pending at a
+//! read unless ingest is already done with it.
 //!
 //! The collector is the only cleanup, and iroh-blobs ends its loop for good
-//! after a run fails (iroh-blobs#291). Each run starts with the protect callback, so
-//! [`Staging::collector_stopped`] notices when the callback stops being
-//! called; the node then restarts (once no push is pending) to get a fresh
-//! collector, rather than letting staged pushes fill the disk.
+//! after a run fails (iroh-blobs#291). Every run that gets through its mark
+//! phase calls the protect callback, so [`Staging::collector_stopped`]
+//! notices when the callback stops being called; the node then restarts
+//! (once no push is pending) to get a fresh collector, rather than letting
+//! staged pushes fill the disk.
 
 use iroh_blobs::Hash;
 use iroh_blobs::api::Store;
@@ -38,8 +41,8 @@ pub struct Staging {
     /// The node's runtime: the collector runs on the store's own runtime,
     /// so its store requests run here instead.
     runtime: tokio::runtime::Handle,
-    /// When the collector last started a run (called the protect callback),
-    /// or the store was attached.
+    /// When a collector run last got through its mark phase (called the
+    /// protect callback), or the store was attached.
     last_run: Mutex<tokio::time::Instant>,
 }
 

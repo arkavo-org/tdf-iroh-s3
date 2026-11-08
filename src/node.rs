@@ -11,7 +11,7 @@ use iroh_blobs::provider::events::{
 };
 use iroh_blobs::provider::{self, StreamPair};
 use iroh_blobs::store::fs::FsStore;
-use iroh_blobs::store::fs::options::{InlineOptions, Options};
+use iroh_blobs::store::fs::options::Options;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -62,21 +62,14 @@ impl TdfIrohNode {
         let staging = Staging::new();
         let store = {
             let root = Path::new(&config.iroh.data_dir);
-            // Outboards are never inlined: iroh-blobs moves an inlined
-            // outboard into its database when an import completes but leaves
-            // the `.obao4` file the import wrote, and deleting the blob later
-            // never removes that file, so every staged push of 16 KiB to
-            // 4 MiB would leave up to 16 KiB on disk (iroh-blobs#292, fixed
-            // upstream after 0.103.1). Data stays inlined: a blob that small
-            // has no outboard and leaves nothing behind.
+            // The default inlining (data and outboards up to 16 KiB in the
+            // database). Before 0.104.1, iroh-blobs left the `.obao4` file of
+            // an inlined outboard behind for good (iroh-blobs#292), so the
+            // node turned outboard inlining off; that is fixed.
             let options = Options {
                 gc: Some(
                     staging.gc_config(Duration::from_secs(config.iroh.gc_interval_secs.max(1))),
                 ),
-                inline: InlineOptions {
-                    max_outboard_inlined: 0,
-                    ..InlineOptions::default()
-                },
                 ..Options::new(root)
             };
             FsStore::load_with_opts(root.join("blobs.db"), options)
