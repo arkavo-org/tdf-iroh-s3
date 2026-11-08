@@ -22,7 +22,8 @@ change between commits; the creator catalog contract is
      the member `payload.url` names (other members, such as HLS playlists
      and fMP4 segments, are allowed), or the legacy `0.manifest.json` +
      `0.payload`
-   - Required attributes present in the policy
+   - Each required attribute is named in the policy's `dataAttributes`, exactly
+     (an FQN without `/value/…` accepts any value of that attribute)
    - Optional assertion signature verification
 3. Valid blobs are stored in S3, keyed by BLAKE3 content hash. Ingest reads
    the blob from a file and streams it to S3; it never holds it in memory.
