@@ -1,6 +1,6 @@
 # Deleting published recordings on request
 
-**Status:** proposal, 2026-11-13. Must ship before Creator 2.0. Two decisions pending (marked **Pending**).
+**Status:** proposal, 2026-11-13. Must ship before Creator 2.0.
 **Scope:** tdf-iroh-s3. Creator's side (Hide copy, empty catalog before account deletion) is built in Creator.
 **Read at:** tdf-iroh-s3 `02caef2`.
 
@@ -14,7 +14,9 @@ Today the node never deletes anything a creator published. Hiding a recording re
 
 - **Mechanism (c):** Hide from Catalog *is* the deletion request. The node records it at the passkey-signed publish; an operator-run sweep deletes after a grace period. No new client route.
 - **Account deletion:** before `DELETE /account`, Creator publishes an empty catalog (index `[]`), which records a request for every listed recording. If that publish fails, Creator stops and offers Try Again or Delete Anyway. On a 404 pointer Creator skips the publish.
-- **Exceptions in the policy:** only the 90-day service logs. A recording the creator asks to delete is deleted even when it is under report or blocked. (See **Pending B** for drops a block forces.)
+- **Exceptions in the policy:** the 90-day service logs, and content removed by moderation: a blocked recording or envelope is kept while the block stands. A report alone does not hold a deletion.
+- **Drops a block forces don't count.** `check_payloads` refuses any publish that lists a blocked hash, so after a takedown the creator must drop it to publish again. That drop is not a request.
+- **Not retroactive.** Drops before this ships recorded no request and are not deleted, including for accounts deleted later.
 - **Creators who can't publish** (entitlement lapsed, suspended, PDP denies, catalog blocked): handled manually by an operator.
 - **The sweep deletes every S3 version** of each object, so deletion is permanent when the sweep runs.
 
@@ -84,7 +86,7 @@ After the precondition and `seq` checks (step 7) and before any write (step 8):
 
 - **Diff base: the catalog `GET` would serve.** The stored pointer counts only if it is live (has an index record), its envelope is not blocked, and its owner has no catalog block or `hideCatalog` suspension. Otherwise there is nothing to diff and no request is written. This keeps a moderation block on a creator's envelope from turning into a deletion of every recording it listed when the creator next publishes over the 404.
 - Parse the base's stored index. A stored index that doesn't parse fails the publish: 502 `storage unavailable`, logged as an error.
-- `dropped` = payload hashes in the base index − payload hashes in the new index. This covers Hide, an entry whose payload was replaced (the old payload is no longer published), and an empty catalog. **Pending B** decides whether a dropped hash that is blocked at publish time counts.
+- `dropped` = payload hashes in the base index − payload hashes in the new index. This covers Hide, an entry whose payload was replaced (the old payload is no longer published), and an empty catalog. A dropped hash that is blocked at publish time is left out: the block forced the drop.
 - Write a `recordings/` request for each dropped hash, and a `catalogs/` request for the base's `catalogHash` (it is being superseded), each with the subject, now and the new pointer's `seq`. If any write fails, the publish fails with 502 `storage unavailable` and nothing else is written.
 
 Requests are written before the pointer, so a committed publish always has its requests. If the pointer write then loses (409) or fails, the requests remain for objects that are still listed or current; the sweep skips those, so they're harmless, and a later drop overwrites them.
@@ -124,14 +126,14 @@ Same pattern as the removed `purge-catalogs-1` (c48ec9d): a subcommand of the no
 
 **What is due.**
 - **Rule R (recordings).** Hash `h` is due when either request for it is due:
-  - `recordings/h`: `requestedAt + GRACE ≤ now` and `h ∉ L`.
+  - `recordings/h`: `requestedAt + GRACE ≤ now`, `h ∉ L`, and `h` is not blocked (a block placed after the request holds it while the block stands).
   - `operator/h`, scope `hash`: `h`'s block is still active. No grace, no `L` check (the operator decided; the block already stops all distribution).
   - `operator/h`, scope `subject`: the subject's catalog block is still active, and `h ∉ L` (another creator's served catalog still lists it).
 - **Rule S (subjects).** `subjects/s` is due while `s`'s catalog block is still active.
 - **Rule C (envelopes).** Enumerate hashes under `catalog-documents/`, `catalog-outboards/` and `catalog-indexes/` (so a partial earlier failure is retried). `h` is due when `h ∉ C` and:
   - a `catalogs/h` request exists and `requestedAt + GRACE ≤ now`; or
   - no request exists and the newest `LastModified` of its objects `+ GRACE ≤ now` (envelopes superseded before this ships, envelopes stored by a publish whose pointer write lost, non-current `/1` documents).
-  - **Pending B** decides whether a blocked envelope is kept.
+  - `h` is not blocked (a blocked envelope is kept while the block stands).
 - A request whose gate (block, catalog block) was lifted, or a record that doesn't parse, is skipped and reported.
 
 **Re-check.** Take the snapshot again (same `S`). Drop any rule-R candidate that is now in `L` and needs the `L` check, and any envelope now in `C`.
@@ -170,12 +172,8 @@ Same pattern as the removed `purge-catalogs-1` (c48ec9d): a subcommand of the no
 - A creator whose catalog `GET` answers 404 (pre-envelope pointer, blocked envelope, catalog block, `hideCatalog`) gets no requests from an empty-catalog publish; Creator skips it on 404. These go through the operator path on request.
 - A catalog-blocked creator who isn't suspended gets 412 on `If-None-Match: *`, because `PUT`'s preconditions ignore the owner's catalog hide while `GET` honours it. Pre-existing, separate fix.
 - Hiding a recording from a Mac without its archive can be undone only within the 7 days.
+- Recordings hidden before this ships stay stored, also after their creator deletes their account. Rule C's first deleting run removes the superseded indexes that list them.
 - A publish that re-lists a hash in the seconds between the sweep's re-check and its delete leaves a listed recording that answers "gone"; the sweep reports it.
-
-## Pending (Paul)
-
-- **A. Hides before this ships.** Drops before this ships have no request, and rule C's first deleting run removes the superseded indexes, the only record of what each creator once listed. Either the promise covers only requests from 2.0 on (nothing to do), or a one-time backfill before the first deleting sweep writes `recordings/` requests for every hash in a superseded index that no served catalog lists.
-- **B. Drops a block forces.** `check_payloads` refuses any publish that lists a blocked hash, so after a takedown the creator must drop it to publish again. Either such a drop is a request (every takedown's bytes are gone 7–14 days after the creator's next publish), or §2 skips hashes blocked at publish time and rule C keeps blocked envelopes (the bytes stay until an operator deletes them; the policy then needs a moderation exception).
 
 ## Left to the builder
 
