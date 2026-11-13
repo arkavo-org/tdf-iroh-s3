@@ -1,184 +1,248 @@
-# Deleting published recordings on request
+# Recording ownership, a signed catalog index, and deletion on request
 
-**Status:** proposal, 2026-11-13. Must ship before Creator 2.0.
-**Scope:** tdf-iroh-s3. Creator's side (Hide copy, empty catalog before account deletion) is built in Creator.
-**Read at:** tdf-iroh-s3 `02caef2`.
+**Status:** proposal, 2026-11-13, revised after reviews by a builder check, Codex and Kimi. Must ship before Creator 2.0, on the pointer /2 switch day.
+**Scope:** tdf-iroh-s3. Contract changes reach Creator (rc.3), ArkavoKit (ArkavoCatalog) and the iOS viewer.
+**Read at:** tdf-iroh-s3 `02caef2`; Creator `feat/2.0-rc3` and ArkavoKit `0.22.0` as reported by their sessions.
 
 ## Why
 
-Arkavo's privacy policy will promise that a published recording is deleted from Arkavo's servers within 30 days of the creator's request, backups and old object versions included ("30 days flat"). Deleting an Arkavo account deletes that account's published recordings within the same 30 days. The creator's passkey is the proof of the request; there is no email step.
+Arkavo's privacy policy will promise that a published recording is deleted from Arkavo's servers within 30 days of the creator's request, backups and old object versions included. Deleting an Arkavo account deletes that account's published recordings within the same 30 days. The creator's passkey is the proof of the request.
 
-Today the node never deletes anything a creator published. Hiding a recording republishes the catalog without its entry, and "the TDF stays on the node" (`docs/creator-catalogs.md`). A moderation block stops distribution and leaves the bytes. `S3Client::delete_blob` exists and has no caller.
+Today the node never deletes anything a creator published. Hiding a recording republishes the catalog without its entry, and "the TDF stays on the node" (`docs/creator-catalogs.md:174`). A moderation block stops distribution and leaves the bytes. Two things also keep "the passkey is the proof" and "only the creator deletes their recordings" from being true: the passkey signs the pointer but not the clear index the node reads, and any creator may list a recording whose policy names their attribute.
 
-## Decisions already made (Paul)
+## Decisions (Paul)
 
-- **Mechanism (c):** Hide from Catalog *is* the deletion request. The node records it at the passkey-signed publish; an operator-run sweep deletes after a grace period. No new client route.
-- **Account deletion:** before `DELETE /account`, Creator publishes an empty catalog (index `[]`), which records a request for every listed recording. If that publish fails, Creator stops and offers Try Again or Delete Anyway. On a 404 pointer Creator skips the publish.
-- **Exceptions in the policy:** the 90-day service logs, and content removed by moderation: a blocked recording or envelope is kept while the block stands. A report alone does not hold a deletion.
-- **Drops a block forces don't count.** `check_payloads` refuses any publish that lists a blocked hash, so after a takedown the creator must drop it to publish again. That drop is not a request.
-- **Not retroactive.** Drops before this ships recorded no request and are not deleted, including for accounts deleted later.
-- **Creators who can't publish** (entitlement lapsed, suspended, PDP denies, catalog blocked): handled manually by an operator.
-- **The sweep deletes every S3 version** of each object, so deletion is permanent when the sweep runs.
+1. **Mechanism (c).** Hide from Catalog is the deletion request, recorded at the passkey-signed publish; an operator-run sweep deletes after a grace period. No new client route for deletion.
+2. **Account deletion.** Before `DELETE /account`, Creator publishes an empty catalog. If that fails, Creator stops and offers Try Again or Delete Anyway. On a 404 pointer Creator skips the publish.
+3. **Policy exceptions:** the 90-day service logs, and content removed by moderation (a blocked recording or envelope is kept while the block stands). A report alone does not hold a deletion.
+4. **A drop a block forces is not a request.** `check_payloads` refuses any publish that lists a blocked hash, so a takedown makes the creator drop it.
+5. **Not retroactive.** Drops before this ships are not requests.
+6. **Creators who can't publish** (entitlement lapsed, suspended, PDP denies, catalog blocked) are handled by an operator.
+7. **The sweep deletes every S3 version.**
+8. **The index is bound into what the passkey signs, now:** pointer `/2` carries `indexHash`. **Hard switch:** from the switch day the node refuses `/1` publishes; it never accepts both.
+9. **No cross-account recordings.** Only a recording's owner can list it or delete it.
+10. **Ownership ends** when the sweep deletes the recording, or when an operator releases it.
 
 ## Goals
 
-- A recording the creator dropped from their catalog (Hide, a replaced payload, an empty catalog) is gone from S3, every version, within 30 days of the publish that dropped it.
-- Superseded catalog envelopes (which carry each entry's metadata TDF, including titles) are gone within the same budget, and no earlier than 7 days after being superseded.
-- The 30-day clock starts at a time the node recorded from a passkey-signed publish.
-- A creator can undo a Hide by publishing the entry again during the grace period.
-- An operator can carry out a deletion for a creator who can't publish.
+- A recording its owner dropped from their catalog (Hide, a replaced payload, an empty catalog) is gone from S3, every version, within 30 days of the publish that dropped it.
+- Superseded catalog envelopes (they carry each entry's metadata TDF, titles included) are gone within the same budget, and no earlier than 7 days after being superseded.
+- Every request traces to a committed, passkey-signed publish whose index the passkey covered.
+- A creator can undo a Hide by publishing the entry again within 7 days.
+- One account owns each recording; nobody else can list it, push it, or cause its deletion.
 
 ## Non-goals
 
-- Deleting the catalog pointer or the current (possibly empty) envelope when a creator deletes their account through Creator. Nothing tells the node an account was deleted. Known gap, accepted.
-- Recordings pushed but never listed in a catalog, outside the operator path. Leftovers of removed features other than envelopes (`/1` tags, `catalog-index/`, `campaign-creators/`).
-- A scheduled, automatic sweep. The operator runs it (at least weekly, see Timing).
-- Copies outside the node: what viewers or other iroh peers already fetched, the KAS, identity, CloudWatch logs.
+- Deleting the pointer or the current (possibly empty) envelope when a creator deletes their account through Creator. Nothing tells the node an account was deleted.
+- Recordings pushed but never listed, outside the operator path. Leftovers of removed features other than envelopes (`/1` tags, `catalog-index/`, `campaign-creators/`).
+- A scheduled, automatic sweep. The operator runs it, at least weekly.
+- Copies outside the node: what viewers or iroh peers already fetched, the KAS, identity, CloudWatch logs.
 
 ## Anti-goals
 
-- **Never delete a recording nobody asked to delete.** No rule of the form "not listed in any catalog ⇒ delete" for recordings. A creator whose pointer predates envelopes has no index record (`catalogs_v2_api.rs:420`), so every one of their recordings is listed nowhere, and such a rule would delete them all.
-- **Never delete on an uncertain view.** Any error reading pointers, indexes, moderation records or requests aborts the sweep before it deletes anything.
-- **Never resurrect what was deleted.** Delete order must not let the node's outboard backfill recreate an object.
+- **Never delete a recording its owner didn't ask to delete.** No "listed nowhere ⇒ delete" rule for recordings: a pre-envelope creator's recordings are listed nowhere (`catalogs_v2_api.rs:420`).
+- **Never act on uncommitted or unreadable state.** Requests derive only from publishes whose pointer committed. Any unreadable record aborts the sweep before it deletes anything.
+- **Never leave a deleted object to come back.** A deletion stays recorded until a later run confirms every object is still gone.
 
 ## Facts the design rests on
 
-- `put_catalog` already reads the stored pointer and its index record before writing (`catalogs_v2_api.rs:411-433`); the previous index's entries are available to diff. Its `live` flag ignores blocks; `served_seq` (`:437-440`) is what `GET` would serve, minus the owner's catalog hide.
-- `GET /v2/catalogs/{sub}` answers 404 for a blocked envelope, for an owner with a catalog block or a `hideCatalog` suspension, and for a pre-envelope pointer. A 404 does not mean the pointer is absent.
-- `check_payloads` has no ownership check: any subject whose envelope attribute the recording's manifest names may list it (`catalogs_api.rs:65`). It refuses blocked hashes first (403 `content is blocked`, `:70`), then HEADs `blobs/<hash>` (422 `payload <hash> is not ingested`).
-- `moderation/publishers/<hash>` is last-pusher-wins, rewritten on every ingested push (`node.rs:293`, written at `:363`), with the pusher's subject.
-- Catalog blocks are keyed by canonical subject (`moderation.rs:1360`); pointers by the token's `sub` byte for byte, so one account can have `catalog-pointers/<uuid>` and `catalog-pointers/arkavo:<uuid>`.
-- `S3Server` recomputes and stores a missing outboard for a blob or envelope that exists (`s3_serve.rs:318-321`). Deleting the outboard before the object can bring it back.
-- After a blob is deleted, a running node's cached size gives one fetch "try again" (`ERR_LIMIT`), then "gone" (`Permission`).
-- Blobs are uploaded with a single `PutObject` (`store/s3.rs:141`), never multipart.
-- Moderation history is append-only under `moderation/audit/<kind>/<key>/<nanos>`; nothing reads old S3 versions.
-- `/1` documents were stored under `catalog-documents/` (c48ec9d).
-- Production bucket (checked 2026-11-13): versioned; no replication, no Object Lock, no AWS Backup plans or recovery points; only lifecycle rule is the 1-day rule on `moderation/sessions/`. So today a delete by key leaves the bytes forever as a noncurrent version.
+- `put_catalog` reads the stored pointer and its index record before writing (`catalogs_v2_api.rs:411-433`), and writes the pointer conditionally on that pointer's ETag (`:455`, `:489`). So a committed publish replaced exactly the pointer it read.
+- `GET /v2/catalogs/{sub}` answers 404 for a blocked envelope, an owner with a catalog block or `hideCatalog` suspension, and a pre-envelope pointer. A 404 does not mean no pointer.
+- The passkey's challenge is SHA-256 of the pointer bytes (`catalog_v2.rs:9`, `:390`). Pointer `/1` is exactly `schema, owner, seq, catalogHash, catalogSize, issuedAt` (`:77-84`); `issuedAt` has no freshness check. The index is not signed (`creator-catalogs.md:113`).
+- `check_payloads` has no ownership check (`catalogs_api.rs:65`): it refuses blocked hashes (403, `:70`), unknown blobs (422, `:74`), and entries whose manifest lacks the envelope's attribute (`:120`).
+- `moderation/publishers/<hash>` is written after each ingested push, overwriting (`node.rs:293`, `:363`), only on a gated node.
+- Ingest writes the outboard first, then uploads the blob if absent (`ingest.rs:170-191`). `S3Server` recomputes a missing outboard for an existing blob or envelope (`s3_serve.rs:302-321`). Blobs are a single `PutObject` (`store/s3.rs:141`).
+- The moderation loader skips unreadable records (`moderation.rs:427`). Catalog blocks are keyed by canonical subject (`:1360`); pointers by the token's `sub`.
+- Production bucket (2026-11-13): versioned, no replication, no Object Lock; no AWS Backup plans or recovery points and no DLM policies; only lifecycle rule is the 1-day rule on `moderation/sessions/`.
+- Every pointer reader today (ArkavoKit `CatalogPointer.decode` 0.22.0; the viewer's own parser at 3.0.0-beta.5) refuses anything but `/1` with exactly six keys. Only Creator writes pointers.
 
 ## Approaches considered
 
 | | Trigger | Cost | Picked |
 |---|---|---|---|
-| (a) | Hide is the request; a sweep deletes whatever no catalog lists | No node route; but no request time to start the clock, and "unlisted" sweeps pre-envelope creators' recordings and in-flight pushes | No |
-| (b) | A passkey-signed `DELETE` route Creator calls | New signed message format, replay protection, contract section, Creator UI; still needs the same sweep | No |
-| (c) | Hide is the request, **recorded by the node at publish**; the sweep acts only on recorded requests | A diff in `put_catalog`, a record prefix, two subcommands | **Yes** |
+| (a) | Hide is the request; a sweep deletes whatever no catalog lists | No request time; sweeps pre-envelope creators' recordings and in-flight pushes | No |
+| (b) | A passkey-signed `DELETE` route | New signed format, replay protection, Creator UI; same sweep | No |
+| (c) | Hide is the request, recorded by the node at publish | A record per publish and two subcommands | **Yes** |
 
-Every option needs a sweep (superseded envelopes, account deletion); the choice is only the trigger. (c) keeps the client unchanged, gives each request a time and a passkey-signed origin, and never infers a recording deletion. Its cost: any entry Creator drops becomes a deletion, a Creator bug included. The grace period is the undo.
+The first version of (c) wrote request objects before the pointer committed. Reviews found that a publish whose pointer write lost could still trigger or back-date a deletion, and that re-listing didn't cancel a request. This version records a **transition** per publish and lets the sweep fold only committed transitions, in order. A sweep that instead compared each catalog with what it saw last run was rejected: a recording listed and hidden between two runs would never be seen, so never deleted.
 
 ## Design
 
-### 1. Deletion requests
+Three parts, built as three PRs in this order and deployed together on the switch day.
 
-Records in S3 under `{prefix}deletion-requests/`. Publish and operator requests use separate keys, so neither overwrites the other.
+### Part 1. Ownership
 
-| Key | Written by | Body |
+**The owner record.** `moderation/publishers/<hash>` (`{"hash","subject","endpointId","at"}`, `subject` canonical) becomes write-once: created with `If-None-Match: *`, never overwritten. The first account to push a hash owns it.
+
+**Push.** When a push arrives, the node knows the pusher's subject from the publish session. Before accepting the transfer it reads the owner record (5 s timeout, bounded concurrency, as session lookups are):
+- names another subject → refuse the push (Permission);
+- names the pusher, or absent → accept;
+- unreadable or timed out → refuse (fail closed).
+
+After a successful ingest it creates the record if absent. If two first pushes race, the first create wins; the loser's bytes are the same bytes, and the loser can't list them.
+
+**Publish.** `check_payloads` gets the publisher's subject and reads each distinct hash's owner record, alongside its existing HEAD and manifest reads:
+- another subject → 403 `recording belongs to another account`;
+- absent → 422 `recording has no owner: push it again` (a push claims it);
+- both refusals carry `"contentIDs"`: every offending entry's `contentID`, sorted.
+
+**Pre-check.** `GET /publish/recordings/{hash}` with the publisher's token (`authorize_publisher`): 200 `{"hash":"<hash>","owner":"you" | "another account" | "none"}`; 400 `invalid hash`; 502 `storage unavailable`. It never names the other account. Creator calls it before the passkey prompt, since a refused iroh push reaches Creator only as a failed push.
+
+**Backfill.** `tdf-iroh-s3 claim-owners [--write]`, dry run by default, run once before the switch. For each payload hash listed in any live index:
+- an owner record exists and names the only lister → nothing to do;
+- no record, and exactly one subject lists it → create the record for that subject;
+- listed by more than one subject, or a record naming someone who doesn't list it → conflict, reported, nothing written.
+
+The switch waits until the dry run reports no conflicts. Hashes listed nowhere and without a record are left; the next push claims them.
+
+**Release.** The sweep deletes the owner record with the recording (Part 3). `tdf-iroh-s3 release-owner --hash <h> --subject <sub> --reason <text>` deletes it only if it names `<sub>`, for an account deleted without emptying its catalog. A released recording is claimed by the next push.
+
+### Part 2. Pointer /2 and the signed index
+
+**Pointer `/2`.** Exactly seven keys, the `/1` rules otherwise unchanged (no repeated key, nothing after it, at most 1024 bytes):
+
+```json
+{"schema":"arkavo.catalog-pointer/2","owner":"<sub>","seq":7,"catalogHash":"<64 hex>","catalogSize":1234,"indexHash":"<64 hex>","issuedAt":"2026-10-19T01:02:03Z"}
+```
+
+A `/1` pointer is exactly its six keys; a `/1` with `indexHash`, or a `/2` without it, is invalid. `indexHash` is **SHA-256**, while `catalogHash` and `payloadHash` are BLAKE3.
+
+**`indexHash`** is the lowercase hex SHA-256 of the canonical index, built from the parsed entries, never from the bytes received:
+- entries sorted by `contentID`, comparing the UTF-8 bytes;
+- each written as `{"contentID":"<id>","version":<n>,"payloadHash":"<hex>","payloadSize":<n>}`, keys in exactly that order;
+- joined with `,` inside `[` `]`, no whitespace. The empty index is `[]`.
+- No escaping arises: `contentID` is `[A-Za-z0-9:._@-]`.
+
+The wire `index` in `PUT` is unchanged (Creator's `encodedIndex()` writes keys alphabetically in document order; the node re-canonicalizes).
+
+**Vectors** (the shared file is ArkavoKit's `Tests/ArkavoCatalogTests/Vectors/catalog-vectors.json`, copied to `tests/fixtures/arkavo-catalog-vectors.json`; ArkavoKit adds these and the invalid pointers):
+
+| Name | Input order of `contentID` | `indexHash` |
 |---|---|---|
-| `recordings/<hash>` | publish | `{"hash", "subject", "requestedAt", "seq"}` |
-| `catalogs/<hash>` | publish | `{"hash", "subject", "requestedAt", "seq"}` (a superseded envelope) |
-| `operator/<hash>` | `request-deletion` | `{"hash", "subject", "requestedAt", "reason", "scope": "hash" \| "subject"}` |
-| `subjects/<canonical sub>` | `request-deletion --all` | `{"subject", "requestedAt", "reason"}` |
+| empty | — | `4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945` |
+| two | `rec-b` (v1, `bb…`, 2048), `rec-a` (v3, `aa…`, 1024) | `03f745d8d08d9e9e11cabf33d85e8beb452eb3a2b2e541f92e1703c1f4152df4` |
+| byte-order | `a_1`, `a@1`, `A`, `a:1`, `a.1`, `a-1` (entry *n* has hash byte `n` ×32, size *n*+1, v1) | `79129b9fa70e8ab5d0894d07098294de6dec2677c9df538b3eb05df98bd8ef18` |
 
-`requestedAt` is Unix seconds. A new publish request for the same hash overwrites the old one: the latest drop is the request in force (hide on day 0, re-list on day 3, hide on day 5 ⇒ the clock starts on day 5).
+Canonical bytes of "two": `[{"contentID":"rec-a","version":3,"payloadHash":"aa…aa","payloadSize":1024},{"contentID":"rec-b","version":1,"payloadHash":"bb…bb","payloadSize":2048}]` (64 hex characters each). "byte-order" sorts to `A`, `a-1`, `a.1`, `a:1`, `a@1`, `a_1`.
 
-### 2. Requests at publish (`PUT /v2/catalogs/{sub}`)
+**The node, from the switch.** `PUT /v2/catalogs/{sub}` accepts only `/2`:
+- `/1` → 422 `invalid bundle: pointer schema must be "arkavo.catalog-pointer/2"` (the existing message with the new schema);
+- `indexHash` differs from the canonical index → 422 `invalid bundle: indexHash does not match the index`, checked after the bundle verifies and before `check_payloads`.
 
-After the precondition and `seq` checks (step 7) and before any write (step 8):
+`GET` still serves stored `/1` pointers; ArkavoKit keeps decoding `/1` while any are stored.
 
-- **Diff base: the catalog `GET` would serve.** The stored pointer counts only if it is live (has an index record), its envelope is not blocked, and its owner has no catalog block or `hideCatalog` suspension. Otherwise there is nothing to diff and no request is written. This keeps a moderation block on a creator's envelope from turning into a deletion of every recording it listed when the creator next publishes over the 404.
-- Parse the base's stored index. A stored index that doesn't parse fails the publish: 502 `storage unavailable`, logged as an error.
-- `dropped` = payload hashes in the base index − payload hashes in the new index. This covers Hide, an entry whose payload was replaced (the old payload is no longer published), and an empty catalog. A dropped hash that is blocked at publish time is left out: the block forced the drop.
-- Write a `recordings/` request for each dropped hash, and a `catalogs/` request for the base's `catalogHash` (it is being superseded), each with the subject, now and the new pointer's `seq`. If any write fails, the publish fails with 502 `storage unavailable` and nothing else is written.
+**Rollout (hard switch).**
+1. ArkavoKit release: reads `/1` and `/2`, writes `/2`; `CatalogPublishRequest` refuses a `/2` whose `indexHash` doesn't match its catalog. Optionally the viewer checks `indexHash` against the decrypted entries.
+2. A viewer build that accepts `/2` reaches users (or a patch to the viewer's own parser).
+3. `claim-owners` reports no conflicts, then runs with `--write`.
+4. Node deploy (Parts 1–3). From here `/1` publishes are refused; rc.2 and earlier TestFlight builds can't publish, update or hide (accepted).
+5. Creator rc.3 publishes `/2`. Before the switch, rc.3 is tested against this branch run outside production.
 
-Requests are written before the pointer, so a committed publish always has its requests. If the pointer write then loses (409) or fails, the requests remain for objects that are still listed or current; the sweep skips those, so they're harmless, and a later drop overwrites them.
+### Part 3. Deletion requests
 
-Any lister's drop counts, whoever pushed the recording: the sweep's check that no served catalog lists the hash protects every other lister.
+#### 3.1 Transitions, written at publish
 
-The response and the contract's status codes are unchanged (502 `storage unavailable` already exists).
+Each publish writes `catalog-transitions/<sub>/<seq, 20 digits>-<catalogHash>` (`<sub>` as the pointer key) **before** the document, index and pointer (step 8), and fails with 502 `storage unavailable` if it can't:
 
-### 3. Operator requests: `tdf-iroh-s3 request-deletion`
-
-For a creator who can't publish. Runs with operator AWS credentials and the node's config file. The operator places the block first through the existing moderation API; verifying the creator's identity for a manual request is the operator's process, outside the node.
-
-```
-tdf-iroh-s3 --config <path> request-deletion --subject <sub> --reason <text> --hash <h> [--hash <h> ...]
-tdf-iroh-s3 --config <path> request-deletion --subject <sub> --reason <text> --all
-```
-
-- `--reason` is required (e.g. a support ticket reference). `--subject` is compared canonically (`canonical_subject`).
-- `--hash`: each hash must have an active block (`moderation/blocks/<hash>`), else the command refuses and writes nothing. Writes `operator/<hash>` with `scope: "hash"`.
-- `--all`: the subject must have an active catalog block (`moderation/catalog-blocks/<sub>`), else it refuses. Writes `operator/<hash>` with `scope: "subject"` for every payload hash in the live index of each pointer whose key is canonically the subject, and for every hash whose `moderation/publishers/<hash>` names the subject canonically (covers pre-envelope creators and never-listed pushes). Writes `subjects/<sub>`, which deletes those pointers (§4).
-- It prints what it wrote.
-
-### 4. The sweep: `tdf-iroh-s3 sweep-deletions`
-
-```
-tdf-iroh-s3 --config <path> sweep-deletions            # dry run: report only
-tdf-iroh-s3 --config <path> sweep-deletions --delete
+```json
+{"subject":"<sub>","seq":8,"catalogHash":"<new>","base":{"seq":7,"catalogHash":"<old>"},"at":<unix secs>,
+ "dropped":["<hash>",...],"added":["<hash>",...]}
 ```
 
-Same pattern as the removed `purge-catalogs-1` (c48ec9d): a subcommand of the node binary, dry run unless `--delete`. Grace is a constant, `GRACE = 7 days`, not a flag: the contract promises creators the 7-day undo.
+- `base` is the stored pointer this publish replaces, whatever its visibility; `null` when there is none.
+- `dropped` = hashes in the **served** base's index (live, envelope not blocked, owner without a catalog block or `hideCatalog` suspension) − hashes in the new index, minus hashes blocked at publish time (decision 4), minus hashes whose owner record doesn't name the publisher. Empty when the base isn't served.
+- `added` = hashes in the new index − hashes in the base's live index (any visibility); all new hashes when the base has no index.
 
-**Snapshot.** Read every pointer under `catalog-pointers/`, its index record, and the moderation records (blocks, catalog blocks, suspensions).
-- `S` = pointers to delete this run: those whose key is canonically a subject with a due `subjects/` request (rule S).
-- `L` = every payload hash in every **served** catalog: pointer not in `S`, live, envelope not blocked, owner without a catalog block or `hideCatalog` suspension.
-- `C` = every `catalogHash` named by a pointer not in `S`, in any state.
-- Any listing, read or parse error aborts the run, nonzero exit, nothing deleted.
+A transition is **committed** when it is reachable from a current pointer by following `base` links. Because the pointer write is conditional on the base's ETag, a transition from a publish that lost is never reachable. The publish path writes no requests.
 
-**What is due.**
-- **Rule R (recordings).** Hash `h` is due when either request for it is due:
-  - `recordings/h`: `requestedAt + GRACE ≤ now`, `h ∉ L`, and `h` is not blocked (a block placed after the request holds it while the block stands).
-  - `operator/h`, scope `hash`: `h`'s block is still active. No grace, no `L` check (the operator decided; the block already stops all distribution).
-  - `operator/h`, scope `subject`: the subject's catalog block is still active, and `h ∉ L` (another creator's served catalog still lists it).
-- **Rule S (subjects).** `subjects/s` is due while `s`'s catalog block is still active.
-- **Rule C (envelopes).** Enumerate hashes under `catalog-documents/`, `catalog-outboards/` and `catalog-indexes/` (so a partial earlier failure is retried). `h` is due when `h ∉ C` and:
-  - a `catalogs/h` request exists and `requestedAt + GRACE ≤ now`; or
-  - no request exists and the newest `LastModified` of its objects `+ GRACE ≤ now` (envelopes superseded before this ships, envelopes stored by a publish whose pointer write lost, non-current `/1` documents).
-  - `h` is not blocked (a blocked envelope is kept while the block stands).
-- A request whose gate (block, catalog block) was lifted, or a record that doesn't parse, is skipped and reported.
+#### 3.2 Records the sweep keeps
 
-**Re-check.** Take the snapshot again (same `S`). Drop any rule-R candidate that is now in `L` and needs the `L` check, and any envelope now in `C`.
+Under `deletion-requests/`, written only by the sweep and the operator commands. Subjects are canonical.
 
-**Delete** (with `--delete`): every version and delete marker of each key.
-- Recording `h`: `blobs/h`, then `outboards/h`, `manifests/h`, `moderation/publishers/h`, then `recordings/h` and `operator/h`.
-- Subject `s`: each pointer in `S` for `s`, then `subjects/s`. Its envelopes then fall to rule C (already excluded from `C`).
-- Envelope `h`: `catalog-documents/h`, then `catalog-outboards/h`, `catalog-indexes/h`, then `catalogs/h`.
-- A failure stops that item: its requests stay for the next run. The run continues with other items and exits nonzero.
-- Block, suspension, catalog-block and audit records are kept.
+| Key | Body |
+|---|---|
+| `recordings/<sub>/<hash>` | `{"hash","subject","requestedAt","seq","state":"pending"\|"deleted","deletedAt"?}` |
+| `envelopes/<hash>` | `{"hash","owner"?,"supersededAt","source":"transition"\|"observed","state","deletedAt"?}` |
+| `operator/<sub>/<hash>` | `{"hash","subject","requestedAt","reason","scope":"hash"\|"subject","state","deletedAt"?}` |
+| `subjects/<sub>` | `{"subject","requestedAt","reason","state","deletedAt"?}` |
 
-**After.** For each deleted recording or envelope, check `outboards/h` or `catalog-outboards/h` again; if a node's backfill recreated it, delete its versions again. Take the snapshot once more; a deleted hash now in `L` is reported as "re-listed during the sweep: the creator must push it again".
+#### 3.3 Operator commands
 
-**Report.** One line per item (`deleted` / `would delete` / `kept: <why>`), then counts. Stdout only; the node keeps no deletion log.
+Each needs operator AWS credentials and the node's config; `--reason` is required; subjects compare canonically. They print what they wrote.
 
-### 5. Timing
+- `request-deletion --subject <s> --hash <h>...`: each hash must have an active block. Writes `operator/<s>/<h>`, scope `hash`.
+- `request-deletion --subject <s> --all`: `<s>` must have an active catalog block. Writes scope-`subject` requests for every hash in the live index of each pointer canonically `<s>`, and every hash whose owner record names `<s>`, then `subjects/<s>`. It reports these sources as its whole coverage; the operator adds `--hash` for anything else.
+- `release-owner` (Part 1).
 
-- With version deletion and no backups, an item is gone at the first sweep after it falls due: `requestedAt + 7 days` for creator requests. A weekly sweep makes the worst case about 14 days, inside 30.
-- The operator runbook schedules the sweep weekly. The 30-day promise depends on it running.
+#### 3.4 The sweep: `tdf-iroh-s3 sweep-deletions [--delete]`
 
-### 6. Operations (outside the code)
+Dry run unless `--delete` (the pattern of the removed `purge-catalogs-1`, c48ec9d): a dry run reads and reports, and writes nothing. `GRACE` is a constant, 7 days.
 
-- **Lifecycle rule** (devsecops' proposal, Paul applies): bucket-wide `NoncurrentVersionExpiration` 7 days and `ExpiredObjectDeleteMarker`; keep the `moderation/sessions/` rule. Needed because overwrites keep old versions forever: old catalog pointers (naming old envelopes and credential IDs), manifests, publisher records. (`AbortIncompleteMultipartUpload` is harmless; the node never uses multipart.)
-- **Instance role:** `s3:PutObject` on `deletion-requests/*` if the role is prefix-scoped.
+1. **Read strictly.** Every pointer, index record, transition, request and moderation record (with its own strict parser, not the skipping loader). Anything unreadable aborts the run, nonzero, nothing written.
+2. **Fold committed transitions.** For each pointer, walk back from its current `(seq, catalogHash)` through transition records until one is missing (start of history, or already folded). Apply them oldest first:
+   - each `added` hash cancels a pending `recordings/<sub>/<hash>`;
+   - each `dropped` hash sets `recordings/<sub>/<hash>` pending with `requestedAt` = the transition's `at` (the newest drop wins);
+   - a `base.catalogHash` different from the new one sets `envelopes/<base>` pending, `supersededAt` = `at`, `source: "transition"`.
+   Then delete the folded transitions, oldest first. Transitions not reachable from any pointer and older than `GRACE` (lost publishes) are deleted unfolded.
+3. **Snapshot.**
+   - `S` = pointers canonically a subject with an active `subjects/` request whose catalog block is still active.
+   - `L` = every payload hash in every live index of a pointer not in `S`, **whatever its visibility**.
+   - `C` = every pointer's `catalogHash`, for pointers not in `S`.
+4. **Observe untracked envelopes.** A hash under `catalog-documents/`, `catalog-outboards/` or `catalog-indexes/` that is not in `C` and has no `envelopes/` record gets one: `source: "observed"`, `supersededAt` = now.
+5. **Due.**
+   - `recordings/<sub>/<h>` pending: `requestedAt + GRACE ≤ now`, `h ∉ L`, `h` not blocked, and `h`'s owner record names `<sub>`. A different or missing owner is kept and reported for manual handling.
+   - `operator/<sub>/<h>`: scope `hash` while `h`'s block is active (no grace, no `L`); scope `subject` while `<sub>`'s catalog block is active and `h ∉ L`.
+   - `subjects/<sub>`: while its catalog block is active.
+   - `envelopes/<h>` pending: `supersededAt + GRACE ≤ now`, `h ∉ C`, `h` not blocked, and its owner (the document's `owner` metadata, else the index record's `owner`) has no catalog block or `hideCatalog` suspension. Unknown owner while any object exists: kept, reported.
+6. **Delete** (with `--delete`), item by item. Immediately before each item, re-read its request record and the moderation records it depends on, and re-read the pointers to recheck `L`/`C`; drop the item if anything changed. Then delete every version and delete marker:
+   - recording `h`: `blobs/h`, then `outboards/h`, `manifests/h`, `moderation/publishers/h` (ownership ends); then mark its request(s) `deleted` with `deletedAt`;
+   - subject `s`: each pointer in `S` for `s`; mark `subjects/s` `deleted` (its envelopes fall to step 4 next run);
+   - envelope `h`: `catalog-documents/h`, then `catalog-outboards/h`, `catalog-indexes/h`; mark `envelopes/h` `deleted`.
+   A failure leaves that item pending for the next run; the run continues and exits nonzero. Block, suspension, catalog-block and audit records are kept.
+7. **Verify tombstones.** For each record marked `deleted` at least an hour earlier (any in-flight push or backfill has finished):
+   - recording `h` in `L` again (re-pushed and re-listed by its owner): remove the record, keep the objects;
+   - any of its objects exists: delete them again, report "recreated", keep the record;
+   - otherwise: remove the record, every version.
+8. **Report.** One line per item (`deleted`, `would delete`, `kept: <why>`, `recreated`), then counts; also any deleted recording now in `L` and any deleted envelope now in `C`. Stdout only.
+
+#### 3.5 Timing
+
+A drop's clock is the publish time recorded in its transition. With a weekly sweep, the drop is folded within 7 days, falls due at publish + 7 days, and is deleted by the first sweep after that: about 14 days worst case. With no backups and version deletion, that is final. The runbook schedules the sweep weekly; the promise depends on it.
+
+### Operations
+
+- **Lifecycle rule** (devsecops' proposal, Paul applies): bucket-wide `NoncurrentVersionExpiration` 7 days and `ExpiredObjectDeleteMarker`, keeping the `moderation/sessions/` rule, so overwrites (old pointers, manifests) don't keep old versions forever.
+- **Instance role:** `s3:PutObject` on `catalog-transitions/*`; conditional creates on `moderation/publishers/*`.
 - **Operator credentials:** `s3:ListBucket`, `s3:ListBucketVersions`, `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:DeleteObjectVersion`.
 
-### 7. Documentation
+## Contract changes (`docs/creator-catalogs.md`)
 
-- `docs/creator-catalogs.md` (the contract): Hide/removal (line 174) now deletes the stored TDF at least 7 and at most 30 days after the publish; re-listing within 7 days cancels; after deletion, re-listing needs a fresh push. A replaced payload is deleted the same way. A superseded envelope is deleted 7 to 30 days after it was superseded (`GET /catalog-documents/<old>` then 404, iroh fetch gone). Account deletion: publish an empty catalog first.
-- `docs/publishing-and-moderation.md`: replace "Not included: deleting stored bytes" with deletion requests, the two subcommands, the manual procedure for creators who can't publish, IAM and the lifecycle rule. The block record outlives the bytes.
-- `CLAUDE.md`: key layout (`deletion-requests/`), the new module, Hide semantics.
+Wire strings are matched exactly by Creator and stay stable.
+
+| Route | Status | `error` | Extra |
+|---|---|---|---|
+| `PUT /v2/catalogs/{sub}` | 422 | `invalid bundle: pointer schema must be "arkavo.catalog-pointer/2"` | |
+| `PUT /v2/catalogs/{sub}` | 422 | `invalid bundle: indexHash does not match the index` | |
+| `PUT /v2/catalogs/{sub}` | 403 | `recording belongs to another account` | `contentIDs` |
+| `PUT /v2/catalogs/{sub}` | 422 | `recording has no owner: push it again` | `contentIDs` |
+| `GET /publish/recordings/{hash}` | 200 | | `{"hash","owner"}` |
+
+None starts with `invalid bundle: credential` or equals a passkey or entitlement refusal Creator already handles.
+
+Also in the contract: pointer `/2` and `indexHash` with the vectors; ownership (first push owns; others' pushes refused); removal (line 174): the stored TDF is deleted 7 to 30 days after the publish that dropped it, re-listing within 7 days cancels, after deletion re-listing needs a fresh push; a replaced payload is deleted the same way; a superseded envelope is deleted 7 to 30 days after it was replaced; account deletion: publish an empty catalog first. `docs/publishing-and-moderation.md`: ownership on push, the operator commands and procedure, IAM, the lifecycle rule. `CLAUDE.md`: key layout and modules.
 
 ## Known gaps (accepted)
 
-- After account deletion through Creator, the pointer and the empty envelope stay (no signal reaches the node).
-- A creator whose catalog `GET` answers 404 (pre-envelope pointer, blocked envelope, catalog block, `hideCatalog`) gets no requests from an empty-catalog publish; Creator skips it on 404. These go through the operator path on request.
-- A catalog-blocked creator who isn't suspended gets 412 on `If-None-Match: *`, because `PUT`'s preconditions ignore the owner's catalog hide while `GET` honours it. Pre-existing, separate fix.
-- Hiding a recording from a Mac without its archive can be undone only within the 7 days.
-- Recordings hidden before this ships stay stored, also after their creator deletes their account. Rule C's first deleting run removes the superseded indexes that list them.
-- A publish that re-lists a hash in the seconds between the sweep's re-check and its delete leaves a listed recording that answers "gone"; the sweep reports it.
+- After account deletion through Creator, the pointer and the empty envelope stay.
+- A creator whose catalog reads 404 (pre-envelope pointer, blocked envelope, catalog block, `hideCatalog`) gets no requests from an empty-catalog publish; Creator skips it on 404. Operator path on request.
+- An account deleted without emptying its catalog keeps owning its recordings, so a new account can't push the same files until an operator runs `release-owner` or `request-deletion`.
+- A catalog-blocked creator who isn't suspended gets 412 on `If-None-Match: *` (`PUT` preconditions ignore the owner's hide). Pre-existing, separate fix.
+- Recordings hidden before this ships stay stored, also after their creator deletes their account.
+- A Hide from a Mac without the archive can be undone only within the 7 days.
+- A publish that re-lists a hash between an item's re-check and its delete leaves a listed recording that answers "gone"; the sweep reports it.
 
 ## Left to the builder
 
-- Module layout (suggested: `src/deletion.rs` for request records, the diff and the sweep's pure decisions, behind a small store trait with an S3 implementation and an in-memory one for tests).
-- How `TagStore` grows to write requests (`MemStore` must implement it).
-- Concurrency limits for request writes and deletions.
-- The report's exact wording.
-- How to test version listing and batch deletion against S3 (extend the in-test S3 stand-in in `tests/s3_client_test.rs`, or test through the trait).
+- Module layout (suggested: `src/ownership.rs`, `src/deletion.rs` for transitions, folding and the sweep's decisions behind a small store trait with an S3 and an in-memory implementation).
+- How `TagStore` grows (`MemStore` implements it), and how the push path's owner lookup shares the session lookup's bounds.
+- Concurrency limits, report wording, and how to test version listing and batch deletion against S3 (extend the stand-in in `tests/s3_client_test.rs`, or test through the trait).
