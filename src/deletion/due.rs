@@ -130,9 +130,10 @@ pub enum Item {
     /// subject, due or not, sorted. Deletion is per hash, so deleting it
     /// satisfies them all, and the sweep marks each `deleted`. The sweep
     /// first lists its versions: if it was pushed again after the drops
-    /// that have it due, and no other request has it due, it cancels those
-    /// drops and deletes nothing (`sweep::pushed_again`); otherwise it
-    /// deletes exactly the versions it listed.
+    /// that have it due, and no other request has it due, it deletes
+    /// nothing, and every pending `recordings/` request of the hash older
+    /// than the push restarts its grace from it (`sweep::pushed_again`);
+    /// otherwise it deletes exactly the versions it listed.
     Recording { hash: String, requests: Vec<String> },
     /// Subject (canonical): its pointers in `S`, then `subjects/<sub>`.
     Subject(String),
@@ -271,9 +272,10 @@ pub fn due(snapshot: &Snapshot, requests: &Requests, view: &View, now: i64) -> D
 
 /// `recordings/<sub>/<hash>`: due once `GRACE` has passed since the drop,
 /// while `hash` is in no listing and not blocked, if its owner record
-/// names `sub`. A push after the drop cancels it, but only the versions'
-/// write times show one, which this module doesn't read: the sweep checks
-/// that when it takes the item (`sweep::pushed_again`).
+/// names `sub`. A push after the drop restarts its grace from the push
+/// (only a listing cancels it), but only the versions' write times show a
+/// push, which this module doesn't read: the sweep checks for one when it
+/// takes the item, and moves `requestedAt` forward (`sweep::pushed_again`).
 fn recording_kept(
     snapshot: &Snapshot,
     view: &View,

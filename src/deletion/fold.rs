@@ -17,8 +17,9 @@
 //! transition over what it already wrote changes nothing (plan call 9):
 //! - a drop sets a request pending over no record, a pending record whose
 //!   `requestedAt` is not after the drop (the newest drop wins across runs
-//!   too), or a tombstone older than the drop; never over a tombstone at
-//!   or after it;
+//!   too, and a `requestedAt` the sweep moved forward to a push never
+//!   moves back), or a tombstone older than the drop; never over a
+//!   tombstone at or after it;
 //! - an add cancels a pending request only. It never removes or alters a
 //!   tombstone: a stored one this fold revived goes back as it was.
 //!
@@ -251,8 +252,9 @@ fn apply(requests: &mut Requests, stored: &Requests, t: &Transition) {
     for hash in &t.dropped {
         let current = requests.recordings.get(&key(hash));
         // The newest drop wins across runs as well: a pending request from
-        // a later drop (the subject's other pointer key, folded earlier)
-        // stays.
+        // a later drop (the subject's other pointer key, folded earlier),
+        // or one the sweep restarted from a later push, stays. `requestedAt`
+        // only moves forward, but for an add, which cancels the request.
         let later = current.is_some_and(|r| r.state == State::Pending && r.requested_at > t.at);
         if !later && may_set_pending(current.map(|r| (r.state, r.deleted_at)), t.at) {
             requests.recordings.insert(

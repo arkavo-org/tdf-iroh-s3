@@ -118,6 +118,7 @@ pub(crate) mod mem {
         failures: Vec<(String, Op)>,
         deletes: Vec<String>,
         hooks: HashMap<String, Hook>,
+        get_hooks: HashMap<String, Hook>,
     }
 
     struct Version {
@@ -205,6 +206,14 @@ pub(crate) mod mem {
             self.state().hooks.insert(key.to_string(), Box::new(f));
         }
 
+        /// Run `f` once, just before the next `get` of `key` (before an
+        /// injected `Op::Get` failure is checked): a write landing during a
+        /// read of the bucket, armed from another hook once the reads
+        /// before it are done. `f` can write through `insert`.
+        pub fn on_before_get(&self, key: &str, f: impl FnOnce(&MemObjects) + Send + 'static) {
+            self.state().get_hooks.insert(key.to_string(), Box::new(f));
+        }
+
         /// A put, synchronously, with no injected failure: for seeding and
         /// for hooks.
         pub fn insert(&self, key: &str, body: impl Into<Bytes>) {
@@ -257,6 +266,11 @@ pub(crate) mod mem {
         }
 
         async fn get(&self, key: &str) -> anyhow::Result<Option<Bytes>> {
+            // Taken out first: the hook writes through `self`, which locks.
+            let hook = self.state().get_hooks.remove(key);
+            if let Some(hook) = hook {
+                hook(self);
+            }
             let mut state = self.state();
             state.injected(Op::Get, |k| k == key)?;
             Ok(state.current(key).and_then(|v| v.body.clone()))
@@ -549,6 +563,16 @@ mod tests {
         m.delete_all_versions("a").await.unwrap();
         m.delete_all_versions("never-written").await.unwrap();
         assert_eq!(m.deletes(), ["b", "a", "never-written"]);
+    }
+
+    #[tokio::test]
+    async fn on_before_get_runs_once_before_the_next_get() {
+        let m = MemObjects::default();
+        m.insert("k", b("one"));
+        m.on_before_get("k", |m| m.insert("k", b("written meanwhile")));
+        assert_eq!(m.get("k").await.unwrap(), Some(b("written meanwhile")));
+        m.insert("k", b("again"));
+        assert_eq!(m.get("k").await.unwrap(), Some(b("again")), "once");
     }
 
     #[tokio::test]
