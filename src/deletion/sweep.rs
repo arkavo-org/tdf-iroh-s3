@@ -1008,8 +1008,8 @@ async fn remove<O: ObjectStore>(store: &O, group: &Tombstones) -> anyhow::Result
     Ok(())
 }
 
-/// Rule 3: `objects` came back, all written by an hour after the delete.
-/// With `delete`, re-check the item on a fresh read, as step 6 does, then
+/// Rule 3: `objects` came back, none of them fresh (each written by an
+/// hour after the delete, or an outboard, which never is). With `delete`, re-check the item on a fresh read, as step 6 does, then
 /// delete its objects again: a recording's and an envelope's keys in
 /// order, a subject's pointer keys. In a dry run, re-check it on `read`
 /// and `requests`. The tombstones stay as they are. `Err` when the fresh

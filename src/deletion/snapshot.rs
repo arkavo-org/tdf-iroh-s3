@@ -373,8 +373,9 @@ fn same(what: &str, body: &str, key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A tombstone carries `deletedAt`: verifying it (spec 3.4 step 7) and
-/// re-folding a drop over it (call 9) both need it.
+/// A tombstone carries `deletedAt`: re-folding a drop over it (call 9)
+/// needs it. Verifying it (spec 3.4 step 7) measures from the record's
+/// own write time instead ([`Snapshot::request_written`]).
 fn tombstone_dated(state: State, deleted_at: Option<i64>) -> anyhow::Result<()> {
     anyhow::ensure!(
         state != State::Deleted || deleted_at.is_some(),
