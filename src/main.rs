@@ -14,7 +14,7 @@ use tdf_iroh_s3::catalogs_api;
 use tdf_iroh_s3::catalogs_v2_api;
 use tdf_iroh_s3::config::{AuthzConfig, Config, PublishDecisions};
 use tdf_iroh_s3::deletion::operator::{self, Outcome, Requested};
-use tdf_iroh_s3::deletion::sweep::sweep;
+use tdf_iroh_s3::deletion::sweep::{Aborted, sweep};
 use tdf_iroh_s3::moderation::{self, Moderation, ModerationApi, PublishGate, PublishPolicy};
 use tdf_iroh_s3::node::TdfIrohNode;
 use tdf_iroh_s3::node_api;
@@ -161,14 +161,18 @@ async fn release_owner(config: &Config, hash: &str, subject: &str, reason: &str)
     }
 }
 
-/// `sweep-deletions`: the report, then counts. Exits 1 when the run
-/// aborts (the error chain on stderr) or any item failed.
+/// `sweep-deletions`: the report, then counts. Exits 1 when any item
+/// failed, or when the run aborts: then the lines of what it did until
+/// then, without counts, and the error chain on stderr.
 async fn sweep_deletions(config: &Config, delete: bool) -> Result<()> {
     let s3 = S3Client::from_config(&config.s3).await?;
     let report = match sweep(&s3, delete, moderation::now_secs()).await {
         Ok(report) => report,
-        Err(e) => {
-            eprintln!("sweep-deletions aborted: {e:#}");
+        Err(Aborted { report, error }) => {
+            for line in &report.lines {
+                println!("{line}");
+            }
+            eprintln!("sweep-deletions aborted: {error:#}");
             std::process::exit(1);
         }
     };

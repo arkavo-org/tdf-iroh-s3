@@ -27,6 +27,9 @@
 //! forgets one whose objects stay gone, or came back fresh or listed, and
 //! deletes again what an in-flight write brought back.
 //!
+//! A run that aborts part way ([`Aborted`]) still reports what it did
+//! until then.
+//!
 //! Never delete what the owner didn't ask to delete; never leave a deleted
 //! object to come back; never act on unreadable state; a dry run writes
 //! nothing.
@@ -88,6 +91,12 @@ const FRESH: &str = "fresh";
 const LISTED_AGAIN: &str = "listed again";
 const CURRENT_AGAIN: &str = "current again";
 
+/// What a failed final read (spec 3.4 step 8) reports as failed.
+const FINAL_READ: &str = "final read";
+
+/// Why a transition no pointer reaches is deleted unfolded.
+const LOST: &str = "lost its publish";
+
 /// Why a subject's tombstone is kept: an envelope request of that owner is
 /// pending, and the tombstone releases it (`due::everything_requested`).
 const ENVELOPES_PENDING: &str = "envelopes pending";
@@ -97,25 +106,28 @@ const ENVELOPES_PENDING: &str = "envelopes pending";
 /// (`N would delete` in a dry run).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
-    /// In order: one line per due item, in the order the run takes them
-    /// (`deleted <id>`, `would delete <id>`, `kept <id>: <why>`,
-    /// `deferred <id>: catalog changed`, `failed <id>: <error>`); then one
-    /// line per tombstoned item verified, in the same order (`verified
+    /// In order: `deleted transition <sub>/<name>: lost its publish`
+    /// (`would delete …` in a dry run) for each transition that lost its
+    /// publish, not counted; then one line per due item, in the order the
+    /// run takes them (`deleted <id>`, `would delete <id>`, `kept <id>:
+    /// <why>`, `deferred <id>: catalog changed`, `failed <id>: <error>`);
+    /// then one line per tombstoned item verified, in the same order (`verified
     /// <id>`, `fresh <id>`, `listed again <id>`, `current again <id>`,
     /// `recreated <id>`, `kept <id>: <why>`, `failed <id>: <error>`; in a
     /// dry run `would verify <id>`, `would forget <id>: <why>`, `would
     /// delete again <id>`); then `kept <id>: <why>` for each pending
     /// request not due, and for each transition the fold keeps; then each
     /// deleted recording a catalog lists and each deleted envelope a
-    /// pointer names (spec 3.4 step 8). `<id>` is [`Item::id`]: `<kind>
-    /// <name>`.
+    /// pointer names (spec 3.4 step 8), or `failed final read: <error>`.
+    /// `<id>` is [`Item::id`]: `<kind> <name>`.
     pub lines: Vec<String>,
     /// Items deleted, and tombstoned items deleted again (in a dry run:
     /// that would be).
     pub deleted: usize,
     pub kept: usize,
     pub deferred: usize,
-    /// Items that failed. Any makes `sweep-deletions` exit nonzero.
+    /// Items that failed, and a failed final read. Any makes
+    /// `sweep-deletions` exit nonzero.
     pub failures: usize,
     pub dry_run: bool,
 }
@@ -144,6 +156,18 @@ impl Report {
     fn failed(&mut self, id: &str, error: &anyhow::Error) {
         self.lines.push(format!("failed {id}: {error:#}"));
         self.failures += 1;
+    }
+
+    /// A transition that lost its publish, deleted unfolded: a line, not
+    /// counted (it is no item).
+    fn lost(&mut self, key: &str) {
+        let verb = if self.dry_run {
+            "would delete"
+        } else {
+            "deleted"
+        };
+        let name = key.strip_prefix(TRANSITIONS).unwrap_or(key);
+        self.lines.push(format!("{verb} transition {name}: {LOST}"));
     }
 
     /// A tombstone whose objects stayed gone, removed.
@@ -193,12 +217,41 @@ impl fmt::Display for Report {
     }
 }
 
+/// A run that stopped part way.
+#[derive(Debug)]
+pub struct Aborted {
+    /// What the run did before it stopped: its [`Report::lines`] so far,
+    /// and their counts. Empty when the first read stopped it, before
+    /// anything was written.
+    pub report: Report,
+    /// Why it stopped.
+    pub error: anyhow::Error,
+}
+
 /// Run the sweep (see the module doc): with `delete`, write and delete;
-/// without, report only. `now` is Unix seconds. `Err` when anything read
-/// is unreadable (before anything is written, or at an item's re-check),
-/// or when a fold or observe write fails; a failed item is reported
-/// instead, in [`Report::failures`].
-pub async fn sweep<O: ObjectStore>(store: &O, delete: bool, now: i64) -> anyhow::Result<Report> {
+/// without, report only. `now` is Unix seconds. [`Aborted`] when anything
+/// read is unreadable (before anything is written, at an item's re-check,
+/// or at the tombstones' verification), or when a fold or observe write
+/// fails, with what the run did until then; a failed item is reported
+/// instead, in [`Report::failures`], and so is a failed final read.
+pub async fn sweep<O: ObjectStore>(store: &O, delete: bool, now: i64) -> Result<Report, Aborted> {
+    let mut report = Report {
+        dry_run: !delete,
+        ..Report::default()
+    };
+    match run(store, delete, now, &mut report).await {
+        Ok(()) => Ok(report),
+        Err(error) => Err(Aborted { report, error }),
+    }
+}
+
+/// [`sweep`], each line into `report` as it happens.
+async fn run<O: ObjectStore>(
+    store: &O,
+    delete: bool,
+    now: i64,
+    report: &mut Report,
+) -> anyhow::Result<()> {
     // Read and decide. Nothing is written before all of this has read.
     let snapshot = snapshot::read(store).await?;
     let fold = fold::fold(&snapshot, now);
@@ -210,21 +263,24 @@ pub async fn sweep<O: ObjectStore>(store: &O, delete: bool, now: i64) -> anyhow:
     }
     let decision = due::due(&snapshot, &requests, &view, now);
 
-    let mut report = Report {
-        dry_run: !delete,
-        ..Report::default()
-    };
     let items = in_deletion_order(&decision.due);
     let mut baseline = Pointers::of(&snapshot.catalogs);
     if delete {
         write_fold(store, &snapshot.requests, &fold).await?;
+        for key in &fold.lost {
+            delete_versions(store, key).await?;
+            report.lost(key);
+        }
         for r in &observed {
             put_json(store, &envelope_key(&r.hash), r).await?;
         }
         for item in items {
-            take(store, item, &mut baseline, now, &mut report).await?;
+            take(store, item, &mut baseline, now, report).await?;
         }
     } else {
+        for key in &fold.lost {
+            report.lost(key);
+        }
         for item in items {
             report.deleted(&item.id());
         }
@@ -235,7 +291,7 @@ pub async fn sweep<O: ObjectStore>(store: &O, delete: bool, now: i64) -> anyhow:
         (&requests, &snapshot.request_written),
         &mut baseline,
         now,
-        &mut report,
+        report,
     )
     .await?;
 
@@ -246,19 +302,22 @@ pub async fn sweep<O: ObjectStore>(store: &O, delete: bool, now: i64) -> anyhow:
         let name = key.strip_prefix(TRANSITIONS).unwrap_or(key);
         report.kept(&format!("transition {name}"), why);
     }
-    // Spec 3.4 step 8, against what the bucket holds now.
+    // Spec 3.4 step 8, against what the bucket holds now. Every delete
+    // is done by then: a failed read is a failure, not an abort.
     if delete {
-        let last = snapshot::read(store)
-            .await
-            .context("the final read failed")?;
-        let view = due::view(&last.catalogs, &last.requests, &last.moderation);
-        report
-            .lines
-            .extend(listed_tombstones(&last.requests, &view));
+        match snapshot::read(store).await {
+            Ok(last) => {
+                let view = due::view(&last.catalogs, &last.requests, &last.moderation);
+                report
+                    .lines
+                    .extend(listed_tombstones(&last.requests, &view));
+            }
+            Err(e) => report.failed(FINAL_READ, &e),
+        }
     } else {
         report.lines.extend(listed_tombstones(&requests, &view));
     }
-    Ok(report)
+    Ok(())
 }
 
 /// Spec 3.4 step 4: [`due::observe`], each request's `owner` read from its
@@ -289,10 +348,11 @@ async fn observe<O: ObjectStore>(
 }
 
 /// Write what the fold decided: each request that differs from what was
-/// read, then delete the cancelled requests, the folded transitions in
-/// the order folded (oldest first), and the lost ones. Every write comes
-/// before any transition is deleted, so a failure leaves them all for the
-/// next run to fold again.
+/// read, then delete the cancelled requests and the folded transitions in
+/// the order folded (oldest first). Every write comes before any
+/// transition is deleted, so a failure leaves them all for the next run
+/// to fold again. The lost transitions are the caller's, each reported as
+/// it goes.
 async fn write_fold<O: ObjectStore>(
     store: &O,
     stored: &Requests,
@@ -323,10 +383,7 @@ async fn write_fold<O: ObjectStore>(
         .cancelled
         .iter()
         .map(|(sub, hash)| recording_key(sub, hash));
-    for key in cancelled
-        .chain(fold.folded.iter().cloned())
-        .chain(fold.lost.iter().cloned())
-    {
+    for key in cancelled.chain(fold.folded.iter().cloned()) {
         delete_versions(store, &key).await?;
     }
     Ok(())
@@ -1568,8 +1625,16 @@ mod tests {
         m.insert(garbage, "not json");
         let before = versions(&m).await;
 
-        let err = sweep(&m, true, NOW).await.unwrap_err();
-        assert!(format!("{err:#}").contains(garbage), "{err:#}");
+        let Aborted { report, error } = sweep(&m, true, NOW).await.unwrap_err();
+        assert!(format!("{error:#}").contains(garbage), "{error:#}");
+        assert_eq!(
+            report,
+            Report {
+                dry_run: false,
+                ..Report::default()
+            },
+            "an empty report"
+        );
         assert_eq!(versions(&m).await, before);
         assert!(m.deletes().is_empty());
     }
@@ -1596,11 +1661,12 @@ mod tests {
         let [first, second] = dropped(&m, &p);
         m.fail_on(&recording_key(U, &p), Op::Put);
 
-        let err = sweep(&m, true, NOW).await.unwrap_err();
+        let Aborted { report, error } = sweep(&m, true, NOW).await.unwrap_err();
         assert!(
-            format!("{err:#}").contains(&recording_key(U, &p)),
-            "{err:#}"
+            format!("{error:#}").contains(&recording_key(U, &p)),
+            "{error:#}"
         );
+        assert!(report.lines.is_empty(), "{report}");
         for t in [first, second] {
             assert!(m.get(&t.key).await.unwrap().is_some(), "{}", t.key);
         }
@@ -1698,6 +1764,16 @@ mod tests {
             has(
                 &report,
                 &format!("kept transition {U}/{young_name}: younger than grace")
+            ),
+            "{report}"
+        );
+        assert!(
+            has(
+                &report,
+                &format!(
+                    "deleted transition {U}/{}: lost its publish",
+                    transition_name(2, &h("ee"))
+                )
             ),
             "{report}"
         );
@@ -1911,14 +1987,126 @@ mod tests {
         let key = recording_key(U, &p);
         m.on_before_delete(&second.key, move |m| m.fail_on(&key, Op::Get));
 
-        let err = sweep(&m, true, NOW).await.unwrap_err();
+        let Aborted { error, .. } = sweep(&m, true, NOW).await.unwrap_err();
         assert!(
-            format!("{err:#}").contains(&recording_key(U, &p)),
-            "{err:#}"
+            format!("{error:#}").contains(&recording_key(U, &p)),
+            "{error:#}"
         );
         for key in recording_keys(&p) {
             assert!(m.get(&key).await.unwrap().is_some(), "{key}");
         }
+    }
+
+    /// A run that aborts part way still reports what it did: here the
+    /// re-check of the second item fails after the first was deleted.
+    #[tokio::test]
+    async fn an_abort_keeps_the_lines_of_what_it_did() {
+        let m = bucket();
+        let (p, q) = (h("a1"), h("a2"));
+        for hash in [&p, &q] {
+            recording(&m, hash, U);
+            request(&m, U, hash, NOW - GRACE);
+        }
+        let key = recording_key(U, &q);
+        m.on_before_delete(&format!("blobs/{p}"), move |m| m.fail_on(&key, Op::Get));
+
+        let Aborted { report, error } = sweep(&m, true, NOW).await.unwrap_err();
+        assert_eq!(report.lines, [format!("deleted recording {p}")], "{report}");
+        assert_eq!(report.deleted, 1);
+        assert!(
+            format!("{error:#}").contains(&recording_key(U, &q)),
+            "{error:#}"
+        );
+        for key in recording_keys(&q) {
+            assert!(m.get(&key).await.unwrap().is_some(), "{key}");
+        }
+        let r: RecordingRequest = record(&m, &recording_key(U, &q)).await;
+        assert_eq!(r.state, State::Pending);
+    }
+
+    /// The final read (spec 3.4 step 8) comes after every delete: a failed
+    /// one is a failure of the run, not an abort.
+    #[tokio::test]
+    async fn a_failed_final_read_is_a_failure() {
+        let m = bucket();
+        let (p, q) = (h("a1"), h("a2"));
+        // A clean tombstone, verified; just before its removal, the next
+        // read of a request fails.
+        m.set_now(NOW - VERIFY_AFTER);
+        put(
+            &m,
+            &recording_key(U, &p),
+            RecordingRequest {
+                hash: p.clone(),
+                subject: U.into(),
+                requested_at: NOW - 2 * GRACE,
+                seq: 1,
+                state: State::Deleted,
+                deleted_at: Some(NOW - VERIFY_AFTER),
+            },
+        );
+        m.set_now(NOW);
+        request(&m, U, &q, NOW);
+        let key = recording_key(U, &q);
+        m.on_before_delete(&recording_key(U, &p), move |m| m.fail_on(&key, Op::Get));
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert_eq!(report.failures, 1, "{report}");
+        let failed = "failed final read: ";
+        let line = report
+            .lines
+            .iter()
+            .find(|l| l.starts_with(failed))
+            .unwrap_or_else(|| panic!("{report}"));
+        assert!(line.contains(&recording_key(U, &q)), "{line}");
+        assert!(has(&report, &format!("verified recording {p}")), "{report}");
+        assert_eq!(
+            report.to_string().lines().last(),
+            Some("0 deleted, 1 kept, 0 deferred, 1 failed")
+        );
+    }
+
+    /// A transition that lost its publish is deleted unfolded, with a line
+    /// (not counted: it is no item).
+    #[tokio::test]
+    async fn a_lost_transition_is_reported() {
+        let m = bucket();
+        publish_2(&m, U, 2, b"doc-2", &[]);
+        let name = transition_name(2, &h("ee"));
+        put(
+            &m,
+            &transition_key(U, &name),
+            Transition {
+                subject: U.into(),
+                seq: 2,
+                catalog_hash: catalog(b"lost"),
+                pointer: h("ee"),
+                base: None,
+                at: NOW - 2 * GRACE,
+                dropped: vec![],
+                added: vec![],
+            },
+        );
+
+        let report = sweep(&m, false, NOW).await.unwrap();
+        assert_eq!(
+            report.to_string(),
+            format!(
+                "would delete transition {U}/{name}: lost its publish\n\
+                 0 would delete, 0 kept, 0 deferred, 0 failed"
+            )
+        );
+        assert!(m.deletes().is_empty());
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert_eq!(
+            report.to_string(),
+            format!(
+                "deleted transition {U}/{name}: lost its publish\n\
+                 0 deleted, 0 kept, 0 deferred, 0 failed"
+            )
+        );
+        assert_eq!(m.deletes(), [transition_key(U, &name)]);
     }
 
     /// Spec 3.4 step 7: tombstones verified an hour after their delete.
