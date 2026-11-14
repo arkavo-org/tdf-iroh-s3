@@ -116,8 +116,8 @@ const LOST: &str = "lost its publish";
 const ENVELOPES_PENDING: &str = "envelopes pending";
 
 /// What a run did, or in a dry run would do. [`fmt::Display`] prints
-/// [`lines`](Self::lines), then `N deleted, N kept, N deferred, N failed`
-/// (`N would delete` in a dry run).
+/// [`lines`](Self::lines), then `N deleted, N closed, N kept, N deferred,
+/// N failed` (`N would delete, N would close` in a dry run).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
     /// In order: `deleted transition <sub>/<name>: lost its publish`
@@ -126,7 +126,7 @@ pub struct Report {
     /// run takes them (`deleted <id>`, `would delete <id>`, `kept <id>:
     /// <why>`, `pushed again <id>` (in a dry run too), `deferred <id>:
     /// catalog changed`, `failed <id>: <error>`); then `closed <id>`
-    /// (`would close <id>`), not counted, or `failed <id>: <error>` for
+    /// (`would close <id>`), counted apart, or `failed <id>: <error>` for
     /// each recording whose requests [`close`] closed, by id: a request it
     /// closed, even one before a failure, isn't reported kept;
     /// then one line per tombstoned item verified, in the same order (`verified
@@ -145,6 +145,10 @@ pub struct Report {
     /// Items deleted, and tombstoned items deleted again (in a dry run:
     /// that would be).
     pub deleted: usize,
+    /// Recordings whose stale requests were closed (in a dry run: would
+    /// be). Apart from `deleted`: a close deletes no recording, which an
+    /// earlier run deleted or no upload finished.
+    pub closed: usize,
     /// Items, tombstoned items, requests and transitions kept, a recording
     /// pushed again among them.
     pub kept: usize,
@@ -202,14 +206,15 @@ impl Report {
         self.lines.push(format!("{verb} transition {name}: {LOST}"));
     }
 
-    /// A recording's stale requests closed ([`close`]): a line, not counted
-    /// (nothing of the recording was left to delete).
+    /// A recording's stale requests closed ([`close`]): counted apart from
+    /// `deleted` (nothing of the recording was left to delete).
     fn closed(&mut self, id: &str) {
         self.lines.push(if self.dry_run {
             format!("would close {id}")
         } else {
             format!("closed {id}")
         });
+        self.closed += 1;
     }
 
     /// A tombstone whose objects stayed gone, removed.
@@ -246,15 +251,15 @@ impl fmt::Display for Report {
         for line in &self.lines {
             writeln!(f, "{line}")?;
         }
-        let verb = if self.dry_run {
-            "would delete"
+        let (deleted, closed) = if self.dry_run {
+            ("would delete", "would close")
         } else {
-            "deleted"
+            ("deleted", "closed")
         };
         write!(
             f,
-            "{} {verb}, {} kept, {} deferred, {} failed",
-            self.deleted, self.kept, self.deferred, self.failures
+            "{} {deleted}, {} {closed}, {} kept, {} deferred, {} failed",
+            self.deleted, self.closed, self.kept, self.deferred, self.failures
         )
     }
 }
@@ -2048,7 +2053,7 @@ mod tests {
         );
         assert_eq!(
             report.to_string().lines().last(),
-            Some("3 would delete, 1 kept, 0 deferred, 0 failed")
+            Some("3 would delete, 0 would close, 1 kept, 0 deferred, 0 failed")
         );
         assert_eq!(report.failures, 0);
         assert_eq!(versions(&m).await, before, "every object and version");
@@ -2065,7 +2070,7 @@ mod tests {
         let report = sweep(&m, true, NOW).await.unwrap();
         assert_eq!(
             report.to_string(),
-            format!("deleted recording {p}\n1 deleted, 0 kept, 0 deferred, 0 failed")
+            format!("deleted recording {p}\n1 deleted, 0 closed, 0 kept, 0 deferred, 0 failed")
         );
         assert_eq!(m.deletes(), recording_keys(&p));
         for key in recording_keys(&p) {
@@ -2525,7 +2530,7 @@ mod tests {
         assert_eq!(r.state, State::Deleted);
         assert_eq!(
             report.to_string().lines().last(),
-            Some("1 deleted, 0 kept, 0 deferred, 1 failed")
+            Some("1 deleted, 0 closed, 0 kept, 0 deferred, 1 failed")
         );
     }
 
@@ -2987,7 +2992,7 @@ mod tests {
         let report = sweep(&m, true, NOW).await.unwrap();
         assert_eq!(
             report.to_string(),
-            format!("deleted recording {p}\n1 deleted, 0 kept, 0 deferred, 0 failed")
+            format!("deleted recording {p}\n1 deleted, 0 closed, 0 kept, 0 deferred, 0 failed")
         );
         assert_eq!(m.deletes(), recording_keys(&p));
         let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
@@ -3103,7 +3108,7 @@ mod tests {
         assert!(has(&report, &format!("verified recording {p}")), "{report}");
         assert_eq!(
             report.to_string().lines().last(),
-            Some("0 deleted, 1 kept, 0 deferred, 1 failed")
+            Some("0 deleted, 0 closed, 1 kept, 0 deferred, 1 failed")
         );
     }
 
@@ -3134,7 +3139,7 @@ mod tests {
             report.to_string(),
             format!(
                 "would delete transition {U}/{name}: lost its publish\n\
-                 0 would delete, 0 kept, 0 deferred, 0 failed"
+                 0 would delete, 0 would close, 0 kept, 0 deferred, 0 failed"
             )
         );
         assert!(m.deletes().is_empty());
@@ -3144,7 +3149,7 @@ mod tests {
             report.to_string(),
             format!(
                 "deleted transition {U}/{name}: lost its publish\n\
-                 0 deleted, 0 kept, 0 deferred, 0 failed"
+                 0 deleted, 0 closed, 0 kept, 0 deferred, 0 failed"
             )
         );
         assert_eq!(m.deletes(), [transition_key(U, &name)]);
@@ -3189,7 +3194,9 @@ mod tests {
         let report = sweep(&m, true, NOW + 20).await.unwrap();
         assert_eq!(
             report.to_string(),
-            format!("pushed again recording {p}\n0 deleted, 1 kept, 0 deferred, 0 failed")
+            format!(
+                "pushed again recording {p}\n0 deleted, 0 closed, 1 kept, 0 deferred, 0 failed"
+            )
         );
         assert_eq!(stored(&m).await, push, "every version of the push");
         let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
@@ -3212,7 +3219,7 @@ mod tests {
         let report = sweep(&m, true, later).await.unwrap();
         assert_eq!(
             report.to_string(),
-            format!("deleted recording {p}\n1 deleted, 0 kept, 0 deferred, 0 failed")
+            format!("deleted recording {p}\n1 deleted, 0 closed, 0 kept, 0 deferred, 0 failed")
         );
         for key in recording_keys(&p) {
             assert!(gone(&m, &key).await, "{key}");
@@ -3247,7 +3254,9 @@ mod tests {
         let report = sweep(&m, true, NOW + 20).await.unwrap();
         assert_eq!(
             report.to_string(),
-            format!("pushed again recording {p}\n0 deleted, 1 kept, 0 deferred, 0 failed")
+            format!(
+                "pushed again recording {p}\n0 deleted, 0 closed, 1 kept, 0 deferred, 0 failed"
+            )
         );
         assert_eq!(stored(&m).await, push);
         let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
@@ -3271,7 +3280,9 @@ mod tests {
         let report = sweep(&m, true, NOW).await.unwrap();
         assert_eq!(
             report.to_string(),
-            format!("pushed again recording {p}\n0 deleted, 1 kept, 0 deferred, 0 failed")
+            format!(
+                "pushed again recording {p}\n0 deleted, 0 closed, 1 kept, 0 deferred, 0 failed"
+            )
         );
         assert_eq!(stored(&m).await, before);
         let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
@@ -3529,7 +3540,7 @@ mod tests {
         let report = sweep(&m, true, NOW).await.unwrap();
         assert_eq!(
             report.to_string(),
-            format!("deleted recording {p}\n1 deleted, 0 kept, 0 deferred, 0 failed")
+            format!("deleted recording {p}\n1 deleted, 0 closed, 0 kept, 0 deferred, 0 failed")
         );
         for key in recording_keys(&p) {
             assert!(gone(&m, &key).await, "{key}");
@@ -3558,7 +3569,7 @@ mod tests {
         let report = sweep(&m, true, NOW).await.unwrap();
         assert_eq!(
             report.to_string(),
-            format!("deleted recording {p}\n1 deleted, 0 kept, 0 deferred, 0 failed")
+            format!("deleted recording {p}\n1 deleted, 0 closed, 0 kept, 0 deferred, 0 failed")
         );
         for key in recording_keys(&p) {
             assert!(gone(&m, &key).await, "{key}");
@@ -3621,7 +3632,7 @@ mod tests {
             report.to_string(),
             format!(
                 "pushed again recording {p}\nwould delete recording {q}\n\
-                 1 would delete, 1 kept, 0 deferred, 0 failed"
+                 1 would delete, 0 would close, 1 kept, 0 deferred, 0 failed"
             )
         );
         assert_eq!(versions(&m).await, before, "its grace isn't restarted");
@@ -3679,7 +3690,7 @@ mod tests {
         let report = sweep(&m, true, NOW).await.unwrap();
         assert_eq!(
             report.to_string(),
-            format!("deleted recording {p}\n1 deleted, 0 kept, 0 deferred, 0 failed")
+            format!("deleted recording {p}\n1 deleted, 0 closed, 0 kept, 0 deferred, 0 failed")
         );
         for key in recording_keys(&p) {
             assert!(gone(&m, &key).await, "{key}");
@@ -3698,7 +3709,9 @@ mod tests {
         let report = sweep(&m, true, NOW).await.unwrap();
         assert_eq!(
             report.to_string(),
-            format!("pushed again recording {p}\n0 deleted, 1 kept, 0 deferred, 0 failed")
+            format!(
+                "pushed again recording {p}\n0 deleted, 0 closed, 1 kept, 0 deferred, 0 failed"
+            )
         );
         let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
         assert_eq!((r.state, r.requested_at), (State::Pending, NOW));
@@ -3728,14 +3741,17 @@ mod tests {
         let report = sweep(&m, false, NOW).await.unwrap();
         assert_eq!(
             report.to_string(),
-            format!("would close recording {p}\n0 would delete, 0 kept, 0 deferred, 0 failed")
+            format!(
+                "would close recording {p}\n\
+                 0 would delete, 1 would close, 0 kept, 0 deferred, 0 failed"
+            )
         );
         assert_eq!(versions(&m).await, before);
 
         let report = sweep(&m, true, NOW).await.unwrap();
         assert_eq!(
             report.to_string(),
-            format!("closed recording {p}\n0 deleted, 0 kept, 0 deferred, 0 failed")
+            format!("closed recording {p}\n0 deleted, 1 closed, 0 kept, 0 deferred, 0 failed")
         );
         deletes.push(recording_key(U, &p));
         assert_eq!(m.deletes(), deletes, "the request record only");
@@ -3806,14 +3822,17 @@ mod tests {
         let report = sweep(&m, false, NOW).await.unwrap();
         assert_eq!(
             report.to_string(),
-            format!("would close recording {p}\n0 would delete, 0 kept, 0 deferred, 0 failed")
+            format!(
+                "would close recording {p}\n\
+                 0 would delete, 1 would close, 0 kept, 0 deferred, 0 failed"
+            )
         );
         assert_eq!(versions(&m).await, before);
 
         let report = sweep(&m, true, NOW).await.unwrap();
         assert_eq!(
             report.to_string(),
-            format!("closed recording {p}\n0 deleted, 0 kept, 0 deferred, 0 failed")
+            format!("closed recording {p}\n0 deleted, 1 closed, 0 kept, 0 deferred, 0 failed")
         );
         assert!(gone(&m, &outboard).await);
         assert!(gone(&m, &recording_key(U, &p)).await);
@@ -3941,7 +3960,7 @@ mod tests {
         assert_eq!(
             report.to_string(),
             format!(
-                "kept recording {U}/{p}: no owner record\n0 deleted, 1 kept, 0 deferred, 0 failed"
+                "kept recording {U}/{p}: no owner record\n0 deleted, 0 closed, 1 kept, 0 deferred, 0 failed"
             )
         );
         assert_eq!(versions(&m).await, before);
@@ -3998,7 +4017,9 @@ mod tests {
         let report = sweep(&m, true, NOW).await.unwrap();
         assert_eq!(
             report.to_string(),
-            format!("pushed again recording {p}\n0 deleted, 1 kept, 0 deferred, 0 failed")
+            format!(
+                "pushed again recording {p}\n0 deleted, 0 closed, 1 kept, 0 deferred, 0 failed"
+            )
         );
         assert_eq!(stored(&m).await, before);
         assert!(m.deletes().is_empty());
@@ -4057,7 +4078,7 @@ mod tests {
         let report = sweep(&m, true, NOW).await.unwrap();
         assert_eq!(
             report.to_string(),
-            format!("deleted recording {p}\n1 deleted, 0 kept, 0 deferred, 0 failed")
+            format!("deleted recording {p}\n1 deleted, 0 closed, 0 kept, 0 deferred, 0 failed")
         );
         for key in recording_keys(&p) {
             assert!(gone(&m, &key).await, "{key}");
@@ -4173,7 +4194,9 @@ mod tests {
             let report = sweep(&m, true, AT).await.unwrap();
             assert_eq!(
                 report.to_string(),
-                format!("verified recording {p}\n0 deleted, 0 kept, 0 deferred, 0 failed")
+                format!(
+                    "verified recording {p}\n0 deleted, 0 closed, 0 kept, 0 deferred, 0 failed"
+                )
             );
             assert!(gone(&m, &recording_key(U, &p)).await);
             assert_eq!(m.deletes(), [recording_key(U, &p)]);
