@@ -132,10 +132,10 @@ pub struct Report {
     /// dry run `would verify <id>`, `would forget <id>: <why>`, `would
     /// delete again <id>`); then `kept <id>: <why>` for each pending
     /// request not due, and for each transition the fold keeps but for
-    /// those of a subject the run deleted (would delete), which went with
-    /// it; then each deleted recording a catalog lists and each deleted
-    /// envelope a pointer names (spec 3.4 step 8), or `failed final read:
-    /// <error>`.
+    /// those of a subject whose delete the run ran (would run): they went
+    /// with it, or go when its next run retries a delete that failed; then
+    /// each deleted recording a catalog lists and each deleted envelope a
+    /// pointer names (spec 3.4 step 8), or `failed final read: <error>`.
     /// `<id>` is [`Item::id`]: `<kind> <name>`.
     pub lines: Vec<String>,
     /// Items deleted, recordings closed with nothing left, and tombstoned
@@ -294,8 +294,9 @@ async fn run<O: ObjectStore>(
 
     let items = in_deletion_order(&decision.due);
     let mut baseline = Pointers::of(&snapshot.catalogs);
-    // The subjects this run deleted (in a dry run: would delete). Their
-    // transitions went with them, those the fold kept included.
+    // The subjects whose delete this run ran (in a dry run: would run).
+    // Their transitions, those the fold kept included, went with them, or
+    // go when the subject's next run retries a delete that failed.
     let mut gone_subjects = BTreeSet::new();
     // The requests this run closed (in a dry run: would close): not kept.
     let mut closed = BTreeSet::new();
@@ -532,8 +533,9 @@ impl Pointers {
 /// Take one due item (spec 3.4 step 6): list its versions, re-check it on
 /// a fresh read, check a recording wasn't pushed again since its drops
 /// ([`pushed_again`]: restart their grace), then delete exactly the listed
-/// versions, or report why not. Whether it deleted the item; `Err` only
-/// when the fresh read or a listing fails.
+/// versions, or report why not. Whether it ran the item's delete, which
+/// either deleted it or failed part way (reported); `Err` only when the
+/// fresh read or a listing fails.
 ///
 /// The versions are listed before the fresh read, so everything the delete
 /// removes existed when that read judged the item; a version written after
@@ -586,15 +588,10 @@ async fn take<O: ObjectStore>(
         }
     }
     match delete_item(store, &item, &fresh, &listed, baseline, now).await {
-        Ok(()) => {
-            report.deleted(&id);
-            Ok(true)
-        }
-        Err(e) => {
-            report.failed(&id, &e);
-            Ok(false)
-        }
+        Ok(()) => report.deleted(&id),
+        Err(e) => report.failed(&id, &e),
     }
+    Ok(true)
 }
 
 /// What a delete may remove: an item's keys, in the order they are
@@ -2111,14 +2108,17 @@ mod tests {
 
     /// A transition delete that fails fails the subject, after its
     /// pointers: the next run takes the subject again, with no pointer
-    /// left, and deletes the rest.
+    /// left, and deletes the rest. Meanwhile none of its transitions is
+    /// reported kept, those deleted before the failure or left for the
+    /// retry.
     #[tokio::test]
     async fn a_failed_transition_delete_is_retried() {
         let m = bucket();
         publish_2(&m, U, 1, b"doc-b", &[]);
         block_and_suspend(&m, U);
         subject_request(&m, U);
-        let t = orphan(&m, U, 2, NOW - 10);
+        let first = orphan(&m, U, 2, NOW - 10);
+        let t = orphan(&m, U, 3, NOW - 10);
         m.fail_on(&t, Op::Delete);
 
         let report = sweep(&m, true, NOW).await.unwrap();
@@ -2129,7 +2129,15 @@ mod tests {
                 .any(|l| l.starts_with(&format!("failed subject {U}: "))),
             "{report}"
         );
+        assert!(
+            report
+                .lines
+                .iter()
+                .all(|l| !l.starts_with(&format!("kept transition {U}/"))),
+            "{report}"
+        );
         assert!(gone(&m, &format!("catalog-pointers/{U}")).await);
+        assert!(gone(&m, &first).await);
         assert!(m.get(&t).await.unwrap().is_some());
         let r: SubjectRequest = record(&m, &subject_key(U)).await;
         assert_eq!(r.state, State::Pending);
