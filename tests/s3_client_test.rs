@@ -33,7 +33,8 @@ async fn test_s3_key_with_prefix() {
     );
 }
 
-/// A loopback S3 that keeps each object's body and `x-amz-meta-owner`.
+/// A loopback S3 that keeps each object's body and `x-amz-meta-owner`. A
+/// `PUT` with `If-None-Match: *` on an existing key fails with 412.
 async fn metadata_s3() -> String {
     use axum::body::Bytes;
     use axum::http::{HeaderMap, Method, StatusCode, Uri};
@@ -51,6 +52,16 @@ async fn metadata_s3() -> String {
                 let mut objects = objects.lock().unwrap();
                 match method {
                     Method::PUT => {
+                        let create_only = headers
+                            .get("if-none-match")
+                            .is_some_and(|v| v.as_bytes() == b"*");
+                        if create_only && objects.contains_key(&key) {
+                            return (
+                                StatusCode::PRECONDITION_FAILED,
+                                "<Error><Code>PreconditionFailed</Code><Message>x</Message></Error>",
+                            )
+                                .into_response();
+                        }
                         let owner = headers
                             .get("x-amz-meta-owner")
                             .and_then(|v| v.to_str().ok())
@@ -157,4 +168,45 @@ async fn test_outboard_put_and_size_including_empty() {
         .await
         .unwrap();
     assert_eq!(s3.outboard_size("bb").await.unwrap(), Some(128));
+}
+
+/// A moderation record created with `If-None-Match: *` is written once: a
+/// second create reports `false` and leaves the first body in place.
+#[tokio::test(flavor = "current_thread")]
+async fn test_create_moderation_record_is_conditional() {
+    use bytes::Bytes;
+    use tdf_iroh_s3::config::S3Config;
+
+    // SAFETY: current_thread runtime ensures no other threads read env vars concurrently.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+    }
+    let s3 = S3Client::from_config(&S3Config {
+        bucket: "test-bucket".into(),
+        region: "us-east-1".into(),
+        prefix: String::new(),
+        endpoint_url: metadata_s3().await,
+        force_path_style: true,
+    })
+    .await
+    .unwrap();
+
+    let hash = "cd".repeat(32);
+    let first = Bytes::from_static(b"{\"subject\":\"u1\"}");
+    let second = Bytes::from_static(b"{\"subject\":\"u2\"}");
+    assert!(
+        s3.create_moderation_record("publishers", &hash, first.clone())
+            .await
+            .unwrap()
+    );
+    assert!(
+        !s3.create_moderation_record("publishers", &hash, second)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        s3.get_moderation_record("publishers", &hash).await.unwrap(),
+        Some(first)
+    );
 }

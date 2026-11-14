@@ -627,6 +627,41 @@ impl S3Client {
         Ok(())
     }
 
+    /// Create one moderation record (`moderation/<kind>/<key>`) only if
+    /// none exists (`If-None-Match: *`). `false` when one already does.
+    pub async fn create_moderation_record(
+        &self,
+        kind: &str,
+        key: &str,
+        body: Bytes,
+    ) -> Result<bool> {
+        match self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(format!("{}{}", self.moderation_prefix(kind), key))
+            .content_type("application/json")
+            .if_none_match("*")
+            .body(body.into())
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            // 412: the record exists; 409: a concurrent conditional write
+            // to the same key is in progress.
+            Err(e)
+                if e.raw_response()
+                    .is_some_and(|r| matches!(r.status().as_u16(), 409 | 412)) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(anyhow::anyhow!(
+                "Failed to create moderation record in S3: {}",
+                e
+            )),
+        }
+    }
+
     /// One moderation record (`moderation/<kind>/<key>`), or `None`.
     pub async fn get_moderation_record(&self, kind: &str, key: &str) -> Result<Option<Bytes>> {
         match self

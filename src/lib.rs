@@ -11,6 +11,7 @@ pub mod ingest;
 pub mod moderation;
 pub mod node;
 pub mod node_api;
+pub mod ownership;
 pub mod publish_decision;
 pub mod s3_serve;
 pub mod secret_key;
