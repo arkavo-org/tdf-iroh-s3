@@ -1086,7 +1086,10 @@ mod tests {
 
     /// The precondition a client sends after reading `sub`'s catalog with
     /// `GET`: `If-Match` with its `ETag`, or `If-None-Match: *` after a 404.
-    /// It reads as an operator, so the reader decision doesn't come into it.
+    /// It reads with an operator token. On a gated harness that skips the
+    /// reader decision; `harness_ungated` admits no operator, so the stub
+    /// decider is asked (and counts the read in `asked`), and it permits
+    /// unless the test changed its answer.
     async fn read_precondition(h: &Harness, sub: &str) -> (header::HeaderName, String) {
         let r = get_as(h, sub, Some(&operator_token())).await;
         match r.status {
@@ -1867,6 +1870,7 @@ mod tests {
         assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
         h.moderation.suspend_for_test(SUB, true);
         assert_eq!(get(&h, SUB).await.status, StatusCode::NOT_FOUND);
+        assert!(h.decider.asked.lock().unwrap().is_empty());
 
         let h = ingested().await;
         assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);

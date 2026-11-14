@@ -123,7 +123,7 @@ This route is public: the bytes are an envelope, ciphertext to anyone who can't 
 - **200:** the stored bytes, with `Content-Type: application/zip`, `ETag: "<hash>"` and `Cache-Control: public, max-age=300`.
 - **304:** no body, with the same `ETag` and `Cache-Control`, when `If-None-Match` names `"<hash>"` (or its weak form `W/"<hash>"`, or `*`), the document is stored, and it is not hidden.
 - **400:** `invalid hash`. The hash must be 64 lowercase hex characters.
-- **404:** `catalog not found`, also when the document's hash is blocked or its owner is suspended with `hideCatalog`, and also in answer to `If-None-Match`.
+- **404:** `catalog not found`, also when the document's hash is blocked or its owner has a catalog block or a `hideCatalog` suspension, and also in answer to `If-None-Match`.
 
 The bytes behind a hash never change, but the node may later block a document or hide its owner's catalog. So a client or proxy reuses a document for at most 5 minutes and then revalidates it, and a block or `hideCatalog` reaches readers within that time. The node records each document's `owner` alongside it when it stores it.
 
@@ -337,7 +337,7 @@ This is the only route that publishes a catalog. The request needs `Authorizatio
 The request must name the base the client merged its document from, with exactly one of two standard conditional headers (RFC 9110), in the form below. Without one, a device whose own highest `seq` exceeds the stored one could publish over a base it never read, and replace what another device saved.
 
 - **`If-Match: "<seq>"`:** the client merged from the stored pointer with this `seq`, as `GET /v2/catalogs/{sub}` tagged it (`ETag`). It is one strong entity tag whose content is ASCII decimal digits, sent as one header line with no list. It holds only when `GET` serves a pointer whose `ETag` is exactly that tag.
-- **`If-None-Match: *`:** exactly `*`, as one header line. The client merged from "no catalog yet" (a 404). No pointer may be stored, apart from one `GET` doesn't serve: preconditions see what `GET` serves. That is a pointer whose catalog is blocked, or the pointer of a creator whose catalog an operator blocked ([catalog blocks](publishing-and-moderation.md#moderation-operators)), in both cases with a `seq` that must still be exceeded; or one at a catalog from before envelopes, which reads as no pointer at all, so the first envelope may start at any `seq`.
+- **`If-None-Match: *`:** exactly `*`, as one header line. The client merged from "no catalog yet" (a 404). No pointer may be stored, apart from one `GET` doesn't serve: preconditions see what `GET` serves. That is a pointer whose envelope's hash is blocked, or the pointer of a creator with a [catalog block](publishing-and-moderation.md#moderation-operators), in both cases with a `seq` that must still be exceeded; or one at a catalog from before envelopes, which reads as no pointer at all, so the first envelope may start at any `seq`.
 
 Anything else gets 428 `precondition required`, before the node reads the stored pointer, also on a node with `[publishing] required = false`. That includes neither header or both, `If-Match: *`, a list of tags, a weak (`W/"7"`), unquoted (`7`), empty or non-digit tag, any `If-None-Match` other than `*`, a repeated header line, and a value that is not visible ASCII.
 
@@ -390,7 +390,7 @@ The request needs `Authorization: Bearer <Arkavo CWT>`, checked before anything 
 - **400:** `invalid subject`; `too many entities` for a chain over 8.
 - **401:** `token required`, `invalid token`, or an `X-Entity-Token` that doesn't verify or isn't bound to the bearer.
 - **403:** `not entitled to catalog`: the reader doesn't hold the attribute. Prompt them to follow the creator's campaign. Distinct from 404.
-- **404:** `catalog not found`. There is no catalog, the creator is suspended with `hideCatalog`, the catalog is blocked, or the pointer names a catalog from before envelopes. Only this 404 means "no catalog".
+- **404:** `catalog not found`. There is no catalog, the envelope's hash is blocked, the creator has a catalog block or a `hideCatalog` suspension, or the pointer names a catalog from before envelopes. Only this 404 means "no catalog".
 - **502:** `decision unavailable` when the decision service doesn't answer or isn't configured; `key set unavailable`; `storage unavailable`.
 
 ### Fetching the document over iroh
