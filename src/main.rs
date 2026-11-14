@@ -72,10 +72,11 @@ enum Command {
     /// once it is due (a dry run unless --delete)
     ///
     /// Folds committed catalog transitions into deletion requests, then
-    /// deletes each recording, catalog envelope and subject's pointers that
-    /// is due, re-checking each just before. One line per item, then
-    /// counts. Anything unreadable aborts the run before it writes
-    /// anything. Exits 1 if the run aborts or any item fails.
+    /// deletes each recording, catalog envelope and subject that is due (a
+    /// subject's pointers, then its transitions), re-checking each just
+    /// before. One line per item, then counts. Anything unreadable aborts
+    /// the run before it writes anything. Exits 1 if the run aborts or any
+    /// item fails.
     SweepDeletions {
         /// Write and delete; without it, only report.
         #[arg(long)]
@@ -89,9 +90,9 @@ enum Command {
     /// subject must have an active catalog block and an active suspension;
     /// a scope-subject request for every hash in the live index of each of
     /// its pointers and every hash its owner records name, then a request
-    /// for the subject (its pointers). Nothing is written unless every
-    /// precondition holds. One line per key; sweep-deletions --delete then
-    /// deletes them. Exits 1 if refused.
+    /// for the subject (its pointers and transitions). Nothing is written
+    /// unless every precondition holds. One line per key; sweep-deletions
+    /// --delete then deletes them. Exits 1 if refused.
     RequestDeletion {
         /// The account, compared canonically: keys carry `<uuid>` for
         /// `arkavo:<uuid>`.
