@@ -1,6 +1,6 @@
 # Recording ownership, a signed catalog index, and deletion on request
 
-**Status:** proposal, 2026-11-13, revised after two builder checks and reviews by Codex and Kimi. Must ship before Creator 2.0, on the pointer /2 switch day.
+**Status:** approved by Paul, 2026-11-13, after two builder checks and reviews by Codex and Kimi. Plan: `docs/superpowers/plans/2026-11-13-deletion-requests.md`. Must ship before Creator 2.0, on the pointer /2 switch day.
 **Scope:** tdf-iroh-s3. Contract changes reach Creator (rc.3), ArkavoKit (ArkavoCatalog) and the iOS viewer.
 **Read at:** tdf-iroh-s3 `02caef2`; Creator `feat/2.0-rc3` and ArkavoKit `0.22.0` as reported by their sessions.
 
