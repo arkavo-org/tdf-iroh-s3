@@ -15,6 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod fold;
 pub mod snapshot;
 
 /// Where transitions live: `catalog-transitions/<sub>/<name>`.
