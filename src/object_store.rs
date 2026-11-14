@@ -65,6 +65,17 @@ pub trait ObjectStore: Send + Sync + 'static {
     /// untouched. With no write in between, `create` on `key` then
     /// succeeds.
     fn delete_all_versions(&self, key: &str) -> impl Future<Output = anyhow::Result<usize>> + Send;
+
+    /// Delete exactly the versions and delete markers of `key` that
+    /// `version_ids` names, the current one last, and return how many
+    /// there were. Any other version stays, one written since the caller
+    /// listed `key` included; a named one already gone is skipped. Keys
+    /// that only start with `key` are untouched.
+    fn delete_versions(
+        &self,
+        key: &str,
+        version_ids: &[String],
+    ) -> impl Future<Output = anyhow::Result<usize>> + Send;
 }
 
 #[cfg(test)]
@@ -80,7 +91,7 @@ pub(crate) mod mem {
         Get,
         /// `put` and `create` of the key.
         Put,
-        /// `delete_all_versions` of the key.
+        /// `delete_all_versions` and `delete_versions` of the key.
         Delete,
         /// `list` and `list_versions` of any prefix of the key, so of any
         /// listing that would include it.
@@ -174,15 +185,17 @@ pub(crate) mod mem {
             self.state().add(key, None, None);
         }
 
-        /// The keys of every `delete_all_versions` call that succeeded, in
-        /// order, one entry per call, also for a key that had no versions.
+        /// The keys of every `delete_all_versions` and `delete_versions`
+        /// call that succeeded, in order, one entry per call, also for one
+        /// that deleted nothing.
         pub fn deletes(&self) -> Vec<String> {
             self.state().deletes.clone()
         }
 
-        /// Run `f` once, just before the first `delete_all_versions` of
-        /// `key` (before an injected `Op::Delete` failure is checked). `f`
-        /// can write through `insert`: no lock is held while it runs.
+        /// Run `f` once, just before the first `delete_all_versions` or
+        /// `delete_versions` of `key` (before an injected `Op::Delete`
+        /// failure is checked). `f` can write through `insert`: no lock is
+        /// held while it runs.
         pub fn on_before_delete(&self, key: &str, f: impl FnOnce(&MemObjects) + Send + 'static) {
             self.state().hooks.insert(key.to_string(), Box::new(f));
         }
@@ -268,6 +281,36 @@ pub(crate) mod mem {
         }
 
         async fn delete_all_versions(&self, key: &str) -> anyhow::Result<usize> {
+            let mut state = self.before_delete(key)?;
+            let deleted = state.keys.remove(key).map_or(0, |versions| versions.len());
+            state.deletes.push(key.to_string());
+            Ok(deleted)
+        }
+
+        async fn delete_versions(
+            &self,
+            key: &str,
+            version_ids: &[String],
+        ) -> anyhow::Result<usize> {
+            let mut state = self.before_delete(key)?;
+            let mut deleted = 0;
+            if let Some(versions) = state.keys.get_mut(key) {
+                let before = versions.len();
+                versions.retain(|v| !version_ids.contains(&v.id));
+                deleted = before - versions.len();
+                if versions.is_empty() {
+                    state.keys.remove(key);
+                }
+            }
+            state.deletes.push(key.to_string());
+            Ok(deleted)
+        }
+    }
+
+    impl MemObjects {
+        /// Run `key`'s [`on_before_delete`](Self::on_before_delete) hook,
+        /// then fail with an injected `Op::Delete`, or lock for the delete.
+        fn before_delete(&self, key: &str) -> anyhow::Result<std::sync::MutexGuard<'_, State>> {
             // Taken out first: the hook writes through `self`, which locks.
             let hook = self.state().hooks.remove(key);
             if let Some(hook) = hook {
@@ -275,9 +318,7 @@ pub(crate) mod mem {
             }
             let mut state = self.state();
             state.injected(Op::Delete, |k| k == key)?;
-            let deleted = state.keys.remove(key).map_or(0, |versions| versions.len());
-            state.deletes.push(key.to_string());
-            Ok(deleted)
+            Ok(state)
         }
     }
 }
@@ -319,6 +360,44 @@ mod tests {
 
         assert_eq!(m.delete_all_versions("k").await.unwrap(), 2);
         assert!(m.list_versions("").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_versions_deletes_only_the_named_versions() {
+        let m = MemObjects::default();
+        m.put("k", b("one")).await.unwrap();
+        m.delete_current("k");
+        m.put("kk", b("longer")).await.unwrap();
+        let ids = |versions: Vec<VersionInfo>| -> Vec<String> {
+            versions
+                .into_iter()
+                .filter(|v| v.key == "k")
+                .map(|v| v.version_id)
+                .collect()
+        };
+        let listed = ids(m.list_versions("k").await.unwrap());
+        m.on_before_delete("k", |m| m.insert("k", b("written meanwhile")));
+
+        // The version and the marker; not the hook's write, nor `kk`.
+        assert_eq!(m.delete_versions("k", &listed).await.unwrap(), 2);
+        assert_eq!(m.get("k").await.unwrap(), Some(b("written meanwhile")));
+        assert_eq!(m.get("kk").await.unwrap(), Some(b("longer")));
+        // Named again: gone already.
+        assert_eq!(m.delete_versions("k", &listed).await.unwrap(), 0);
+        let rest = ids(m.list_versions("k").await.unwrap());
+        assert_eq!(m.delete_versions("k", &rest).await.unwrap(), 1);
+        assert!(
+            m.list_versions("k")
+                .await
+                .unwrap()
+                .iter()
+                .all(|v| v.key == "kk")
+        );
+        assert_eq!(m.deletes(), ["k", "k", "k"]);
+
+        m.fail_on("kk", Op::Delete);
+        assert!(m.delete_versions("kk", &[]).await.is_err());
+        assert_eq!(m.deletes().len(), 3, "a failed delete is not recorded");
     }
 
     #[tokio::test]

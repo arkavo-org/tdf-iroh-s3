@@ -1,6 +1,7 @@
 //! `ObjectStore for S3Client` against a real versioned bucket: conditional
 //! creates, delete markers, version listing across pages and version
-//! deletion (plan call 12), and a publish's transition writes: the
+//! deletion (plan call 12: every version, or the ones named), and a
+//! publish's transition writes: the
 //! conditional create and the replace over an ETag. Every test is ignored, and passes without touching S3 when
 //! `TDF_IROH_S3_VERSIONED_BUCKET` or `AWS_REGION` is unset:
 //!
@@ -194,6 +195,56 @@ async fn version_listing_paginates() {
         let left = s3.list_versions("v/").await.unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].key, "v/ab");
+    })
+    .catch_unwind()
+    .await;
+    clean_up(&s3, outcome).await;
+}
+
+/// `delete_versions` deletes exactly the versions named, a delete marker
+/// among them, as the sweep deletes what it listed: a version written after
+/// the listing stays, and so does a key the named one is a prefix of. A
+/// named version already gone is skipped; naming none deletes nothing.
+#[tokio::test]
+#[ignore = "needs a real versioned bucket: TDF_IROH_S3_VERSIONED_BUCKET"]
+async fn only_the_named_versions_are_deleted() {
+    let Some(s3) = scratch("named-versions").await else {
+        return;
+    };
+    let outcome = AssertUnwindSafe(async {
+        let hash = "aa".repeat(32);
+        let (blob, longer) = (format!("blobs/{hash}"), format!("blobs/{hash}-longer"));
+        s3.put(&blob, body("one")).await.unwrap();
+        s3.put(&blob, body("two")).await.unwrap();
+        s3.delete_blob(&hash).await.unwrap();
+        s3.put(&longer, body("longer")).await.unwrap();
+        let listed: Vec<String> = s3
+            .list_versions(&blob)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|v| v.key == blob)
+            .map(|v| v.version_id)
+            .collect();
+        assert_eq!(listed.len(), 3, "{listed:?}");
+        s3.put(&blob, body("three")).await.unwrap();
+
+        assert_eq!(s3.delete_versions(&blob, &listed).await.unwrap(), 3);
+        let left: Vec<VersionInfo> = s3
+            .list_versions(&blob)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|v| v.key == blob)
+            .collect();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(!left[0].delete_marker && !listed.contains(&left[0].version_id));
+        assert_eq!(s3.get(&blob).await.unwrap(), Some(body("three")));
+        assert_eq!(s3.get(&longer).await.unwrap(), Some(body("longer")));
+
+        assert_eq!(s3.delete_versions(&blob, &listed).await.unwrap(), 0);
+        assert_eq!(s3.delete_versions(&blob, &[]).await.unwrap(), 0);
+        assert_eq!(s3.get(&blob).await.unwrap(), Some(body("three")));
     })
     .catch_unwind()
     .await;

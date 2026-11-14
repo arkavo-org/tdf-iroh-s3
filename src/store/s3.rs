@@ -1083,7 +1083,28 @@ impl ObjectStore for S3Client {
     /// rest for the next run.
     async fn delete_all_versions(&self, key: &str) -> Result<usize> {
         let versions = versions_of(key, self.list_versions_marked(key).await?);
-        for v in &versions {
+        self.delete_each_version(key, &versions).await
+    }
+
+    /// Call 12 for the versions a caller listed and judged: list `key`'s
+    /// versions as [`delete_all_versions`](Self::delete_all_versions) does,
+    /// for which is current, keep those `version_ids` names, and delete
+    /// them the same way. One written since the caller listed isn't named,
+    /// and stays. No call at all when nothing is named.
+    async fn delete_versions(&self, key: &str, version_ids: &[String]) -> Result<usize> {
+        if version_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut versions = versions_of(key, self.list_versions_marked(key).await?);
+        versions.retain(|v| version_ids.contains(&v.version_id));
+        self.delete_each_version(key, &versions).await
+    }
+}
+
+impl S3Client {
+    /// One `DeleteObject` with `VersionId` per version of `key`, in order.
+    async fn delete_each_version(&self, key: &str, versions: &[VersionInfo]) -> Result<usize> {
+        for v in versions {
             self.client
                 .delete_object()
                 .bucket(&self.bucket)
