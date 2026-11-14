@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap};
 use crate::catalogs_v2_api::{IndexRecord, stored_pointer};
 use crate::creator_catalog::{index_hash, is_lower_hex_hash, parse_index};
 use crate::moderation::{canonical_subject, valid_subject};
-use crate::object_store::{ObjectInfo, ObjectStore, bodies};
+use crate::object_store::{ObjectInfo, ObjectStore, bodies, parsed};
 
 /// Where the signed pointers live: `catalog-pointers/<sub>`.
 pub const POINTERS: &str = "catalog-pointers/";
@@ -64,7 +64,8 @@ impl Catalogs {
 }
 
 /// Read every pointer, then every index record, 16 reads at a time
-/// ([`bodies`]). `Err` if any of them can't be read or parsed, or
+/// ([`bodies`], [`parsed`]: each index record parsed as its read ends).
+/// `Err` if any of them can't be read or parsed, or
 /// vanishes between the listing and its read, or if a `/2` pointer's index
 /// record is missing or doesn't hash to its `indexHash`. The first error
 /// ends the scan.
@@ -96,21 +97,26 @@ pub async fn scan<O: ObjectStore>(store: &O) -> anyhow::Result<Catalogs> {
     let mut indexes = HashMap::new();
     // Each record's canonical index hash, by catalog hash.
     let mut canonical = HashMap::new();
-    for (ObjectInfo { key, .. }, body) in bodies(store, INDEXES).await? {
+    // Each record is parsed as its read ends, so the scan holds what it
+    // keeps of each, never every body at once.
+    let records = parsed(store, INDEXES, |ObjectInfo { key, .. }, body| {
         let hash = name(&key, INDEXES)?;
         anyhow::ensure!(is_lower_hex_hash(hash), "{key}: not a catalog hash");
         let record: IndexRecord =
             serde_json::from_slice(&body).with_context(|| format!("{key} unreadable"))?;
         let entries = parse_index(record.entries)
             .map_err(|why| anyhow::anyhow!("{key} unreadable: invalid index: {why}"))?;
-        canonical.insert(hash.to_string(), index_hash(&entries));
-        indexes.insert(
-            hash.to_string(),
-            ScannedIndex {
-                owner: record.owner,
-                hashes: entries.into_iter().map(|e| e.payload_hash).collect(),
-            },
-        );
+        let canonical = index_hash(&entries);
+        let index = ScannedIndex {
+            owner: record.owner,
+            hashes: entries.into_iter().map(|e| e.payload_hash).collect(),
+        };
+        Ok((hash.to_string(), canonical, index))
+    })
+    .await?;
+    for (hash, index_hash, index) in records {
+        canonical.insert(hash.clone(), index_hash);
+        indexes.insert(hash, index);
     }
 
     // A `/2` pointer's live index is the one it signed. Its index record is
@@ -564,6 +570,27 @@ mod tests {
             .rposition(|e| matches!(e, Event::Read(key) if key.starts_with(POINTERS)))
             .unwrap();
         assert!(last_pointer < listing, "{log:?}");
+    }
+
+    /// Each index record is parsed as its read ends, inside the read
+    /// stream, so the scan holds parsed records and never every body at
+    /// once: a malformed record first in listing order ends the scan
+    /// before the records after it have all been read.
+    #[tokio::test]
+    async fn index_records_are_parsed_as_they_are_read() {
+        let scrambled = Scrambled::default();
+        many(&scrambled.inner);
+        let first = format!("{INDEXES}{}", "0".repeat(64));
+        scrambled.inner.insert(&first, "not an index record");
+
+        let err = scan(&scrambled).await.unwrap_err();
+        assert!(format!("{err:#}").contains(&first), "{err:#}");
+        let read = scrambled.reads(INDEXES).len();
+        assert!(
+            read <= READS_AT_ONCE,
+            "{read} of {} index records read",
+            MANY + 1
+        );
     }
 
     #[tokio::test]

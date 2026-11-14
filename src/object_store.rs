@@ -92,10 +92,24 @@ pub async fn bodies<O: ObjectStore>(
     store: &O,
     prefix: &str,
 ) -> anyhow::Result<Vec<(ObjectInfo, Bytes)>> {
+    parsed(store, prefix, |listed, body| Ok((listed, body))).await
+}
+
+/// [`bodies`], each one handed to `parse` as its read ends, inside the
+/// read stream: a caller that keeps only what `parse` makes of a body
+/// never holds every body at once. What `parse` returns, in listing
+/// order. The first failure in listing order, a read's or a parse's, ends
+/// it.
+pub async fn parsed<O, T, F>(store: &O, prefix: &str, parse: F) -> anyhow::Result<Vec<T>>
+where
+    O: ObjectStore,
+    F: Fn(ObjectInfo, Bytes) -> anyhow::Result<T> + Sync,
+{
     let listed = store
         .list(prefix)
         .await
         .with_context(|| format!("listing {prefix} failed"))?;
+    let parse = &parse;
     stream::iter(listed)
         .map(|listed| async move {
             let key = &listed.key;
@@ -104,7 +118,7 @@ pub async fn bodies<O: ObjectStore>(
                 .await
                 .with_context(|| format!("{key} unreadable"))?
                 .with_context(|| format!("{key} vanished during the read"))?;
-            anyhow::Ok((listed, body))
+            parse(listed, body)
         })
         .buffered(READS_AT_ONCE)
         .try_collect()

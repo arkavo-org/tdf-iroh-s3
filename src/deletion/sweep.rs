@@ -4625,6 +4625,25 @@ mod tests {
             assert_eq!(listed.versions.len(), 1);
         }
 
+        /// Key order, not the order the key forms are listed in (`<uuid>`,
+        /// then `arkavo:<uuid>`): for a UUID that starts with `b` to `f`,
+        /// `arkavo:<uuid>` sorts first, versions and keys alike.
+        #[tokio::test]
+        async fn a_subject_tombstones_versions_are_in_key_order() {
+            const B: &str = "b1e2c3d4-0000-4000-8000-000000000001";
+            let m = MemObjects::default();
+            let bare = format!("{POINTERS}{B}");
+            let prefixed = format!("{POINTERS}{}", arkavo(B));
+            m.insert(&bare, "pointer");
+            m.insert(&prefixed, "pointer");
+            m.insert(&prefixed, "pointer again");
+
+            let listed = tombstoned(&m, &Item::Subject(B.into())).await.unwrap();
+            assert_eq!(listed.keys, [prefixed.clone(), bare.clone()]);
+            let keys: Vec<&str> = listed.versions.iter().map(|v| v.key.as_str()).collect();
+            assert_eq!(keys, [prefixed.as_str(), &prefixed, &bare]);
+        }
+
         /// A subject's tombstone releases its hidden envelopes while its
         /// catalog block stands (spec 3.4 step 5), so it stays while any
         /// envelope request of that owner is pending and the block stands.
