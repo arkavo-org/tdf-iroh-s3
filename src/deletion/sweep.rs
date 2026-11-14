@@ -39,7 +39,7 @@ use std::fmt;
 
 use super::due::{self, Decision, Item, View};
 use super::fold::{self, Fold};
-use super::snapshot::{self, Requests, Snapshot};
+use super::snapshot::{self, ModerationView, Requests, Snapshot};
 use super::{
     EnvelopeRequest, State, TRANSITIONS, VERIFY_AFTER, envelope_key, operator_key, recording_key,
     subject_key,
@@ -610,7 +610,8 @@ async fn delete_item<O: ObjectStore>(
 ///    fresh (a new push, publish or pointer): forget the tombstones, keep
 ///    everything;
 /// 2. a recording in `L`, or an envelope in `C`: forget them, keep the
-///    objects;
+///    objects. `L` and `C` leave out a deleted subject's late pointers
+///    ([`late_pointers`]);
 /// 3. any other object came back in flight: re-check the item as step 6
 ///    does ([`deletable_again`]) and delete its objects again, keeping the
 ///    tombstones; or keep everything, and say why;
@@ -638,7 +639,12 @@ async fn verify_tombstones<O: ObjectStore>(
         .await
         .context("the verify read failed")?;
     let requests = if delete { &read.requests } else { unwritten };
-    let view = due::view(&read.catalogs, requests, &read.moderation);
+    // For rule 2 only. A pointer rule 3 deletes again (now, or once its
+    // subject's tombstone is old enough) lists and names nothing: were its
+    // recordings and envelope forgotten here, their objects would outlive
+    // it with no request left to delete them.
+    let late = late_pointers(store, requests, &read.moderation).await?;
+    let view = due::view_except(&read.catalogs, requests, &read.moderation, &late);
     let mut groups: Vec<Tombstones> = tombstones(requests)
         .into_iter()
         .filter(|t| t.deleted_at.saturating_add(VERIFY_AFTER) <= now)
@@ -826,6 +832,44 @@ fn object_keys(item: &Item) -> Vec<String> {
         Item::Subject(_) => return Vec::new(),
     };
     prefixes.iter().map(|p| format!("{p}{hash}")).collect()
+}
+
+/// The keys of the pointers rule 3 deletes again, now or once their
+/// subject's tombstone is [`VERIFY_AFTER`] old: those of a subject with a
+/// `subjects/` tombstone of any age whose catalog block stands, whose
+/// current version was written by the tombstone's `deletedAt` +
+/// [`VERIFY_AFTER`] (an in-flight publish). One written later is a
+/// returning creator's, and counts.
+async fn late_pointers<O: ObjectStore>(
+    store: &O,
+    requests: &Requests,
+    moderation: &ModerationView,
+) -> anyhow::Result<BTreeSet<String>> {
+    let written_by: BTreeMap<&str, i64> = requests
+        .subjects
+        .iter()
+        .filter(|(sub, _)| moderation.catalog_blocked.contains(sub.as_str()))
+        .filter_map(|(sub, r)| {
+            let at = r.deleted_at.filter(|_| r.state == State::Deleted)?;
+            Some((sub.as_str(), at.saturating_add(VERIFY_AFTER)))
+        })
+        .collect();
+    if written_by.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let pointers = store
+        .list(POINTERS)
+        .await
+        .with_context(|| format!("listing {POINTERS} failed"))?;
+    Ok(pointers
+        .into_iter()
+        .filter(|p| {
+            pointer_subject(&p.key)
+                .and_then(|sub| written_by.get(sub))
+                .is_some_and(|by| p.modified <= *by)
+        })
+        .map(|p| p.key)
+        .collect())
 }
 
 /// A pointer key's subject, canonical; `None` for a name that isn't one.
@@ -1878,6 +1922,11 @@ mod tests {
 
         /// `subjects/<sub>`, deleted at `T`.
         fn subject_tombstone(m: &MemObjects, sub: &str) {
+            subject_tombstone_at(m, sub, T);
+        }
+
+        /// `subjects/<sub>`, deleted at `deleted_at`.
+        fn subject_tombstone_at(m: &MemObjects, sub: &str, deleted_at: i64) {
             put(
                 m,
                 &subject_key(sub),
@@ -1886,7 +1935,7 @@ mod tests {
                     requested_at: T,
                     reason: "account closed".into(),
                     state: State::Deleted,
-                    deleted_at: Some(T),
+                    deleted_at: Some(deleted_at),
                 },
             );
         }
@@ -2227,6 +2276,107 @@ mod tests {
                 "{report}"
             );
             assert!(m.deletes().is_empty());
+        }
+
+        /// A deleted subject's late pointer (an in-flight publish, still
+        /// catalog-blocked) is deleted again by rule 3, so what it lists is
+        /// not listed again: the recording is deleted again too, not
+        /// forgotten with no request left to delete it.
+        #[tokio::test]
+        async fn a_deleted_subjects_late_pointer_lists_nothing() {
+            let m = MemObjects::default();
+            let p = h("a1");
+            subject_tombstone(&m, U);
+            catalog_block(&m, U);
+            tombstone(&m, U, &p);
+            m.set_now(T + 10);
+            recording(&m, &p, U);
+            publish_2(&m, U, 1, b"doc-late", &[&p]);
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(has(&report, &format!("recreated subject {U}")), "{report}");
+            assert!(
+                has(&report, &format!("recreated recording {p}")),
+                "{report}"
+            );
+            assert_eq!(report.failures, 0);
+            for key in recording_keys(&p) {
+                assert!(gone(&m, &key).await, "{key}");
+            }
+            let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
+            assert_eq!((r.state, r.deleted_at), (State::Deleted, Some(T)));
+        }
+
+        /// The same while the subject's tombstone is young: the recording
+        /// waits, kept with its tombstone, until the pointer is gone.
+        #[tokio::test]
+        async fn a_young_deleted_subjects_late_pointer_lists_nothing() {
+            let m = MemObjects::default();
+            let p = h("a1");
+            subject_tombstone_at(&m, U, T + 1);
+            catalog_block(&m, U);
+            tombstone(&m, U, &p);
+            m.set_now(T + 10);
+            recording(&m, &p, U);
+            publish_2(&m, U, 1, b"doc-late", &[&p]);
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(
+                has(&report, &format!("kept recording {p}: still listed")),
+                "{report}"
+            );
+            assert!(m.deletes().is_empty());
+            assert!(m.get(&recording_key(U, &p)).await.unwrap().is_some());
+        }
+
+        /// A deleted subject's pointer written after the hour is a
+        /// returning creator's: it lists and names as any other.
+        #[tokio::test]
+        async fn a_returning_subjects_pointer_still_lists() {
+            let m = MemObjects::default();
+            let p = h("a1");
+            subject_tombstone(&m, U);
+            catalog_block(&m, U);
+            tombstone(&m, U, &p);
+            m.set_now(T + 10);
+            recording(&m, &p, U);
+            m.set_now(AT + 1);
+            publish_2(&m, U, 1, b"doc-new", &[&p]);
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(has(&report, &format!("fresh subject {U}")), "{report}");
+            assert!(
+                has(&report, &format!("listed again recording {p}")),
+                "{report}"
+            );
+            for key in recording_keys(&p) {
+                assert!(m.get(&key).await.unwrap().is_some(), "{key}");
+            }
+            assert!(gone(&m, &recording_key(U, &p)).await);
+        }
+
+        /// The envelope a deleted subject's late pointer names is not
+        /// current: it is deleted again after the pointer.
+        #[tokio::test]
+        async fn a_deleted_subjects_late_pointer_names_nothing() {
+            let m = MemObjects::default();
+            let e = catalog(b"doc-e");
+            subject_tombstone(&m, U);
+            catalog_block(&m, U);
+            envelope_tombstone(&m, &e, U, T);
+            m.set_now(T + 10);
+            publish_2(&m, U, 1, b"doc-e", &[]);
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(has(&report, &format!("recreated subject {U}")), "{report}");
+            assert!(has(&report, &format!("recreated envelope {e}")), "{report}");
+            assert_eq!(report.failures, 0);
+            let mut expected = vec![format!("catalog-pointers/{U}")];
+            expected.extend(envelope_keys(&e));
+            assert_eq!(m.deletes(), expected);
+            let r: EnvelopeRequest = record(&m, &envelope_key(&e)).await;
+            assert_eq!((r.state, r.deleted_at), (State::Deleted, Some(T)));
+            snapshot::read(&m).await.unwrap();
         }
 
         /// A late write whose requester published since the run's first

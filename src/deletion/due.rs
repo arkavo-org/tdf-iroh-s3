@@ -65,8 +65,23 @@ pub struct View {
 /// `S`, `L` and `C` (see [`View`]). A pointer from before envelopes has
 /// no live index: it lists nothing, and its catalog hash is still current.
 pub fn view(catalogs: &Catalogs, requests: &Requests, moderation: &ModerationView) -> View {
+    view_except(catalogs, requests, moderation, &BTreeSet::new())
+}
+
+/// [`view`] as if the pointers at `except` (their keys) were gone: in
+/// none of `S`, `L` and `C`.
+pub fn view_except(
+    catalogs: &Catalogs,
+    requests: &Requests,
+    moderation: &ModerationView,
+    except: &BTreeSet<String>,
+) -> View {
     let mut view = View::default();
-    for p in &catalogs.pointers {
+    for p in catalogs
+        .pointers
+        .iter()
+        .filter(|p| !except.contains(&p.key))
+    {
         let subject = canonical_subject(&p.subject);
         if pending_subject(requests, subject) && moderation.catalog_blocked.contains(subject) {
             view.s.insert(p.key.clone());
