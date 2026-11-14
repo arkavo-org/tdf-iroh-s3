@@ -63,7 +63,7 @@ The session lasts `[publishing] session_ttl_secs` (default 900).
 
 - The node accepts iroh pushes only from an endpoint with a live session, and only while its subject is not suspended.
 - Any other push is refused with a permission error, and nothing is stored.
-- The pusher's subject is recorded at `moderation/publishers/<hash>`.
+- Once a push is ingested, the first pusher's subject is recorded at `moderation/publishers/<hash>`, and a push of another account's recording is refused (see [Ownership](#ownership)).
 - Each session is also stored at `moderation/sessions/<endpointId>` as `{"kid", "record", "tag"}`. `record` is `{"endpointId", "subject", "expiresAt"}`, plus `chain` when decisions aren't local (see above). A node that receives a push from an endpoint it holds no session for reads this record (5 s timeout) before refusing. So a session opened on one instance holds for a push that reaches another, during an instance replacement or after a restart (#32). A record that has expired, names another endpoint, can't be read, or can't be fetched in time counts as no session.
 - `tag` is the keyed BLAKE3 hash, in hex, of `record`'s exact bytes. The key is derived from the node's secret key (`[iroh] secret_key_param`, shared by every instance and never rotated), and `kid` is the first 8 bytes of the key's BLAKE3 hash, in hex. A record without a tag, tagged by another key, or edited after tagging counts as no session, and the node logs a warning with the endpoint ID only (#46). So records written before #46 are refused once: a session opened on an older node must be opened again on a newer one. A node with an empty `secret_key_param` has a new key each start, so its stored sessions don't survive a restart. At most 16 lookups run at once; a push that finds them all busy is refused. An endpoint whose lookup found no live session is refused for 10 s without another lookup. So a peer without a session can't make the node send S3 a request per push.
 - If the node can't store a session, `POST /publish/sessions` still succeeds. The session then holds only on the instance that opened it, and the node logs `Publish session not stored`.
@@ -80,6 +80,57 @@ When the membership lapses, the entitlement disappears from new tokens (authnz-r
 ### Creator app impact
 
 The Creator app must open a session before each push. Until it does, pushes to a gated node are refused. Set `required = false` only on development nodes.
+
+## Ownership
+
+The first account to push a recording owns it. Its owner record is `moderation/publishers/<hash>`, `{"hash","subject","endpointId","at"}` with `subject` in canonical form. It is created only if none exists (`If-None-Match: *`) and never overwritten. On a node with `required = false` no owner is recorded and nothing in this section applies.
+
+- **First push owns.** Once a push is ingested, the node creates the record for the session's subject. If two first pushes race, the first create wins. If the create fails, the node logs it and the recording stays unowned; its next push claims it (that push skips the upload, since the blob is already there).
+- **Push refusal.** Before accepting a push, the node reads the hash's owner record, after the session, suspension, block and decision checks. A record naming another subject refuses the push with a permission error. So does a record that can't be read or parsed, a lookup over 5 s, or finding all 16 owner lookups busy (a bound of their own, apart from the session lookups'): the check fails closed. A record naming the pusher, or no record, lets the push through.
+- **Publish refusals.** `PUT /v2/catalogs/<sub>` reads each listed recording's owner record ([creator-catalogs.md](creator-catalogs.md#put-v2catalogssub-publish)):
+  - an entry another account owns: 403 `recording belongs to another account`;
+  - else an entry with no owner: 422 `recording has no owner: push it again`, and pushing it again claims it;
+  - both carry `contentIDs`, the `contentID` of every entry refused, sorted;
+  - an owner record that can't be read or parsed: 502 `storage unavailable`.
+- **Pre-check.** `GET /publish/recordings/<hash>` ([creator-catalogs.md](creator-catalogs.md#get-publishrecordingshash-who-owns-a-recording)), authorized as `POST /publish/sessions` and `PUT /v2/catalogs` are, answers `{"hash":"<hash>","owner":"you" | "another account" | "none"}`. It never names the other account. Creator asks it before the passkey prompt, and after a failed push to explain it.
+
+A recording without an owner arises only when its record's create failed, an operator released it, or it predates publish sessions and no catalog listed it at the backfill.
+
+### `claim-owners`: the backfill
+
+Run it before ownership is enforced, so existing catalogs keep publishing. It reads every pointer (`catalog-pointers/`) and every index record (`catalog-indexes/`); a live index is the index record of the catalog a pointer names. For each payload hash a live index lists:
+
+- an owner record names the only account that lists it: owned, nothing to do;
+- no record, and exactly one account lists it: claim it, creating the record for that account with `"endpointId":"claim-owners"`;
+- more than one account lists it, or the record names an account that doesn't list it: a conflict, reported, nothing written.
+
+Accounts compare in canonical form, so the pointers `arkavo:<uuid>` and `<uuid>` are one account. Hashes no live index lists are left alone: the next push claims them. Anything it can't read or parse (a pointer, an index record, an owner record) stops it before it writes anything.
+
+```bash
+tdf-iroh-s3 --config /etc/tdf-iroh-s3/config.toml claim-owners          # dry run
+tdf-iroh-s3 --config /etc/tdf-iroh-s3/config.toml claim-owners --write  # creates the records
+```
+
+It prints one line per claim (`would claim <hash> <subject>`, or `claimed <hash> <subject>` with `--write`), one per conflict (`conflict <hash>: listed by <a>, <b>; owner <c>`, or `; no owner record`), then the counts (`<n> owned, <n> would claim, <n> conflicts`, with `claimed` under `--write`). It exits 1 if there is any conflict. With `--write` it still claims every hash that isn't a conflict. A record that appears between the read and the create (a push claimed the hash meanwhile) is logged, not claimed; the next run reads it.
+
+The switch waits until the dry run reports no conflicts. Then run it with `--write`, and once the node is deployed, the dry run again.
+
+### `release-owner`
+
+```bash
+tdf-iroh-s3 --config /etc/tdf-iroh-s3/config.toml release-owner \
+  --hash <hash> --subject <sub> --reason "account deleted, catalog not emptied"
+```
+
+It deletes the hash's owner record, every version and delete marker, only if the record names `<sub>` (compared in canonical form). The next push of the recording claims it. Use it for an account deleted without emptying its catalog. `--reason` is required, and printed, not stored.
+
+- Released: `released <hash> from <sub> (<n> versions): <reason>`.
+- Not released, exit 1: `not released: <hash> is owned by <owner>, not <sub>`, or `not released: <hash> has no owner record`. A record it can't parse is kept, and the command fails.
+
+### IAM
+
+- **The instance role** needs `s3:PutObject` on `<prefix>moderation/publishers/*` for the owner records' conditional creates (`If-None-Match: *`), and `s3:GetObject` there for the push and publish checks.
+- **Operators running `claim-owners` or `release-owner`** need `s3:ListBucket`, `s3:ListBucketVersions`, `s3:GetObject`, `s3:PutObject` and `s3:DeleteObjectVersion`, and the node's config for the bucket and prefix.
 
 ## Moderation (operators)
 
@@ -143,4 +194,4 @@ moderation_refresh_secs = 30
 decisions = "local"                # local | shadow | pdp (needs [catalog.authz] endpoint)
 ```
 
-The node's IAM role needs `s3:PutObject`, `s3:GetObject` and `s3:ListBucket` on `<prefix>moderation/*`, which includes `moderation/audit/`.
+The node's IAM role needs `s3:PutObject`, `s3:GetObject` and `s3:ListBucket` on `<prefix>moderation/*`, which includes `moderation/audit/` and the conditional creates of `moderation/publishers/` (see [IAM](#iam)).

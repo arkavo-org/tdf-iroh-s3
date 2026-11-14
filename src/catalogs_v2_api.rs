@@ -30,6 +30,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
 use iroh_blobs::Hash;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -192,12 +193,15 @@ pub struct Readers {
 }
 
 /// A catalog's index record (`catalog-indexes/<hash>`): what the node
-/// checked at publish. Moderation reads it to find an entry's hashes.
+/// checked at publish. Moderation reads it to find an entry's hashes, and
+/// so do the offline commands (`catalog_scan`).
 #[derive(serde::Serialize, Deserialize)]
-struct IndexRecord {
-    owner: String,
-    attribute: String,
-    entries: serde_json::Value,
+pub(crate) struct IndexRecord {
+    /// The publisher's `sub`, byte for byte.
+    pub owner: String,
+    pub attribute: String,
+    /// The index as received (`creator_catalog::parse_index` reads it).
+    pub entries: serde_json::Value,
 }
 
 pub fn router<S: TagStore>(state: Arc<V2State<S>>) -> Router {
@@ -217,13 +221,26 @@ struct PutRequest {
     index: serde_json::Value,
 }
 
-/// The `seq` of a stored bundle. The node wrote it after verifying it, so
-/// failing to read it back is a storage fault.
-pub(crate) fn stored_seq(body: &[u8]) -> anyhow::Result<(u64, String)> {
+/// What a stored bundle's pointer says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredPointerInfo {
+    pub seq: u64,
+    pub catalog_hash: String,
+    /// Lowercase hex SHA-256 of the signed pointer bytes.
+    pub digest: String,
+}
+
+/// Read a stored bundle's pointer. The node wrote it after verifying it,
+/// so failing to read it back is a storage fault.
+pub(crate) fn stored_pointer(body: &[u8]) -> anyhow::Result<StoredPointerInfo> {
     let bundle: Bundle = serde_json::from_slice(body)?;
     let bytes = URL_SAFE_NO_PAD.decode(&bundle.pointer)?;
     let pointer = catalog_v2::parse_pointer(&bytes).map_err(anyhow::Error::msg)?;
-    Ok((pointer.seq, pointer.catalog_hash))
+    Ok(StoredPointerInfo {
+        seq: pointer.seq,
+        catalog_hash: pointer.catalog_hash,
+        digest: hex::encode(Sha256::digest(&bytes)),
+    })
 }
 
 /// A stored pointer's entity tag: its `seq`, quoted. A stored seq only
@@ -418,7 +435,7 @@ async fn put_catalog<S: TagStore>(
         .await
         .map_err(|e| storage_unavailable("Catalog pointer read", e))?;
     let current = current
-        .map(|stored| stored_seq(&stored.body).map(|parsed| (stored, parsed)))
+        .map(|stored| stored_pointer(&stored.body).map(|parsed| (stored, parsed)))
         .transpose()
         .map_err(|e| storage_unavailable("Catalog pointer parse", e))?;
     // A pointer at a catalog with no index record names a document from
@@ -426,22 +443,22 @@ async fn put_catalog<S: TagStore>(
     // first envelope may start at any seq. The conditional write below
     // still replaces exactly that pointer.
     let live = match &current {
-        Some((_, (_, hash))) => api
+        Some((_, info)) => api
             .store
-            .get_catalog_index(hash)
+            .get_catalog_index(&info.catalog_hash)
             .await
             .map_err(|e| storage_unavailable("Catalog index read", e))?
             .is_some(),
         None => false,
     };
-    let current_seq = current.as_ref().filter(|_| live).map(|(_, (seq, _))| *seq);
+    let current_seq = current.as_ref().filter(|_| live).map(|(_, info)| info.seq);
     // Preconditions see what `GET` serves: a pointer whose catalog is
     // blocked reads as none, so a client that got the 404 can publish with
     // `If-None-Match: *`.
     let served_seq = current
         .as_ref()
-        .filter(|(_, (_, hash))| live && !is_blocked(api, hash))
-        .map(|(_, (seq, _))| *seq);
+        .filter(|(_, info)| live && !is_blocked(api, &info.catalog_hash))
+        .map(|(_, info)| info.seq);
     if !preconditions_hold(&headers, served_seq.map(pointer_etag).as_deref()) {
         return Err(reject(
             StatusCode::PRECONDITION_FAILED,
@@ -654,8 +671,10 @@ async fn get_pointer<S: TagStore>(
         Ok(None) => return Err(not_found()),
         Err(e) => return Err(storage_unavailable("Catalog pointer read", e)),
     };
-    let (seq, catalog_hash) =
-        stored_seq(&stored.body).map_err(|e| storage_unavailable("Catalog pointer parse", e))?;
+    let StoredPointerInfo {
+        seq, catalog_hash, ..
+    } = stored_pointer(&stored.body)
+        .map_err(|e| storage_unavailable("Catalog pointer parse", e))?;
     if is_blocked(api, &catalog_hash) {
         return Err(not_found());
     }

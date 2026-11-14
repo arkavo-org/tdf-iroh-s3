@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod authz;
 pub mod catalog_metadata;
+pub mod catalog_scan;
 pub mod catalog_v2;
 pub mod catalogs_api;
 pub mod catalogs_v2_api;

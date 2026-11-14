@@ -16,7 +16,7 @@ use tdf_iroh_s3::config::{AuthzConfig, Config, PublishDecisions};
 use tdf_iroh_s3::moderation::{self, Moderation, ModerationApi, PublishGate, PublishPolicy};
 use tdf_iroh_s3::node::TdfIrohNode;
 use tdf_iroh_s3::node_api;
-use tdf_iroh_s3::ownership::OwnerStore;
+use tdf_iroh_s3::ownership::{self, OwnerStore, Released};
 use tdf_iroh_s3::publish_decision::PublishDecider;
 use tdf_iroh_s3::ssm;
 use tdf_iroh_s3::store::s3::S3Client;
@@ -31,6 +31,94 @@ use tdf_iroh_s3::tls;
 struct Cli {
     #[arg(short, long, default_value = "/etc/tdf-iroh-s3/config.toml")]
     config: PathBuf,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Create owner records for the recordings live catalogs list (a dry run
+    /// unless --write)
+    ///
+    /// For each recording a live catalog lists: no owner record and one
+    /// listing account → claim it for that account; listed by more than one
+    /// account, or owned by an account that doesn't list it → a conflict,
+    /// nothing written. Run before ownership is enforced, until the dry run
+    /// reports no conflicts. Exits 1 on any conflict.
+    ClaimOwners {
+        /// Create the records; without it, only report.
+        #[arg(long)]
+        write: bool,
+    },
+    /// Delete a recording's owner record if it names --subject
+    ///
+    /// Deletes every version, so the next push claims the recording. For an
+    /// account deleted without emptying its catalog. Exits 1 if nothing is
+    /// released.
+    ReleaseOwner {
+        /// The recording's BLAKE3 hash, 64 lowercase hex characters.
+        #[arg(long)]
+        hash: String,
+        /// The subject the record must name (compared canonically).
+        #[arg(long)]
+        subject: String,
+        /// Why; printed, not stored.
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+/// `claim-owners`: one line per claim and per conflict, then counts.
+async fn claim_owners(config: &Config, write: bool) -> Result<()> {
+    let s3 = S3Client::from_config(&config.s3).await?;
+    let report = ownership::claim_owners(&s3, write, moderation::now_secs()).await?;
+    let verb = if write { "claimed" } else { "would claim" };
+    for (hash, subject) in &report.claimed {
+        println!("{verb} {hash} {subject}");
+    }
+    for conflict in &report.conflicts {
+        let owner = match &conflict.owner {
+            Some(owner) => format!("owner {owner}"),
+            None => "no owner record".to_string(),
+        };
+        println!(
+            "conflict {}: listed by {}; {owner}",
+            conflict.hash,
+            conflict.listers.join(", ")
+        );
+    }
+    println!(
+        "{} owned, {} {verb}, {} conflicts",
+        report.owned,
+        report.claimed.len(),
+        report.conflicts.len()
+    );
+    anyhow::ensure!(
+        report.conflicts.is_empty(),
+        "{} conflicts: ownership can't be enforced until there are none",
+        report.conflicts.len()
+    );
+    Ok(())
+}
+
+/// `release-owner`: what it did, or why it didn't.
+async fn release_owner(config: &Config, hash: &str, subject: &str, reason: &str) -> Result<()> {
+    anyhow::ensure!(!reason.trim().is_empty(), "--reason must not be empty");
+    let s3 = S3Client::from_config(&config.s3).await?;
+    match ownership::release_owner(&s3, hash, subject).await? {
+        Released::Deleted(versions) => {
+            println!("released {hash} from {subject} ({versions} versions): {reason}");
+            Ok(())
+        }
+        Released::NotOwner(owner) => {
+            println!("not released: {hash} is owned by {owner}, not {subject}");
+            anyhow::bail!("not released")
+        }
+        Released::NoRecord => {
+            println!("not released: {hash} has no owner record");
+            anyhow::bail!("not released")
+        }
+    }
 }
 
 #[tokio::main]
@@ -53,6 +141,15 @@ async fn main() -> Result<()> {
     let config = Config::from_file(&cli.config)?;
     info!("Config loaded from {:?}", cli.config);
     info!("S3: {}:{}", config.s3.bucket, config.s3.region);
+    match cli.command {
+        Some(Command::ClaimOwners { write }) => return claim_owners(&config, write).await,
+        Some(Command::ReleaseOwner {
+            hash,
+            subject,
+            reason,
+        }) => return release_owner(&config, &hash, &subject, &reason).await,
+        None => {}
+    }
     info!(
         "Required attributes: {:?}",
         config.validation.required_attributes
