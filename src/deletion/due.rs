@@ -1,0 +1,977 @@
+//! What is due (spec 3.4 steps 3 to 5), decided from what the run read
+//! ([`Snapshot`]) and the requests after folding.
+//!
+//! - [`view`]: the pointers of subjects being deleted (`S`), every payload
+//!   hash still listed (`L`) and every current envelope (`C`);
+//! - [`observe`]: a request for each envelope whose objects no pointer
+//!   names and no request tracks;
+//! - [`due`]: each pending request due now, as the [`Item`]s the sweep
+//!   deletes, and why each other one is kept.
+//!
+//! Never delete a recording its owner didn't ask to delete, and never
+//! delete anything still listed. So a recording is due only on a request
+//! its owner record bears out, or on an operator's over an active block;
+//! and `L` counts every catalog whatever its visibility: hidden, blocked
+//! and catalog-blocked owners' too. Only the pointers of a subject an
+//! operator asked to delete, while its catalog block stands, leave it.
+//!
+//! Every rule reads the requests passed in (the folded ones, with those
+//! [`observe`] made), never the snapshot's. Subjects compare canonically.
+//! Tombstones (`deleted` requests) are neither due nor kept here: the
+//! sweep verifies them (spec 3.4 step 7).
+//!
+//! Pure: no I/O, and `now` is a parameter.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+use super::snapshot::{ModerationView, Requests, Snapshot};
+use super::{
+    EnvelopeRequest, GRACE, OperatorRequest, RecordingRequest, Scope, Source, State, operator_key,
+    recording_key,
+};
+use crate::catalog_scan::Catalogs;
+use crate::moderation::canonical_subject;
+
+/// Why a pending request is kept.
+const WITHIN_GRACE: &str = "within grace";
+const STILL_LISTED: &str = "still listed";
+const STILL_CURRENT: &str = "still current";
+const BLOCKED: &str = "blocked";
+const NOT_THE_REQUESTER: &str = "owner is not the requester";
+const NO_OWNER_RECORD: &str = "no owner record";
+const BLOCK_LIFTED: &str = "block lifted";
+const CATALOG_BLOCK_LIFTED: &str = "catalog block lifted";
+const OWNER_HIDDEN: &str = "owner hidden";
+const UNKNOWN_OWNER: &str = "unknown owner";
+
+/// Spec 3.4 step 3.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct View {
+    /// `S`: the keys (`catalog-pointers/<sub>`) of every pointer whose
+    /// canonical subject has a pending `subjects/` request and an active
+    /// catalog block. Both pointer keys of one subject (`arkavo:<uuid>` and
+    /// `<uuid>`) are here together.
+    pub s: BTreeSet<String>,
+    /// `L`: every payload hash in the live index of a pointer not in `S`,
+    /// whatever its visibility.
+    pub l: HashSet<String>,
+    /// `C`: the catalog hash of every pointer not in `S`.
+    pub c: HashSet<String>,
+}
+
+/// `S`, `L` and `C` (see [`View`]). A pointer from before envelopes has
+/// no live index: it lists nothing, and its catalog hash is still current.
+pub fn view(catalogs: &Catalogs, requests: &Requests, moderation: &ModerationView) -> View {
+    let mut view = View::default();
+    for p in &catalogs.pointers {
+        let subject = canonical_subject(&p.subject);
+        if pending_subject(requests, subject) && moderation.catalog_blocked.contains(subject) {
+            view.s.insert(p.key.clone());
+            continue;
+        }
+        view.c.insert(p.catalog_hash.clone());
+        if let Some(hashes) = catalogs.live_hashes(p) {
+            view.l.extend(hashes.iter().cloned());
+        }
+    }
+    view
+}
+
+/// Spec 3.4 step 4: a request for each catalog hash with an object under
+/// `catalog-documents/`, `catalog-outboards/` or `catalog-indexes/` that
+/// is not in `C` and has no `envelopes/` record (a tombstone is one), by
+/// hash. Superseded now, as far as the sweep can tell. Its `owner` is
+/// left to the sweep, which reads the document's owner metadata.
+pub fn observe(
+    snapshot: &Snapshot,
+    requests: &Requests,
+    view: &View,
+    now: i64,
+) -> Vec<EnvelopeRequest> {
+    snapshot
+        .envelope_objects
+        .iter()
+        .filter(|hash| !view.c.contains(*hash) && !requests.envelopes.contains_key(*hash))
+        .map(|hash| EnvelopeRequest {
+            hash: hash.clone(),
+            owner: None,
+            superseded_at: now,
+            source: Source::Observed,
+            state: State::Pending,
+            deleted_at: None,
+        })
+        .collect()
+}
+
+/// What the sweep deletes for one due item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Item {
+    /// Recording `hash`: `blobs/`, `outboards/`, `manifests/` and its owner
+    /// record. `requests` are the keys ([`super::recording_key`],
+    /// [`super::operator_key`]) of every request due for it, sorted: the
+    /// ones the sweep marks `deleted`.
+    Recording { hash: String, requests: Vec<String> },
+    /// Subject (canonical): its pointers in `S`, then `subjects/<sub>`.
+    Subject(String),
+    /// Envelope hash: `catalog-documents/`, `catalog-outboards/`,
+    /// `catalog-indexes/`, then `envelopes/<hash>`.
+    Envelope(String),
+}
+
+impl Item {
+    /// `<kind> <name>`: how the report names it, and the order of
+    /// [`Decision::due`].
+    pub fn id(&self) -> String {
+        match self {
+            Item::Recording { hash, .. } => format!("recording {hash}"),
+            Item::Subject(sub) => format!("subject {sub}"),
+            Item::Envelope(hash) => format!("envelope {hash}"),
+        }
+    }
+}
+
+/// What [`due`] decided.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Decision {
+    /// One item per recording hash, subject and envelope due, by
+    /// [`Item::id`]: envelopes, then recordings, then subjects.
+    pub due: Vec<Item>,
+    /// Each pending request not due, as `(id, why)`, by id:
+    /// `recording <sub>/<hash>`, `operator <sub>/<hash>`, `subject <sub>`
+    /// or `envelope <hash>`. `why` is the first rule it fails, in the
+    /// spec's order.
+    pub kept: Vec<(String, String)>,
+}
+
+/// Spec 3.4 step 5: every pending request in `requests`, due or kept.
+///
+/// Deletion is per hash: a recording hash due under any of its requests is
+/// one [`Item::Recording`] naming those requests, and its other requests
+/// are reported as kept.
+pub fn due(snapshot: &Snapshot, requests: &Requests, view: &View, now: i64) -> Decision {
+    let mut recordings: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    let mut items = Vec::new();
+    let mut kept = Vec::new();
+
+    for ((sub, hash), r) in &requests.recordings {
+        if r.state != State::Pending {
+            continue;
+        }
+        match recording_kept(snapshot, view, sub, hash, r, now) {
+            None => recordings
+                .entry(hash)
+                .or_default()
+                .push(recording_key(sub, hash)),
+            Some(why) => kept.push((format!("recording {sub}/{hash}"), why)),
+        }
+    }
+    for ((sub, hash), r) in &requests.operator {
+        if r.state != State::Pending {
+            continue;
+        }
+        match operator_kept(snapshot, view, sub, hash, r) {
+            None => recordings
+                .entry(hash)
+                .or_default()
+                .push(operator_key(sub, hash)),
+            Some(why) => kept.push((format!("operator {sub}/{hash}"), why)),
+        }
+    }
+    for (sub, r) in &requests.subjects {
+        if r.state != State::Pending {
+            continue;
+        }
+        // While its catalog block stands.
+        if snapshot
+            .moderation
+            .catalog_blocked
+            .contains(canonical_subject(sub))
+        {
+            items.push(Item::Subject(sub.clone()));
+        } else {
+            kept.push((format!("subject {sub}"), CATALOG_BLOCK_LIFTED));
+        }
+    }
+    for (hash, r) in &requests.envelopes {
+        if r.state != State::Pending {
+            continue;
+        }
+        match envelope_kept(snapshot, requests, view, hash, r, now) {
+            None => items.push(Item::Envelope(hash.clone())),
+            Some(why) => kept.push((format!("envelope {hash}"), why)),
+        }
+    }
+
+    items.extend(recordings.into_iter().map(|(hash, mut requests)| {
+        requests.sort();
+        Item::Recording {
+            hash: hash.to_string(),
+            requests,
+        }
+    }));
+    items.sort_by_cached_key(Item::id);
+    kept.sort();
+    Decision {
+        due: items,
+        kept: kept
+            .into_iter()
+            .map(|(id, why)| (id, why.to_string()))
+            .collect(),
+    }
+}
+
+/// `recordings/<sub>/<hash>`: due once `GRACE` has passed since the drop,
+/// while `hash` is in no listing and not blocked, if its owner record
+/// names `sub`.
+fn recording_kept(
+    snapshot: &Snapshot,
+    view: &View,
+    sub: &str,
+    hash: &str,
+    r: &RecordingRequest,
+    now: i64,
+) -> Option<&'static str> {
+    if r.requested_at.saturating_add(GRACE) > now {
+        Some(WITHIN_GRACE)
+    } else if view.l.contains(hash) {
+        Some(STILL_LISTED)
+    } else if snapshot.moderation.blocked.contains(hash) {
+        Some(BLOCKED)
+    } else {
+        not_owned_by(&snapshot.owners, hash, sub)
+    }
+}
+
+/// `operator/<sub>/<hash>`. Scope `hash`: while `hash`'s block stands, at
+/// once, listed or not. Scope `subject`: while `sub`'s catalog block
+/// stands, `hash` is in no listing, and its owner record names `sub`.
+fn operator_kept(
+    snapshot: &Snapshot,
+    view: &View,
+    sub: &str,
+    hash: &str,
+    r: &OperatorRequest,
+) -> Option<&'static str> {
+    let moderation = &snapshot.moderation;
+    match r.scope {
+        Scope::Hash => (!moderation.blocked.contains(hash)).then_some(BLOCK_LIFTED),
+        Scope::Subject => {
+            if !moderation.catalog_blocked.contains(canonical_subject(sub)) {
+                Some(CATALOG_BLOCK_LIFTED)
+            } else if view.l.contains(hash) {
+                Some(STILL_LISTED)
+            } else {
+                not_owned_by(&snapshot.owners, hash, sub)
+            }
+        }
+    }
+}
+
+/// `envelopes/<hash>`: due once `GRACE` has passed since it was
+/// superseded, while it is not current and not blocked, unless its owner's
+/// catalog is hidden (an operator asking for everything the owner
+/// published lifts that) or its owner is unknown.
+fn envelope_kept(
+    snapshot: &Snapshot,
+    requests: &Requests,
+    view: &View,
+    hash: &str,
+    r: &EnvelopeRequest,
+    now: i64,
+) -> Option<&'static str> {
+    if r.superseded_at.saturating_add(GRACE) > now {
+        return Some(WITHIN_GRACE);
+    }
+    if view.c.contains(hash) {
+        return Some(STILL_CURRENT);
+    }
+    if snapshot.moderation.blocked.contains(hash) {
+        return Some(BLOCKED);
+    }
+    match envelope_owner(r, &snapshot.catalogs) {
+        Some(owner) => (snapshot.moderation.hidden.contains(owner)
+            && !everything_requested(requests, owner))
+        .then_some(OWNER_HIDDEN),
+        None if snapshot.envelope_objects.contains(hash) => Some(UNKNOWN_OWNER),
+        // No owner known, and no object left to hold back: due, so the
+        // sweep, deleting nothing, marks the request `deleted`.
+        None => None,
+    }
+}
+
+/// An envelope's owner, canonical: its request's (the transition's
+/// subject, or the document's owner metadata the sweep read), else its
+/// index record's.
+fn envelope_owner<'a>(r: &'a EnvelopeRequest, catalogs: &'a Catalogs) -> Option<&'a str> {
+    r.owner
+        .as_deref()
+        .or_else(|| catalogs.indexes.get(&r.hash).map(|i| i.owner.as_str()))
+        .map(canonical_subject)
+}
+
+/// Whether an operator asked for everything `subject` published, which
+/// releases its envelopes from its hidden catalog: a pending `subjects/`
+/// request. A tombstone doesn't count, so an envelope first observed on
+/// the run that deleted its subject's pointers stays held while the
+/// catalog block stands.
+fn everything_requested(requests: &Requests, subject: &str) -> bool {
+    pending_subject(requests, subject)
+}
+
+fn pending_subject(requests: &Requests, subject: &str) -> bool {
+    requests
+        .subjects
+        .get(subject)
+        .is_some_and(|r| r.state == State::Pending)
+}
+
+/// Why `hash` isn't `sub`'s to delete, per its owner record; `None` when
+/// the record names `sub`.
+fn not_owned_by(owners: &HashMap<String, String>, hash: &str, sub: &str) -> Option<&'static str> {
+    match owners.get(hash) {
+        Some(owner) if canonical_subject(owner) == canonical_subject(sub) => None,
+        Some(_) => Some(NOT_THE_REQUESTER),
+        None => Some(NO_OWNER_RECORD),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog_scan::{POINTERS, ScannedIndex, ScannedPointer};
+    use crate::deletion::{
+        GRACE, OperatorRequest, RecordingRequest, Scope, Source, State, SubjectRequest,
+        operator_key, recording_key,
+    };
+    use crate::moderation::canonical_subject;
+
+    const U: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const U2: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+    const NOW: i64 = 1_000_000_000;
+
+    fn h(byte: &str) -> String {
+        byte.repeat(32)
+    }
+
+    fn arkavo(uuid: &str) -> String {
+        format!("arkavo:{uuid}")
+    }
+
+    fn pointer_key(sub: &str) -> String {
+        format!("{POINTERS}{sub}")
+    }
+
+    /// `catalog-pointers/<sub>` at `catalog`, whose index record (owner
+    /// `sub`, as recorded) lists `payloads`.
+    fn point(s: &mut Snapshot, sub: &str, catalog: &str, payloads: &[&str]) {
+        point_1(s, sub, catalog);
+        s.catalogs.indexes.insert(
+            catalog.to_string(),
+            ScannedIndex {
+                owner: sub.to_string(),
+                hashes: payloads.iter().map(|p| p.to_string()).collect(),
+            },
+        );
+    }
+
+    /// `catalog-pointers/<sub>` at `catalog`, with no index record: a
+    /// catalog from before envelopes.
+    fn point_1(s: &mut Snapshot, sub: &str, catalog: &str) {
+        s.catalogs.pointers.push(ScannedPointer {
+            key: pointer_key(sub),
+            subject: canonical_subject(sub).to_string(),
+            seq: 1,
+            catalog_hash: catalog.to_string(),
+            index_hash: None,
+            digest: h("d1"),
+        });
+        s.catalogs.pointers.sort_by(|a, b| a.key.cmp(&b.key));
+    }
+
+    fn recording(r: &mut Requests, sub: &str, hash: &str, requested_at: i64) {
+        r.recordings.insert(
+            (sub.to_string(), hash.to_string()),
+            RecordingRequest {
+                hash: hash.to_string(),
+                subject: sub.to_string(),
+                requested_at,
+                seq: 1,
+                state: State::Pending,
+                deleted_at: None,
+            },
+        );
+    }
+
+    fn operator(r: &mut Requests, sub: &str, hash: &str, scope: Scope) {
+        r.operator.insert(
+            (sub.to_string(), hash.to_string()),
+            OperatorRequest {
+                hash: hash.to_string(),
+                subject: sub.to_string(),
+                requested_at: NOW,
+                reason: "r".into(),
+                scope,
+                state: State::Pending,
+                deleted_at: None,
+            },
+        );
+    }
+
+    fn subject(r: &mut Requests, sub: &str) {
+        r.subjects.insert(
+            sub.to_string(),
+            SubjectRequest {
+                subject: sub.to_string(),
+                requested_at: NOW,
+                reason: "r".into(),
+                state: State::Pending,
+                deleted_at: None,
+            },
+        );
+    }
+
+    fn envelope(r: &mut Requests, hash: &str, owner: Option<&str>, superseded_at: i64) {
+        r.envelopes.insert(
+            hash.to_string(),
+            EnvelopeRequest {
+                hash: hash.to_string(),
+                owner: owner.map(str::to_string),
+                superseded_at,
+                source: Source::Transition,
+                state: State::Pending,
+                deleted_at: None,
+            },
+        );
+    }
+
+    fn catalog_block(s: &mut Snapshot, sub: &str) {
+        s.moderation.catalog_blocked.insert(sub.to_string());
+        s.moderation.hidden.insert(sub.to_string());
+    }
+
+    fn lift_catalog_block(s: &mut Snapshot, sub: &str) {
+        s.moderation.catalog_blocked.remove(sub);
+        s.moderation.hidden.remove(sub);
+    }
+
+    fn owns(s: &mut Snapshot, hash: &str, sub: &str) {
+        s.owners.insert(hash.to_string(), sub.to_string());
+    }
+
+    /// Decide on `requests`, passed apart from the snapshot (whose own
+    /// `requests` the tests leave empty: the functions read the folded
+    /// ones only).
+    fn decide(s: &Snapshot, requests: &Requests) -> Decision {
+        due(
+            s,
+            requests,
+            &view(&s.catalogs, requests, &s.moderation),
+            NOW,
+        )
+    }
+
+    fn rec(hash: &str, requests: &[String]) -> Item {
+        Item::Recording {
+            hash: hash.to_string(),
+            requests: requests.to_vec(),
+        }
+    }
+
+    fn kept(id: String, why: &str) -> (String, String) {
+        (id, why.to_string())
+    }
+
+    fn set<const N: usize>(items: [String; N]) -> HashSet<String> {
+        HashSet::from(items)
+    }
+
+    #[test]
+    fn s_holds_every_pointer_of_a_subject_being_deleted() {
+        let mut s = Snapshot::default();
+        point(&mut s, &arkavo(U), &h("c1"), &[&h("a1")]);
+        point(&mut s, U, &h("c2"), &[&h("a2")]);
+        point(&mut s, "u2", &h("c3"), &[&h("a3")]);
+        let mut r = Requests::default();
+        subject(&mut r, U);
+        catalog_block(&mut s, U);
+
+        let v = view(&s.catalogs, &r, &s.moderation);
+        assert_eq!(
+            v.s,
+            BTreeSet::from([pointer_key(&arkavo(U)), pointer_key(U)]),
+            "both pointer keys of the canonical subject"
+        );
+        assert_eq!(v.l, set([h("a3")]));
+        assert_eq!(v.c, set([h("c3")]));
+
+        // With the block lifted, nothing is being deleted.
+        lift_catalog_block(&mut s, U);
+        let v = view(&s.catalogs, &r, &s.moderation);
+        assert!(v.s.is_empty(), "{:?}", v.s);
+        assert_eq!(v.l, set([h("a1"), h("a2"), h("a3")]));
+        assert_eq!(v.c, set([h("c1"), h("c2"), h("c3")]));
+
+        // Nor with the block alone, or over a tombstone.
+        catalog_block(&mut s, U);
+        assert!(
+            view(&s.catalogs, &Requests::default(), &s.moderation)
+                .s
+                .is_empty()
+        );
+        let done = r.subjects.get_mut(U).unwrap();
+        done.state = State::Deleted;
+        done.deleted_at = Some(NOW);
+        assert!(view(&s.catalogs, &r, &s.moderation).s.is_empty());
+    }
+
+    #[test]
+    fn l_counts_hidden_catalogs() {
+        let mut s = Snapshot::default();
+        // Catalog-blocked, with no subject request.
+        point(&mut s, "u1", &h("c1"), &[&h("a1")]);
+        catalog_block(&mut s, "u1");
+        // Hidden by a hideCatalog suspension, with a subject request (no
+        // catalog block, so not being deleted).
+        point(&mut s, "u2", &h("c2"), &[&h("a2")]);
+        s.moderation.hidden.insert("u2".into());
+        let mut r = Requests::default();
+        subject(&mut r, "u2");
+        // A blocked envelope.
+        point(&mut s, "u3", &h("c3"), &[&h("a3")]);
+        s.moderation.blocked.insert(h("c3"));
+        // From before envelopes: current, listing nothing.
+        point_1(&mut s, "u4", &h("c4"));
+
+        let v = view(&s.catalogs, &r, &s.moderation);
+        assert!(v.s.is_empty(), "{:?}", v.s);
+        assert_eq!(v.l, set([h("a1"), h("a2"), h("a3")]));
+        assert_eq!(v.c, set([h("c1"), h("c2"), h("c3"), h("c4")]));
+    }
+
+    #[test]
+    fn untracked_envelopes_are_observed() {
+        let mut s = Snapshot::default();
+        point(&mut s, "u1", &h("c1"), &[]);
+        // Being deleted: its current envelope is no longer in `C`.
+        point(&mut s, U, &h("c2"), &[]);
+        catalog_block(&mut s, U);
+        let mut r = Requests::default();
+        subject(&mut r, U);
+        // Tracked: pending, and a tombstone.
+        envelope(&mut r, &h("e2"), None, 1);
+        envelope(&mut r, &h("e3"), None, 1);
+        let done = r.envelopes.get_mut(&h("e3")).unwrap();
+        done.state = State::Deleted;
+        done.deleted_at = Some(2);
+        s.envelope_objects = BTreeSet::from([h("c1"), h("c2"), h("e1"), h("e2"), h("e3")]);
+
+        let v = view(&s.catalogs, &r, &s.moderation);
+        let observed = |hash: String| EnvelopeRequest {
+            hash,
+            owner: None,
+            superseded_at: NOW,
+            source: Source::Observed,
+            state: State::Pending,
+            deleted_at: None,
+        };
+        assert_eq!(
+            observe(&s, &r, &v, NOW),
+            [observed(h("c2")), observed(h("e1"))],
+            "by hash"
+        );
+    }
+
+    #[test]
+    fn a_dropped_recording_is_due_after_grace() {
+        let mut s = Snapshot::default();
+        point(&mut s, "u2", &h("c1"), &[&h("a3")]);
+        s.moderation.blocked.insert(h("a4"));
+        for hash in ["a1", "a2", "a3", "a4"] {
+            owns(&mut s, &h(hash), "u1");
+        }
+        owns(&mut s, &h("a5"), "u2");
+        let mut r = Requests::default();
+        recording(&mut r, "u1", &h("a1"), NOW - GRACE);
+        recording(&mut r, "u1", &h("a2"), NOW - GRACE + 1);
+        for hash in ["a3", "a4", "a5", "a6"] {
+            recording(&mut r, "u1", &h(hash), NOW - GRACE);
+        }
+
+        let out = decide(&s, &r);
+        assert_eq!(out.due, [rec(&h("a1"), &[recording_key("u1", &h("a1"))])]);
+        let id = |hash: &str| format!("recording u1/{}", h(hash));
+        assert_eq!(
+            out.kept,
+            [
+                kept(id("a2"), "within grace"),
+                kept(id("a3"), "still listed"),
+                kept(id("a4"), "blocked"),
+                kept(id("a5"), "owner is not the requester"),
+                kept(id("a6"), "no owner record"),
+            ]
+        );
+
+        // A grace that would overflow never reads as due.
+        let mut r = Requests::default();
+        recording(&mut r, "u1", &h("a1"), i64::MAX);
+        let out = decide(&s, &r);
+        assert!(out.due.is_empty());
+        assert_eq!(out.kept, [kept(id("a1"), "within grace")]);
+    }
+
+    #[test]
+    fn one_item_per_recording() {
+        let mut s = Snapshot::default();
+        owns(&mut s, &h("a1"), U);
+        catalog_block(&mut s, U);
+        let mut r = Requests::default();
+        recording(&mut r, U, &h("a1"), NOW - GRACE);
+        operator(&mut r, U, &h("a1"), Scope::Subject);
+
+        let out = decide(&s, &r);
+        assert_eq!(
+            out.due,
+            [rec(
+                &h("a1"),
+                &[operator_key(U, &h("a1")), recording_key(U, &h("a1"))]
+            )]
+        );
+        assert!(out.kept.is_empty(), "{:?}", out.kept);
+    }
+
+    /// Deletion is per hash: a hash due under one request is due, and only
+    /// its due requests are named (and marked). The others are reported.
+    #[test]
+    fn a_hash_due_under_one_request_and_kept_under_another() {
+        let mut s = Snapshot::default();
+        owns(&mut s, &h("a1"), "u1");
+        s.moderation.blocked.insert(h("a1"));
+        let mut r = Requests::default();
+        recording(&mut r, "u1", &h("a1"), NOW - GRACE);
+        operator(&mut r, "u1", &h("a1"), Scope::Hash);
+        // Another subject's request for the same hash: still one item.
+        operator(&mut r, "u2", &h("a1"), Scope::Hash);
+
+        let out = decide(&s, &r);
+        assert_eq!(
+            out.due,
+            [rec(
+                &h("a1"),
+                &[operator_key("u1", &h("a1")), operator_key("u2", &h("a1"))]
+            )]
+        );
+        assert_eq!(
+            out.kept,
+            [kept(format!("recording u1/{}", h("a1")), "blocked")]
+        );
+    }
+
+    #[test]
+    fn operator_hash_scope_needs_only_its_block() {
+        let mut s = Snapshot::default();
+        // Listed, owned by another account, and requested just now.
+        point(&mut s, "u2", &h("c1"), &[&h("a1")]);
+        owns(&mut s, &h("a1"), "u2");
+        s.moderation.blocked.insert(h("a1"));
+        let mut r = Requests::default();
+        operator(&mut r, "u1", &h("a1"), Scope::Hash);
+
+        let out = decide(&s, &r);
+        assert_eq!(out.due, [rec(&h("a1"), &[operator_key("u1", &h("a1"))])]);
+        assert!(out.kept.is_empty(), "{:?}", out.kept);
+
+        s.moderation.blocked.clear();
+        let out = decide(&s, &r);
+        assert!(out.due.is_empty(), "{:?}", out.due);
+        assert_eq!(
+            out.kept,
+            [kept(format!("operator u1/{}", h("a1")), "block lifted")]
+        );
+    }
+
+    #[test]
+    fn operator_subject_scope_needs_the_catalog_block() {
+        let mut s = Snapshot::default();
+        // `U`'s own catalog lists a1, but `U` is being deleted: its
+        // pointer is in `S`, so a1 is not in `L`.
+        point(&mut s, &arkavo(U), &h("c1"), &[&h("a1")]);
+        point(&mut s, "u2", &h("c2"), &[&h("a2")]);
+        catalog_block(&mut s, U);
+        for hash in ["a1", "a2"] {
+            owns(&mut s, &h(hash), U);
+        }
+        owns(&mut s, &h("a3"), "u2");
+        let mut r = Requests::default();
+        subject(&mut r, U);
+        for hash in ["a1", "a2", "a3", "a4"] {
+            operator(&mut r, U, &h(hash), Scope::Subject);
+        }
+        let id = |hash: &str| format!("operator {U}/{}", h(hash));
+
+        let out = decide(&s, &r);
+        assert_eq!(
+            out.due,
+            [
+                rec(&h("a1"), &[operator_key(U, &h("a1"))]),
+                Item::Subject(U.to_string()),
+            ]
+        );
+        assert_eq!(
+            out.kept,
+            [
+                kept(id("a2"), "still listed"),
+                kept(id("a3"), "owner is not the requester"),
+                kept(id("a4"), "no owner record"),
+            ]
+        );
+
+        lift_catalog_block(&mut s, U);
+        let out = decide(&s, &r);
+        assert!(out.due.is_empty(), "{:?}", out.due);
+        assert_eq!(
+            out.kept,
+            [
+                kept(id("a1"), "catalog block lifted"),
+                kept(id("a2"), "catalog block lifted"),
+                kept(id("a3"), "catalog block lifted"),
+                kept(id("a4"), "catalog block lifted"),
+                kept(format!("subject {U}"), "catalog block lifted"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_subject_is_due_while_its_catalog_block_stands() {
+        let mut s = Snapshot::default();
+        point(&mut s, &arkavo(U), &h("c1"), &[]);
+        point(&mut s, U, &h("c2"), &[]);
+        catalog_block(&mut s, U);
+        let mut r = Requests::default();
+        subject(&mut r, U);
+        // A subject with no pointer left is due too.
+        subject(&mut r, U2);
+        catalog_block(&mut s, U2);
+
+        let out = decide(&s, &r);
+        assert_eq!(
+            out.due,
+            [Item::Subject(U.to_string()), Item::Subject(U2.to_string())]
+        );
+        assert!(out.kept.is_empty(), "{:?}", out.kept);
+
+        lift_catalog_block(&mut s, U);
+        let out = decide(&s, &r);
+        assert_eq!(out.due, [Item::Subject(U2.to_string())]);
+        assert_eq!(
+            out.kept,
+            [kept(format!("subject {U}"), "catalog block lifted")]
+        );
+    }
+
+    #[test]
+    fn an_envelope_is_due_after_grace() {
+        let mut s = Snapshot::default();
+        point(&mut s, "u3", &h("e3"), &[]);
+        s.moderation.blocked.insert(h("e4"));
+        catalog_block(&mut s, "u4");
+        s.moderation.hidden.insert("u5".into());
+        catalog_block(&mut s, "u6");
+        let mut r = Requests::default();
+        subject(&mut r, "u6");
+        let past = NOW - GRACE;
+        envelope(&mut r, &h("e1"), Some("u1"), past);
+        envelope(&mut r, &h("e2"), Some("u1"), past + 1);
+        envelope(&mut r, &h("e3"), Some("u3"), past);
+        envelope(&mut r, &h("e4"), Some("u1"), past);
+        // Hidden: by a catalog block, and by hideCatalog.
+        envelope(&mut r, &h("e5"), Some("u4"), past);
+        envelope(&mut r, &h("e6"), Some("u5"), past);
+        // Hidden, but the operator asked for everything u6 published.
+        envelope(&mut r, &h("e7"), Some("u6"), past);
+        // No owner known, and its objects are there.
+        envelope(&mut r, &h("e8"), None, past);
+        s.envelope_objects = (1..=8).map(|i| h(&format!("e{i}"))).collect();
+
+        let out = decide(&s, &r);
+        assert_eq!(
+            out.due,
+            [
+                Item::Envelope(h("e1")),
+                Item::Envelope(h("e7")),
+                Item::Subject("u6".into()),
+            ]
+        );
+        let id = |hash: &str| format!("envelope {}", h(hash));
+        assert_eq!(
+            out.kept,
+            [
+                kept(id("e2"), "within grace"),
+                kept(id("e3"), "still current"),
+                kept(id("e4"), "blocked"),
+                kept(id("e5"), "owner hidden"),
+                kept(id("e6"), "owner hidden"),
+                kept(id("e8"), "unknown owner"),
+            ]
+        );
+    }
+
+    /// An envelope's owner is its request's, else its index record's; both
+    /// compared canonically.
+    #[test]
+    fn an_envelopes_owner_is_its_requests_else_its_index_records() {
+        let mut s = Snapshot::default();
+        catalog_block(&mut s, U);
+        let past = NOW - GRACE;
+        let mut r = Requests::default();
+        // The index record names the owner: not hidden, then hidden.
+        envelope(&mut r, &h("e1"), None, past);
+        envelope(&mut r, &h("e2"), None, past);
+        for (hash, owner) in [("e1", U2.to_string()), ("e2", arkavo(U))] {
+            s.catalogs.indexes.insert(
+                h(hash),
+                ScannedIndex {
+                    owner,
+                    hashes: BTreeSet::new(),
+                },
+            );
+        }
+        // The request names the owner first, over its index record's.
+        envelope(&mut r, &h("e3"), Some(&arkavo(U)), past);
+        s.catalogs.indexes.insert(
+            h("e3"),
+            ScannedIndex {
+                owner: U2.to_string(),
+                hashes: BTreeSet::new(),
+            },
+        );
+        s.envelope_objects = BTreeSet::from([h("e1"), h("e2"), h("e3")]);
+
+        let out = decide(&s, &r);
+        assert_eq!(out.due, [Item::Envelope(h("e1"))]);
+        assert_eq!(
+            out.kept,
+            [
+                kept(format!("envelope {}", h("e2")), "owner hidden"),
+                kept(format!("envelope {}", h("e3")), "owner hidden"),
+            ]
+        );
+    }
+
+    /// With every object gone, an unknown owner holds nothing back: the
+    /// sweep deletes nothing and marks the request `deleted`. The other
+    /// conditions still apply.
+    #[test]
+    fn an_envelope_whose_objects_are_gone_is_due() {
+        let mut s = Snapshot::default();
+        point(&mut s, "u3", &h("e3"), &[]);
+        s.moderation.blocked.insert(h("e4"));
+        let past = NOW - GRACE;
+        let mut r = Requests::default();
+        envelope(&mut r, &h("e1"), None, past);
+        envelope(&mut r, &h("e2"), None, past + 1);
+        envelope(&mut r, &h("e3"), None, past);
+        envelope(&mut r, &h("e4"), None, past);
+
+        let out = decide(&s, &r);
+        assert_eq!(out.due, [Item::Envelope(h("e1"))]);
+        let id = |hash: &str| format!("envelope {}", h(hash));
+        assert_eq!(
+            out.kept,
+            [
+                kept(id("e2"), "within grace"),
+                kept(id("e3"), "still current"),
+                kept(id("e4"), "blocked"),
+            ]
+        );
+    }
+
+    /// Only a pending `subjects/` request releases a hidden owner's
+    /// envelopes; a tombstone doesn't.
+    #[test]
+    fn a_subject_tombstone_does_not_release_a_hidden_owners_envelope() {
+        let mut s = Snapshot::default();
+        catalog_block(&mut s, U);
+        let mut r = Requests::default();
+        subject(&mut r, U);
+        let done = r.subjects.get_mut(U).unwrap();
+        done.state = State::Deleted;
+        done.deleted_at = Some(NOW - GRACE);
+        envelope(&mut r, &h("e1"), Some(U), NOW - GRACE);
+        s.envelope_objects = BTreeSet::from([h("e1")]);
+
+        let out = decide(&s, &r);
+        assert!(out.due.is_empty(), "{:?}", out.due);
+        assert_eq!(
+            out.kept,
+            [kept(format!("envelope {}", h("e1")), "owner hidden")]
+        );
+    }
+
+    #[test]
+    fn tombstones_are_neither_due_nor_kept() {
+        let mut s = Snapshot::default();
+        owns(&mut s, &h("a1"), "u1");
+        s.moderation.blocked.insert(h("a2"));
+        catalog_block(&mut s, "u1");
+        let mut r = Requests::default();
+        recording(&mut r, "u1", &h("a1"), 1);
+        operator(&mut r, "u1", &h("a2"), Scope::Hash);
+        subject(&mut r, "u1");
+        envelope(&mut r, &h("e1"), None, 1);
+        for request in r.recordings.values_mut() {
+            (request.state, request.deleted_at) = (State::Deleted, Some(2));
+        }
+        for request in r.operator.values_mut() {
+            (request.state, request.deleted_at) = (State::Deleted, Some(2));
+        }
+        for request in r.subjects.values_mut() {
+            (request.state, request.deleted_at) = (State::Deleted, Some(2));
+        }
+        for request in r.envelopes.values_mut() {
+            (request.state, request.deleted_at) = (State::Deleted, Some(2));
+        }
+
+        assert_eq!(decide(&s, &r), Decision::default());
+    }
+
+    #[test]
+    fn due_and_kept_are_listed_by_id() {
+        let mut s = Snapshot::default();
+        owns(&mut s, &h("a1"), "u1");
+        owns(&mut s, &h("a2"), "u1");
+        catalog_block(&mut s, "u1");
+        let mut r = Requests::default();
+        subject(&mut r, "u1");
+        recording(&mut r, "u1", &h("a2"), NOW - GRACE);
+        recording(&mut r, "u1", &h("a1"), NOW - GRACE);
+        envelope(&mut r, &h("e2"), None, NOW - GRACE);
+        envelope(&mut r, &h("e1"), None, NOW - GRACE);
+        // Kept, one of each kind.
+        recording(&mut r, "u2", &h("a3"), NOW);
+        operator(&mut r, "u2", &h("a3"), Scope::Hash);
+        subject(&mut r, "u2");
+        envelope(&mut r, &h("e3"), None, NOW);
+
+        let out = decide(&s, &r);
+        assert_eq!(
+            out.due,
+            [
+                Item::Envelope(h("e1")),
+                Item::Envelope(h("e2")),
+                rec(&h("a1"), &[recording_key("u1", &h("a1"))]),
+                rec(&h("a2"), &[recording_key("u1", &h("a2"))]),
+                Item::Subject("u1".into()),
+            ]
+        );
+        let ids: Vec<_> = out.kept.iter().map(|(id, _)| id.clone()).collect();
+        assert_eq!(
+            ids,
+            [
+                format!("envelope {}", h("e3")),
+                format!("operator u2/{}", h("a3")),
+                format!("recording u2/{}", h("a3")),
+                "subject u2".to_string(),
+            ]
+        );
+    }
+}
