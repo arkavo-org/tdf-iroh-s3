@@ -374,7 +374,7 @@ The node checks the following in order:
 | exactly one of `If-Match: "<seq>"` or `If-None-Match: *` is sent | 428 `precondition required` |
 | The stored pointer is the base named by `If-Match` or `If-None-Match` | 412 `catalog changed since it was read` |
 | `seq` is greater than the stored one | 409 `seq must be greater than <n>` |
-| The envelope has no index record yet, or its record is a retry of this publish: `{sub}`'s (subjects compared canonically), with the same canonical index. Checked as the record is written, before the envelope and its outboard. | 409 `catalog document already published with another index`; 502 `storage unavailable` when the existing record can't be read |
+| The envelope has no index record yet, or its record is a retry of this publish: `{sub}`'s (subjects compared canonically), with the same canonical index. Checked as the record is written, before the envelope and its outboard. | 409 `catalog document already published with another index`; 502 `storage unavailable` when the record can't be created or the existing one can't be read |
 
 The two owner refusals also carry `contentIDs`: the `contentID` of every entry refused, sorted, including every entry that names the same payload. For example: `{"error":"recording belongs to another account","contentIDs":["rec-a","rec-b"]}`. Every other refusal in the table is `{"error":"…"}` alone.
 

@@ -61,8 +61,8 @@ pub trait TagStore: Send + Sync + 'static {
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
     /// Create a catalog's index record (`catalog-indexes/<hash>`, never
     /// served) only if none exists: one envelope has one index. `false`
-    /// when one already does, or when a concurrent create of it is still in
-    /// flight.
+    /// when one already does; `Err` when it can't be created, a concurrent
+    /// create of it still in flight after the retries included.
     fn create_catalog_index(
         &self,
         hash_hex: &str,
@@ -299,8 +299,9 @@ pub(crate) mod test_support {
         /// The next conditional pointer write loses, as if another publish
         /// had moved the pointer since it was read.
         pub lose_next_pointer_race: std::sync::atomic::AtomicBool,
-        /// The next index record create loses without writing, as if a
-        /// concurrent create of the same record were still in flight.
+        /// The next index record create reports one already there, without
+        /// writing, though none is stored: as if the record were deleted
+        /// between the create and its read.
         pub lose_next_index_create: std::sync::atomic::AtomicBool,
         /// The next index record create fails without writing.
         pub fail_next_index_create: std::sync::atomic::AtomicBool,

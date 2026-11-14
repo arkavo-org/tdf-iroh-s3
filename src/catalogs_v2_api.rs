@@ -548,8 +548,9 @@ async fn put_catalog<S: TagStore>(
         .map_err(|e| storage_unavailable("Catalog index write", e))?;
     if !created {
         // The envelope already has a record: a retry of this publish goes
-        // on, another index is a 409, and none readable yet (a concurrent
-        // create still in flight) is a 502.
+        // on, another index is a 409, and none there to read (deleted since
+        // the create lost) is a 502. A create still answered 409 after its
+        // retries (`send_conditional`) was an `Err`: a 502 above.
         let existing = api
             .store
             .get_catalog_index(&hash)
@@ -558,7 +559,7 @@ async fn put_catalog<S: TagStore>(
             .ok_or_else(|| {
                 storage_unavailable(
                     "Catalog index read",
-                    anyhow::anyhow!("index record {hash} exists but can't be read yet"),
+                    anyhow::anyhow!("index record {hash} exists but can't be read"),
                 )
             })?;
         let retry = is_retry(&existing, &sub, &index_hash)
@@ -2096,7 +2097,7 @@ mod tests {
     #[tokio::test]
     async fn an_index_record_that_cannot_be_read_back_is_unavailable() {
         let unavailable = (StatusCode::BAD_GATEWAY, "storage unavailable");
-        // The create loses to one still in flight, so nothing is there yet.
+        // The create loses, yet no record is there to read.
         let h = ingested().await;
         h.store
             .lose_next_index_create
@@ -2105,7 +2106,7 @@ mod tests {
         assert_eq!((r.status, r.error().as_str()), unavailable);
         assert_nothing_stored(&h).await;
 
-        // The create fails.
+        // The create fails: S3's 409 on every attempt, say.
         let h = ingested().await;
         h.store
             .fail_next_index_create
