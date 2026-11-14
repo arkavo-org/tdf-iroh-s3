@@ -12,7 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 use tracing::warn;
 
-use crate::creator_catalog::is_lower_hex_hash;
+use crate::creator_catalog::{is_lower_hex_hash, object_from_slice};
 use crate::moderation::{canonical_subject, valid_subject};
 use crate::object_store::ObjectStore;
 use crate::store::s3::S3Client;
@@ -41,7 +41,7 @@ pub enum OwnerView {
 /// record's JSON, name `hash` itself and carry a valid subject.
 pub fn parse_owner(hash: &str, bytes: &[u8]) -> anyhow::Result<BlobOwner> {
     let owner: BlobOwner =
-        serde_json::from_slice(bytes).with_context(|| format!("owner record {hash} unreadable"))?;
+        object_from_slice(bytes).with_context(|| format!("owner record {hash} unreadable"))?;
     anyhow::ensure!(owner.hash == hash, "owner record {hash} names another hash");
     anyhow::ensure!(
         valid_subject(&owner.subject),
@@ -309,6 +309,15 @@ mod tests {
 
         let no_at = format!(r#"{{"hash":"{H}","subject":"u1","endpointId":"e"}}"#);
         assert!(parse_owner(H, no_at.as_bytes()).is_err());
+
+        // The same values as an array: a derived struct reads it, the
+        // record must be an object.
+        let array = crate::creator_catalog::test_support::array_form(good.as_bytes());
+        let why = parse_owner(H, &array).unwrap_err();
+        assert!(
+            format!("{why:#}").contains("expected a JSON object"),
+            "{why:#}"
+        );
     }
 
     #[test]

@@ -51,8 +51,8 @@ use crate::catalog_metadata::{self, CAMPAIGN_FQN_PREFIX, EnvelopeRefusal};
 use crate::catalog_v2::{self, Bundle, BundleError, POINTER_SCHEMA, Passkeys};
 use crate::catalogs_api::{check_payloads, is_json, owner_hidden, owner_subjects};
 use crate::creator_catalog::{
-    self, CreatorCatalogEntry, MAX_CATALOG_BYTES, MAX_OWNER_BYTES, NoDuplicateKeys,
-    valid_identifier,
+    self, CreatorCatalogEntry, MAX_CATALOG_BYTES, MAX_OWNER_BYTES, NoDuplicateKeys, object,
+    object_from_slice, valid_identifier,
 };
 use crate::deletion::{Transition, TransitionBase, transition_name};
 use crate::moderation::{bearer, canonical_subject, now_secs};
@@ -228,6 +228,7 @@ pub fn router<S: TagStore>(state: Arc<V2State<S>>) -> Router {
 #[serde(deny_unknown_fields)]
 struct PutRequest {
     document: String,
+    #[serde(deserialize_with = "object")]
     bundle: Bundle,
     index: serde_json::Value,
 }
@@ -246,7 +247,7 @@ pub(crate) struct StoredPointerInfo {
 /// Read a stored bundle's pointer. The node wrote it after verifying it,
 /// so failing to read it back is a storage fault.
 pub(crate) fn stored_pointer(body: &[u8]) -> anyhow::Result<StoredPointerInfo> {
-    let bundle: Bundle = serde_json::from_slice(body)?;
+    let bundle: Bundle = object_from_slice(body)?;
     let bytes = URL_SAFE_NO_PAD.decode(&bundle.pointer)?;
     let pointer = catalog_v2::parse_pointer(&bytes).map_err(anyhow::Error::msg)?;
     Ok(StoredPointerInfo {
@@ -376,7 +377,7 @@ async fn put_catalog<S: TagStore>(
     let invalid =
         |e: serde_json::Error| fail(StatusCode::BAD_REQUEST, format!("invalid request: {e}"));
     serde_json::from_slice::<NoDuplicateKeys>(&bytes).map_err(invalid)?;
-    let req: PutRequest = serde_json::from_slice(&bytes).map_err(invalid)?;
+    let req: PutRequest = object_from_slice(&bytes).map_err(invalid)?;
     let document = URL_SAFE_NO_PAD
         .decode(&req.document)
         .ok()
@@ -767,7 +768,7 @@ fn is_retry(record: &[u8], sub: &str, index_hash: &str) -> anyhow::Result<bool> 
 
 /// A stored index record's owner and parsed entries.
 fn read_index_record(record: &[u8]) -> anyhow::Result<(String, Vec<CreatorCatalogEntry>)> {
-    let record: IndexRecord = serde_json::from_slice(record)?;
+    let record: IndexRecord = object_from_slice(record)?;
     let entries = creator_catalog::parse_index(record.entries)
         .map_err(|why| anyhow::anyhow!("invalid index: {why}"))?;
     Ok((record.owner, entries))
@@ -901,7 +902,7 @@ impl<S: TagStore> V2State<S> {
         else {
             return Ok(None);
         };
-        let record: IndexRecord = serde_json::from_slice(&body)
+        let record: IndexRecord = object_from_slice(&body)
             .map_err(|e| storage_unavailable("Catalog index parse", e.into()))?;
         let mut known = self.known_attributes();
         if known.len() >= ATTRIBUTE_CACHE_CAPACITY {
@@ -3425,6 +3426,67 @@ mod tests {
             (StatusCode::NOT_FOUND, "catalog not found")
         );
         assert_eq!(get(&h, "a..b").await.status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A derived struct also reads a JSON array of its fields in order;
+    /// the request, its bundle and the bundle's assertion must be objects.
+    #[tokio::test]
+    async fn a_request_bundle_or_assertion_as_an_array_is_refused() {
+        let h = ingested().await;
+        let document = envelope(1);
+        let bundle = signed(1, &document, &index());
+        let good: serde_json::Value = serde_json::from_slice(&body(&document, &bundle)).unwrap();
+        let values = |v: &serde_json::Value, keys: &[&str]| {
+            json!(keys.iter().map(|k| v[*k].clone()).collect::<Vec<_>>())
+        };
+        let request = values(&good, &["document", "bundle", "index"]);
+        let mut in_bundle = good.clone();
+        in_bundle["bundle"] = values(&good["bundle"], &["pointer", "assertion", "credential"]);
+        let mut in_assertion = good.clone();
+        in_assertion["bundle"]["assertion"] = values(
+            &good["bundle"]["assertion"],
+            &[
+                "credentialId",
+                "authenticatorData",
+                "clientDataJSON",
+                "signature",
+            ],
+        );
+        for (what, b) in [
+            ("request", request),
+            ("bundle", in_bundle),
+            ("assertion", in_assertion),
+        ] {
+            let r = put(&h, SUB, &token(SUB), serde_json::to_vec(&b).unwrap()).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{what}: {}", r.error());
+            assert!(
+                r.error().starts_with("invalid request: ")
+                    && r.error().contains("expected a JSON object"),
+                "{what}: {}",
+                r.error()
+            );
+        }
+        assert!(h.store.catalog_pointers.lock().await.is_empty());
+        let r = put(&h, SUB, &token(SUB), serde_json::to_vec(&good).unwrap()).await;
+        assert!(r.status.is_success(), "{}", r.error());
+    }
+
+    /// The stored bundle and index record are read back as objects only.
+    #[test]
+    fn a_stored_bundle_or_index_record_as_an_array_is_refused() {
+        use crate::creator_catalog::test_support::array_form;
+        let document = envelope(1);
+        let stored = serde_json::to_vec(&signed(1, &document, &index())).unwrap();
+        assert!(stored_pointer(&stored).is_ok());
+        assert!(stored_pointer(&array_form(&stored)).is_err());
+        let record = serde_json::to_vec(&IndexRecord {
+            owner: SUB.to_string(),
+            attribute: "https://patreon.arkavo.com/attr/campaign/value/1".to_string(),
+            entries: index(),
+        })
+        .unwrap();
+        assert!(read_index_record(&record).is_ok());
+        assert!(read_index_record(&array_form(&record)).is_err());
     }
 
     #[tokio::test]

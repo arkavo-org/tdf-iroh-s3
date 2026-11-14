@@ -10,7 +10,7 @@ use anyhow::Context;
 use std::collections::{BTreeSet, HashMap};
 
 use crate::catalogs_v2_api::{IndexRecord, stored_pointer};
-use crate::creator_catalog::{index_hash, is_lower_hex_hash, parse_index};
+use crate::creator_catalog::{index_hash, is_lower_hex_hash, object_from_slice, parse_index};
 use crate::moderation::{canonical_subject, valid_subject};
 use crate::object_store::{ObjectInfo, ObjectStore, bodies, parsed};
 
@@ -103,7 +103,7 @@ pub async fn scan<O: ObjectStore>(store: &O) -> anyhow::Result<Catalogs> {
         let hash = name(&key, INDEXES)?;
         anyhow::ensure!(is_lower_hex_hash(hash), "{key}: not a catalog hash");
         let record: IndexRecord =
-            serde_json::from_slice(&body).with_context(|| format!("{key} unreadable"))?;
+            object_from_slice(&body).with_context(|| format!("{key} unreadable"))?;
         let entries = parse_index(record.entries)
             .map_err(|why| anyhow::anyhow!("{key} unreadable: invalid index: {why}"))?;
         let canonical = index_hash(&entries);

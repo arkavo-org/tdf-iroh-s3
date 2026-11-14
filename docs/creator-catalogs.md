@@ -108,7 +108,7 @@ A creator whose metadata TDF had a weaker policy than its recording would show t
 
 ## The index
 
-The node can't decrypt the envelope, so the publisher sends the document's entries in the clear alongside it, as `index` in `PUT /v2/catalogs/{sub}`: a JSON array of at most 1000 entries, each exactly `{"contentID", "version", "payloadHash", "payloadSize"}`, the document's entry without its `metadata`, held to the same rules. **The creator's passkey signs the index** through the pointer's [`indexHash`](#indexhash), the SHA-256 of its canonical form, and the node refuses an index that doesn't match it. The node checks the recordings against what it has ingested, stores the index at `catalog-indexes/<hash>`, once per envelope, and **never serves it**. Moderation reads it to find a recording's hash from its `contentID`.
+The node can't decrypt the envelope, so the publisher sends the document's entries in the clear alongside it, as `index` in `PUT /v2/catalogs/{sub}`: a JSON array of at most 1000 entries, each exactly `{"contentID", "version", "payloadHash", "payloadSize"}` (a JSON object: the same values as an array are rejected), the document's entry without its `metadata`, held to the same rules. **The creator's passkey signs the index** through the pointer's [`indexHash`](#indexhash), the SHA-256 of its canonical form, and the node refuses an index that doesn't match it. The node checks the recordings against what it has ingested, stores the index at `catalog-indexes/<hash>`, once per envelope, and **never serves it**. Moderation reads it to find a recording's hash from its `contentID`.
 
 The signature binds the index to the pointer, and so to the envelope's hash, but not to the entries inside the encrypted document: those two agree only by the creator's honesty. An entry left out of the index can only hide the creator's own entry from moderation, so reports carry the `payloadHash`, not just a `contentID`.
 
@@ -257,7 +257,7 @@ A reader checks the whole chain itself. So neither the node nor its storage can 
 
 ### The pointer
 
-The exact UTF-8 bytes of one JSON object. It is carried base64url-encoded and is never re-serialized, so the signed bytes are the bytes everyone reads.
+The exact UTF-8 bytes of one JSON object (the same values as a JSON array are rejected). It is carried base64url-encoded and is never re-serialized, so the signed bytes are the bytes everyone reads.
 
 ```json
 {"schema":"arkavo.catalog-pointer/2","owner":"<sub>","seq":7,"catalogHash":"<64 lowercase hex>","catalogSize":1234,"indexHash":"<64 lowercase hex>","issuedAt":"2026-10-19T01:02:03Z"}
@@ -304,7 +304,7 @@ The `index` sent in `PUT` is unchanged: its key and entry order are free, and th
 | two | `rec-b` (v1, `bb…`, 2048), `rec-a` (v3, `aa…`, 1024) | `03f745d8d08d9e9e11cabf33d85e8beb452eb3a2b2e541f92e1703c1f4152df4` |
 | byte-order | `a_1`, `a@1`, `A`, `a:1`, `a.1`, `a-1` (entry *n*, counting from 0 in this order, has hash byte `n` ×32, size *n*+1, v1; so `a_1` is `00`×32, size 1) | `79129b9fa70e8ab5d0894d07098294de6dec2677c9df538b3eb05df98bd8ef18` |
 
-Canonical bytes of "two": `[{"contentID":"rec-a","version":3,"payloadHash":"aa…aa","payloadSize":1024},{"contentID":"rec-b","version":1,"payloadHash":"bb…bb","payloadSize":2048}]` (64 hex characters each). "byte-order" sorts to `A`, `a-1`, `a.1`, `a:1`, `a@1`, `a_1`. ArkavoKit's shared vectors (`Tests/ArkavoCatalogTests/Vectors/catalog-vectors.json`) are to carry these, each with its full `index` text.
+Canonical bytes of "two": `[{"contentID":"rec-a","version":3,"payloadHash":"aa…aa","payloadSize":1024},{"contentID":"rec-b","version":1,"payloadHash":"bb…bb","payloadSize":2048}]` (64 hex characters each). "byte-order" sorts to `A`, `a-1`, `a.1`, `a:1`, `a@1`, `a_1`. ArkavoKit 0.24.0's shared vectors (`Tests/ArkavoCatalogTests/Vectors/catalog-vectors.json`, copied verbatim to this repository's `tests/fixtures/arkavo-catalog-vectors.json`) carry these, each with its full `index` text and its `indexHash`.
 
 ### The signed bundle
 

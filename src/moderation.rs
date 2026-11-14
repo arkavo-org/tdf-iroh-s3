@@ -39,6 +39,7 @@ use tracing::{info, warn};
 
 use crate::auth::{AuthError, CwtVerifier, VerifiedClaims, VerifyOpts, subject_id_bind};
 use crate::authz::{ChainEntity, EntityKind};
+use crate::creator_catalog::{Object, object_from_slice};
 use crate::entity_chain;
 use crate::ownership::{OwnerStore, parse_owner};
 use crate::publish_decision::{
@@ -435,7 +436,7 @@ impl Moderation {
     pub async fn reload<S: ModerationStore>(&self, store: &S) -> anyhow::Result<()> {
         let mut suspensions = HashMap::new();
         for raw in store.list_records(SUSPENSIONS).await? {
-            match serde_json::from_slice::<Suspension>(&raw) {
+            match object_from_slice::<Suspension>(&raw) {
                 Ok(s) if s.lifted_at.is_none() => {
                     suspensions.insert(s.subject.clone(), s);
                 }
@@ -445,7 +446,7 @@ impl Moderation {
         }
         let mut blocks = HashMap::new();
         for raw in store.list_records(BLOCKS).await? {
-            match serde_json::from_slice::<Block>(&raw) {
+            match object_from_slice::<Block>(&raw) {
                 Ok(b) if b.lifted_at.is_none() => {
                     blocks.insert(b.hash.clone(), b);
                 }
@@ -455,7 +456,7 @@ impl Moderation {
         }
         let mut catalog_blocks = HashMap::new();
         for raw in store.list_records(CATALOG_BLOCKS).await? {
-            match serde_json::from_slice::<CatalogBlock>(&raw) {
+            match object_from_slice::<CatalogBlock>(&raw) {
                 Ok(b) if b.lifted_at.is_none() => {
                     catalog_blocks.insert(b.subject.clone(), b);
                 }
@@ -584,7 +585,7 @@ impl PublishGate {
             warn!(%endpoint, "No session record key yet; stored session refused");
             return None;
         };
-        let Ok(sealed) = serde_json::from_slice::<SealedRecord>(body) else {
+        let Ok(sealed) = object_from_slice::<SealedRecord>(body) else {
             warn!(%endpoint, "Session record unreadable or untagged; refused");
             return None;
         };
@@ -1147,7 +1148,7 @@ fn verify_possession(
 async fn open_session<S: ModerationStore>(
     State(s): State<Arc<ModerationApi<S>>>,
     headers: HeaderMap,
-    Json(body): Json<SessionRequest>,
+    Json(Object(body)): Json<Object<SessionRequest>>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let (claims, chain) = s
         .policy
@@ -1278,7 +1279,7 @@ async fn suspend<S: ModerationStore>(
     State(s): State<Arc<ModerationApi<S>>>,
     Path(subject): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<ActionRequest>,
+    Json(Object(body)): Json<Object<ActionRequest>>,
 ) -> ApiResult<Json<Suspension>> {
     let by = s
         .policy
@@ -1354,7 +1355,7 @@ async fn block<S: ModerationStore>(
     State(s): State<Arc<ModerationApi<S>>>,
     Path(hash): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<ActionRequest>,
+    Json(Object(body)): Json<Object<ActionRequest>>,
 ) -> ApiResult<Json<Block>> {
     let by = s
         .policy
@@ -1429,7 +1430,7 @@ async fn block_catalog<S: ModerationStore>(
     State(s): State<Arc<ModerationApi<S>>>,
     Path(subject): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<ActionRequest>,
+    Json(Object(body)): Json<Object<ActionRequest>>,
 ) -> ApiResult<Json<CatalogBlock>> {
     let by = s
         .policy
@@ -2570,6 +2571,110 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(!h.gate.moderation.is_suspended("u1"));
+    }
+
+    /// Request bodies and stored records are JSON objects: the same values
+    /// as an array, which a derived struct also reads, are refused.
+    #[tokio::test]
+    async fn requests_and_records_as_arrays_are_refused() {
+        use crate::creator_catalog::test_support::array_form;
+        let h = harness();
+        let sk = key();
+        let ep = sk.public();
+        let tok = creator("u1");
+        let session = format!("sessions/{ep}");
+        let body = signed(&sk, &tok).unwrap();
+        let array = serde_json::json!([body["endpointId"], body["timestamp"], body["signature"]]);
+        let (status, _) = call(&h.app, "POST", "/publish/sessions", &tok, Some(array)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!h.store.records.lock().unwrap().contains_key(&session));
+        let (status, _) = call(&h.app, "POST", "/publish/sessions", &tok, Some(body)).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // The stored session record, its tagged bytes kept as they are.
+        let raw = h.store.records.lock().unwrap()[&session].clone();
+        assert!(h.gate.unseal(&ep, &raw).is_some());
+        let sealed: SealedRecord = serde_json::from_slice(&raw).unwrap();
+        let array = format!(
+            "[{},{},{}]",
+            serde_json::to_string(&sealed.kid).unwrap(),
+            sealed.record.get(),
+            serde_json::to_string(&sealed.tag).unwrap()
+        );
+        assert!(h.gate.unseal(&ep, array.as_bytes()).is_none());
+
+        // An operator's action.
+        let (status, _) = call(
+            &h.app,
+            "PUT",
+            "/moderation/suspensions/u2",
+            &operator(),
+            Some(serde_json::json!(["repeated violations", null, true])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!h.gate.moderation.is_suspended("u2"));
+
+        // Stored suspensions, blocks and catalog blocks.
+        let store = MemModeration::default();
+        let suspension = Suspension {
+            subject: "u3".into(),
+            reason: "r".into(),
+            report_id: None,
+            hide_catalog: true,
+            by: "client:m".into(),
+            at: 1,
+            lifted_by: None,
+            lifted_at: None,
+        };
+        let block = Block {
+            hash: "ab".repeat(32),
+            reason: "r".into(),
+            report_id: None,
+            by: "client:m".into(),
+            at: 1,
+            lifted_by: None,
+            lifted_at: None,
+        };
+        let catalog_block = CatalogBlock {
+            subject: "u4".into(),
+            reason: "r".into(),
+            report_id: None,
+            by: "client:m".into(),
+            at: 1,
+            lifted_by: None,
+            lifted_at: None,
+        };
+        let m = Moderation::default();
+        for as_array in [false, true] {
+            for (kind, key, record) in [
+                (SUSPENSIONS, "u3", serde_json::to_vec(&suspension).unwrap()),
+                (
+                    BLOCKS,
+                    block.hash.as_str(),
+                    serde_json::to_vec(&block).unwrap(),
+                ),
+                (
+                    CATALOG_BLOCKS,
+                    "u4",
+                    serde_json::to_vec(&catalog_block).unwrap(),
+                ),
+            ] {
+                let record = if as_array {
+                    array_form(&record)
+                } else {
+                    record
+                };
+                store
+                    .put_record(kind, key, Bytes::from(record))
+                    .await
+                    .unwrap();
+            }
+            m.reload(&store).await.unwrap();
+            assert_eq!(m.is_suspended("u3"), !as_array);
+            assert_eq!(m.is_blocked(&block.hash), !as_array);
+            assert_eq!(m.catalog_hidden("u4"), !as_array);
+        }
     }
 
     #[tokio::test]
