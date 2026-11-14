@@ -1083,10 +1083,10 @@ fn request_ids(requests: &Requests, item: &Item) -> Vec<String> {
 /// recording (its owner record last) but failed to mark them `deleted`,
 /// or a push failed after its outboard, before the drop. The close deletes
 /// those outboard versions as listed, then the requests' records, and
-/// reports `closed <id>` (not counted). It writes no tombstone: the
-/// recording went in an earlier run, and a tombstone's verification hour
-/// would read a new push by the requester as in flight and delete it
-/// again.
+/// reports `closed <id>`, counted apart from deletes. It writes no
+/// tombstone: the recording went in an earlier run, and a tombstone's
+/// verification hour would read a new push by the requester as in flight
+/// and delete it again.
 ///
 /// It lists the recording's objects and stops at a blob, manifest or owner
 /// record, with no fresh read: an unowned recording still stored is kept,

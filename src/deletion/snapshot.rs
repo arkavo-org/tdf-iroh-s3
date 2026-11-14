@@ -749,6 +749,7 @@ mod tests {
             U.to_string(),
             format!("arkavo:{U}"),
             format!("arkavo:arkavo:{U}"),
+            "arkavo:".to_string(),
         ];
         for written in names.iter().map(|name| canonical_subject(name)) {
             for (kind, body) in [
