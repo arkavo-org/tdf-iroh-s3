@@ -319,7 +319,8 @@ fn operator_kept(
 /// `envelopes/<hash>`: due once `GRACE` has passed since it was
 /// superseded, while it is not current and not blocked, unless its owner's
 /// catalog is hidden (an operator asking for everything the owner
-/// published lifts that) or its owner is unknown.
+/// published lifts that, while the owner's catalog block stands) or its
+/// owner is unknown.
 fn envelope_kept(
     snapshot: &Snapshot,
     requests: &Requests,
@@ -339,7 +340,7 @@ fn envelope_kept(
     }
     match envelope_owner(r, &snapshot.catalogs) {
         Some(owner) => (snapshot.moderation.hidden.contains(owner)
-            && !everything_requested(requests, owner))
+            && !everything_requested(requests, &snapshot.moderation, owner))
         .then_some(OWNER_HIDDEN),
         None if snapshot.envelope_objects.contains(hash) => Some(UNKNOWN_OWNER),
         // No owner known, and no object left to hold back: due, so the
@@ -363,13 +364,15 @@ pub(super) fn envelope_owner<'a>(
 
 /// Whether an operator asked for everything `subject` published, which
 /// releases its envelopes from its hidden catalog: a `subjects/` record in
-/// any state. A tombstone counts: the envelopes current when the subject's
+/// any state, while `subject`'s catalog block (the request's precondition)
+/// stands. A tombstone counts: the envelopes current when the subject's
 /// pointers were deleted are observed on that run and fall due after
 /// their grace (spec 3.4 step 6), and tombstone verification keeps a
 /// `subjects/` tombstone while a pending envelope request names its
-/// subject.
-fn everything_requested(requests: &Requests, subject: &str) -> bool {
-    requests.subjects.contains_key(subject)
+/// subject and its catalog block stands. With the block lifted, the
+/// request holds nothing: a hidden owner's envelopes stay hidden.
+fn everything_requested(requests: &Requests, moderation: &ModerationView, subject: &str) -> bool {
+    requests.subjects.contains_key(subject) && moderation.catalog_blocked.contains(subject)
 }
 
 fn pending_subject(requests: &Requests, subject: &str) -> bool {
@@ -998,9 +1001,10 @@ mod tests {
     }
 
     /// A `subjects/` record in any state releases a hidden owner's
-    /// envelopes: a deleted subject's envelopes are observed on the run
-    /// that deletes its pointers, and fall due once their grace ends, with
-    /// the subject's tombstone still there (spec 3.4 step 6).
+    /// envelopes while the owner's catalog block stands: a deleted
+    /// subject's envelopes are observed on the run that deletes its
+    /// pointers, and fall due once their grace ends, with the subject's
+    /// tombstone still there (spec 3.4 step 6).
     #[test]
     fn a_subject_tombstone_releases_a_hidden_owners_envelope() {
         let mut s = Snapshot::default();
@@ -1024,6 +1028,36 @@ mod tests {
             [
                 kept(format!("envelope {}", h("e2")), "within grace"),
                 kept(format!("envelope {}", h("e3")), "owner hidden"),
+            ]
+        );
+    }
+
+    /// Only while the owner's catalog block stands: lifted, the operator's
+    /// request no longer holds, and a hideCatalog suspension hides the
+    /// owner's envelopes as any hidden owner's.
+    #[test]
+    fn a_subject_record_releases_envelopes_only_while_its_catalog_block_stands() {
+        let mut s = Snapshot::default();
+        s.moderation.hidden.insert(U.to_string());
+        s.moderation.hidden.insert(U2.to_string());
+        let mut r = Requests::default();
+        // A tombstone, and a pending request.
+        subject(&mut r, U);
+        let done = r.subjects.get_mut(U).unwrap();
+        (done.state, done.deleted_at) = (State::Deleted, Some(NOW - GRACE));
+        subject(&mut r, U2);
+        envelope(&mut r, &h("e1"), Some(U), NOW - GRACE);
+        envelope(&mut r, &h("e2"), Some(U2), NOW - GRACE);
+        s.envelope_objects = BTreeSet::from([h("e1"), h("e2")]);
+
+        let out = decide(&s, &r);
+        assert!(out.due.is_empty(), "{:?}", out.due);
+        assert_eq!(
+            out.kept,
+            [
+                kept(format!("envelope {}", h("e1")), "owner hidden"),
+                kept(format!("envelope {}", h("e2")), "owner hidden"),
+                kept(format!("subject {U2}"), "catalog block lifted"),
             ]
         );
     }

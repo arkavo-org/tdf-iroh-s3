@@ -98,7 +98,8 @@ const FINAL_READ: &str = "final read";
 const LOST: &str = "lost its publish";
 
 /// Why a subject's tombstone is kept: an envelope request of that owner is
-/// pending, and the tombstone releases it (`due::everything_requested`).
+/// pending, and the tombstone releases it while the owner's catalog block
+/// stands (`due::everything_requested`).
 const ENVELOPES_PENDING: &str = "envelopes pending";
 
 /// What a run did, or in a dry run would do. [`fmt::Display`] prints
@@ -693,8 +694,9 @@ async fn delete_item<O: ObjectStore>(
 /// 4. no object: forget them.
 ///
 /// A subject's tombstone is not forgotten while an envelope request of
-/// that owner is pending: it releases those envelopes from a hidden
-/// catalog (`due::everything_requested`).
+/// that owner is pending and the owner's catalog block stands: it releases
+/// those envelopes from a hidden catalog then (`due::everything_requested`).
+/// With the block lifted it releases nothing, and goes.
 ///
 /// It reads the bucket again first: with `delete`, the requests and their
 /// write times too; in a dry run, which wrote nothing, it takes
@@ -764,6 +766,7 @@ async fn verify_tombstones<O: ObjectStore>(
         };
         // A subject has no rule 2: this holds rules 1 and 4.
         if let Item::Subject(sub) = &group.item
+            && read.moderation.catalog_blocked.contains(sub)
             && envelopes_pending(requests, &read.catalogs, sub)
         {
             report.kept(&id, ENVELOPES_PENDING);
@@ -2482,9 +2485,9 @@ mod tests {
             assert!(m.get(&pointer).await.unwrap().is_some());
         }
 
-        /// A subject's tombstone releases its hidden envelopes (spec 3.4
-        /// step 5), so it stays while any envelope request of that owner
-        /// is pending.
+        /// A subject's tombstone releases its hidden envelopes while its
+        /// catalog block stands (spec 3.4 step 5), so it stays while any
+        /// envelope request of that owner is pending and the block stands.
         #[tokio::test]
         async fn a_subject_tombstone_waits_for_its_envelopes() {
             let m = MemObjects::default();
@@ -2520,6 +2523,38 @@ mod tests {
             let report = sweep(&m, true, AT).await.unwrap();
             assert!(has(&report, &format!("verified subject {U}")), "{report}");
             assert!(gone(&m, &subject_key(U)).await);
+        }
+
+        /// With its catalog block lifted, a subject's tombstone releases
+        /// nothing: its owner's envelope is kept while a hideCatalog
+        /// suspension hides it, and the tombstone verifies all the same.
+        #[tokio::test]
+        async fn a_lifted_blocks_subject_tombstone_releases_nothing() {
+            let m = MemObjects::default();
+            subject_tombstone(&m, U);
+            put(
+                &m,
+                &format!("moderation/suspensions/{U}"),
+                json!({"subject": U, "reason": "r", "hideCatalog": true, "by": "op", "at": 1}),
+            );
+            let e = envelope(&m, U, b"doc-u");
+            envelope_request(&m, &e, U, AT - GRACE);
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert_eq!(
+                report.lines,
+                [
+                    format!("verified subject {U}"),
+                    format!("kept envelope {e}: owner hidden"),
+                ],
+                "{report}"
+            );
+            assert!(gone(&m, &subject_key(U)).await);
+            for key in envelope_keys(&e) {
+                assert!(m.get(&key).await.unwrap().is_some(), "{key}");
+            }
+            let r: EnvelopeRequest = record(&m, &envelope_key(&e)).await;
+            assert_eq!(r.state, State::Pending);
         }
 
         /// A late pointer of a subject still catalog-blocked is deleted
