@@ -9,8 +9,6 @@
 //! are never read.
 
 use anyhow::Context;
-use bytes::Bytes;
-use futures::{StreamExt, TryStreamExt, stream};
 use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -24,11 +22,8 @@ use crate::moderation::{
     BLOCKS, Block, CATALOG_BLOCKS, CatalogBlock, SUSPENSIONS, Suspension, canonical_subject,
     valid_subject,
 };
-use crate::object_store::{ObjectInfo, ObjectStore};
+use crate::object_store::{ObjectInfo, ObjectStore, bodies};
 use crate::ownership::{PUBLISHERS, parse_owner};
-
-/// How many bodies [`bodies`] reads at once.
-const READS_AT_ONCE: usize = 16;
 
 /// Where a catalog envelope's objects live, each keyed by its catalog
 /// hash. Only listed: [`Snapshot::envelope_objects`].
@@ -315,33 +310,6 @@ async fn owners<O: ObjectStore>(store: &O) -> anyhow::Result<HashMap<String, Str
 
 fn moderation_prefix(kind: &str) -> String {
     format!("moderation/{kind}/")
-}
-
-/// Every object listed under `prefix`, as listed (its key and write
-/// time), with its body, in listing order. The bodies are read
-/// [`READS_AT_ONCE`] at a time. A read that fails, or finds the object gone
-/// since the listing, names the key, and fails the whole read.
-async fn bodies<O: ObjectStore>(
-    store: &O,
-    prefix: &str,
-) -> anyhow::Result<Vec<(ObjectInfo, Bytes)>> {
-    let listed = store
-        .list(prefix)
-        .await
-        .with_context(|| format!("listing {prefix} failed"))?;
-    stream::iter(listed)
-        .map(|listed| async move {
-            let key = &listed.key;
-            let body = store
-                .get(key)
-                .await
-                .with_context(|| format!("{key} unreadable"))?
-                .with_context(|| format!("{key} vanished during the read"))?;
-            anyhow::Ok((listed, body))
-        })
-        .buffered(READS_AT_ONCE)
-        .try_collect()
-        .await
 }
 
 /// The `N` names after `prefix` in a listed `key`: exactly `N`, none empty.

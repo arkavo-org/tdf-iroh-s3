@@ -5,8 +5,13 @@
 //!
 //! Keys are relative to the `[s3] prefix`.
 
+use anyhow::Context;
 use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt, stream};
 use std::future::Future;
+
+/// How many bodies [`bodies`] reads at once.
+pub const READS_AT_ONCE: usize = 16;
 
 /// A current object and when its current version was written (Unix
 /// seconds).
@@ -76,6 +81,34 @@ pub trait ObjectStore: Send + Sync + 'static {
         key: &str,
         version_ids: &[String],
     ) -> impl Future<Output = anyhow::Result<usize>> + Send;
+}
+
+/// Every object listed under `prefix`, as listed (its key and write
+/// time), with its body, in listing order whatever order the reads finish
+/// in. The bodies are read [`READS_AT_ONCE`] at a time, and every read has
+/// finished when this returns. A read that fails, or finds the object gone
+/// since the listing, names the key, and fails the whole read.
+pub async fn bodies<O: ObjectStore>(
+    store: &O,
+    prefix: &str,
+) -> anyhow::Result<Vec<(ObjectInfo, Bytes)>> {
+    let listed = store
+        .list(prefix)
+        .await
+        .with_context(|| format!("listing {prefix} failed"))?;
+    stream::iter(listed)
+        .map(|listed| async move {
+            let key = &listed.key;
+            let body = store
+                .get(key)
+                .await
+                .with_context(|| format!("{key} unreadable"))?
+                .with_context(|| format!("{key} vanished during the read"))?;
+            anyhow::Ok((listed, body))
+        })
+        .buffered(READS_AT_ONCE)
+        .try_collect()
+        .await
 }
 
 #[cfg(test)]
