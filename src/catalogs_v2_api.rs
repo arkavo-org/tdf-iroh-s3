@@ -846,7 +846,13 @@ mod tests {
     const SUB: &str = "5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10";
     const READER: &str = "0b5e7c1d-8a2f-4c3e-9d10-7f6a5b4c3d2e";
 
-    struct StubStatus(Mutex<Result<(), StatusRefusal>>);
+    /// The IdP's credential status: `answer`, asked only about `subject`.
+    struct StubStatus {
+        answer: Mutex<Result<(), StatusRefusal>>,
+        /// The subject the test's token and path name: `SUB`, unless a test
+        /// publishes as another account.
+        subject: Mutex<&'static str>,
+    }
 
     impl CredentialStatus for StubStatus {
         fn check<'a>(
@@ -855,9 +861,8 @@ mod tests {
             sub: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<(), StatusRefusal>> + Send + 'a>> {
             assert_eq!(credential_id, v2::CREDENTIAL_ID);
-            // The two accounts the tests publish as.
-            assert!(sub == SUB || sub == READER, "{sub}");
-            let answer = self.0.lock().unwrap().clone();
+            assert_eq!(sub, *self.subject.lock().unwrap(), "the path's subject");
+            let answer = self.answer.lock().unwrap().clone();
             Box::pin(async move { answer })
         }
     }
@@ -926,7 +931,10 @@ mod tests {
                 moderation: Arc::clone(&moderation),
             }),
         });
-        let status = Arc::new(StubStatus(Mutex::new(Ok(()))));
+        let status = Arc::new(StubStatus {
+            answer: Mutex::new(Ok(())),
+            subject: Mutex::new(SUB),
+        });
         let decider = Arc::new(StubDecider {
             answer: Mutex::new(Some(true)),
             asked: Mutex::new(Vec::new()),
@@ -975,6 +983,17 @@ mod tests {
         token_with(
             sub,
             &publisher_claims(Some(patreon("creator", Some("12345678")))),
+        )
+    }
+
+    /// An operator's service CWT, as the moderation API admits one:
+    /// allowlisted client, `aud` naming it, role service-account.
+    fn operator_token() -> String {
+        let roles = Value::Array(vec![Value::Text("service-account".into())]);
+        token_for(
+            "client:moderation",
+            "moderation",
+            &[("arkavo_roles", roles)],
         )
     }
 
@@ -1065,16 +1084,18 @@ mod tests {
         }
     }
 
-    /// The precondition a client sends after reading `sub`'s catalog: the
-    /// stored pointer's `If-Match: "<seq>"` once one is stored,
-    /// `If-None-Match: *` before.
+    /// The precondition a client sends after reading `sub`'s catalog with
+    /// `GET`: `If-Match` with its `ETag`, or `If-None-Match: *` after a 404.
+    /// It reads as an operator, so the reader decision doesn't come into it.
     async fn read_precondition(h: &Harness, sub: &str) -> (header::HeaderName, String) {
-        match h.store.catalog_pointers.lock().await.get(sub) {
-            Some((body, _)) => (
+        let r = get_as(h, sub, Some(&operator_token())).await;
+        match r.status {
+            StatusCode::OK => (
                 header::IF_MATCH,
-                pointer_etag(stored_pointer(body).unwrap().seq),
+                r.headers[header::ETAG].to_str().unwrap().into(),
             ),
-            None => (header::IF_NONE_MATCH, "*".into()),
+            StatusCode::NOT_FOUND => (header::IF_NONE_MATCH, "*".into()),
+            other => panic!("GET /v2/catalogs/{sub}: {other} {}", r.error()),
         }
     }
 
@@ -1282,9 +1303,7 @@ mod tests {
         assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
         *h.decider.answer.lock().unwrap() = Some(false);
         let roles = |r: &str| [("arkavo_roles", Value::Array(vec![Value::Text(r.into())]))];
-        // As the moderation API admits an operator: allowlisted client, `aud`
-        // naming it, role service-account.
-        let operator = token_for("client:moderation", "moderation", &roles("service-account"));
+        let operator = operator_token();
         assert_eq!(
             get_as(&h, SUB, Some(&operator)).await.status,
             StatusCode::OK
@@ -1582,17 +1601,22 @@ mod tests {
         assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"7\"");
     }
 
-    /// A refused precondition stores nothing: not the refused document, not
-    /// its outboard or index, and no pointer beyond the `pointers` already
-    /// there.
-    async fn assert_precondition_failed(h: &Harness, r: Reply, document: &[u8], pointers: usize) {
-        assert_eq!(r.status, StatusCode::PRECONDITION_FAILED, "{}", r.error());
-        assert_eq!(r.error(), "catalog changed since it was read");
+    /// Nothing of a refused publish of `document` is stored: not the
+    /// document, its outboard or its index record, and no pointer beyond the
+    /// `pointers` already there.
+    async fn assert_unstored(h: &Harness, document: &[u8], pointers: usize) {
         let hash = hash_of(document);
         assert!(!h.store.catalog_documents.lock().await.contains_key(&hash));
         assert!(!h.store.catalog_outboards.lock().await.contains_key(&hash));
         assert!(!h.store.catalog_indexes.lock().await.contains_key(&hash));
         assert_eq!(h.store.catalog_pointers.lock().await.len(), pointers);
+    }
+
+    /// A refused precondition: 412, and nothing of the publish stored.
+    async fn assert_precondition_failed(h: &Harness, r: Reply, document: &[u8], pointers: usize) {
+        assert_eq!(r.status, StatusCode::PRECONDITION_FAILED, "{}", r.error());
+        assert_eq!(r.error(), "catalog changed since it was read");
+        assert_unstored(h, document, pointers).await;
     }
 
     #[tokio::test]
@@ -1746,14 +1770,8 @@ mod tests {
                 (StatusCode::PRECONDITION_REQUIRED, "precondition required"),
                 "{headers:?}"
             );
+            assert_unstored(&h, &other, 1).await;
         }
-        assert!(
-            !h.store
-                .catalog_documents
-                .lock()
-                .await
-                .contains_key(&hash_of(&other))
-        );
         assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"1\"");
     }
 
@@ -1814,12 +1832,13 @@ mod tests {
     #[tokio::test]
     async fn a_revoked_or_unknown_credential_is_refused() {
         let h = ingested().await;
-        *h.status.0.lock().unwrap() = Err(StatusRefusal::Refused("passkey credential revoked"));
+        *h.status.answer.lock().unwrap() =
+            Err(StatusRefusal::Refused("passkey credential revoked"));
         let r = publish(&h, 1, &envelope(1)).await;
         assert_eq!(r.status, StatusCode::FORBIDDEN);
         assert_eq!(r.error(), "passkey credential revoked");
 
-        *h.status.0.lock().unwrap() = Err(StatusRefusal::Unavailable);
+        *h.status.answer.lock().unwrap() = Err(StatusRefusal::Unavailable);
         let r = publish(&h, 1, &envelope(1)).await;
         assert_eq!(r.status, StatusCode::BAD_GATEWAY);
         assert_eq!(r.error(), "credential status unavailable");
@@ -2038,11 +2057,13 @@ mod tests {
         let hash = hash_of(&document);
         assert_eq!(publish(&h, 1, &document).await.status, StatusCode::OK);
         let outboard = h.store.catalog_outboards.lock().await[&hash].clone();
+        let record = h.store.catalog_indexes.lock().await[&hash].clone();
 
         // READER's token also names campaign 12345678 as its creator's, and
         // its index lists a recording of its own.
         ingest(&h, 2).await;
         h.store.own(&payload(2), READER).await;
+        *h.status.subject.lock().unwrap() = READER;
         let theirs = json!([entry("rec-2", &payload(2))]);
         let bundle = v2::bundle(READER, 1, &document, Some(&hash_of_index(&theirs)));
         let r = put(
@@ -2066,6 +2087,7 @@ mod tests {
             assert_eq!(docs[&hash].owner.as_deref(), Some(SUB));
         }
         assert_eq!(h.store.catalog_outboards.lock().await[&hash], outboard);
+        assert_eq!(h.store.catalog_indexes.lock().await[&hash], record);
         assert!(!h.store.catalog_pointers.lock().await.contains_key(READER));
         assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"1\"");
     }
