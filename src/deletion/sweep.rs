@@ -1353,21 +1353,21 @@ fn tombstones(requests: &Requests, written: &BTreeMap<String, i64>) -> Vec<Tombs
     out
 }
 
-/// Every version and delete marker of a tombstoned `item`'s keys: a
-/// recording's and an envelope's [`object_keys`], a subject's pointer keys
-/// whose `<sub>` is canonically it (both `arkavo:<uuid>` and `<uuid>`), in
-/// key order. Its objects are the versions that aren't markers.
+/// Every version and delete marker of a tombstoned `item`'s keys, each
+/// key listed exactly ([`candidate_keys`]): a recording's and an
+/// envelope's [`object_keys`]; a subject's two pointer keys
+/// (`arkavo:<uuid>` and `<uuid>`, [`spellings`]), never every pointer,
+/// keeping those with a version, in key order. Its objects are the
+/// versions that aren't markers.
 async fn tombstoned<O: ObjectStore>(store: &O, item: &Item) -> anyhow::Result<Listed> {
-    let Item::Subject(sub) = item else {
-        return list_keys(store, object_keys(item)).await;
-    };
-    let mut versions = list_versions(store, POINTERS).await?;
-    versions.retain(|v| pointer_subject(&v.key) == Some(sub.as_str()));
-    let keys: BTreeSet<String> = versions.iter().map(|v| v.key.clone()).collect();
-    Ok(Listed {
-        keys: keys.into_iter().collect(),
-        versions,
-    })
+    let mut listed = list_keys(store, candidate_keys(item)).await?;
+    if let Item::Subject(_) = item {
+        // In key order, each key's versions as listed (stable sort).
+        listed.versions.sort_by(|a, b| a.key.cmp(&b.key));
+        let keys: BTreeSet<String> = listed.versions.iter().map(|v| v.key.clone()).collect();
+        listed.keys = keys.into_iter().collect();
+    }
+    Ok(listed)
 }
 
 /// Whether `key`, one of `item`'s objects, is one a new push or publish
@@ -4116,6 +4116,58 @@ mod tests {
             assert!(gone(&m, &envelope_key(&e)).await);
             assert!(gone(&m, &subject_key(U)).await);
             assert!(m.get(&pointer).await.unwrap().is_some());
+        }
+
+        /// A subject tombstone's objects are the versions of its own two
+        /// pointer keys, each listed exactly: not every pointer in the
+        /// bucket, never another subject's, not even one whose key starts
+        /// with this subject's. Only keys with a version count, in key order.
+        #[tokio::test]
+        async fn a_subject_tombstone_lists_only_its_own_pointers() {
+            let m = MemObjects::default();
+            let bare = format!("{POINTERS}{U}");
+            let prefixed = format!("{POINTERS}{}", arkavo(U));
+            m.insert(&bare, "pointer");
+            m.insert(&bare, "pointer again");
+            m.insert(&prefixed, "pointer");
+            m.delete_current(&prefixed);
+            let others = [
+                format!("{bare}0"),
+                format!("{prefixed}0"),
+                format!("{POINTERS}{U2}"),
+            ];
+            for key in &others {
+                m.insert(key, "another subject's");
+            }
+            // A listing of every pointer would fail.
+            m.fail_on(&format!("{POINTERS}{U2}"), Op::List);
+
+            let listed = tombstoned(&m, &Item::Subject(U.into())).await.unwrap();
+            assert_eq!(listed.keys, [bare.clone(), prefixed.clone()]);
+            let versions: Vec<(&str, bool)> = listed
+                .versions
+                .iter()
+                .map(|v| (v.key.as_str(), v.delete_marker))
+                .collect();
+            assert_eq!(
+                versions,
+                [
+                    (bare.as_str(), false),
+                    (bare.as_str(), false),
+                    (prefixed.as_str(), true),
+                    (prefixed.as_str(), false),
+                ],
+                "each key's versions newest first"
+            );
+            assert!(
+                m.list_versions(POINTERS).await.is_err(),
+                "nothing listed every pointer"
+            );
+
+            // A key form with no version is no key of it.
+            let listed = tombstoned(&m, &Item::Subject(U2.into())).await.unwrap();
+            assert_eq!(listed.keys, [format!("{POINTERS}{U2}")]);
+            assert_eq!(listed.versions.len(), 1);
         }
 
         /// A subject's tombstone releases its hidden envelopes while its
