@@ -5,6 +5,8 @@
 //!   catalog's attribute.
 //! - `GET /blobs/{hash}` — public ingest confirmation: the size of an
 //!   ingested, unblocked TDF.
+//! - `GET /publish/recordings/{hash}` — a publisher's pre-check: whether a
+//!   recording is theirs, another account's, or nobody's.
 //!
 //! [`check_payloads`] holds the per-entry publish checks `PUT
 //! /v2/catalogs/{sub}` runs on a catalog's index: the recordings it lists. On an ungated node
@@ -26,8 +28,8 @@ use tracing::warn;
 use crate::catalog_metadata;
 use crate::creator_catalog::{CreatorCatalogEntry, is_lower_hex_hash};
 use crate::moderation::canonical_subject;
-use crate::ownership::parse_owner;
-use crate::tags_api::{ApiState, TagStore, is_blocked};
+use crate::ownership::{OwnerView, parse_owner};
+use crate::tags_api::{ApiState, TagStore, authorize_publisher, is_blocked};
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
 
@@ -79,6 +81,7 @@ pub fn router<S: TagStore>(state: Arc<ApiState<S>>) -> Router {
     Router::new()
         .route("/catalog-documents/{hash}", get(get_catalog_document::<S>))
         .route("/blobs/{hash}", get(get_blob::<S>))
+        .route("/publish/recordings/{hash}", get(recording_owner::<S>))
         .with_state(state)
 }
 
@@ -383,20 +386,58 @@ async fn get_blob<S: TagStore>(
     }
 }
 
+/// `GET /publish/recordings/{hash}`: whose a recording is, by its owner
+/// record, for a publisher to ask before signing a catalog that lists it
+/// and after a refused push (an iroh refusal carries no reason). Authorized
+/// as `PUT /v2/catalogs/{sub}` is ([`authorize_publisher`]), before the
+/// hash is looked at. The answer never names another account. An ungated
+/// node writes no owner records, so it always answers `none`.
+async fn recording_owner<S: TagStore>(
+    State(state): State<Arc<ApiState<S>>>,
+    Path(hash): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let claims = authorize_publisher(&state, &headers)
+        .await
+        .map_err(|(status, msg)| fail(status, msg))?;
+    if !is_lower_hex_hash(&hash) {
+        return Err(fail(StatusCode::BAD_REQUEST, "invalid hash"));
+    }
+    let owner = if state.publishing.is_none() {
+        OwnerView::None
+    } else {
+        match state.store.get_blob_owner(&hash).await {
+            Ok(None) => OwnerView::None,
+            Ok(Some(bytes)) => match parse_owner(&hash, &bytes) {
+                Ok(owner)
+                    if canonical_subject(&owner.subject) == canonical_subject(&claims.sub) =>
+                {
+                    OwnerView::You
+                }
+                Ok(_) => OwnerView::Another,
+                Err(e) => return Err(storage_unavailable("Owner record parse", e)),
+            },
+            Err(e) => return Err(storage_unavailable("Owner record read", e)),
+        }
+    };
+    Ok(Json(serde_json::json!({ "hash": hash, "owner": owner })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::CwtVerifier;
-    use crate::auth::test_support::keypair;
+    use crate::auth::test_support::{keypair, mint_with_aud};
     use crate::catalog_metadata::test_support::{CAMPAIGN, KAS, manifest, recording_policy};
     use crate::creator_catalog::test_support::{PAYLOAD_SIZE, entry};
     use crate::creator_catalog::{self, CreatorCatalogEntry};
-    use crate::moderation::{DEFAULT_PUBLISH_ENTITLEMENT, Moderation, PublishPolicy};
+    use crate::moderation::{DEFAULT_PUBLISH_ENTITLEMENT, Moderation, PublishPolicy, now_secs};
     use crate::tags_api::test_support::MemStore;
     use crate::tags_api::{StoredDocument, TagPublishing};
     use axum::body::Body;
     use axum::http::Request;
     use bytes::Bytes;
+    use ciborium::value::Value;
     use http_body_util::BodyExt;
     use serde_json::json;
     use tower::ServiceExt;
@@ -519,11 +560,7 @@ mod tests {
         }
     }
 
-    async fn get_with(app: &Router, uri: &str, if_none_match: Option<&str>) -> Reply {
-        let mut req = Request::get(uri);
-        if let Some(tag) = if_none_match {
-            req = req.header(header::IF_NONE_MATCH, tag);
-        }
+    async fn send(app: &Router, req: axum::http::request::Builder) -> Reply {
         let res = app
             .clone()
             .oneshot(req.body(Body::empty()).unwrap())
@@ -539,8 +576,50 @@ mod tests {
         }
     }
 
+    async fn get_with(app: &Router, uri: &str, if_none_match: Option<&str>) -> Reply {
+        let mut req = Request::get(uri);
+        if let Some(tag) = if_none_match {
+            req = req.header(header::IF_NONE_MATCH, tag);
+        }
+        send(app, req).await
+    }
+
     async fn get(app: &Router, uri: &str) -> Reply {
         get_with(app, uri, None).await
+    }
+
+    /// A person token for `sub` (audience `arkavo`), carrying the publishing
+    /// entitlement when `entitled`.
+    fn token(sub: &str, entitled: bool) -> String {
+        let (sk, _) = keypair();
+        let entitlements = (
+            "arkavo_entitlements",
+            Value::Array(vec![Value::Text(DEFAULT_PUBLISH_ENTITLEMENT.into())]),
+        );
+        let extras = if entitled { vec![entitlements] } else { vec![] };
+        mint_with_aud(
+            &sk,
+            b"kid-1",
+            "https://identity.test",
+            sub,
+            "arkavo",
+            now_secs(),
+            now_secs() + 3600,
+            &extras,
+        )
+    }
+
+    /// `GET /publish/recordings/{hash}`, with `token` as the bearer if given.
+    async fn owner_of(app: &Router, hash: &str, token: Option<&str>) -> Reply {
+        let mut req = Request::get(format!("/publish/recordings/{hash}"));
+        if let Some(token) = token {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        send(app, req).await
+    }
+
+    fn json_body(r: &Reply) -> serde_json::Value {
+        serde_json::from_slice(&r.body).unwrap_or_default()
     }
 
     /// Store `body` as a catalog document of `owner`; its hash.
@@ -1002,6 +1081,135 @@ mod tests {
         assert_eq!(
             (r.status, r.error().as_str()),
             (StatusCode::NOT_FOUND, "blob not found")
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_owner_answers_you_another_or_none() {
+        let h = harness(true);
+        h.store.own(&payload(1), SUB).await;
+        h.store.own(&payload(2), "u2").await;
+        let tok = token(SUB, true);
+        for (n, owner) in [(1, "you"), (2, "another account"), (3, "none")] {
+            let r = owner_of(&h.app, &payload(n), Some(&tok)).await;
+            assert_eq!(r.status, StatusCode::OK, "{owner}");
+            assert_eq!(
+                json_body(&r),
+                json!({ "hash": payload(n), "owner": owner }),
+                "{owner}"
+            );
+            // The other account is never named.
+            assert!(!String::from_utf8_lossy(&r.body).contains("u2"), "{owner}");
+        }
+
+        // `arkavo:<uuid>` and `<uuid>` are one account, either way round.
+        h.store.own(&payload(4), &format!("arkavo:{SUB}")).await;
+        let r = owner_of(&h.app, &payload(4), Some(&tok)).await;
+        assert_eq!(json_body(&r), json!({ "hash": payload(4), "owner": "you" }));
+        let prefixed = token(&format!("arkavo:{SUB}"), true);
+        let r = owner_of(&h.app, &payload(1), Some(&prefixed)).await;
+        assert_eq!(json_body(&r), json!({ "hash": payload(1), "owner": "you" }));
+    }
+
+    #[tokio::test]
+    async fn recording_owner_needs_a_publisher_token() {
+        let h = harness(true);
+        h.store.own(&payload(1), SUB).await;
+        let r = owner_of(&h.app, &payload(1), None).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::UNAUTHORIZED, "missing bearer token")
+        );
+        let r = owner_of(&h.app, &payload(1), Some(&token(SUB, false))).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::FORBIDDEN, "publishing entitlement required")
+        );
+        h.moderation.suspend_for_test(SUB, false);
+        let r = owner_of(&h.app, &payload(1), Some(&token(SUB, true))).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::FORBIDDEN, "publishing suspended")
+        );
+        // The token is checked before the hash.
+        let r = owner_of(&h.app, "xyz", None).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            h.store
+                .owner_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_owner_refuses_an_invalid_hash() {
+        let h = harness(true);
+        let tok = token(SUB, true);
+        for bad in ["AB".repeat(32), "xyz".to_string()] {
+            let r = owner_of(&h.app, &bad, Some(&tok)).await;
+            assert_eq!(
+                (r.status, r.error().as_str()),
+                (StatusCode::BAD_REQUEST, "invalid hash"),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            h.store
+                .owner_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_owner_storage_failure_is_502() {
+        let h = harness(true);
+        let tok = token(SUB, true);
+        h.store
+            .down
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let r = owner_of(&h.app, &payload(1), Some(&tok)).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::BAD_GATEWAY, "storage unavailable")
+        );
+        // A record that can't be parsed is a storage fault too.
+        let h = harness(true);
+        h.store
+            .owners
+            .lock()
+            .await
+            .insert(payload(1), Bytes::from_static(b"x"));
+        let r = owner_of(&h.app, &payload(1), Some(&tok)).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::BAD_GATEWAY, "storage unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_owner_on_an_ungated_node_is_none() {
+        // No owner records are written on an ungated node; one that is
+        // there anyway is not read. The token must still verify.
+        let h = harness(false);
+        h.store.own(&payload(1), SUB).await;
+        let r = owner_of(&h.app, &payload(1), Some(&token(SUB, false))).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(
+            json_body(&r),
+            json!({ "hash": payload(1), "owner": "none" })
+        );
+        assert_eq!(
+            h.store
+                .owner_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let r = owner_of(&h.app, &payload(1), None).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::UNAUTHORIZED, "missing bearer token")
         );
     }
 }

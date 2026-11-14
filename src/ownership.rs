@@ -14,6 +14,21 @@ pub use crate::moderation::BlobOwner;
 /// `moderation/publishers/<hash>`: the recording's owner record.
 pub const PUBLISHERS: &str = "publishers";
 
+/// Whose a recording is, as `GET /publish/recordings/{hash}` tells the
+/// caller. It never names another account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum OwnerView {
+    /// The caller's subject owns it (compared canonically).
+    #[serde(rename = "you")]
+    You,
+    /// Another account owns it.
+    #[serde(rename = "another account")]
+    Another,
+    /// It has no owner record: the next push claims it.
+    #[serde(rename = "none")]
+    None,
+}
+
 /// Read the owner record stored under `hash`, strictly: it must be the
 /// record's JSON, name `hash` itself and carry a valid subject.
 pub fn parse_owner(hash: &str, bytes: &[u8]) -> anyhow::Result<BlobOwner> {
@@ -139,6 +154,17 @@ mod tests {
 
         let no_at = format!(r#"{{"hash":"{H}","subject":"u1","endpointId":"e"}}"#);
         assert!(parse_owner(H, no_at.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn owner_view_serializes_as_the_wire_strings() {
+        for (view, wire) in [
+            (OwnerView::You, "you"),
+            (OwnerView::Another, "another account"),
+            (OwnerView::None, "none"),
+        ] {
+            assert_eq!(serde_json::to_value(view).unwrap(), wire);
+        }
     }
 
     #[tokio::test]

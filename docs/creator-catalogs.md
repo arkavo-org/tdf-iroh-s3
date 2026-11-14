@@ -135,6 +135,22 @@ This route is public. It is how a publisher confirms ingest before naming a hash
 - **404:** `blob not found`. The hash was never pushed, is still being ingested, failed validation, or is blocked.
 - **400:** `invalid hash`.
 
+### `GET /publish/recordings/{hash}`: who owns a recording
+
+Creator asks this before the passkey prompt, so the creator doesn't sign a catalog that lists another account's recording. It asks again after a failed push, to explain it: the node refuses a push of another account's recording with only an iroh error code (see [Ownership](#ownership)).
+
+The request needs `Authorization: Bearer <Arkavo CWT>`, checked before the hash, as for [`PUT /v2/catalogs/{sub}`](#put-v2catalogssub-publish): the publishing checks in [publishing-and-moderation.md](publishing-and-moderation.md), with the `X-Entity-Token` devices when `[publishing] decisions` is `shadow` or `pdp`. On a node with `[publishing] required = false` the token still has to verify.
+
+- **200:** `{"hash":"<hash>","owner":"<owner>"}`, where `owner` is one of:
+  - `"you"`: the token's subject owns the recording. Subjects are compared canonically, so `arkavo:<uuid>` and `<uuid>` are one account.
+  - `"another account"`: another account owns it. The node never says which account.
+  - `"none"`: no account owns it, and its next push claims it. This doesn't say the recording is ingested; `GET /blobs/<hash>` does. A node with `[publishing] required = false` records no owners, so it always answers `"none"`.
+- **400:** `invalid hash`. The hash must be 64 lowercase hex characters.
+- **401:** `missing bearer token` or `invalid token`.
+- **403:** `publishing entitlement required`, `publishing suspended` or `publishing not permitted`.
+- **502:** `storage unavailable` when the owner record can't be read. The node also answers 502 when it can't fetch the key set to check the token.
+- **503:** `decision service unavailable`.
+
 ### `GET /node`: the node's iroh identity
 
 This route is public.
@@ -178,8 +194,9 @@ To remove a recording, Creator publishes the catalog without its entry. The TDF 
 The first account to push a recording owns it. When the node ingests a push, it records the pusher's subject as the owner of that BLAKE3 hash, unless the hash already has an owner. It never overwrites an owner. On a node with `[publishing] required = false` nothing is owned and nothing below applies.
 
 - **A push of another account's recording is refused,** the same way as a push without a session (step 3), so the pusher may see no error.
+- **Creator can ask whose a recording is** with [`GET /publish/recordings/<hash>`](#get-publishrecordingshash-who-owns-a-recording): before the passkey prompt, and after a failed push, to explain it.
 - **A catalog may list only its publisher's recordings.** `PUT /v2/catalogs/<sub>` refuses an index that names another account's recording with 403 `recording belongs to another account`. A recording with no owner gets 422 `recording has no owner: push it again`. Both name the entries in `contentIDs`.
-- **A recording with no owner is claimed by its next push.** Push it again, then publish again. `GET /blobs/<hash>` answers 200 for the recording before the push is ingested too, so it doesn't show the claim.
+- **A recording with no owner is claimed by its next push.** Push it again. The node records the claim once it has ingested the push, so poll `GET /publish/recordings/<hash>` as in step 4 until it answers `"you"`, then publish again.
 
 ## Reading a catalog and downloading (viewer)
 
