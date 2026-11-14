@@ -113,7 +113,12 @@ tdf-iroh-s3 --config /etc/tdf-iroh-s3/config.toml claim-owners --write  # create
 
 It prints one line per claim (`would claim <hash> <subject>`, or `claimed <hash> <subject>` with `--write`), one per conflict (`conflict <hash>: listed by <a>, <b>; owner <c>`, or `; no owner record`), then the counts (`<n> owned, <n> would claim, <n> conflicts`, with `claimed` under `--write`). It exits 1 if there is any conflict. With `--write` it still claims every hash that isn't a conflict. A record that appears between the read and the create (a push claimed the hash meanwhile) is logged, not claimed; the next run reads it.
 
-The switch waits until the dry run reports no conflicts. Then run it with `--write`, and once the node is deployed, the dry run again.
+The switch waits until the dry run reports no conflicts. To resolve one, whichever applies:
+
+- the record names an account that doesn't list the hash: release it, `release-owner --hash <hash> --subject <owner> --reason <why>` ([`release-owner`](#release-owner));
+- more than one account lists the hash: have all but one of them drop it from their catalogs, keeping the account the record names if it names one of them.
+
+Then run the dry run again. Once it reports no conflicts, run it with `--write`, and once the node is deployed, the dry run again.
 
 ### `release-owner`
 
@@ -225,14 +230,14 @@ tdf-iroh-s3 --config /etc/tdf-iroh-s3/config.toml sweep-deletions --delete  # wr
 
 A run:
 
-1. **Reads strictly** every pointer, index record, transition and deletion request, and the suspensions, blocks, catalog blocks and owner records it decides on (not sessions or audit records). Anything it can't read or parse, or a `/2` pointer whose index record doesn't match its `indexHash`, aborts the run before it writes anything: exit 1, with `sweep-deletions aborted: <error>`, naming the key, on stderr.
-2. **Folds** each pointer's committed transitions into requests, oldest first: a dropped hash makes `recordings/<sub>/<hash>` pending from that publish's time (the newest drop wins), an added hash cancels it, and a replaced envelope makes `envelopes/<hash>` pending. The folded transitions are deleted. A transition no pointer reaches, older than 7 days, whose subject's pointer has a `seq` at least its own, lost its publish and is deleted unfolded; any other unreachable one is kept and reported.
+1. **Reads strictly** every pointer, index record, transition and deletion request, and the suspensions, blocks, catalog blocks and owner records it decides on (not sessions or audit records). Anything it can't read or parse aborts the run before it writes anything: exit 1, with `sweep-deletions aborted: <error>`, naming the key, on stderr. So does a `/2` pointer whose index record doesn't match its `indexHash`, and a moderation record whose key isn't what the node writes: a canonical subject (`<uuid>`, not `arkavo:<uuid>`) for a suspension or catalog block, 64 lowercase hex characters for a block.
+2. **Folds** each pointer's committed transitions into requests, oldest first: a dropped hash makes `recordings/<sub>/<hash>` pending from that publish's time (the newest drop wins), an added hash cancels it, and a replaced envelope makes `envelopes/<hash>` pending. The folded transitions are deleted. A transition no pointer reaches, older than 7 days, whose subject's pointer has a `seq` at least its own, lost its publish and is deleted unfolded (`deleted transition <sub>/<name>: lost its publish`); any other unreachable one is kept and reported.
 3. **Observes** envelopes: a hash under `catalog-documents/`, `catalog-outboards/` or `catalog-indexes/` that no pointer names and no request tracks gets an `envelopes/` request, superseded now.
 4. **Deletes** what is due (below), with `--delete`, item by item: subjects (their pointers), then recordings, then envelopes. Just before each item it reads everything again. An item no longer due is kept. One whose requester's catalog moved since the first read is deferred to the next run, which folds the new transitions first. A failed item stays pending for the next run, and the run goes on.
-5. **Verifies tombstones.** A deleted item's request stays, marked `deleted` with `deletedAt`, until a run at least an hour later checks its objects:
-   - an object written more than an hour after the delete is fresh (a new push, publish or pointer): the tombstone goes, and the objects stay;
+5. **Verifies tombstones.** A deleted item's request stays, marked `deleted` with `deletedAt`, until a run at least an hour later checks its objects. The hour counts from when the tombstone was written, by S3's clock (the request's last-modified time), not from `deletedAt`, which is the run's start on the operator's clock: a long run deletes items well after it starts.
+   - an object a new push or publish writes, written more than an hour after the tombstone, is fresh: a recording's blob, manifest or owner record, an envelope's document or index record, a subject's pointer. The tombstone goes, and the objects stay. An outboard never counts: the node writes one itself when it serves a blob or envelope that lacks it;
    - a recording listed again, or an envelope current again: the tombstone goes, the objects stay;
-   - an object written within that hour (a write in flight during the delete): deleted again (`recreated`), and the tombstone stays;
+   - any other object (one written within that hour, by a write in flight during the delete, or an outboard): deleted again (`recreated`), and the tombstone stays;
    - nothing left: the tombstone goes.
 
 The requests live under `deletion-requests/`, written only by the sweep and `request-deletion`, subjects canonical. Below, *listed* means in the live index of any pointer, whatever its catalog's visibility, except the pointers of an account being deleted (a pending `subjects/` request whose catalog block stands).
@@ -243,7 +248,7 @@ The requests live under `deletion-requests/`, written only by the sweep and `req
 | `operator/<sub>/<hash>`, scope `hash` | `{"hash","subject","requestedAt","reason","scope","state","deletedAt"?}` | while the hash's block stands: at once, listed or not, whoever owns it |
 | `operator/<sub>/<hash>`, scope `subject` | as above | while `<sub>`'s catalog block stands, the hash isn't listed or blocked, and its owner record names `<sub>` |
 | `subjects/<sub>` | `{"subject","requestedAt","reason","state","deletedAt"?}` | while `<sub>`'s catalog block stands |
-| `envelopes/<hash>`: superseded | `{"hash","owner"?,"supersededAt","source","state","deletedAt"?}` | 7 days after it was superseded, while no pointer names it (other than an account's being deleted), it isn't blocked, and its owner's catalog isn't hidden (catalog block or `hideCatalog`), unless an operator asked for everything that owner published (`subjects/<owner>`) |
+| `envelopes/<hash>`: superseded | `{"hash","owner"?,"supersededAt","source","state","deletedAt"?}` | 7 days after it was superseded, while no pointer names it (other than an account's being deleted), it isn't blocked, and its owner's catalog isn't hidden (catalog block or `hideCatalog`), unless an operator asked for everything that owner published (`subjects/<owner>`, pending or deleted) and the owner's catalog block still stands |
 
 `state` is `pending` or `deleted`; `source` is `transition` or `observed`. A recording whose owner record names another account, or that has none, is kept for manual handling, and so is an envelope whose owner is unknown.
 
@@ -257,13 +262,22 @@ Then the request is marked `deleted`. Suspension, block, catalog-block and audit
 
 **Output,** on stdout:
 
+- one line per transition that lost its publish: `deleted transition <sub>/<name>: lost its publish` (`would delete` in a dry run), not counted;
 - one line per due item, in the order taken: `deleted <item>` (`would delete` in a dry run), `kept <item>: <why>`, `deferred <item>: catalog changed`, `failed <item>: <error>`;
 - one per tombstoned item checked: `verified <item>`, `fresh <item>`, `listed again <item>`, `current again <item>`, `recreated <item>`, or `kept <item>: <why>` (in a dry run `would verify <item>`, `would forget <item>: <why>`, `would delete again <item>`);
 - `kept <request>: <why>` for each pending request not due, and `kept transition <sub>/<name>: <why>` for each transition kept;
-- `deleted recording <hash> is listed again` or `deleted envelope <hash> is current again` for a deleted item a catalog names again;
+- `deleted recording <hash> is listed again` or `deleted envelope <hash> is current again` for a deleted item a catalog names again, or `failed final read: <error>` if the read for these lines fails (a failure, counted: every delete is done by then);
 - last, the counts: `<n> deleted, <n> kept, <n> deferred, <n> failed` (`would delete` in a dry run).
 
-An `<item>` is `recording <hash>`, `subject <sub>` or `envelope <hash>`; a `<request>` is `recording <sub>/<hash>`, `operator <sub>/<hash>`, `subject <sub>` or `envelope <hash>`. A `<why>` is one of `within grace`, `still listed`, `still current`, `blocked`, `owner is not the requester`, `no owner record`, `block lifted`, `catalog block lifted`, `owner hidden`, `unknown owner`, `no longer due`, `a pointer still names it`, `envelopes pending`, `catalog changed`; a transition's is `younger than grace`, `seq above the current pointer`, `no pointer` or `a cycle in its chain`. It exits 1 if the run aborts or any item failed.
+A run that aborts after its first read (a fold write fails, or a re-read before an item or for the tombstones) prints the lines of what it did until then, without counts, then `sweep-deletions aborted: <error>` on stderr.
+
+An `<item>` is `recording <hash>`, `subject <sub>` or `envelope <hash>`; a `<request>` is `recording <sub>/<hash>`, `operator <sub>/<hash>`, `subject <sub>` or `envelope <hash>`. A `<why>` is one of `within grace`, `still listed`, `still current`, `blocked`, `owner is not the requester`, `no owner record`, `block lifted`, `catalog block lifted`, `owner hidden`, `unknown owner`, `no longer due`, `a pointer still names it`, `envelopes pending`, `catalog changed`; a transition's is `younger than grace`, `seq above the current pointer`, `no pointer` or `a cycle in its chain`. It exits 1 if the run aborts, any item failed, or the final read failed.
+
+**Running it.**
+
+- Run only one `sweep-deletions` at a time: two runs would fold, write, delete and verify the same records at once.
+- A `--delete` run reads the whole bucket again before each due item (16 records at a time), so it costs about one full read per due item. A dry run reads it about twice.
+- When a run reports `deferred`, run it again promptly: the requester published during the run, and the next run folds that publish first. A deferred item isn't deleted before then, and that wait counts against the 30 days.
 
 #### `request-deletion`
 
@@ -296,7 +310,7 @@ The privacy policy excepts content removed by moderation: a blocked recording or
 
 A creator whose entitlement lapsed, who is suspended, whom the decision service denies, or whose catalog is blocked can't publish the empty catalog that deletes their recordings. On their request, an operator:
 
-1. **Blocks their catalog,** unless it is already: `PUT /moderation/blocks/catalogs/<sub>` ([Moderation](#moderation-operators)). This hides the catalog at once and is `--all`'s precondition. Keep it until the sweep is done: while it is lifted, every request waits (`catalog block lifted`).
+1. **Blocks their catalog,** unless it is already: `PUT /moderation/blocks/catalogs/<sub>` ([Moderation](#moderation-operators)). This hides the catalog at once and is `--all`'s precondition. Keep it until the sweep is done, envelopes included (step 4): while it is lifted, every request waits (`catalog block lifted`), and an envelope of the subject's that a `hideCatalog` suspension still hides is kept (`owner hidden`).
 2. **Runs `request-deletion --subject <sub> --all --reason <why>`.**
 3. **Adds what `--all` doesn't delete** with `request-deletion --subject <sub> --hash <hash>...`, blocking each hash first if it isn't: the subject's blocked recordings, which scope `subject` keeps, and anything of theirs outside its coverage, such as a recording no live index lists that has no owner record. Scope `hash` doesn't check the owner, so make sure each hash is the subject's: a recording whose owner record names another account is not theirs to delete.
 4. **Runs `sweep-deletions`, then `sweep-deletions --delete`.** That run deletes the subject's pointers and recordings and records its envelopes, which the first sweep at least 7 days later deletes.
@@ -359,11 +373,11 @@ Ownership, pointer `/2` and deletion ship as three PRs that merge and deploy tog
 3. **Before the deploy,** with operator credentials and the new binary:
    1. Against a scratch versioned bucket, never production: `TDF_IROH_S3_VERSIONED_BUCKET=<scratch bucket> AWS_REGION=<region> cargo test --test s3_versioned_test -- --ignored --nocapture` passes. With either variable unset, every test passes without touching S3 and prints `<test> skipped: set TDF_IROH_S3_VERSIONED_BUCKET and AWS_REGION` (shown only with `--nocapture`). A run that prints it proves nothing.
    2. `claim-owners` reports no conflicts; then `claim-owners --write`.
-   3. `sweep-deletions` (a dry run) completes: no unreadable record.
+   3. `sweep-deletions` (a dry run) on production completes: no unreadable record. Time it: a `--delete` run costs about one full read per due item, and a dry run about two full reads.
    4. The instance role can write `catalog-transitions/*` ([IAM for deletion](#iam-for-deletion)). The lifecycle rule can go on any time.
 4. **Deploy the node with no overlap:** no instance running the old code serves after a new one does. An old instance would overwrite owner records and accept `/1` publishes that write no transition, which breaks the chain the sweep follows. Then run `claim-owners` (a dry run) again. From here `/1` publishes get 422 `invalid bundle: pointer schema must be "arkavo.catalog-pointer/2"`, so Creator rc.2 and earlier TestFlight builds can't publish, update or hide.
 5. **The Creator release that publishes `/2` ships.** Before the switch, test it against a node running this version outside production.
-6. **The operator schedules `sweep-deletions --delete` weekly** from then on, for example in the deploy runbook: nothing in the node runs it.
+6. **The operator schedules `sweep-deletions --delete` weekly** from then on, for example in the deploy runbook: nothing in the node runs it. The first `--delete` run after the switch records every envelope superseded before it, each carrying its entries' metadata TDFs, titles included (no transition named them, so the run observes them). The first run 7 or more days later deletes them all in one wave.
 
 ## Configuration
 
