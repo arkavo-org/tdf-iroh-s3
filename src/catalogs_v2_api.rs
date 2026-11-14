@@ -9,16 +9,17 @@
 //!   (`catalog_metadata::check_envelope`); the node never decrypts it and
 //!   checks the recordings it lists through the index, which it stores
 //!   once per envelope at `catalog-indexes/<hash>` (`If-None-Match: *`;
-//!   another index for the same envelope is a 409) and never serves. The
-//!   document is stored under `catalog-documents/<blake3>` with its BAO
-//!   outboard, so it is served over iroh; the bundle replaces
+//!   another index for the same envelope is a 409, and nothing is written)
+//!   and never serves. Once the checks pass, a publish writes in five
+//!   steps: the index record; its transition (`deletion::Transition`, never
+//!   served: what it dropped from the served base catalog and what it
+//!   added); the document under `catalog-documents/<blake3>`; its BAO
+//!   outboard, so it is served over iroh; then the bundle, which replaces
 //!   `catalog-pointers/<sub>` only when its `seq` is greater than the
-//!   stored one's, and only when the stored pointer is still the base named
-//!   by `If-Match` / `If-None-Match` (tdf-iroh-s3#29; 412 otherwise), one of
-//!   which is required (428 without). Once the checks pass, each publish
-//!   records its transition (`deletion::Transition`, never served) before
-//!   the document, index and pointer: what it dropped from the served base
-//!   catalog and what it added.
+//!   stored one's, and only when the stored pointer is still the base the
+//!   request names (tdf-iroh-s3#29; 412 otherwise), with exactly one of
+//!   `If-Match: "<seq>"` or `If-None-Match: *` (428 for anything else, or
+//!   neither).
 //! - `GET /v2/catalogs/{sub}` — a token, then the catalog decision: whether
 //!   the reader may open the envelope's attribute (403 otherwise). The
 //!   stored bundle, with `ETag: "<seq>"`, which readers verify themselves
@@ -28,7 +29,7 @@
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -268,45 +269,65 @@ fn pointer_etag(seq: u64) -> String {
     format!("\"{seq}\"")
 }
 
-/// The comma-separated entity tags of every `name` header line: `None`
-/// without one, `Err` when a value is not visible ASCII.
-fn entity_tags(headers: &HeaderMap, name: header::HeaderName) -> Option<Result<Vec<&str>, ()>> {
-    let mut values = headers.get_all(name).iter().peekable();
-    values.peek()?;
-    let mut tags = Vec::new();
-    for value in values {
-        let Ok(value) = value.to_str() else {
-            return Some(Err(()));
-        };
-        tags.extend(value.split(',').map(str::trim));
-    }
-    Some(Ok(tags))
+/// Whether `GET /v2/catalogs/{sub}` hides `sub`'s stored pointer at
+/// `catalog_hash` from every reader: its owner is hidden (an active catalog
+/// block, or a suspension with `hideCatalog`), or its catalog is blocked.
+/// `GET` serves no pointer at a catalog without an index record either
+/// (from before envelopes). `PUT`'s preconditions see what `GET` serves, so
+/// both decide with this.
+fn pointer_hidden<S: TagStore>(api: &ApiState<S>, sub: &str, catalog_hash: &str) -> bool {
+    owner_hidden(api, Some(sub)) || is_blocked(api, catalog_hash)
 }
 
-/// Whether the request's preconditions (RFC 9110 §13.2.2) hold for the
-/// served pointer's tag (`None`: no pointer served). `If-Match` takes strong
-/// comparison, so a weak or unquoted tag never matches, and `*` needs a
-/// pointer; `If-None-Match` takes weak comparison and fails on `*` or the
-/// tag while a pointer is served. Both are evaluated when both are sent. A
-/// value that is not visible ASCII fails. No header: no condition.
-fn preconditions_hold(headers: &HeaderMap, served: Option<&str>) -> bool {
-    if let Some(tags) = entity_tags(headers, header::IF_MATCH) {
-        let Ok(tags) = tags else { return false };
-        if !served.is_some_and(|etag| tags.iter().any(|&t| t == "*" || t == etag)) {
-            return false;
+/// The base a publish names, in one of the two forms Creator sends
+/// (`docs/creator-catalogs.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Precondition<'a> {
+    /// `If-Match: "<seq>"`: merged from the pointer `GET` served with this
+    /// `ETag`.
+    IfMatch(&'a str),
+    /// `If-None-Match: *`: merged from no catalog (`GET` answered 404).
+    IfNoneMatchAny,
+}
+
+impl<'a> Precondition<'a> {
+    /// Exactly one of `If-Match: "<seq>"` (one strong entity tag of ASCII
+    /// decimal digits) or `If-None-Match: *`, each one header line with
+    /// that one value. `None`, a 428, for anything else: neither header or
+    /// both, `If-Match: *`, a list, a weak, unquoted, empty or non-digit
+    /// tag, any other `If-None-Match`, a repeated line, or a value that is
+    /// not visible ASCII.
+    fn read(headers: &'a HeaderMap) -> Option<Self> {
+        let if_match: Vec<&HeaderValue> = headers.get_all(header::IF_MATCH).iter().collect();
+        let if_none_match: Vec<&HeaderValue> =
+            headers.get_all(header::IF_NONE_MATCH).iter().collect();
+        match (if_match.as_slice(), if_none_match.as_slice()) {
+            ([tag], []) => tag
+                .to_str()
+                .ok()
+                .filter(|tag| is_seq_tag(tag))
+                .map(Self::IfMatch),
+            ([], [any]) if any.as_bytes() == b"*" => Some(Self::IfNoneMatchAny),
+            _ => None,
         }
     }
-    if let Some(tags) = entity_tags(headers, header::IF_NONE_MATCH) {
-        let Ok(tags) = tags else { return false };
-        if let Some(etag) = served
-            && tags
-                .iter()
-                .any(|&t| t == "*" || t.strip_prefix("W/").unwrap_or(t) == etag)
-        {
-            return false;
+
+    /// Whether the base is still what `GET` serves: `served` is the served
+    /// pointer's tag, `None` when it serves none.
+    fn holds(self, served: Option<&str>) -> bool {
+        match self {
+            Self::IfMatch(tag) => served == Some(tag),
+            Self::IfNoneMatchAny => served.is_none(),
         }
     }
-    true
+}
+
+/// `"<digits>"`: a strong entity tag whose content is one or more ASCII
+/// decimal digits, the form [`pointer_etag`] writes.
+fn is_seq_tag(tag: &str) -> bool {
+    tag.strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 async fn put_catalog<S: TagStore>(
@@ -474,14 +495,15 @@ async fn put_catalog<S: TagStore>(
             }
         })?;
 
-    // 7. Merged from the stored pointer the request names as its base
-    //    (one of the two headers is required), and newer than it.
-    if !headers.contains_key(header::IF_MATCH) && !headers.contains_key(header::IF_NONE_MATCH) {
+    // 7. Merged from the stored pointer the request names as its base, in
+    //    one of the two forms (428 otherwise, before the stored pointer is
+    //    read), and newer than it.
+    let Some(precondition) = Precondition::read(&headers) else {
         return Err(reject(
             StatusCode::PRECONDITION_REQUIRED,
             "precondition required".into(),
         ));
-    }
+    };
     let current = api
         .store
         .get_catalog_pointer(&sub)
@@ -502,14 +524,15 @@ async fn put_catalog<S: TagStore>(
     };
     let live = base_hashes.is_some();
     let current_seq = current.as_ref().filter(|_| live).map(|(_, info)| info.seq);
-    // Preconditions see what `GET` serves: a pointer whose catalog is
-    // blocked reads as none, so a client that got the 404 can publish with
-    // `If-None-Match: *`.
+    // Preconditions see what `GET` serves: a pointer it hides (a hidden
+    // owner, a blocked catalog) reads as none, so a client that got the 404
+    // can publish with `If-None-Match: *`. The seq above is still the
+    // stored one's.
     let served_seq = current
         .as_ref()
-        .filter(|(_, info)| live && !is_blocked(api, &info.catalog_hash))
+        .filter(|(_, info)| live && !pointer_hidden(api, &sub, &info.catalog_hash))
         .map(|(_, info)| info.seq);
-    if !preconditions_hold(&headers, served_seq.map(pointer_etag).as_deref()) {
+    if !precondition.holds(served_seq.map(pointer_etag).as_deref()) {
         return Err(reject(
             StatusCode::PRECONDITION_FAILED,
             "catalog changed since it was read".into(),
@@ -525,24 +548,32 @@ async fn put_catalog<S: TagStore>(
     }
     let expected = current.as_ref().map(|(stored, _)| stored.etag.as_str());
 
-    // 8. The transition first (after the 412 and 409, so a retry of a
-    //    publish that committed can't rewrite its transition), then the
-    //    document, its outboard and its index, so a stored pointer never
-    //    names a document that cannot be served or decided; then the
-    //    pointer, only if nobody else moved it meanwhile. The index record
-    //    is created once: one envelope has one index, so a publish that
-    //    lost can't rewrite the committed pointer's index. A transition
-    //    whose pointer write lost is never reachable from a pointer, so the
-    //    sweep never folds it.
+    // 8. Five writes, in this order: the index record, the transition, the
+    //    document, its outboard, then the pointer. Everything that can
+    //    refuse comes first: the 412 and 409 above (so a retry of a publish
+    //    that committed can't rewrite its transition), the owner reads the
+    //    transition needs (an unreadable one is a 502 with nothing written),
+    //    then the index record's create. That record is created once: one
+    //    envelope has one index, so a publish that lost can't rewrite the
+    //    committed pointer's index, nor the envelope's owner metadata, and
+    //    its 409 or 502 writes nothing else, no transition either. The
+    //    document and its outboard come before the pointer, so a stored
+    //    pointer never names a document that cannot be served or decided;
+    //    the pointer is written only if nobody else moved it meanwhile. An
+    //    index record or transition whose later writes fail is named by no
+    //    pointer: a transition whose pointer write lost is never reachable
+    //    from a pointer, so the sweep never folds it, and a retry of this
+    //    publish completes the rest.
     let outboard = crate::ingest::compute_outboard(
         &document[..],
         document.len() as u64,
         Hash::from_bytes(*blake3::hash(&document).as_bytes()),
     )
     .map_err(|e| storage_unavailable("Catalog outboard", e))?;
-    // Dropped only from a base `GET` served: its catalog not blocked and
-    // its owner not hidden.
-    let served = served_seq.is_some() && !owner_hidden(api, Some(&sub));
+    // Dropped only from a base `GET` served: `served_seq`, which the
+    // shared `pointer_hidden` decided (its catalog not blocked, its owner
+    // not hidden).
+    let served = served_seq.is_some();
     let new_hashes: BTreeSet<String> = entries.iter().map(|e| e.payload_hash.clone()).collect();
     let transition = Transition {
         subject: sub.clone(),
@@ -568,14 +599,6 @@ async fn put_catalog<S: TagStore>(
             .cloned()
             .collect(),
     };
-    api.store
-        .put_catalog_transition(
-            &sub,
-            &transition_name(transition.seq, &transition.pointer),
-            Bytes::from(serde_json::to_vec(&transition).expect("transition serializes")),
-        )
-        .await
-        .map_err(|e| storage_unavailable("Catalog transition write", e))?;
     let size = document.len();
     let record = IndexRecord {
         owner: sub.clone(),
@@ -583,14 +606,6 @@ async fn put_catalog<S: TagStore>(
         entries: index,
     };
     let entries = entries.len();
-    api.store
-        .put_catalog_document(&hash, Bytes::from(document), &sub)
-        .await
-        .map_err(|e| storage_unavailable("Catalog document write", e))?;
-    api.store
-        .put_catalog_outboard(&hash, Bytes::from(outboard))
-        .await
-        .map_err(|e| storage_unavailable("Catalog outboard write", e))?;
     let created = api
         .store
         .create_catalog_index(
@@ -601,8 +616,9 @@ async fn put_catalog<S: TagStore>(
         .map_err(|e| storage_unavailable("Catalog index write", e))?;
     if !created {
         // The envelope already has a record: a retry of this publish goes
-        // on, another index is a 409, and none readable yet (a concurrent
-        // create still in flight) is a 502.
+        // on, another index is a 409, and none there to read (deleted since
+        // the create lost) is a 502. A create still answered 409 after its
+        // retries (`send_conditional`) was an `Err`: a 502 above.
         let existing = api
             .store
             .get_catalog_index(&hash)
@@ -611,7 +627,7 @@ async fn put_catalog<S: TagStore>(
             .ok_or_else(|| {
                 storage_unavailable(
                     "Catalog index read",
-                    anyhow::anyhow!("index record {hash} exists but can't be read yet"),
+                    anyhow::anyhow!("index record {hash} exists but can't be read"),
                 )
             })?;
         let retry = is_retry(&existing, &sub, &index_hash)
@@ -623,6 +639,22 @@ async fn put_catalog<S: TagStore>(
             ));
         }
     }
+    api.store
+        .put_catalog_transition(
+            &sub,
+            &transition_name(transition.seq, &transition.pointer),
+            Bytes::from(serde_json::to_vec(&transition).expect("transition serializes")),
+        )
+        .await
+        .map_err(|e| storage_unavailable("Catalog transition write", e))?;
+    api.store
+        .put_catalog_document(&hash, Bytes::from(document), &sub)
+        .await
+        .map_err(|e| storage_unavailable("Catalog document write", e))?;
+    api.store
+        .put_catalog_outboard(&hash, Bytes::from(outboard))
+        .await
+        .map_err(|e| storage_unavailable("Catalog outboard write", e))?;
     let bundle = serde_json::to_vec(&req.bundle).expect("bundle serializes");
     let written = api
         .store
@@ -864,9 +896,6 @@ async fn get_pointer<S: TagStore>(
         return Err(fail(StatusCode::BAD_REQUEST, "invalid subject"));
     }
     let not_found = || fail(StatusCode::NOT_FOUND, "catalog not found");
-    if owner_hidden(api, Some(&sub)) {
-        return Err(not_found());
-    }
     let stored = match api.store.get_catalog_pointer(&sub).await {
         Ok(Some(stored)) => stored,
         Ok(None) => return Err(not_found()),
@@ -876,7 +905,7 @@ async fn get_pointer<S: TagStore>(
         seq, catalog_hash, ..
     } = stored_pointer(&stored.body)
         .map_err(|e| storage_unavailable("Catalog pointer parse", e))?;
-    if is_blocked(api, &catalog_hash) {
+    if pointer_hidden(api, &sub, &catalog_hash) {
         return Err(not_found());
     }
     // A pointer at a catalog from before envelopes has no attribute to
@@ -955,10 +984,18 @@ mod tests {
     const SUB: &str = "5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10";
     const READER: &str = "0b5e7c1d-8a2f-4c3e-9d10-7f6a5b4c3d2e";
 
-    /// The IdP's answer, and something to run once when it is asked (step
-    /// 6): a moderation change that lands after the token checks.
+    /// Something to run once when the IdP is asked (step 6): a moderation
+    /// change that lands after the token checks.
     type OnCheck = Box<dyn FnOnce() + Send>;
-    struct StubStatus(Mutex<Result<(), StatusRefusal>>, Mutex<Option<OnCheck>>);
+
+    /// The IdP's credential status: `answer`, asked only about `subject`.
+    struct StubStatus {
+        answer: Mutex<Result<(), StatusRefusal>>,
+        /// The subject the test's token and path name: `SUB`, unless a test
+        /// publishes as another account.
+        subject: Mutex<&'static str>,
+        on_check: Mutex<Option<OnCheck>>,
+    }
 
     impl CredentialStatus for StubStatus {
         fn check<'a>(
@@ -967,11 +1004,11 @@ mod tests {
             sub: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<(), StatusRefusal>> + Send + 'a>> {
             assert_eq!(credential_id, v2::CREDENTIAL_ID);
-            assert_eq!(sub, SUB);
-            if let Some(on_check) = self.1.lock().unwrap().take() {
+            assert_eq!(sub, *self.subject.lock().unwrap(), "the path's subject");
+            if let Some(on_check) = self.on_check.lock().unwrap().take() {
                 on_check();
             }
-            let answer = self.0.lock().unwrap().clone();
+            let answer = self.answer.lock().unwrap().clone();
             Box::pin(async move { answer })
         }
     }
@@ -1040,7 +1077,11 @@ mod tests {
                 moderation: Arc::clone(&moderation),
             }),
         });
-        let status = Arc::new(StubStatus(Mutex::new(Ok(())), Mutex::new(None)));
+        let status = Arc::new(StubStatus {
+            answer: Mutex::new(Ok(())),
+            subject: Mutex::new(SUB),
+            on_check: Mutex::new(None),
+        });
         let decider = Arc::new(StubDecider {
             answer: Mutex::new(Some(true)),
             asked: Mutex::new(Vec::new()),
@@ -1089,6 +1130,17 @@ mod tests {
         token_with(
             sub,
             &publisher_claims(Some(patreon("creator", Some("12345678")))),
+        )
+    }
+
+    /// An operator's service CWT, as the moderation API admits one:
+    /// allowlisted client, `aud` naming it, role service-account.
+    fn operator_token() -> String {
+        let roles = Value::Array(vec![Value::Text("service-account".into())]);
+        token_for(
+            "client:moderation",
+            "moderation",
+            &[("arkavo_roles", roles)],
         )
     }
 
@@ -1179,20 +1231,28 @@ mod tests {
         }
     }
 
-    /// The precondition a client sends after reading `sub`'s catalog:
-    /// `If-Match: *` once a pointer is stored, `If-None-Match: *` before.
-    async fn read_precondition(h: &Harness, sub: &str) -> (header::HeaderName, &'static str) {
-        if h.store.catalog_pointers.lock().await.contains_key(sub) {
-            (header::IF_MATCH, "*")
-        } else {
-            (header::IF_NONE_MATCH, "*")
+    /// The precondition a client sends after reading `sub`'s catalog with
+    /// `GET`: `If-Match` with its `ETag`, or `If-None-Match: *` after a 404.
+    /// It reads with an operator token. On a gated harness that skips the
+    /// reader decision; `harness_ungated` admits no operator, so the stub
+    /// decider is asked (and counts the read in `asked`), and it permits
+    /// unless the test changed its answer.
+    async fn read_precondition(h: &Harness, sub: &str) -> (header::HeaderName, String) {
+        let r = get_as(h, sub, Some(&operator_token())).await;
+        match r.status {
+            StatusCode::OK => (
+                header::IF_MATCH,
+                r.headers[header::ETAG].to_str().unwrap().into(),
+            ),
+            StatusCode::NOT_FOUND => (header::IF_NONE_MATCH, "*".into()),
+            other => panic!("GET /v2/catalogs/{sub}: {other} {}", r.error()),
         }
     }
 
     /// A publish with the precondition of [`read_precondition`].
     async fn put(h: &Harness, sub: &str, bearer: &str, body: Vec<u8>) -> Reply {
-        let precondition = read_precondition(h, sub).await;
-        put_with(h, sub, bearer, body, &[precondition]).await
+        let (name, value) = read_precondition(h, sub).await;
+        put_with(h, sub, bearer, body, &[(name, &value)]).await
     }
 
     async fn put_with(
@@ -1393,9 +1453,7 @@ mod tests {
         assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
         *h.decider.answer.lock().unwrap() = Some(false);
         let roles = |r: &str| [("arkavo_roles", Value::Array(vec![Value::Text(r.into())]))];
-        // As the moderation API admits an operator: allowlisted client, `aud`
-        // naming it, role service-account.
-        let operator = token_for("client:moderation", "moderation", &roles("service-account"));
+        let operator = operator_token();
         assert_eq!(
             get_as(&h, SUB, Some(&operator)).await.status,
             StatusCode::OK
@@ -1693,17 +1751,22 @@ mod tests {
         assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"7\"");
     }
 
-    /// A refused precondition stores nothing: not the refused document, not
-    /// its outboard or index, and no pointer beyond the `pointers` already
-    /// there.
-    async fn assert_precondition_failed(h: &Harness, r: Reply, document: &[u8], pointers: usize) {
-        assert_eq!(r.status, StatusCode::PRECONDITION_FAILED, "{}", r.error());
-        assert_eq!(r.error(), "catalog changed since it was read");
+    /// Nothing of a refused publish of `document` is stored: not the
+    /// document, its outboard or its index record, and no pointer beyond the
+    /// `pointers` already there.
+    async fn assert_unstored(h: &Harness, document: &[u8], pointers: usize) {
         let hash = hash_of(document);
         assert!(!h.store.catalog_documents.lock().await.contains_key(&hash));
         assert!(!h.store.catalog_outboards.lock().await.contains_key(&hash));
         assert!(!h.store.catalog_indexes.lock().await.contains_key(&hash));
         assert_eq!(h.store.catalog_pointers.lock().await.len(), pointers);
+    }
+
+    /// A refused precondition: 412, and nothing of the publish stored.
+    async fn assert_precondition_failed(h: &Harness, r: Reply, document: &[u8], pointers: usize) {
+        assert_eq!(r.status, StatusCode::PRECONDITION_FAILED, "{}", r.error());
+        assert_eq!(r.error(), "catalog changed since it was read");
+        assert_unstored(h, document, pointers).await;
     }
 
     #[tokio::test]
@@ -1716,35 +1779,28 @@ mod tests {
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
 
         // Ours, merged from seq 6 but signed with a higher seq: 412, not a
-        // silent overwrite of seq 7, and not a 409 either.
+        // silent overwrite of seq 7, and not a 409 either. So is any tag
+        // that is not exactly the served one.
         let ours = envelope(3);
-        for seq in [11, 7] {
-            let r = publish_if(&h, seq, &ours, header::IF_MATCH, "\"6\"").await;
-            assert_precondition_failed(&h, r, &ours, 1).await;
-        }
-        for stale in ["W/\"7\"", "7", "\"6\", W/\"7\""] {
-            let r = publish_if(&h, 11, &ours, header::IF_MATCH, stale).await;
+        for (seq, tag) in [(11, "\"6\""), (7, "\"6\""), (11, "\"07\""), (11, "\"8\"")] {
+            let r = publish_if(&h, seq, &ours, header::IF_MATCH, tag).await;
             assert_precondition_failed(&h, r, &ours, 1).await;
         }
         let served: Bundle = serde_json::from_slice(&get(&h, SUB).await.body).unwrap();
         assert_eq!(served, signed(7, &theirs, &index()));
 
-        let r = publish_if(&h, 11, &ours, header::IF_MATCH, "\"6\", \"7\"").await;
-        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
-        let r = publish_if(&h, 12, &envelope(1), header::IF_MATCH, "*").await;
+        let r = publish_if(&h, 11, &ours, header::IF_MATCH, "\"7\"").await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
         // A matching base still needs a greater seq.
-        let r = publish_if(&h, 12, &envelope(1), header::IF_MATCH, "\"12\"").await;
+        let r = publish_if(&h, 11, &envelope(1), header::IF_MATCH, "\"11\"").await;
         assert_eq!(r.status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]
     async fn if_match_needs_a_stored_pointer() {
         let h = ingested().await;
-        for tag in ["\"1\"", "*"] {
-            let r = publish_if(&h, 1, &envelope(1), header::IF_MATCH, tag).await;
-            assert_precondition_failed(&h, r, &envelope(1), 0).await;
-        }
+        let r = publish_if(&h, 1, &envelope(1), header::IF_MATCH, "\"1\"").await;
+        assert_precondition_failed(&h, r, &envelope(1), 0).await;
     }
 
     #[tokio::test]
@@ -1755,11 +1811,6 @@ mod tests {
         let other = envelope(2);
         let r = publish_if(&h, 2, &other, header::IF_NONE_MATCH, "*").await;
         assert_precondition_failed(&h, r, &other, 1).await;
-        // The tag itself (or its weak form) also fails; another tag passes.
-        let r = publish_if(&h, 2, &other, header::IF_NONE_MATCH, "W/\"1\"").await;
-        assert_precondition_failed(&h, r, &other, 1).await;
-        let r = publish_if(&h, 2, &other, header::IF_NONE_MATCH, "\"9\"").await;
-        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
     }
 
     #[tokio::test]
@@ -1782,42 +1833,96 @@ mod tests {
         assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"4\"");
     }
 
-    #[tokio::test]
-    async fn both_preconditions_must_hold() {
-        let h = ingested().await;
-        assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
-        let other = envelope(2);
-        let put = |none_match: &'static str| {
-            let body = body(&other, &signed(2, &other, &index()));
-            let both = [
-                (header::IF_MATCH, "\"1\""),
-                (header::IF_NONE_MATCH, none_match),
-            ];
-            let h = &h;
-            async move { put_with(h, SUB, &token(SUB), body, &both).await }
-        };
-        assert_precondition_failed(&h, put("*").await, &other, 1).await;
-        let r = put("\"9\"").await;
-        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+    /// The stored pointer's seq, as the node stored it.
+    async fn stored_seq(h: &Harness) -> u64 {
+        stored_pointer(&h.store.catalog_pointers.lock().await[SUB].0)
+            .unwrap()
+            .seq
     }
 
+    /// A creator whose catalog is blocked, unsuspended, still publishes:
+    /// `GET` answers 404, so preconditions see no pointer, but the seq must
+    /// still exceed the stored one.
     #[tokio::test]
-    async fn a_precondition_that_is_not_ascii_fails() {
+    async fn a_catalog_blocked_creator_reads_as_none_to_preconditions() {
+        let fresh = envelope(2);
+        // Unblocked, the stored pointer is the base.
+        let h = ingested().await;
+        assert_eq!(publish(&h, 3, &envelope(1)).await.status, StatusCode::OK);
+        let r = publish_if(&h, 4, &fresh, header::IF_NONE_MATCH, "*").await;
+        assert_precondition_failed(&h, r, &fresh, 1).await;
+        let r = publish_if(&h, 4, &fresh, header::IF_MATCH, "\"3\"").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        assert_eq!(stored_seq(&h).await, 4);
+
+        // Blocked: the 404 path.
+        let h = ingested().await;
+        assert_eq!(publish(&h, 3, &envelope(1)).await.status, StatusCode::OK);
+        h.moderation.block_catalog_for_test(SUB);
+        assert_eq!(get(&h, SUB).await.status, StatusCode::NOT_FOUND);
+        let r = publish_if(&h, 4, &fresh, header::IF_MATCH, "\"3\"").await;
+        assert_precondition_failed(&h, r, &fresh, 1).await;
+        for seq in [2, 3] {
+            let r = publish_if(&h, seq, &fresh, header::IF_NONE_MATCH, "*").await;
+            assert_eq!(
+                (r.status, r.error().as_str()),
+                (StatusCode::CONFLICT, "seq must be greater than 3")
+            );
+        }
+        let r = publish_if(&h, 4, &fresh, header::IF_NONE_MATCH, "*").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        assert_eq!(stored_seq(&h).await, 4);
+        assert_eq!(get(&h, SUB).await.status, StatusCode::NOT_FOUND);
+    }
+
+    /// Exactly one of `If-Match: "<seq>"` or `If-None-Match: *`, each one
+    /// header line with that one value. Anything else is 428, before the
+    /// stored pointer is read: here seq 1 over the stored seq 1 would
+    /// otherwise be a 412 or a 409.
+    #[tokio::test]
+    async fn only_the_two_precondition_forms_are_accepted() {
         let h = ingested().await;
         assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
         let other = envelope(2);
-        for name in [header::IF_MATCH, header::IF_NONE_MATCH] {
-            let req = Request::builder()
+        let (m, n) = (header::IF_MATCH, header::IF_NONE_MATCH);
+        let v = header::HeaderValue::from_static;
+        let not_ascii = |bytes: &[u8]| header::HeaderValue::from_bytes(bytes).unwrap();
+        let refused = [
+            vec![],
+            vec![(m.clone(), v("\"1\"")), (n.clone(), v("*"))],
+            vec![(m.clone(), v("*"))],
+            vec![(m.clone(), v("\"1\", \"2\""))],
+            vec![(m.clone(), v("W/\"1\""))],
+            vec![(m.clone(), v("1"))],
+            vec![(m.clone(), v("\"1a\""))],
+            vec![(m.clone(), v("\"\""))],
+            vec![(n.clone(), v("W/\"1\""))],
+            vec![(n.clone(), v("\"9\""))],
+            vec![(n.clone(), v("*, \"9\""))],
+            vec![(m.clone(), v("\"1\"")), (m.clone(), v("\"1\""))],
+            vec![(n.clone(), v("*")), (n.clone(), v("*"))],
+            vec![(m.clone(), not_ascii(b"\"1\xff\""))],
+            vec![(n.clone(), not_ascii(b"*\xff"))],
+        ];
+        for headers in refused {
+            let mut req = Request::builder()
                 .method(Method::PUT)
                 .uri(format!("/v2/catalogs/{SUB}"))
                 .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {}", token(SUB)))
-                .header(name, header::HeaderValue::from_bytes(b"\"1\xff\"").unwrap())
-                .body(Body::from(body(&other, &signed(2, &other, &index()))))
-                .unwrap();
-            let r = send(&h.app, req).await;
-            assert_precondition_failed(&h, r, &other, 1).await;
+                .header("authorization", format!("Bearer {}", token(SUB)));
+            for (name, value) in &headers {
+                req = req.header(name, value);
+            }
+            let body = Body::from(body(&other, &signed(1, &other, &index())));
+            let r = send(&h.app, req.body(body).unwrap()).await;
+            assert_eq!(
+                (r.status, r.error().as_str()),
+                (StatusCode::PRECONDITION_REQUIRED, "precondition required"),
+                "{headers:?}"
+            );
+            assert_unstored(&h, &other, 1).await;
         }
+        assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"1\"");
     }
 
     #[tokio::test]
@@ -1877,12 +1982,13 @@ mod tests {
     #[tokio::test]
     async fn a_revoked_or_unknown_credential_is_refused() {
         let h = ingested().await;
-        *h.status.0.lock().unwrap() = Err(StatusRefusal::Refused("passkey credential revoked"));
+        *h.status.answer.lock().unwrap() =
+            Err(StatusRefusal::Refused("passkey credential revoked"));
         let r = publish(&h, 1, &envelope(1)).await;
         assert_eq!(r.status, StatusCode::FORBIDDEN);
         assert_eq!(r.error(), "passkey credential revoked");
 
-        *h.status.0.lock().unwrap() = Err(StatusRefusal::Unavailable);
+        *h.status.answer.lock().unwrap() = Err(StatusRefusal::Unavailable);
         let r = publish(&h, 1, &envelope(1)).await;
         assert_eq!(r.status, StatusCode::BAD_GATEWAY);
         assert_eq!(r.error(), "credential status unavailable");
@@ -1911,6 +2017,7 @@ mod tests {
         assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
         h.moderation.suspend_for_test(SUB, true);
         assert_eq!(get(&h, SUB).await.status, StatusCode::NOT_FOUND);
+        assert!(h.decider.asked.lock().unwrap().is_empty());
 
         let h = ingested().await;
         assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
@@ -2071,6 +2178,7 @@ mod tests {
         let r = publish_index(&h, 2, &document, json!([entry("rec-2", &payload(2))])).await;
         assert_eq!((r.status, r.error().as_str()), conflict);
         assert_eq!(h.store.catalog_indexes.lock().await[&hash], first);
+        assert_eq!(h.store.transitions.lock().await.len(), 1, "no transition");
         assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"1\"");
 
         // Another account's record of the envelope is no retry, even with
@@ -2085,7 +2193,109 @@ mod tests {
         let r = publish(&h, 1, &document).await;
         assert_eq!((r.status, r.error().as_str()), conflict);
         assert_eq!(h.store.catalog_indexes.lock().await[&hash], theirs);
+        // Refused before the transition, the envelope and its outboard are
+        // written.
+        assert!(h.store.transitions.lock().await.is_empty());
+        assert!(h.store.catalog_documents.lock().await.is_empty());
+        assert!(h.store.catalog_outboards.lock().await.is_empty());
         assert!(h.store.catalog_pointers.lock().await.is_empty());
+    }
+
+    /// Another account publishing the same envelope bytes with its own index
+    /// gets the 409 before anything of its publish is written: the envelope
+    /// keeps its publisher as owner, which `owner_hidden` and the deletion
+    /// sweep read.
+    #[tokio::test]
+    async fn another_accounts_index_leaves_the_envelope_as_published() {
+        let h = ingested().await;
+        let document = envelope(1);
+        let hash = hash_of(&document);
+        assert_eq!(publish(&h, 1, &document).await.status, StatusCode::OK);
+        let outboard = h.store.catalog_outboards.lock().await[&hash].clone();
+        let record = h.store.catalog_indexes.lock().await[&hash].clone();
+
+        // READER's token also names campaign 12345678 as its creator's, and
+        // its index lists a recording of its own.
+        ingest(&h, 2).await;
+        h.store.own(&payload(2), READER).await;
+        *h.status.subject.lock().unwrap() = READER;
+        let theirs = json!([entry("rec-2", &payload(2))]);
+        let bundle = v2::bundle(READER, 1, &document, Some(&hash_of_index(&theirs)));
+        let r = put(
+            &h,
+            READER,
+            &token(READER),
+            body_with(&document, &bundle, theirs),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (
+                StatusCode::CONFLICT,
+                "catalog document already published with another index"
+            )
+        );
+
+        {
+            let docs = h.store.catalog_documents.lock().await;
+            assert_eq!(docs[&hash].body, Bytes::from(document.clone()));
+            assert_eq!(docs[&hash].owner.as_deref(), Some(SUB));
+        }
+        assert_eq!(h.store.catalog_outboards.lock().await[&hash], outboard);
+        assert_eq!(h.store.catalog_indexes.lock().await[&hash], record);
+        assert!(!h.store.catalog_pointers.lock().await.contains_key(READER));
+        let transitions = h.store.transitions.lock().await;
+        assert_eq!(transitions.len(), 1, "no transition of READER's");
+        assert!(transitions.keys().all(|key| key.starts_with(SUB)));
+        drop(transitions);
+        assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"1\"");
+    }
+
+    /// The index record is created first, so a document write that fails
+    /// after it leaves a record no pointer names, which nothing serves, and
+    /// the same publish sent again completes.
+    #[tokio::test]
+    async fn a_publish_whose_document_write_failed_completes_on_retry() {
+        let h = ingested().await;
+        let document = envelope(1);
+        let hash = hash_of(&document);
+        h.store
+            .fail_next_document_write
+            .store(true, Ordering::Relaxed);
+        let r = publish(&h, 1, &document).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::BAD_GATEWAY, "storage unavailable")
+        );
+        let record = h
+            .store
+            .catalog_indexes
+            .lock()
+            .await
+            .get(&hash)
+            .cloned()
+            .expect("the index record is created before the document");
+        assert_eq!(
+            h.store.transitions.lock().await.len(),
+            1,
+            "the transition is written before the document"
+        );
+        assert!(h.store.catalog_documents.lock().await.is_empty());
+        assert!(h.store.catalog_outboards.lock().await.is_empty());
+        assert!(h.store.catalog_pointers.lock().await.is_empty());
+        assert_eq!(get(&h, SUB).await.status, StatusCode::NOT_FOUND);
+
+        let r = publish(&h, 1, &document).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        assert_eq!(
+            h.store.catalog_documents.lock().await[&hash]
+                .owner
+                .as_deref(),
+            Some(SUB)
+        );
+        assert!(h.store.catalog_outboards.lock().await.contains_key(&hash));
+        assert_eq!(h.store.catalog_indexes.lock().await[&hash], record);
+        assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"1\"");
     }
 
     #[tokio::test]
@@ -2123,15 +2333,23 @@ mod tests {
     #[tokio::test]
     async fn an_index_record_that_cannot_be_read_back_is_unavailable() {
         let unavailable = (StatusCode::BAD_GATEWAY, "storage unavailable");
-        // The create loses to one still in flight, so nothing is there yet.
+        // The create loses, yet no record is there to read.
         let h = ingested().await;
         h.store
             .lose_next_index_create
             .store(true, Ordering::Relaxed);
         let r = publish(&h, 1, &envelope(1)).await;
         assert_eq!((r.status, r.error().as_str()), unavailable);
-        assert!(h.store.catalog_indexes.lock().await.is_empty());
-        assert!(h.store.catalog_pointers.lock().await.is_empty());
+        assert_nothing_stored(&h).await;
+
+        // The create fails: S3's 409 on every attempt, say.
+        let h = ingested().await;
+        h.store
+            .fail_next_index_create
+            .store(true, Ordering::Relaxed);
+        let r = publish(&h, 1, &envelope(1)).await;
+        assert_eq!((r.status, r.error().as_str()), unavailable);
+        assert_nothing_stored(&h).await;
 
         // The record there doesn't parse.
         let h = ingested().await;
@@ -2145,6 +2363,9 @@ mod tests {
         let r = publish(&h, 1, &envelope(1)).await;
         assert_eq!((r.status, r.error().as_str()), unavailable);
         assert_eq!(h.store.catalog_indexes.lock().await[&hash], garbage);
+        assert!(h.store.transitions.lock().await.is_empty());
+        assert!(h.store.catalog_documents.lock().await.is_empty());
+        assert!(h.store.catalog_outboards.lock().await.is_empty());
         assert!(h.store.catalog_pointers.lock().await.is_empty());
     }
 
@@ -2327,20 +2548,16 @@ mod tests {
             (r.status, r.error().as_str()),
             (StatusCode::BAD_GATEWAY, "storage unavailable")
         );
+        // Read before any write: nothing of the publish is stored, not even
+        // its index record.
         assert_eq!(h.store.transitions.lock().await.len(), 1);
-        assert!(
-            !h.store
-                .catalog_documents
-                .lock()
-                .await
-                .contains_key(&hash_of(&second))
-        );
+        assert_unstored(&h, &second, 1).await;
         assert_eq!(h.store.catalog_pointers.lock().await[SUB], stored);
     }
 
     #[tokio::test]
     async fn nothing_is_dropped_from_a_base_that_is_not_served() {
-        #[derive(Debug)]
+        #[derive(Debug, Clone, Copy)]
         enum Hidden {
             EnvelopeBlocked,
             CatalogBlocked,
@@ -2348,60 +2565,94 @@ mod tests {
             /// after its token checks, mid-publish.
             HideCatalogSuspension,
         }
+        // `GET` serves none of these bases, and preconditions see what
+        // `GET` serves: the base's tag is a 412 that writes no transition,
+        // and the client publishes as after a 404.
+        let tag = (header::IF_MATCH, "\"1\"");
+        let none = (header::IF_NONE_MATCH, "*");
         for hidden in [
             Hidden::EnvelopeBlocked,
             Hidden::CatalogBlocked,
             Hidden::HideCatalogSuspension,
         ] {
-            let h = ingested().await;
-            ingest(&h, 2).await;
-            ingest(&h, 3).await;
-            let (first, both) = (envelope(1), json!([rec(1), rec(2)]));
-            let r = publish_index(&h, 1, &first, both.clone()).await;
-            assert_eq!(r.status, StatusCode::OK, "{}", r.error());
-            let precondition = match hidden {
-                // `GET` serves none, so the client publishes as after a 404.
-                Hidden::EnvelopeBlocked => {
-                    h.moderation.block_for_test(&hash_of(&first));
-                    (header::IF_NONE_MATCH, "*")
+            for precondition in [tag.clone(), none.clone()] {
+                let h = ingested().await;
+                ingest(&h, 2).await;
+                ingest(&h, 3).await;
+                let (first, both) = (envelope(1), json!([rec(1), rec(2)]));
+                let r = publish_index(&h, 1, &first, both.clone()).await;
+                assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+                match hidden {
+                    Hidden::EnvelopeBlocked => h.moderation.block_for_test(&hash_of(&first)),
+                    Hidden::CatalogBlocked => h.moderation.block_catalog_for_test(SUB),
+                    Hidden::HideCatalogSuspension => {
+                        let moderation = Arc::clone(&h.moderation);
+                        *h.status.on_check.lock().unwrap() =
+                            Some(Box::new(move || moderation.suspend_for_test(SUB, true)));
+                    }
                 }
-                Hidden::CatalogBlocked => {
-                    h.moderation.block_catalog_for_test(SUB);
-                    (header::IF_MATCH, "\"1\"")
-                }
-                Hidden::HideCatalogSuspension => {
-                    let moderation = Arc::clone(&h.moderation);
-                    *h.status.1.lock().unwrap() =
-                        Some(Box::new(move || moderation.suspend_for_test(SUB, true)));
-                    (header::IF_MATCH, "\"1\"")
-                }
-            };
 
-            let (second, next) = (envelope(2), json!([rec(1), rec(3)]));
-            let r = publish_index_if(&h, 2, &second, &next, precondition).await;
-            assert_eq!(r.status, StatusCode::OK, "{hidden:?}: {}", r.error());
-            let t = transition(&h, 2, &second, &next).await;
-            assert!(t.dropped.is_empty(), "{hidden:?}");
-            assert_eq!(
-                t.added,
-                [payload(3)],
-                "{hidden:?}: against the base's index"
-            );
-            assert_eq!(t.base, base(1, &first, &both), "{hidden:?}");
+                let (second, next) = (envelope(2), json!([rec(1), rec(3)]));
+                let is_tag = precondition == tag;
+                let r = publish_index_if(&h, 2, &second, &next, precondition).await;
+                if is_tag {
+                    assert_eq!(
+                        r.status,
+                        StatusCode::PRECONDITION_FAILED,
+                        "{hidden:?}: {}",
+                        r.error()
+                    );
+                    assert_eq!(h.store.transitions.lock().await.len(), 1, "{hidden:?}");
+                    assert_unstored(&h, &second, 1).await;
+                    continue;
+                }
+                assert_eq!(r.status, StatusCode::OK, "{hidden:?}: {}", r.error());
+                let t = transition(&h, 2, &second, &next).await;
+                assert!(t.dropped.is_empty(), "{hidden:?}");
+                assert_eq!(
+                    t.added,
+                    [payload(3)],
+                    "{hidden:?}: against the base's index"
+                );
+                assert_eq!(t.base, base(1, &first, &both), "{hidden:?}");
+            }
         }
     }
 
+    /// The index record is created before the transition, so a failed
+    /// transition write leaves only that record, which no pointer names and
+    /// nothing serves; the same publish sent again completes.
     #[tokio::test]
-    async fn a_failed_transition_write_stores_nothing() {
+    async fn a_failed_transition_write_leaves_only_the_index_record() {
         let unavailable = (StatusCode::BAD_GATEWAY, "storage unavailable");
         let h = ingested().await;
+        let first = envelope(1);
         h.store.fail_next_transition.store(true, Ordering::Relaxed);
-        let r = publish(&h, 1, &envelope(1)).await;
+        let r = publish(&h, 1, &first).await;
         assert_eq!((r.status, r.error().as_str()), unavailable);
-        assert_nothing_stored(&h).await;
+        assert!(h.store.transitions.lock().await.is_empty());
+        assert!(h.store.catalog_documents.lock().await.is_empty());
+        assert!(h.store.catalog_outboards.lock().await.is_empty());
+        assert!(h.store.catalog_pointers.lock().await.is_empty());
+        let record = h
+            .store
+            .catalog_indexes
+            .lock()
+            .await
+            .get(&hash_of(&first))
+            .cloned();
+        let record = record.expect("the index record is created before the transition");
+        assert_eq!(get(&h, SUB).await.status, StatusCode::NOT_FOUND);
 
-        // Over a stored pointer: nothing of the new publish either.
-        assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
+        // Sent again: completes, over the same record.
+        assert_eq!(publish(&h, 1, &first).await.status, StatusCode::OK);
+        assert_eq!(h.store.transitions.lock().await.len(), 1);
+        assert_eq!(
+            h.store.catalog_indexes.lock().await[&hash_of(&first)],
+            record
+        );
+
+        // Over a stored pointer: none of the new publish's other writes.
         let stored = h.store.catalog_pointers.lock().await[SUB].clone();
         h.store.fail_next_transition.store(true, Ordering::Relaxed);
         let second = envelope(2);
@@ -2410,9 +2661,14 @@ mod tests {
         let hash = hash_of(&second);
         assert!(!h.store.catalog_documents.lock().await.contains_key(&hash));
         assert!(!h.store.catalog_outboards.lock().await.contains_key(&hash));
-        assert!(!h.store.catalog_indexes.lock().await.contains_key(&hash));
+        assert!(h.store.catalog_indexes.lock().await.contains_key(&hash));
         assert_eq!(h.store.catalog_pointers.lock().await[SUB], stored);
         assert_eq!(h.store.transitions.lock().await.len(), 1);
+        assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"1\"");
+
+        assert_eq!(publish(&h, 2, &second).await.status, StatusCode::OK);
+        assert_eq!(h.store.transitions.lock().await.len(), 2);
+        assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"2\"");
     }
 
     #[tokio::test]
@@ -2430,7 +2686,8 @@ mod tests {
         let r = publish_if(&h, 2, &second, header::IF_MATCH, "\"1\"").await;
         assert_eq!(r.status, StatusCode::PRECONDITION_FAILED, "{}", r.error());
         assert_eq!(*h.store.transitions.lock().await, committed);
-        let r = publish_if(&h, 2, &second, header::IF_MATCH, "*").await;
+        // Sent with the committed pointer's own tag: past the 412, the 409.
+        let r = publish_if(&h, 2, &second, header::IF_MATCH, "\"2\"").await;
         assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.error());
         assert_eq!(*h.store.transitions.lock().await, committed);
     }

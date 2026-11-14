@@ -92,14 +92,18 @@ pub struct ModerationView {
 /// between its listing and its read; [`catalog_scan::scan`]'s rules apply
 /// to pointers and index records.
 pub async fn read<O: ObjectStore>(store: &O) -> anyhow::Result<Snapshot> {
-    // The order matters, because a publish writes its transition, then its
-    // document, outboard and index, then its pointer:
+    // The order matters, because a publish writes its index record, its
+    // transition, its document and outboard, and only then its pointer:
+    // whatever a pointer names was written before it.
     // - pointers before transitions, so the transition of every pointer
     //   read is listed too. The other way round, a publish landing between
     //   the two reads would leave its pointer's walk with no first step,
     //   and the older transitions it reaches would look unreachable;
-    // - envelope objects before pointers, so only a publish whose writes
-    //   span the pointer read lists a document no pointer read names.
+    // - pointers before index records (`catalog_scan::scan`), so every `/2`
+    //   pointer read finds the index record it signed;
+    // - envelope objects before pointers, so a publish in flight lists an
+    //   envelope object (its index record is the first) that no pointer
+    //   read names only when its writes span the pointer read.
     let envelope_objects = envelope_objects(store).await?;
     let catalogs = catalog_scan::scan(store).await?;
     let transitions = transitions(store).await?;

@@ -36,25 +36,41 @@ async fn test_s3_key_with_prefix() {
 /// A loopback S3 that keeps each object's body and `x-amz-meta-owner`. A
 /// `PUT` with `If-None-Match: *` on an existing key fails with 412.
 async fn metadata_s3() -> String {
+    metadata_s3_with_conflicts(0).await
+}
+
+/// As [`metadata_s3`], answering the first `conflicts` `PUT`s with
+/// `If-None-Match: *` 409 `ConditionalRequestConflict`, as S3 does while a
+/// conflicting conditional write to the key is in progress.
+async fn metadata_s3_with_conflicts(conflicts: usize) -> String {
     use axum::body::Bytes;
     use axum::http::{HeaderMap, Method, StatusCode, Uri};
     use axum::response::IntoResponse;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    type Objects = Arc<Mutex<HashMap<String, (Bytes, Option<String>)>>>;
-    let objects: Objects = Arc::default();
+    type Objects = Arc<Mutex<(HashMap<String, (Bytes, Option<String>)>, usize)>>;
+    let objects: Objects = Arc::new(Mutex::new((HashMap::new(), conflicts)));
     let app = axum::Router::new().fallback(
         move |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| {
             let objects = Arc::clone(&objects);
             async move {
                 let key = uri.path().to_string();
-                let mut objects = objects.lock().unwrap();
+                let mut guard = objects.lock().unwrap();
+                let (objects, conflicts) = &mut *guard;
                 match method {
                     Method::PUT => {
                         let create_only = headers
                             .get("if-none-match")
                             .is_some_and(|v| v.as_bytes() == b"*");
+                        if create_only && *conflicts > 0 {
+                            *conflicts -= 1;
+                            return (
+                                StatusCode::CONFLICT,
+                                "<Error><Code>ConditionalRequestConflict</Code><Message>x</Message></Error>",
+                            )
+                                .into_response();
+                        }
                         if create_only && objects.contains_key(&key) {
                             return (
                                 StatusCode::PRECONDITION_FAILED,
@@ -239,4 +255,50 @@ async fn test_create_catalog_index_is_conditional() {
     assert!(s3.create_catalog_index(&hash, first.clone()).await.unwrap());
     assert!(!s3.create_catalog_index(&hash, second).await.unwrap());
     assert_eq!(s3.get_catalog_index(&hash).await.unwrap(), Some(first));
+}
+
+/// A client of a loopback S3 at `endpoint_url`.
+async fn loopback_client(endpoint_url: String) -> S3Client {
+    // SAFETY: callers run on a current_thread runtime, so no other thread
+    // reads env vars concurrently.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+    }
+    S3Client::from_config(&tdf_iroh_s3::config::S3Config {
+        bucket: "test-bucket".into(),
+        region: "us-east-1".into(),
+        prefix: String::new(),
+        endpoint_url,
+        force_path_style: true,
+    })
+    .await
+    .unwrap()
+}
+
+/// S3's 409 on the index record's create (a conflicting conditional write
+/// still in progress) is no answer: the create is sent again and written,
+/// and a 409 on every attempt is an error, never `false`.
+#[tokio::test(flavor = "current_thread")]
+async fn test_create_catalog_index_sends_a_409_again() {
+    use bytes::Bytes;
+
+    let hash = "ef".repeat(32);
+    let body = Bytes::from_static(b"{\"owner\":\"u1\"}");
+    let s3 = loopback_client(metadata_s3_with_conflicts(1).await).await;
+    assert!(s3.create_catalog_index(&hash, body.clone()).await.unwrap());
+    assert_eq!(
+        s3.get_catalog_index(&hash).await.unwrap(),
+        Some(body.clone())
+    );
+
+    let s3 = loopback_client(metadata_s3_with_conflicts(usize::MAX).await).await;
+    let e = s3.create_catalog_index(&hash, body).await.unwrap_err();
+    let shown = format!("{e:#}");
+    assert!(
+        shown.starts_with("Failed to create catalog index in S3: "),
+        "{shown}"
+    );
+    assert!(shown.contains("409"), "{shown}");
+    assert_eq!(s3.get_catalog_index(&hash).await.unwrap(), None);
 }

@@ -4,7 +4,9 @@ use aws_sdk_s3::config::RequestChecksumCalculation;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::{ByteStream, DateTime};
 use bytes::Bytes;
+use std::future::Future;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::config::S3Config;
 use crate::object_store::{ObjectInfo, ObjectStore, VersionInfo};
@@ -23,11 +25,57 @@ pub struct S3Client {
     list_page_size: i32,
 }
 
-/// Whether a conditional write lost: 412, the condition failed, or 409, a
-/// concurrent conditional write to the same key is in progress.
+/// The pauses before sending a conditional write again after S3's 409:
+/// at most three attempts in all.
+const CONFLICT_BACKOFF: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(500)];
+
+/// The HTTP status S3 answered with, if it answered.
+fn status<E>(e: &SdkError<E>) -> Option<u16> {
+    e.raw_response().map(|r| r.status().as_u16())
+}
+
+/// Whether a conditional write lost: 412, its condition failed. Not 409
+/// (see [`in_conflict`]).
 fn lost_condition<E>(e: &SdkError<E>) -> bool {
-    e.raw_response()
-        .is_some_and(|r| matches!(r.status().as_u16(), 409 | 412))
+    status(e) == Some(412)
+}
+
+/// Whether S3 answered a conditional write 409 (`ConditionalRequestConflict`):
+/// a conflicting conditional write to the same key is still in progress,
+/// so whether this one loses is unknown. S3 says to retry.
+fn in_conflict<E>(e: &SdkError<E>) -> bool {
+    status(e) == Some(409)
+}
+
+/// Send a conditional write, `send` building it afresh for each attempt.
+/// `Ok(true)` when written, `Ok(false)` when it lost (412). A 409 is sent
+/// again after each of [`CONFLICT_BACKOFF`]'s pauses; a 409 on the last
+/// attempt is `Err` (the outcome is unknown), never `Ok(false)`. Any other
+/// error is `Err` at once. `what` is the error's context.
+async fn send_conditional<T, E, F, Fut>(what: &str, mut send: F) -> Result<bool>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, SdkError<E>>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut pauses = CONFLICT_BACKOFF.iter();
+    loop {
+        match send().await {
+            Ok(_) => return Ok(true),
+            Err(e) if lost_condition(&e) => return Ok(false),
+            Err(e) if in_conflict(&e) => match pauses.next() {
+                Some(pause) => tokio::time::sleep(*pause).await,
+                None => {
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "{what}: S3 answered 409 {} times, a conflicting conditional write \
+                         to the key still in progress",
+                        CONFLICT_BACKOFF.len() + 1
+                    )));
+                }
+            },
+            Err(e) => return Err(anyhow::Error::new(e).context(what.to_string())),
+        }
+    }
 }
 
 /// The versions of exactly `key` in a listing of `key` as a prefix (which
@@ -675,24 +723,22 @@ impl S3Client {
 
     /// Create a catalog's index record under `catalog-indexes/<hash>` only
     /// if none exists (`If-None-Match: *`): one envelope has one index.
-    /// `false` when one already does, or when a concurrent conditional
-    /// write to it is in progress.
+    /// `false` when one already does; `Err` when a concurrent conditional
+    /// write to it is still in progress after the retries
+    /// (`send_conditional`).
     pub async fn create_catalog_index(&self, hash_hex: &str, body: Bytes) -> Result<bool> {
-        match self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(self.catalog_index_key(hash_hex))
-            .content_type("application/json")
-            .if_none_match("*")
-            .body(body.into())
-            .send()
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(e) if lost_condition(&e) => Ok(false),
-            Err(e) => Err(anyhow::Error::new(e).context("Failed to create catalog index in S3")),
-        }
+        let key = self.catalog_index_key(hash_hex);
+        send_conditional("Failed to create catalog index in S3", || {
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .content_type("application/json")
+                .if_none_match("*")
+                .body(body.clone().into())
+                .send()
+        })
+        .await
     }
 
     /// A catalog's index record, or `None` (a catalog published before
@@ -715,8 +761,8 @@ impl S3Client {
         }
     }
 
-    /// Write a publish's transition record, before its document, index and
-    /// pointer.
+    /// Write a publish's transition record, after its index record and
+    /// before its document, outboard and pointer.
     pub async fn put_catalog_transition(&self, sub: &str, name: &str, body: Bytes) -> Result<()> {
         self.client
             .put_object()
@@ -732,29 +778,30 @@ impl S3Client {
 
     /// Store a creator's pointer bundle only if the stored one is still
     /// `expected` (its ETag), or, with `None`, only if there is none.
-    /// `false` when another write got there first.
+    /// `false` when another write got there first; `Err` when a conflicting
+    /// write is still in progress after the retries (`send_conditional`).
     pub async fn put_catalog_pointer(
         &self,
         sub: &str,
         body: Bytes,
         expected: Option<&str>,
     ) -> Result<bool> {
-        let put = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(self.catalog_pointer_key(sub))
-            .content_type("application/json")
-            .body(body.into());
-        let put = match expected {
-            Some(etag) => put.if_match(etag),
-            None => put.if_none_match("*"),
-        };
-        match put.send().await {
-            Ok(_) => Ok(true),
-            Err(e) if lost_condition(&e) => Ok(false),
-            Err(e) => Err(anyhow::Error::new(e).context("Failed to PUT catalog pointer to S3")),
-        }
+        let key = self.catalog_pointer_key(sub);
+        send_conditional("Failed to PUT catalog pointer to S3", || {
+            let put = self
+                .client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .content_type("application/json")
+                .body(body.clone().into());
+            match expected {
+                Some(etag) => put.if_match(etag),
+                None => put.if_none_match("*"),
+            }
+            .send()
+        })
+        .await
     }
 
     pub async fn delete_blob(&self, hash_hex: &str) -> Result<()> {
@@ -794,31 +841,27 @@ impl S3Client {
     }
 
     /// Create one moderation record (`moderation/<kind>/<key>`) only if
-    /// none exists (`If-None-Match: *`). `false` when one already does, or
-    /// when a concurrent conditional write to it is in progress.
+    /// none exists (`If-None-Match: *`). `false` when one already does;
+    /// `Err` when a concurrent conditional write to it is still in progress
+    /// after the retries (`send_conditional`).
     pub async fn create_moderation_record(
         &self,
         kind: &str,
         key: &str,
         body: Bytes,
     ) -> Result<bool> {
-        match self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(format!("{}{}", self.moderation_prefix(kind), key))
-            .content_type("application/json")
-            .if_none_match("*")
-            .body(body.into())
-            .send()
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(e) if lost_condition(&e) => Ok(false),
-            Err(e) => {
-                Err(anyhow::Error::new(e).context("Failed to create moderation record in S3"))
-            }
-        }
+        let key = format!("{}{}", self.moderation_prefix(kind), key);
+        send_conditional("Failed to create moderation record in S3", || {
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .content_type("application/json")
+                .if_none_match("*")
+                .body(body.clone().into())
+                .send()
+        })
+        .await
     }
 
     /// One moderation record (`moderation/<kind>/<key>`), or `None`.
@@ -981,20 +1024,17 @@ impl ObjectStore for S3Client {
     }
 
     async fn create(&self, key: &str, body: Bytes) -> Result<bool> {
-        match self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(self.object_key(key))
-            .if_none_match("*")
-            .body(body.into())
-            .send()
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(e) if lost_condition(&e) => Ok(false),
-            Err(e) => Err(anyhow::Error::new(e).context(format!("Failed to create {key} in S3"))),
-        }
+        let object_key = self.object_key(key);
+        send_conditional(&format!("Failed to create {key} in S3"), || {
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&object_key)
+                .if_none_match("*")
+                .body(body.clone().into())
+                .send()
+        })
+        .await
     }
 
     /// Call 12: list `key`'s versions with `key` as the prefix, keep exact
@@ -1112,19 +1152,87 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_lost_condition_is_409_or_412_only() {
+    /// A PutObject that S3 answered with `status`.
+    fn failed(status: u16) -> SdkError<aws_sdk_s3::operation::put_object::PutObjectError> {
         use aws_sdk_s3::config::http::HttpResponse;
         use aws_sdk_s3::operation::put_object::PutObjectError;
         use aws_sdk_s3::primitives::SdkBody;
 
-        let failed = |status: u16| -> SdkError<PutObjectError> {
-            let raw = HttpResponse::new(status.try_into().unwrap(), SdkBody::empty());
-            SdkError::service_error(PutObjectError::unhandled("x"), raw)
-        };
+        let raw = HttpResponse::new(status.try_into().unwrap(), SdkBody::empty());
+        SdkError::service_error(PutObjectError::unhandled("x"), raw)
+    }
+
+    /// `send_conditional` against S3 answering `statuses` in turn (200 is a
+    /// write): its result, how many attempts it made and how long it took.
+    async fn conditional(statuses: &[u16]) -> (Result<bool>, usize, std::time::Duration) {
+        let mut answers = statuses.iter().copied();
+        let mut attempts = 0;
+        let started = tokio::time::Instant::now();
+        let result = send_conditional("Failed to PUT k", || {
+            attempts += 1;
+            let status = answers.next().expect("no attempt left");
+            std::future::ready(match status {
+                200 => Ok(()),
+                _ => Err(failed(status)),
+            })
+        })
+        .await;
+        (result, attempts, started.elapsed())
+    }
+
+    /// 409 is not "lost": a conflicting conditional write is still in
+    /// progress, and S3 says to retry.
+    #[test]
+    fn a_lost_condition_is_412_only() {
         assert!(lost_condition(&failed(412)));
-        assert!(lost_condition(&failed(409)));
+        assert!(!lost_condition(&failed(409)));
         assert!(!lost_condition(&failed(403)));
         assert!(!lost_condition(&failed(500)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_conditional_write_is_sent_again_after_a_409() {
+        let (result, attempts, took) = conditional(&[409, 200]).await;
+        assert!(result.unwrap());
+        assert_eq!(attempts, 2);
+        assert_eq!(took, std::time::Duration::from_millis(100));
+
+        // The conflicting write won meanwhile: lost.
+        let (result, attempts, _) = conditional(&[409, 409, 412]).await;
+        assert!(!result.unwrap());
+        assert_eq!(attempts, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_409_on_every_attempt_is_an_error_not_lost() {
+        let (result, attempts, took) = conditional(&[409, 409, 409]).await;
+        let e = result.unwrap_err();
+        assert_eq!(attempts, 3);
+        assert_eq!(took, std::time::Duration::from_millis(600));
+        let shown = e.to_string();
+        assert!(shown.starts_with("Failed to PUT k: "), "{shown}");
+        assert!(shown.contains("409"), "{shown}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_412_is_lost_without_a_retry() {
+        let (result, attempts, took) = conditional(&[412]).await;
+        assert!(!result.unwrap());
+        assert_eq!(attempts, 1);
+        assert_eq!(took, std::time::Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn other_errors_fail_without_a_retry() {
+        for status in [403, 500, 503] {
+            let (result, attempts, took) = conditional(&[status]).await;
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "Failed to PUT k",
+                "{status}"
+            );
+            assert_eq!(attempts, 1, "{status}");
+            assert_eq!(took, std::time::Duration::ZERO, "{status}");
+        }
     }
 }

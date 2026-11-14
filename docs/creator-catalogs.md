@@ -123,7 +123,7 @@ This route is public: the bytes are an envelope, ciphertext to anyone who can't 
 - **200:** the stored bytes, with `Content-Type: application/zip`, `ETag: "<hash>"` and `Cache-Control: public, max-age=300`.
 - **304:** no body, with the same `ETag` and `Cache-Control`, when `If-None-Match` names `"<hash>"` (or its weak form `W/"<hash>"`, or `*`), the document is stored, and it is not hidden.
 - **400:** `invalid hash`. The hash must be 64 lowercase hex characters.
-- **404:** `catalog not found`, also when the document's hash is blocked or its owner is suspended with `hideCatalog`, and also in answer to `If-None-Match`.
+- **404:** `catalog not found`, also when the document's hash is blocked or its owner has a catalog block or a `hideCatalog` suspension, and also in answer to `If-None-Match`.
 
 The bytes behind a hash never change, but the node may later block a document or hide its owner's catalog. So a client or proxy reuses a document for at most 5 minutes and then revalidates it, and a block or `hideCatalog` reaches readers within that time. The node records each document's `owner` alongside it when it stores it.
 
@@ -346,12 +346,14 @@ The node checks this on publish and readers check it on read. The rules are the 
 
 This is the only route that publishes a catalog. The request needs `Authorization: Bearer <Arkavo CWT>` and `Content-Type: application/json`. Its body is `{"document": "<base64url envelope bytes>", "bundle": {…}, "index": [ … ]}`, at most 10 MiB (10 485 760 bytes): a 4 MiB envelope is about 5.6 MiB in base64url, and an index of 1000 entries up to about 400 KiB.
 
-The request must name the base the client merged its document from, with a standard conditional header (RFC 9110). Without one, a device whose own highest `seq` exceeds the stored one could publish over a base it never read, and replace what another device saved.
+The request must name the base the client merged its document from, with exactly one of two standard conditional headers (RFC 9110), in the form below. Without one, a device whose own highest `seq` exceeds the stored one could publish over a base it never read, and replace what another device saved.
 
-- **`If-Match: "<seq>"`:** the client merged from the stored pointer with this `seq`, as `GET /v2/catalogs/{sub}` tagged it (`ETag`). The tag is compared strongly: a weak tag (`W/"7"`) or a bare `7` never matches. `If-Match: *` matches any pointer that `GET` serves.
-- **`If-None-Match: *`:** the client merged from "no catalog yet" (a 404). No pointer may be stored, apart from one `GET` doesn't serve: preconditions see what `GET` serves. That is a pointer whose catalog is blocked, whose `seq` must still be exceeded, or one at a catalog from before envelopes, which reads as no pointer at all, so the first envelope may start at any `seq`.
+- **`If-Match: "<seq>"`:** the client merged from the stored pointer with this `seq`, as `GET /v2/catalogs/{sub}` tagged it (`ETag`). It is one strong entity tag whose content is ASCII decimal digits, sent as one header line with no list. It holds only when `GET` serves a pointer whose `ETag` is exactly that tag.
+- **`If-None-Match: *`:** exactly `*`, as one header line. The client merged from "no catalog yet" (a 404). No pointer may be stored, apart from one `GET` doesn't serve: preconditions see what `GET` serves. That is a pointer whose envelope's hash is blocked, or the pointer of a creator with a [catalog block](publishing-and-moderation.md#moderation-operators), in both cases with a `seq` that must still be exceeded; or one at a catalog from before envelopes, which reads as no pointer at all, so the first envelope may start at any `seq`.
 
-If the stored pointer is no longer that base, the node answers 412 `catalog changed since it was read` and stores nothing. Read the pointer again, merge, sign and retry. When both headers are sent, both must hold. A header value that is not visible ASCII fails. A request with neither header gets 428 `precondition required`, also on a node with `[publishing] required = false`.
+Anything else gets 428 `precondition required`, before the node reads the stored pointer, also on a node with `[publishing] required = false`. That includes neither header or both, `If-Match: *`, a list of tags, a weak (`W/"7"`), unquoted (`7`), empty or non-digit tag, any `If-None-Match` other than `*`, a repeated header line, and a value that is not visible ASCII.
+
+If the stored pointer is no longer that base, the node answers 412 `catalog changed since it was read` and stores nothing. Read the pointer again, merge, sign and retry.
 
 The node checks the following in order:
 
@@ -381,14 +383,19 @@ The node checks the following in order:
 | Every recording's manifest is stored (at ingest) and readable. A recording ingested before the node stored manifests has none: push it again. | 422 `payload <hash> manifest is not stored` or `… manifest is unreadable` |
 | Every entry's recording policy names the envelope's attribute | 422 `entry <contentID> policy does not include the catalog attribute` |
 | The passkey credential is still the subject's, according to the IdP's status route | 403 `passkey credential unknown`, `… revoked` or `… belongs to another subject`; 502 `credential status unavailable` |
-| `If-Match` or `If-None-Match` is sent | 428 `precondition required` |
+| exactly one of `If-Match: "<seq>"` or `If-None-Match: *` is sent | 428 `precondition required` |
 | The stored pointer is the base named by `If-Match` or `If-None-Match` | 412 `catalog changed since it was read`; 502 `storage unavailable` when the stored pointer or its index record can't be read or parsed, or a stored `/2` pointer's index record doesn't match its `indexHash` |
 | `seq` is greater than the stored one | 409 `seq must be greater than <n>` |
-| The envelope has no index record yet, or its record is a retry of this publish: `{sub}`'s (subjects compared canonically), with the same canonical index. Checked as the record is written, after the envelope and its outboard. | 409 `catalog document already published with another index`; 502 `storage unavailable` when the existing record can't be read |
+| The envelope has no index record yet, or its record is a retry of this publish: `{sub}`'s (subjects compared canonically), with the same canonical index. Checked as the record is written, before the transition, the envelope and its outboard. | 409 `catalog document already published with another index`; 502 `storage unavailable` when the record can't be created or the existing one can't be read |
 
 The two owner refusals also carry `contentIDs`: the `contentID` of every entry refused, sorted, including every entry that names the same payload. For example: `{"error":"recording belongs to another account","contentIDs":["rec-a","rec-b"]}`. Every other refusal in the table is `{"error":"…"}` alone.
 
-The node then writes the publish's transition at `catalog-transitions/<sub>/<seq, 20 digits>-<pointer digest>` (never served): the base pointer it replaces, and which recordings it drops from the served catalog and adds, for the [deletion of dropped recordings](#removing-a-recording). To know what the publish drops, the node reads the owner record of each recording the served base lists, the new index doesn't and no block covers (only a recording the publisher owns is dropped). If one of those owner records can't be read, or the transition can't be written, the node answers 502 `storage unavailable` and stores nothing else. It then stores the envelope at `catalog-documents/<blake3>` with its BAO outboard at `catalog-outboards/<blake3>`, the index at `catalog-indexes/<blake3>` (never served), then the bundle at `catalog-pointers/<sub>`. The index is written only if the envelope has none (`If-None-Match: *`): one envelope has one index, so a publish that lost can't rewrite the index of the pointer that won. An envelope already stored with another index gets the table's last 409; a fresh envelope (a new policy `uuid`) has a new hash. The pointer is written only if no other publish replaced it in the meantime; otherwise 409 `seq must be greater than the stored seq: another publish won`. Read the pointer again and retry.
+The node then writes, in this order: the index at `catalog-indexes/<blake3>` (never served), the publish's transition at `catalog-transitions/<sub>/<seq, 20 digits>-<pointer digest>` (never served), the envelope at `catalog-documents/<blake3>`, its BAO outboard at `catalog-outboards/<blake3>`, then the bundle at `catalog-pointers/<sub>`.
+
+- **The index** is written only if the envelope has none (`If-None-Match: *`): one envelope has one index, so a publish that lost can't rewrite the index of the pointer that won. An envelope that already has another index record gets the table's last 409, and nothing of that publish is written; a fresh envelope (a new policy `uuid`) has a new hash.
+- **The transition** holds the base pointer the publish replaces, and which recordings it drops from the served catalog and adds, for the [deletion of dropped recordings](#removing-a-recording). To know what the publish drops, the node reads the owner record of each recording the served base lists, the new index doesn't and no block covers (only a recording the publisher owns is dropped). It reads them before it writes anything: if one of those owner records can't be read, the node answers 502 `storage unavailable` and stores nothing.
+- **A failed write** of the transition, the envelope or its outboard is 502 `storage unavailable`. What the publish wrote before it is named by no pointer, so `GET` serves the catalog as before, and the same publish sent again completes.
+- **The pointer** is written only if no other publish replaced it in the meantime; otherwise 409 `seq must be greater than the stored seq: another publish won`. Read the pointer again and retry.
 
 200: `{"owner":"<sub>","seq":<n>,"hash":"<blake3 hex>","size":<bytes>}`.
 
@@ -400,7 +407,7 @@ The request needs `Authorization: Bearer <Arkavo CWT>`, checked before anything 
 - **400:** `invalid subject`; `too many entities` for a chain over 8.
 - **401:** `token required`, `invalid token`, or an `X-Entity-Token` that doesn't verify or isn't bound to the bearer.
 - **403:** `not entitled to catalog`: the reader doesn't hold the attribute. Prompt them to follow the creator's campaign. Distinct from 404.
-- **404:** `catalog not found`. There is no catalog, the creator is suspended with `hideCatalog`, the catalog is blocked, or the pointer names a catalog from before envelopes. Only this 404 means "no catalog".
+- **404:** `catalog not found`. There is no catalog, the envelope's hash is blocked, the creator has a catalog block or a `hideCatalog` suspension, or the pointer names a catalog from before envelopes. Only this 404 means "no catalog".
 - **502:** `decision unavailable` when the decision service doesn't answer or isn't configured; `key set unavailable`; `storage unavailable`.
 
 ### Fetching the document over iroh
@@ -417,7 +424,7 @@ Fetch `catalogHash` from the pinned node, with a size limit of `catalogSize`. Th
 3. Write the `/2` pointer bytes over the envelope's hash and size and the index's [`indexHash`](#indexhash), and keep them exactly.
 4. Get a passkey assertion for RP `identity.arkavo.net`, with challenge SHA-256(pointer bytes) and user verification required. Allow only the signed-in account's credentials.
 5. Get the attestation for the assertion's credential: `POST https://identity.arkavo.net/passkeys/credential-attestation`.
-6. `PUT /v2/catalogs/<sub>` with the envelope, the bundle and the index (the merged document's `entries`, which `indexHash` covers), and `If-Match: <the ETag>`, or `If-None-Match: *` after a 404. One of the two is required. On a 412 or a 409, go back to step 1 and retry once.
+6. `PUT /v2/catalogs/<sub>` with the envelope, the bundle and the index (the merged document's `entries`, which `indexHash` covers), and `If-Match: <the ETag>`, or `If-None-Match: *` after a 404. Send exactly one of the two, in that form. On a 412 or a 409, go back to step 1 and retry once.
 
 ## Removed with `/1` (2026-10-27)
 

@@ -169,8 +169,8 @@ pub struct SubjectRequest {
     pub deleted_at: Option<i64>,
 }
 
-/// What one publish changed (spec 3.1), written before its document, index
-/// and pointer, and never served.
+/// What one publish changed (spec 3.1), written after its index record and
+/// before its document, outboard and pointer, and never served.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Transition {

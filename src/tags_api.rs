@@ -61,8 +61,8 @@ pub trait TagStore: Send + Sync + 'static {
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
     /// Create a catalog's index record (`catalog-indexes/<hash>`, never
     /// served) only if none exists: one envelope has one index. `false`
-    /// when one already does, or when a concurrent create of it is still in
-    /// flight.
+    /// when one already does; `Err` when it can't be created, a concurrent
+    /// create of it still in flight after the retries included.
     fn create_catalog_index(
         &self,
         hash_hex: &str,
@@ -74,8 +74,8 @@ pub trait TagStore: Send + Sync + 'static {
         hash_hex: &str,
     ) -> impl Future<Output = anyhow::Result<Option<Bytes>>> + Send;
     /// Write a publish's transition record
-    /// (`catalog-transitions/<sub>/<name>`, never served), before its
-    /// document, index and pointer.
+    /// (`catalog-transitions/<sub>/<name>`, never served), after its index
+    /// record and before its document, outboard and pointer.
     fn put_catalog_transition(
         &self,
         sub: &str,
@@ -321,9 +321,14 @@ pub(crate) mod test_support {
         /// The next conditional pointer write loses, as if another publish
         /// had moved the pointer since it was read.
         pub lose_next_pointer_race: std::sync::atomic::AtomicBool,
-        /// The next index record create loses without writing, as if a
-        /// concurrent create of the same record were still in flight.
+        /// The next index record create reports one already there, without
+        /// writing, though none is stored: as if the record were deleted
+        /// between the create and its read.
         pub lose_next_index_create: std::sync::atomic::AtomicBool,
+        /// The next index record create fails without writing.
+        pub fail_next_index_create: std::sync::atomic::AtomicBool,
+        /// The next catalog document write fails without writing.
+        pub fail_next_document_write: std::sync::atomic::AtomicBool,
     }
 
     impl MemStore {
@@ -415,6 +420,12 @@ pub(crate) mod test_support {
             owner: &str,
         ) -> anyhow::Result<()> {
             self.up()?;
+            anyhow::ensure!(
+                !self
+                    .fail_next_document_write
+                    .swap(false, std::sync::atomic::Ordering::Relaxed),
+                "document write failed"
+            );
             self.catalog_documents.lock().await.insert(
                 hash_hex.to_string(),
                 StoredDocument {
@@ -439,6 +450,12 @@ pub(crate) mod test_support {
         /// As S3's `If-None-Match: *`: the first body stays.
         async fn create_catalog_index(&self, hash_hex: &str, body: Bytes) -> anyhow::Result<bool> {
             self.up()?;
+            anyhow::ensure!(
+                !self
+                    .fail_next_index_create
+                    .swap(false, std::sync::atomic::Ordering::Relaxed),
+                "index create failed"
+            );
             if self
                 .lose_next_index_create
                 .swap(false, std::sync::atomic::Ordering::Relaxed)

@@ -232,14 +232,17 @@ pub(crate) mod test_support {
     use std::collections::hash_map::Entry;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     /// Owner records keyed by hash. With `down` set every call fails; with
-    /// `hang` set `get_owner` never resolves.
+    /// `hang` set `get_owner` never resolves; with `delay` set it answers
+    /// that much later.
     #[derive(Default)]
     pub struct MemOwners {
         pub records: Mutex<HashMap<String, Bytes>>,
         pub down: AtomicBool,
         pub hang: AtomicBool,
+        pub delay: Mutex<Duration>,
     }
 
     impl OwnerStore for MemOwners {
@@ -250,6 +253,10 @@ pub(crate) mod test_support {
             Box::pin(async move {
                 if self.hang.load(Ordering::Relaxed) {
                     std::future::pending::<()>().await;
+                }
+                let delay = *self.delay.lock().unwrap();
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
                 }
                 anyhow::ensure!(!self.down.load(Ordering::Relaxed), "down");
                 Ok(self.records.lock().unwrap().get(hash).cloned())

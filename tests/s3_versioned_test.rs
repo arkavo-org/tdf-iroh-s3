@@ -200,7 +200,8 @@ async fn version_listing_paginates() {
 }
 
 /// Two creates of one key at once: S3 lets exactly one through, and the
-/// other reports `false` (412, or 409 while the first is in flight).
+/// other reports `false` (412, at once or when it is sent again after a
+/// 409 while the first was in flight).
 #[tokio::test]
 #[ignore = "needs a real versioned bucket: TDF_IROH_S3_VERSIONED_BUCKET"]
 async fn a_concurrent_conditional_create_reports_false() {

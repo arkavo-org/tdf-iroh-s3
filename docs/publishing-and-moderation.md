@@ -85,8 +85,8 @@ The Creator app must open a session before each push. Until it does, pushes to a
 
 The first account to push a recording owns it. Its owner record is `moderation/publishers/<hash>`, `{"hash","subject","endpointId","at"}` with `subject` in canonical form. It is created only if none exists (`If-None-Match: *`) and never overwritten. On a node with `required = false` no owner is recorded and nothing in this section applies.
 
-- **First push owns.** Once a push is ingested, the node creates the record for the session's subject. If two first pushes race, the first create wins. If the create fails, the node logs it and the recording stays unowned; its next push claims it (that push skips the upload, since the blob is already there).
-- **Push refusal.** Before accepting a push, the node reads the hash's owner record, after the session, suspension, block and decision checks. A record naming another subject refuses the push with a permission error. So does a record that can't be read or parsed, a lookup over 5 s, or finding all 16 owner lookups busy (a bound of their own, apart from the session lookups'): the check fails closed. A record naming the pusher, or no record, lets the push through.
+- **First push owns.** Once a push is ingested, the node creates the record for the session's subject. If two first pushes race, the first create wins. A create S3 answers 409 (another create of the record still in progress) is sent again, three attempts in all; still 409, it has failed. If the create fails, the node logs it and the recording stays unowned; its next push claims it (that push skips the upload, since the blob is already there).
+- **Push refusal.** Before accepting a push, the node reads the hash's owner record, after the session, suspension, block and decision checks. A record naming another subject refuses the push with a permission error. So does a record that can't be read or parsed, or a check over 5 s: the check fails closed. At most 16 owner lookups run at once (a bound of their own, apart from the session lookups'); a push that finds them all busy waits for one, and the wait counts toward the 5 s. A record naming the pusher, or no record, lets the push through.
 - **Publish refusals.** `PUT /v2/catalogs/<sub>` reads each listed recording's owner record ([creator-catalogs.md](creator-catalogs.md#put-v2catalogssub-publish)):
   - an entry another account owns: 403 `recording belongs to another account`;
   - else an entry with no owner: 422 `recording has no owner: push it again`, and pushing it again claims it;
@@ -192,7 +192,7 @@ A recording its owner drops from their catalog is deleted from S3, every version
 
 ### What a publish records
 
-Hide from Catalog publishes the catalog without the entry, and an account deletion through Creator publishes an empty one; there is no other deletion route. Each `PUT /v2/catalogs/<sub>` first writes a transition at `catalog-transitions/<sub>/<seq, 20 digits>-<pointer digest>` (`<sub>` as in the pointer key; never served):
+Hide from Catalog publishes the catalog without the entry, and an account deletion through Creator publishes an empty one; there is no other deletion route. Each `PUT /v2/catalogs/<sub>` writes a transition at `catalog-transitions/<sub>/<seq, 20 digits>-<pointer digest>` (`<sub>` as in the pointer key; never served), after the envelope's index record and before the envelope, its outboard and the pointer ([write order](creator-catalogs.md#put-v2catalogssub-publish)):
 
 ```json
 {"subject":"<sub>","seq":8,"catalogHash":"<new>","pointer":"<digest>","base":{"seq":7,"catalogHash":"<old>","pointer":"<digest>"},"at":<unix secs>,"dropped":["<hash>"],"added":["<hash>"]}
