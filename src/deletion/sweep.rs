@@ -60,15 +60,12 @@ use super::due::{self, Decision, Item, View};
 use super::fold::{self, Fold};
 use super::snapshot::{self, ModerationView, Requests, Snapshot};
 use super::{
-    EnvelopeRequest, RecordingRequest, State, TRANSITIONS, VERIFY_AFTER, envelope_key,
-    operator_key, recording_key, subject_key,
+    DOCUMENTS, ENVELOPE_OBJECTS, EnvelopeRequest, RecordingRequest, State, TRANSITIONS,
+    VERIFY_AFTER, envelope_key, operator_key, recording_key, subject_key,
 };
 use crate::catalog_scan::{Catalogs, INDEXES, POINTERS};
 use crate::moderation::{canonical_subject, valid_subject};
 use crate::object_store::{ObjectStore, VersionInfo};
-
-/// Where a catalog document lives, with its `owner` metadata.
-const DOCUMENTS: &str = "catalog-documents/";
 
 /// A recording's objects, deleted in this order: the blob first, so
 /// nothing is served once anything is gone, and its owner record last
@@ -79,9 +76,6 @@ const RECORDING_OBJECTS: [&str; 4] = [
     "manifests/",
     "moderation/publishers/",
 ];
-
-/// An envelope's objects, deleted in this order.
-const ENVELOPE_OBJECTS: [&str; 3] = [DOCUMENTS, "catalog-outboards/", INDEXES];
 
 /// The objects of a recording a new push writes, and of an envelope a new
 /// publish writes: what makes a tombstone fresh (spec 3.4 step 7, rule 1),

@@ -13,8 +13,8 @@ use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::{
-    ENVELOPES, EnvelopeRequest, OPERATOR, OperatorRequest, RECORDINGS, RecordingRequest, SUBJECTS,
-    State, SubjectRequest, TRANSITIONS, Transition, transition_name,
+    ENVELOPE_OBJECTS, ENVELOPES, EnvelopeRequest, OPERATOR, OperatorRequest, RECORDINGS,
+    RecordingRequest, SUBJECTS, State, SubjectRequest, TRANSITIONS, Transition, transition_name,
 };
 use crate::catalog_scan::{self, Catalogs};
 use crate::creator_catalog::is_lower_hex_hash;
@@ -24,14 +24,6 @@ use crate::moderation::{
 };
 use crate::object_store::{ObjectInfo, ObjectStore, bodies};
 use crate::ownership::{PUBLISHERS, parse_owner};
-
-/// Where a catalog envelope's objects live, each keyed by its catalog
-/// hash. Only listed: [`Snapshot::envelope_objects`].
-const ENVELOPE_OBJECTS: [&str; 3] = [
-    "catalog-documents/",
-    "catalog-outboards/",
-    catalog_scan::INDEXES,
-];
 
 /// Everything the sweep decides on, as one run read it.
 #[derive(Debug, Default)]

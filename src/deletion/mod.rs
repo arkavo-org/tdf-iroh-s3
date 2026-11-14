@@ -16,6 +16,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::catalog_scan::INDEXES;
+
 pub mod due;
 pub mod fold;
 pub mod operator;
@@ -32,6 +34,14 @@ pub const ENVELOPES: &str = "deletion-requests/envelopes/";
 pub const OPERATOR: &str = "deletion-requests/operator/";
 /// `deletion-requests/subjects/<sub>`: [`SubjectRequest`].
 pub const SUBJECTS: &str = "deletion-requests/subjects/";
+
+/// Where a catalog document lives, with its `owner` metadata:
+/// `catalog-documents/<catalog hash>`.
+pub const DOCUMENTS: &str = "catalog-documents/";
+/// A catalog envelope's objects, each keyed by its catalog hash, in the
+/// order the sweep deletes them: its document, its outboard, its index
+/// record. The snapshot only lists them ([`snapshot::Snapshot::envelope_objects`]).
+pub const ENVELOPE_OBJECTS: [&str; 3] = [DOCUMENTS, "catalog-outboards/", INDEXES];
 
 /// How long a request waits before it is due, and how old an unreachable
 /// transition must be before the sweep deletes it unfolded: 7 days, in
