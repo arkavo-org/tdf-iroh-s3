@@ -15,9 +15,12 @@
 //! A run that stops after writing its requests and before deleting the
 //! transitions it folded folds them again next time. So applying a
 //! transition over what it already wrote changes nothing (plan call 9):
-//! - a drop sets a request pending over no record, a pending record, or a
-//!   tombstone older than the drop, never over a tombstone at or after it;
-//! - an add cancels a pending request only, never a tombstone.
+//! - a drop sets a request pending over no record, a pending record whose
+//!   `requestedAt` is not after the drop (the newest drop wins across runs
+//!   too), or a tombstone older than the drop; never over a tombstone at
+//!   or after it;
+//! - an add cancels a pending request only. It never removes or alters a
+//!   tombstone: a stored one this fold revived goes back as it was.
 //!
 //! Pure: the sweep reads the [`Snapshot`] and writes what this decides.
 
@@ -54,7 +57,9 @@ pub struct Fold {
     /// drop set it again), in key order. Not here: a request an add
     /// cancelled and a later drop set again, which is in `requests` (the
     /// sweep writes it); one created and cancelled within this fold, which
-    /// was never stored; and a tombstone, which no add removes.
+    /// was never stored; and a stored tombstone, which no add removes or
+    /// alters (one a drop revived and an add then cancelled is back in
+    /// `requests`, unchanged).
     pub cancelled: Vec<(String, String)>,
     /// The transitions applied, by key, in the order applied: oldest first
     /// in each chain, one subject's chains interleaved by time. Deleted in
@@ -109,7 +114,7 @@ pub fn fold(snapshot: &Snapshot, now: i64) -> Fold {
     }
     for chains in by_subject.into_values() {
         for (key, t) in in_time_order(chains) {
-            apply(&mut requests, t);
+            apply(&mut requests, stored, t);
             reached.insert(key);
             folded.push(key.clone());
         }
@@ -220,21 +225,36 @@ fn pointer_sub(p: &ScannedPointer) -> &str {
 
 /// Apply one committed transition (spec 3.4 step 2, under plan call 9).
 /// Request keys carry the canonical subject.
-fn apply(requests: &mut Requests, t: &Transition) {
+fn apply(requests: &mut Requests, stored: &Requests, t: &Transition) {
     let subject = canonical_subject(&t.subject);
     let key = |hash: &String| (subject.to_string(), hash.clone());
     for hash in &t.added {
+        let key = key(hash);
         if requests
             .recordings
-            .get(&key(hash))
+            .get(&key)
             .is_some_and(|r| r.state == State::Pending)
         {
-            requests.recordings.remove(&key(hash));
+            // A pending record over a stored tombstone is one this fold
+            // revived: the add puts the tombstone back as it was, so
+            // `requests` still matches storage. Any other is cancelled.
+            match stored.recordings.get(&key) {
+                Some(tombstone) if tombstone.state == State::Deleted => {
+                    requests.recordings.insert(key, tombstone.clone());
+                }
+                _ => {
+                    requests.recordings.remove(&key);
+                }
+            }
         }
     }
     for hash in &t.dropped {
-        let stored = requests.recordings.get(&key(hash));
-        if may_set_pending(stored.map(|r| (r.state, r.deleted_at)), t.at) {
+        let current = requests.recordings.get(&key(hash));
+        // The newest drop wins across runs as well: a pending request from
+        // a later drop (the subject's other pointer key, folded earlier)
+        // stays.
+        let later = current.is_some_and(|r| r.state == State::Pending && r.requested_at > t.at);
+        if !later && may_set_pending(current.map(|r| (r.state, r.deleted_at)), t.at) {
             requests.recordings.insert(
                 key(hash),
                 RecordingRequest {
@@ -268,11 +288,12 @@ fn apply(requests: &mut Requests, t: &Transition) {
     }
 }
 
-/// Whether a request may be set pending at `at` over the stored one's
-/// `(state, deletedAt)`: none, a pending one, or a tombstone from before
-/// `at`. A tombstone at or after `at` stays: the transition is a re-fold
-/// of one its deletion already covered. So does one without a date, which
-/// the strict read refuses anyway.
+/// Whether a request may be set pending at `at` over the current one's
+/// `(state, deletedAt)`: none, a pending one (a drop also keeps a later
+/// `requestedAt`; see [`apply`]), or a tombstone from before `at`. A
+/// tombstone at or after `at` stays: the transition is a re-fold of one
+/// its deletion already covered. So does one without a date, which the
+/// strict read refuses anyway.
 fn may_set_pending(stored: Option<(State, Option<i64>)>, at: i64) -> bool {
     match stored {
         None | Some((State::Pending, _)) => true,
@@ -610,6 +631,63 @@ mod tests {
             tombstone("u1", &p, 500)
         );
         assert!(out.cancelled.is_empty());
+    }
+
+    /// A drop revives a stored tombstone, and a later add in the same fold
+    /// puts the stored tombstone back as it was: `requests` matches storage.
+    #[test]
+    fn an_add_restores_a_revived_tombstone() {
+        let p = h("a1");
+        let stored = RecordingRequest {
+            requested_at: 42,
+            seq: 9,
+            ..tombstone("u1", &p, 500)
+        };
+        let mut s = chain("u1", &[(600, &[&p], &[]), (700, &[], &[&p])]);
+        with_recording(&mut s, stored.clone());
+        let out = fold(&s, NOW);
+        let folded = &out.requests.recordings[&rk("u1", &p)];
+        assert_eq!(folded, &stored);
+        assert_eq!(
+            serde_json::to_vec(folded).unwrap(),
+            serde_json::to_vec(&stored).unwrap(),
+            "byte-equal"
+        );
+        assert!(out.cancelled.is_empty(), "{:?}", out.cancelled);
+
+        // A drop after that revives it again.
+        let mut s = chain(
+            "u1",
+            &[(600, &[&p], &[]), (700, &[], &[&p]), (800, &[&p], &[])],
+        );
+        with_recording(&mut s, stored);
+        assert_eq!(
+            fold(&s, NOW).requests.recordings[&rk("u1", &p)],
+            pending("u1", &p, 800, 3)
+        );
+    }
+
+    /// A drop over a stored pending request keeps the later of the two, so
+    /// the newest drop wins across runs too (an older drop from the other
+    /// pointer key of the subject, folded in a later run).
+    #[test]
+    fn the_newest_drop_wins_across_runs() {
+        let p = h("a1");
+        let mut s = chain("u1", &[(250, &[&p], &[])]);
+        with_recording(&mut s, pending("u1", &p, 300, 5));
+        let out = fold(&s, NOW);
+        assert_eq!(
+            out.requests.recordings[&rk("u1", &p)],
+            pending("u1", &p, 300, 5)
+        );
+
+        // At the same time, the transition's seq is taken.
+        let mut s = chain("u1", &[(300, &[&p], &[])]);
+        with_recording(&mut s, pending("u1", &p, 300, 5));
+        assert_eq!(
+            fold(&s, NOW).requests.recordings[&rk("u1", &p)],
+            pending("u1", &p, 300, 1)
+        );
     }
 
     /// Publish `seq` of `sub` that lost the pointer race: its own digest,
