@@ -2144,8 +2144,9 @@ mod tests {
 
     /// A transition written after its subject was deleted (a publish in
     /// flight, under either key) is lost: the next run deletes it unfolded
-    /// and reports it, young or not. Another account's transition no
-    /// pointer reaches, with no tombstone, is still kept.
+    /// and reports it, young or not (one made before the delete, older
+    /// than grace by its `at`, landed after it). Another account's
+    /// transition no pointer reaches, with no tombstone, is still kept.
     #[tokio::test]
     async fn a_late_transition_of_a_deleted_subject_is_deleted() {
         let m = bucket();
@@ -2167,6 +2168,7 @@ mod tests {
         let late = [
             orphan(&m, U, 2, deleted_at + 10),
             orphan(&m, &arkavo(U), 2, NOW - 10),
+            orphan(&m, U, 3, deleted_at - 10),
         ];
         let other = orphan(&m, U2, 1, deleted_at - GRACE);
         m.set_now(NOW);
@@ -2198,7 +2200,8 @@ mod tests {
     /// `--all`'s preconditions are re-checked at each item's fresh read,
     /// the suspension as the catalog block: lifted after the first read,
     /// the subject and its scope-`subject` recording are kept, and the
-    /// recording its pointer lists stays listed.
+    /// recording its pointer lists stays listed. So do its transitions, and
+    /// the report says so.
     #[tokio::test]
     async fn a_suspension_lifted_after_the_first_read_keeps_the_subject() {
         let m = bucket();
@@ -2220,6 +2223,8 @@ mod tests {
                 deleted_at: None,
             },
         );
+        // A publish in flight, which the fold keeps.
+        let kept = orphan(&m, U, 2, NOW - 10);
         // Once the run has decided (it folds `t` first), the operator lifts
         // the suspension.
         m.on_before_delete(&t.key, |m| lift_suspension(m, U));
@@ -2247,6 +2252,15 @@ mod tests {
         assert_eq!(r.state, State::Pending);
         let r: OperatorRequest = record(&m, &operator_key(U, &p)).await;
         assert_eq!(r.state, State::Pending);
+        assert!(m.get(&kept).await.unwrap().is_some());
+        let name = kept.strip_prefix(TRANSITIONS).unwrap();
+        assert!(
+            has(
+                &report,
+                &format!("kept transition {name}: younger than grace")
+            ),
+            "{report}"
+        );
     }
 
     #[tokio::test]
@@ -3226,6 +3240,32 @@ mod tests {
         assert_eq!(left.len(), 1, "{left:?}");
         assert!(!listed.contains(&left[0]), "{left:?}");
         snapshot::read(&m).await.unwrap();
+    }
+
+    /// A subject's transition written during the item's fresh read, after
+    /// its listing, survives the delete: the run deletes only the
+    /// transitions it listed, as everything else, never one it lists
+    /// later. One listed before goes.
+    #[tokio::test]
+    async fn a_transition_written_during_the_fresh_read_survives() {
+        let m = bucket();
+        let t = publish(&m, U, 1, b"doc-u", &[], None, NOW - 10, &[], &[]);
+        block_and_suspend(&m, U);
+        subject_request(&m, U);
+        let listed = orphan(&m, U, 2, NOW - 10);
+        let late = transition_key(U, &transition_name(3, &h("ee")));
+        let key = subject_key(U);
+        m.on_before_delete(&t.key, move |m| {
+            m.on_before_get(&key, move |m| {
+                orphan(m, U, 3, NOW);
+            });
+        });
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert!(has(&report, &format!("deleted subject {U}")), "{report}");
+        assert!(gone(&m, &listed).await, "{listed}");
+        assert!(m.get(&late).await.unwrap().is_some(), "{late}");
+        assert!(!m.deletes().contains(&late), "{:?}", m.deletes());
     }
 
     /// An envelope object's version written during the item's fresh read,
@@ -4287,6 +4327,39 @@ mod tests {
             );
             assert!(m.get(&pointer).await.unwrap().is_some());
             assert!(m.get(&subject_key(U)).await.unwrap().is_some());
+        }
+
+        /// A subject tombstone's objects are its pointers only. A
+        /// transition of the subject written more than an hour after the
+        /// tombstone, which the fold keeps (a pointer stands under the
+        /// other key), doesn't make it fresh: were it counted, a publish
+        /// that never wrote its pointer would forget `--all`'s tombstone,
+        /// as a fresh pointer did before the suspension was required. The
+        /// late pointer is deleted again, and the tombstone stays.
+        #[tokio::test]
+        async fn a_subjects_transition_is_no_object_of_its_tombstone() {
+            let m = MemObjects::default();
+            subject_tombstone(&m, U);
+            block_and_suspend(&m, U);
+            m.set_now(T + 10);
+            publish_2(&m, &arkavo(U), 1, b"doc-late", &[]);
+            let pointer = format!("catalog-pointers/{}", arkavo(U));
+            m.set_now(AT + 1);
+            let transition = orphan(&m, U, 2, AT + 1);
+
+            let report = sweep(&m, true, AT + 10).await.unwrap();
+            assert!(has(&report, &format!("recreated subject {U}")), "{report}");
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .all(|l| *l != format!("fresh subject {U}")),
+                "{report}"
+            );
+            assert!(gone(&m, &pointer).await);
+            let r: SubjectRequest = record(&m, &subject_key(U)).await;
+            assert_eq!((r.state, r.deleted_at), (State::Deleted, Some(T)));
+            assert!(m.get(&transition).await.unwrap().is_some());
         }
 
         /// A deleted subject's late pointer lists and names nothing only
