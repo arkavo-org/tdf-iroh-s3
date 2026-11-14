@@ -175,10 +175,11 @@ pub struct Decision {
     /// kept only for want of an owner record ([`NO_OWNER_RECORD`], the last
     /// rule: they pass every other), as an [`Item::Recording`] whose
     /// `requests` are those, by [`Item::id`]. They are in `kept` too. When
-    /// nothing of the recording is left, an earlier run deleted it and
-    /// failed to mark these `deleted` (the sweep deletes the owner record
-    /// last), or a push failed after its outboard: the sweep closes them
-    /// then, deleting their records (and such an outboard).
+    /// no blob, manifest or owner record is left, and no outboard within
+    /// `GRACE`, an earlier run deleted it and failed to mark these
+    /// `deleted` (the sweep deletes the owner record last), or a push
+    /// failed after its outboard: the sweep closes them then, deleting
+    /// their records (and such an outboard).
     pub unowned: Vec<Item>,
 }
 

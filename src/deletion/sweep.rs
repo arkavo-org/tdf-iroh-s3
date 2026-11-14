@@ -31,13 +31,14 @@
 //!    deletes exactly the versions it listed, never one written since. A
 //!    failure leaves the item pending, and the run goes on;
 //! 4. each recording kept only for want of an owner record with nothing
-//!    left but outboard versions older than its drop ([`close`]): an
+//!    left but outboard versions older than `GRACE` ([`close`]): an
 //!    earlier run deleted it but failed to write its tombstone, or a push
 //!    failed after its outboard. After the same fresh re-check and a
 //!    second listing, it deletes those outboard versions and the
 //!    requests' records, writing no tombstone (`closed <id>`). A write
-//!    meanwhile keeps them, and a push's grace restarts next run. A dry
-//!    run reports these too, from its listing alone.
+//!    meanwhile keeps them, and a push whose owner record names the
+//!    requester restarts the grace next run. A dry run reports these too,
+//!    from its listing alone.
 //!
 //! Then, in both modes, it verifies each tombstone at least
 //! [`VERIFY_AFTER`] old ([`verify_tombstones`], spec 3.4 step 7): it
@@ -62,7 +63,7 @@ use super::due::{self, Decision, Item, View};
 use super::fold::{self, Fold};
 use super::snapshot::{self, ModerationView, Requests, Snapshot};
 use super::{
-    DOCUMENTS, ENVELOPE_OBJECTS, EnvelopeRequest, RecordingRequest, State, TRANSITIONS,
+    DOCUMENTS, ENVELOPE_OBJECTS, EnvelopeRequest, GRACE, RecordingRequest, State, TRANSITIONS,
     VERIFY_AFTER, envelope_key, operator_key, recording_key, subject_key,
 };
 use crate::catalog_scan::{Catalogs, INDEXES, POINTERS};
@@ -378,9 +379,7 @@ async fn run<O: ObjectStore>(
             let listed = list_keys(store, object_keys(item))
                 .await
                 .with_context(|| format!("checking {id}"))?;
-            if earliest_request(&requests, item)
-                .is_some_and(|requested_at| closable(&listed.versions, requested_at))
-            {
+            if closable(&listed.versions, now.saturating_sub(GRACE)) {
                 report.closed(&id);
                 closed.extend(request_ids(&requests, item));
             }
@@ -1081,24 +1080,24 @@ fn request_ids(requests: &Requests, item: &Item) -> Vec<String> {
 /// nothing left ([`closable`]). Its requests, kept only for want of an
 /// owner record, passed every other rule: an earlier run deleted the
 /// recording (its owner record last) but failed to mark them `deleted`,
-/// or a push failed after its outboard, before the drop. The close deletes
-/// those outboard versions as listed, then the requests' records, and
-/// reports `closed <id>`, counted apart from deletes. It writes no
+/// or a push failed after its outboard, more than `GRACE` ago. The close
+/// deletes those outboard versions as listed, then the requests' records,
+/// and reports `closed <id>`, counted apart from deletes. It writes no
 /// tombstone: the recording went in an earlier run, and a tombstone's
 /// verification hour would read a new push by the requester as in flight
 /// and delete it again.
 ///
-/// It lists the recording's objects and stops at a blob, manifest or owner
-/// record, with no fresh read: an unowned recording still stored is kept,
-/// as the first decision reported it. Otherwise it reads everything again:
-/// the recording must still be unowned there, with its requester's
-/// catalog unmoved; then it lists the objects once more, and both listings
-/// must leave it [`closable`] by the fresh requests' `requestedAt`. A push
-/// that lands meanwhile writes an object that keeps it, and with an owner
-/// record makes the request due, so the next run restarts its grace
-/// ([`pushed_again`]). The ids of the requests it closed, also when a
-/// failed delete stops it part way (reported). `Err` when the fresh read or
-/// a listing fails.
+/// It lists the recording's objects and stops, with no fresh read, unless
+/// that listing alone is [`closable`]: an unowned recording still stored,
+/// or with an outboard within `GRACE`, is kept, as the first decision
+/// reported it. Otherwise it reads everything again: the recording must
+/// still be unowned there, with its requester's catalog unmoved; then it
+/// lists the objects once more, and both listings must leave it
+/// [`closable`]. A push that lands meanwhile writes an object that keeps
+/// it, and one whose owner record names the requester makes the request
+/// due, so the next run restarts its grace ([`pushed_again`]). The ids of
+/// the requests it closed, also when a failed delete stops it part way
+/// (reported). `Err` when the fresh read or a listing fails.
 async fn close<O: ObjectStore>(
     store: &O,
     item: &Item,
@@ -1107,10 +1106,11 @@ async fn close<O: ObjectStore>(
     report: &mut Report,
 ) -> anyhow::Result<Vec<String>> {
     let id = item.id();
+    let orphan_before = now.saturating_sub(GRACE);
     let listed = list_keys(store, object_keys(item))
         .await
         .with_context(|| format!("re-checking {id}"))?;
-    if newest_push(&listed.versions).is_some() {
+    if !closable(&listed.versions, orphan_before) {
         return Ok(Vec::new());
     }
     let fresh = snapshot::read(store)
@@ -1127,10 +1127,7 @@ async fn close<O: ObjectStore>(
     let since = list_keys(store, object_keys(&item))
         .await
         .with_context(|| format!("re-checking {id}"))?;
-    let Some(requested_at) = earliest_request(&fresh.requests, &item) else {
-        return Ok(Vec::new());
-    };
-    if !closable(listed.versions.iter().chain(&since.versions), requested_at) {
+    if !closable(&since.versions, orphan_before) {
         return Ok(Vec::new());
     }
     if let Err(e) = delete_outboards(store, &item, &listed.versions).await {
@@ -1147,38 +1144,18 @@ async fn close<O: ObjectStore>(
 
 /// Whether a recording's listed `versions` leave its unowned requests
 /// closable: no object but outboard versions written before
-/// `requested_at` (the earliest of the requests'), what a push whose
-/// upload failed after its outboard left before the drop. A blob, manifest
-/// or owner record keeps them, and so does an outboard written since: a
-/// push may be uploading (ingest writes the outboard first). A delete
+/// `orphan_before` (`now - GRACE`), what a push whose upload failed after
+/// its outboard left. A blob, manifest or owner record keeps them, and so
+/// does an outboard written since: a push may be uploading (ingest writes
+/// the outboard first). The age is `GRACE` for every request: a due drop's
+/// `requestedAt` is at least that old, and an operator's scope-`subject`
+/// request, which has no grace, still keeps a fresh outboard. A delete
 /// marker is no object.
-fn closable<'a>(versions: impl IntoIterator<Item = &'a VersionInfo>, requested_at: i64) -> bool {
+fn closable(versions: &[VersionInfo], orphan_before: i64) -> bool {
     versions
-        .into_iter()
+        .iter()
         .filter(|v| !v.delete_marker)
-        .all(|v| v.key.starts_with("outboards/") && v.modified < requested_at)
-}
-
-/// The earliest `requestedAt` of the requests a recording `item` names.
-fn earliest_request(requests: &Requests, item: &Item) -> Option<i64> {
-    let Item::Recording {
-        hash,
-        requests: keys,
-    } = item
-    else {
-        return None;
-    };
-    let recordings = requests
-        .recordings
-        .iter()
-        .filter(|((sub, h), _)| h == hash && keys.contains(&recording_key(sub, h)))
-        .map(|(_, r)| r.requested_at);
-    let operator = requests
-        .operator
-        .iter()
-        .filter(|((sub, h), _)| h == hash && keys.contains(&operator_key(sub, h)))
-        .map(|(_, r)| r.requested_at);
-    recordings.chain(operator).min()
+        .all(|v| v.key.starts_with("outboards/") && v.modified < orphan_before)
 }
 
 /// Delete exactly the listed versions of a recording's outboard, if any
@@ -3889,11 +3866,11 @@ mod tests {
         assert_eq!(m.deletes(), [outboard, recording_key(U, &p)]);
     }
 
-    /// An outboard written after the drop may be an upload in progress
-    /// (ingest writes the outboard first): the request is kept, and so is
-    /// the outboard.
+    /// An outboard written within `GRACE` of now may be an upload in
+    /// progress (ingest writes the outboard first): the request is kept,
+    /// and so is the outboard.
     #[tokio::test]
-    async fn an_outboard_since_the_drop_keeps_the_request() {
+    async fn an_outboard_within_grace_keeps_the_request() {
         let m = bucket();
         let p = h("a1");
         m.set_now(PUSHED_AT);
@@ -3914,6 +3891,136 @@ mod tests {
         }
         assert_eq!(versions(&m).await, before);
         assert!(m.deletes().is_empty());
+    }
+
+    /// The orphan age is `GRACE`: an outboard written at `now - GRACE`
+    /// keeps the request, one a second older is an orphan. That holds also
+    /// for an upload that failed after the drop: once its outboard is older
+    /// than `GRACE`, the request is closed, not kept forever.
+    #[tokio::test]
+    async fn an_orphan_outboard_is_older_than_grace() {
+        let p = h("a1");
+        let outboard = format!("outboards/{p}");
+        let with_outboard_at = |at: i64| {
+            let m = bucket();
+            request(&m, U, &p, NOW - 2 * GRACE);
+            m.set_now(at);
+            m.insert(&outboard, "outboard");
+            m.set_now(NOW);
+            m
+        };
+
+        let m = with_outboard_at(NOW - GRACE);
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert_eq!(
+            report.lines,
+            [format!("kept recording {U}/{p}: no owner record")],
+            "{report}"
+        );
+        assert!(m.get(&outboard).await.unwrap().is_some());
+
+        // After the drop, but older than `GRACE`.
+        let m = with_outboard_at(NOW - GRACE - 1);
+        let report = sweep(&m, false, NOW).await.unwrap();
+        assert_eq!(
+            report.lines,
+            [format!("would close recording {p}")],
+            "{report}"
+        );
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert_eq!(report.lines, [format!("closed recording {p}")], "{report}");
+        assert!(gone(&m, &outboard).await);
+        assert!(gone(&m, &recording_key(U, &p)).await);
+    }
+
+    /// An operator's scope-`subject` request has no grace: an outboard
+    /// written shortly before `request-deletion` ran, maybe an upload in
+    /// progress, keeps it like any outboard within `GRACE`.
+    #[tokio::test]
+    async fn a_fresh_outboard_keeps_a_scope_subject_request() {
+        let m = bucket();
+        let p = h("a1");
+        block_and_suspend(&m, U);
+        m.set_now(NOW - 10);
+        m.insert(&format!("outboards/{p}"), "outboard");
+        m.set_now(NOW);
+        put(
+            &m,
+            &operator_key(U, &p),
+            OperatorRequest {
+                hash: p.clone(),
+                subject: U.into(),
+                requested_at: NOW,
+                reason: "account closed".into(),
+                scope: Scope::Subject,
+                state: State::Pending,
+                deleted_at: None,
+            },
+        );
+        let before = versions(&m).await;
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert_eq!(
+            report.lines,
+            [format!("kept operator {U}/{p}: no owner record")],
+            "{report}"
+        );
+        assert_eq!(versions(&m).await, before);
+        assert!(m.deletes().is_empty());
+    }
+
+    /// A failed outboard delete fails the close before any request record
+    /// goes: `failed`, and the requests are reported kept.
+    #[tokio::test]
+    async fn a_failed_outboard_delete_closes_nothing() {
+        let m = bucket();
+        let p = h("a1");
+        let outboard = format!("outboards/{p}");
+        m.set_now(PUSHED_AT);
+        m.insert(&outboard, "outboard");
+        m.set_now(NOW);
+        request(&m, U, &p, NOW - GRACE);
+        m.fail_on(&outboard, Op::Delete);
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert_eq!(report.failures, 1, "{report}");
+        let failed = format!("failed recording {p}: ");
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.starts_with(&failed) && l.contains(&outboard)),
+            "{report}"
+        );
+        assert!(
+            has(&report, &format!("kept recording {U}/{p}: no owner record")),
+            "{report}"
+        );
+        assert!(m.get(&outboard).await.unwrap().is_some());
+        let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
+        assert_eq!(r.state, State::Pending);
+        assert!(m.deletes().is_empty());
+    }
+
+    /// A request its first listing already keeps (here by an outboard
+    /// within `GRACE`) costs no fresh read: a read failing after the first
+    /// one fails the verification's read, not the close's.
+    #[tokio::test]
+    async fn a_close_its_first_listing_keeps_reads_nothing_more() {
+        let m = bucket();
+        let p = h("a1");
+        m.set_now(NOW - 10);
+        m.insert(&format!("outboards/{p}"), "outboard");
+        m.set_now(NOW);
+        request(&m, U, &p, NOW - GRACE);
+        let t = publish(&m, U, 1, b"doc-u", &[], None, PUSHED_AT, &[], &[]);
+        let key = recording_key(U, &p);
+        m.on_before_delete(&t.key, move |m| m.fail_on(&key, Op::Get));
+
+        let Aborted { error, .. } = sweep(&m, true, NOW).await.unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("the verify read failed"), "{error}");
+        assert!(!error.contains("re-checking"), "{error}");
     }
 
     /// The second listing, after the close's fresh read, decides with the
