@@ -177,7 +177,7 @@ Under `deletion-requests/`, written only by the sweep and the operator commands.
 Each needs operator AWS credentials and the node's config; `--reason` is required; subjects compare canonically. They print what they wrote.
 
 - `request-deletion --subject <s> --hash <h>...`: each hash must have an active block. Writes `operator/<s>/<h>`, scope `hash`.
-- `request-deletion --subject <s> --all`: `<s>` must have an active catalog block. Writes scope-`subject` requests for every hash in the live index of each pointer canonically `<s>`, and every hash whose owner record names `<s>`, then `subjects/<s>`. It reports these sources as its whole coverage; the operator adds `--hash` for anything else.
+- `request-deletion --subject <s> --all`: `<s>` must have an active catalog block and an active suspension (step 3.4's note). Writes scope-`subject` requests for every hash in the live index of each pointer canonically `<s>`, and every hash whose owner record names `<s>`, then `subjects/<s>`. It reports these sources as its whole coverage; the operator adds `--hash` for anything else.
 - `release-owner` (Part 1).
 
 #### 3.4 The sweep: `tdf-iroh-s3 sweep-deletions [--delete]`
@@ -189,20 +189,20 @@ Dry run unless `--delete` (the pattern of the removed `purge-catalogs-1`, c48ec9
    - each `added` hash cancels a pending `recordings/<sub>/<hash>`;
    - each `dropped` hash sets `recordings/<sub>/<hash>` pending with `requestedAt` = the transition's `at` (the newest drop wins);
    - a `base.catalogHash` different from the new one sets `envelopes/<base>` pending, `supersededAt` = `at`, `source: "transition"`.
-   Then delete the folded transitions, oldest first. A transition not reachable from any pointer, older than `GRACE`, whose subject's current pointer has a `seq` at least its own, lost its publish and is deleted unfolded. Any other unreachable transition is kept and reported.
+   Then delete the folded transitions, oldest first. A transition not reachable from any pointer, older than `GRACE`, whose subject's current pointer has a `seq` at least its own, lost its publish and is deleted unfolded. So is one, of any age, whose subject has a `deleted` `subjects/` record and no pointer under either key: a publish in flight when step 6 deleted the account. Any other unreachable transition is kept and reported.
 3. **Snapshot.**
-   - `S` = pointers canonically a subject with an active `subjects/` request whose catalog block is still active.
+   - `S` = pointers canonically a subject with an active `subjects/` request whose catalog block and suspension are still active.
    - `L` = every payload hash in every live index of a pointer not in `S`, **whatever its visibility**.
    - `C` = every pointer's `catalogHash`, for pointers not in `S`.
 4. **Observe untracked envelopes.** A hash under `catalog-documents/`, `catalog-outboards/` or `catalog-indexes/` that is not in `C` and has no `envelopes/` record gets one: `source: "observed"`, `supersededAt` = now.
 5. **Due.**
    - `recordings/<sub>/<h>` pending: `requestedAt + GRACE ≤ now`, `h ∉ L`, `h` not blocked, and `h`'s owner record names `<sub>`. A different or missing owner is kept and reported for manual handling.
-   - `operator/<sub>/<h>`: scope `hash` while `h`'s block is active (no grace, no `L`); scope `subject` while `<sub>`'s catalog block is active, `h ∉ L`, and `h`'s owner record names `<sub>` (absent or another owner: kept, reported). If the block is lifted, pending scope-`subject` items are kept and reported each run.
-   - `subjects/<sub>`: while its catalog block is active.
-   - `envelopes/<h>` pending: `supersededAt + GRACE ≤ now`, `h ∉ C`, `h` not blocked, and its owner (the document's `owner` metadata, else the index record's `owner`) has no catalog block or `hideCatalog` suspension, **unless** the owner has a `subjects/` request (the operator asked for everything; the block was its precondition). Unknown owner while any object exists: kept, reported.
+   - `operator/<sub>/<h>`: scope `hash` while `h`'s block is active (no grace, no `L`); scope `subject` while `<sub>`'s catalog block and suspension are active, `h ∉ L`, and `h`'s owner record names `<sub>` (absent or another owner: kept, reported). If either is lifted, pending scope-`subject` items are kept and reported each run.
+   - `subjects/<sub>`: while its catalog block and suspension are active.
+   - `envelopes/<h>` pending: `supersededAt + GRACE ≤ now`, `h ∉ C`, `h` not blocked, and its owner (the document's `owner` metadata, else the index record's `owner`) has no catalog block or `hideCatalog` suspension, **unless** the owner has a `subjects/` request (the operator asked for everything) and its preconditions, the block and the suspension, are still active. Unknown owner while any object exists: kept, reported.
 6. **Delete** (with `--delete`), item by item. Immediately before each item, re-read its request record and the moderation records it depends on, and re-read the pointers to recheck `L`/`C`; drop the item if anything changed. If the request's subject's pointer has moved since step 1, defer the item to the next run, where its new transitions are folded first. Then delete every version and delete marker:
    - recording `h`: `blobs/h`, then `outboards/h`, `manifests/h`, `moderation/publishers/h` (ownership ends); then mark its request(s) `deleted` with `deletedAt`;
-   - subject `s`: each pointer in `S` for `s`; mark `subjects/s` `deleted` (its envelopes fall to step 4 next run);
+   - subject `s`: each pointer in `S` for `s`, then every key under `catalog-transitions/s/` and `catalog-transitions/arkavo:s/` (its publish history); mark `subjects/s` `deleted` (its envelopes fall to step 4 next run);
    - envelope `h`: `catalog-documents/h`, then `catalog-outboards/h`, `catalog-indexes/h`; mark `envelopes/h` `deleted`.
    A failure leaves that item pending for the next run; the run continues and exits nonzero. Block, suspension, catalog-block and audit records are kept.
 7. **Verify tombstones.** For each record marked `deleted` at least an hour earlier (any in-flight push, backfill or publish has finished), with the pointers re-read:
@@ -211,6 +211,10 @@ Dry run unless `--delete` (the pattern of the removed `purge-catalogs-1`, c48ec9
    - else, any object written by `deletedAt` + 1 hour exists (an in-flight write that landed after the delete): run step 6's re-check, delete it again, report "recreated", keep the tombstone;
    - else: remove the tombstone, every version.
 8. **Report.** One line per item (`deleted`, `would delete`, `kept: <why>`, `recreated`), then counts; also any deleted recording now in `L` and any deleted envelope now in `C`. Stdout only.
+
+**Changed after review (2026-11-14).** Two changes to the text approved on 2026-11-13:
+- `--all` needs an active suspension as well as the catalog block, and the sweep re-checks both wherever it acted on the block alone (`S`, step 5, and step 7's checks of a deleted subject's tombstone). A catalog block hides the catalog but doesn't stop publishing: once step 6 had deleted the account's pointers, it could publish with `If-None-Match: *`, and step 7 would forget the `subjects/` tombstone as fresh. A suspended account can't publish. Lifting the suspension later is the operator's decision to let it publish again.
+- Deleting a subject deletes its transitions after its pointers, and step 2 deletes a later one as lost, whatever its age. Before, step 2 kept a transition whose subject had no pointer forever, so a deleted account's history (its recordings and when it dropped them) stayed. Step 7 still counts only pointers as a subject's objects: a transition without a pointer is a publish in flight, not a returning creator.
 
 #### 3.5 Timing
 
