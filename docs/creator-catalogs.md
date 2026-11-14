@@ -114,7 +114,7 @@ The index and the encrypted document are bound only by the creator's honesty. An
 
 ## HTTP routes
 
-TLS terminates in front of the node. A request's headers, the `Authorization` CWT and every `X-Entity-Token` together, may be up to 64 KiB over HTTP/2; larger ones are refused before the node reads them. Every error body is `{"error":"<message>"}`, with one exception: on an ungated node `POST /publish/sessions` answers 404 with an empty body (see [Publishing a recording](#publishing-a-recording-creator)).
+TLS terminates in front of the node. A request's headers, the `Authorization` CWT and every `X-Entity-Token` together, may be up to 64 KiB over HTTP/2; larger ones are refused before the node reads them. Every error body is `{"error":"<message>"}`, with two exceptions: the two owner refusals of `PUT /v2/catalogs/{sub}` add `contentIDs` (see [`PUT /v2/catalogs/{sub}`](#put-v2catalogssub-publish)), and on an ungated node `POST /publish/sessions` answers 404 with an empty body (see [Publishing a recording](#publishing-a-recording-creator)).
 
 ### `GET /catalog-documents/{hash}`: read a catalog
 
