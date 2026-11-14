@@ -277,8 +277,9 @@ impl<'de> Visitor<'de> for NoDuplicateKeysVisitor {
 pub(crate) mod test_support {
     /// ArkavoKit's shared catalog vectors of `kind`
     /// (`Tests/ArkavoCatalogTests/Vectors/catalog-vectors.json`), so the node
-    /// and the Swift readers agree: (name, valid, bytes).
-    pub fn vectors(kind: &str) -> Vec<(String, bool, Vec<u8>)> {
+    /// and the Swift readers agree: (name, valid, bytes, `indexHash`, which
+    /// only some `index` vectors carry).
+    pub fn vectors(kind: &str) -> Vec<(String, bool, Vec<u8>, Option<String>)> {
         use base64::Engine as _;
         let file: serde_json::Value = serde_json::from_str(include_str!(
             "../tests/fixtures/arkavo-catalog-vectors.json"
@@ -301,6 +302,7 @@ pub(crate) mod test_support {
                     v["name"].as_str().unwrap().to_string(),
                     v["valid"].as_bool().unwrap(),
                     bytes,
+                    v.get("indexHash").map(|h| h.as_str().unwrap().to_string()),
                 )
             })
             .collect();
@@ -553,9 +555,26 @@ mod tests {
 
     #[test]
     fn arkavo_kit_index_vectors_agree() {
-        for (name, valid, bytes) in test_support::vectors("index") {
+        for (name, valid, bytes, _) in test_support::vectors("index") {
             assert_eq!(parse(&bytes).is_ok(), valid, "{name}: {:?}", parse(&bytes));
         }
+    }
+
+    /// Every `index` vector carrying `indexHash` hashes to it, as the route
+    /// parses it.
+    #[test]
+    fn arkavo_kit_index_hash_vectors_agree() {
+        let mut checked = 0;
+        for (name, valid, bytes, expected) in test_support::vectors("index") {
+            let Some(expected) = expected else {
+                continue;
+            };
+            assert!(valid, "{name}: a vector with indexHash is valid");
+            let entries = parse(&bytes).unwrap_or_else(|why| panic!("{name}: {why}"));
+            assert_eq!(index_hash(&entries), expected, "{name}");
+            checked += 1;
+        }
+        assert!(checked > 0, "no index vector carries indexHash");
     }
 
     fn catalog_entry(

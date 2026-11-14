@@ -304,7 +304,7 @@ The `index` sent in `PUT` is unchanged: its key and entry order are free, and th
 | two | `rec-b` (v1, `bb…`, 2048), `rec-a` (v3, `aa…`, 1024) | `03f745d8d08d9e9e11cabf33d85e8beb452eb3a2b2e541f92e1703c1f4152df4` |
 | byte-order | `a_1`, `a@1`, `A`, `a:1`, `a.1`, `a-1` (entry *n*, counting from 0 in this order, has hash byte `n` ×32, size *n*+1, v1; so `a_1` is `00`×32, size 1) | `79129b9fa70e8ab5d0894d07098294de6dec2677c9df538b3eb05df98bd8ef18` |
 
-Canonical bytes of "two": `[{"contentID":"rec-a","version":3,"payloadHash":"aa…aa","payloadSize":1024},{"contentID":"rec-b","version":1,"payloadHash":"bb…bb","payloadSize":2048}]` (64 hex characters each). "byte-order" sorts to `A`, `a-1`, `a.1`, `a:1`, `a@1`, `a_1`. ArkavoKit's shared vectors (`Tests/ArkavoCatalogTests/Vectors/catalog-vectors.json`) are to carry these, each with its full `index` text.
+Canonical bytes of "two": `[{"contentID":"rec-a","version":3,"payloadHash":"aa…aa","payloadSize":1024},{"contentID":"rec-b","version":1,"payloadHash":"bb…bb","payloadSize":2048}]` (64 hex characters each). "byte-order" sorts to `A`, `a-1`, `a.1`, `a:1`, `a@1`, `a_1`. ArkavoKit 0.24.0's shared vectors (`Tests/ArkavoCatalogTests/Vectors/catalog-vectors.json`, copied verbatim to this repository's `tests/fixtures/arkavo-catalog-vectors.json`) carry these, each with its full `index` text and its `indexHash`.
 
 ### The signed bundle
 

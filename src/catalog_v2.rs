@@ -691,7 +691,7 @@ mod tests {
 
     #[test]
     fn arkavo_kit_pointer_vectors_agree() {
-        for (name, valid, bytes) in crate::creator_catalog::test_support::vectors("pointer") {
+        for (name, valid, bytes, _) in crate::creator_catalog::test_support::vectors("pointer") {
             let parsed = parse_pointer(&bytes);
             assert_eq!(parsed.is_ok(), valid, "{name}: {:?}", parsed.err());
         }
