@@ -1812,23 +1812,54 @@ mod tests {
     }
 
     /// The routine leftover of a publish whose writes stopped after its
-    /// index record: no document, outboard or pointer. Observed as an
-    /// untracked envelope with no owner of its own (no document to name
+    /// index record and transition: no document, outboard or pointer. The
+    /// fold keeps its transition, which no pointer reaches. Its envelope is
+    /// observed as untracked with no owner of its own (no document to name
     /// one), its owner is its index record's, and it is deleted once its
     /// grace has passed. Nothing aborts.
     #[tokio::test]
     async fn an_index_record_left_alone_is_deleted_after_grace() {
         let m = bucket();
-        publish_2(&m, U, 1, b"doc-u", &[]);
+        let base_index = publish_2(&m, U, 1, b"doc-u", &[]);
         let e = catalog(b"doc-left");
         put(
             &m,
             &format!("catalog-indexes/{e}"),
             index_record(&arkavo(U), &[]),
         );
+        // Its transition: seq 2 over `U`'s stored seq 1.
+        let digest = |seq, doc: &[u8], index: &str| {
+            hex::encode(Sha256::digest(pointer_bytes(U, seq, doc, Some(index))))
+        };
+        let left_index = crate::creator_catalog::index_hash(&[]);
+        let pointer = digest(2, b"doc-left", &left_index);
+        let name = transition_name(2, &pointer);
+        put(
+            &m,
+            &transition_key(U, &name),
+            Transition {
+                subject: U.into(),
+                seq: 2,
+                catalog_hash: e.clone(),
+                pointer,
+                base: Some(TransitionBase {
+                    seq: 1,
+                    catalog_hash: catalog(b"doc-u"),
+                    pointer: digest(1, b"doc-u", &base_index),
+                }),
+                at: NOW,
+                dropped: vec![],
+                added: vec![],
+            },
+        );
+        let kept_transition = |why: &str| format!("kept transition {U}/{name}: {why}");
 
         let report = sweep(&m, true, NOW).await.unwrap();
         assert_eq!(report.failures, 0, "{report}");
+        assert!(
+            has(&report, &kept_transition("younger than grace")),
+            "{report}"
+        );
         assert!(
             has(&report, &format!("kept envelope {e}: within grace")),
             "{report}"
@@ -1852,6 +1883,11 @@ mod tests {
         m.set_now(later);
         let report = sweep(&m, true, later).await.unwrap();
         assert_eq!(report.failures, 0, "{report}");
+        assert!(
+            has(&report, &kept_transition("seq above the current pointer")),
+            "{report}"
+        );
+        assert!(m.get(&transition_key(U, &name)).await.unwrap().is_some());
         assert!(has(&report, &format!("deleted envelope {e}")), "{report}");
         assert_eq!(m.deletes(), envelope_keys(&e));
         assert!(gone(&m, &format!("catalog-indexes/{e}")).await);
