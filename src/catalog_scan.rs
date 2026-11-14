@@ -3,8 +3,8 @@
 //! `catalog-pointers/<sub>` and each index record at
 //! `catalog-indexes/<hash>`. Anything listed that can't be read or parsed
 //! fails the scan, so a command never decides on part of the bucket, and
-//! so does a `/2` pointer whose index record no longer hashes to the
-//! `indexHash` it signed.
+//! so does a `/2` pointer whose index record is missing or no longer
+//! hashes to the `indexHash` it signed.
 
 use anyhow::Context;
 use std::collections::{BTreeSet, HashMap};
@@ -56,7 +56,8 @@ pub struct Catalogs {
 impl Catalogs {
     /// The payload hashes of `p`'s live index: the index record of the
     /// catalog it names. `None` for a pointer at a catalog from before
-    /// envelopes, which has no index record and which `GET` never serves.
+    /// envelopes (always `/1`), which has no index record and which `GET`
+    /// never serves.
     pub fn live_hashes(&self, p: &ScannedPointer) -> Option<&BTreeSet<String>> {
         self.indexes.get(&p.catalog_hash).map(|index| &index.hashes)
     }
@@ -64,7 +65,8 @@ impl Catalogs {
 
 /// Read every pointer and every index record. `Err` if any of them can't
 /// be read or parsed, or vanishes between the listing and its read, or if
-/// a `/2` pointer's index record doesn't hash to its `indexHash`.
+/// a `/2` pointer's index record is missing or doesn't hash to its
+/// `indexHash`.
 pub async fn scan<O: ObjectStore>(store: &O) -> anyhow::Result<Catalogs> {
     let mut pointers = Vec::new();
     for listed in store.list(POINTERS).await? {
@@ -105,16 +107,22 @@ pub async fn scan<O: ObjectStore>(store: &O) -> anyhow::Result<Catalogs> {
         );
     }
 
-    // A `/2` pointer's live index is the one it signed. One with no index
-    // record is from before envelopes, as a `/1` would be.
+    // A `/2` pointer's live index is the one it signed. Its index record is
+    // written once, before the pointer, so a missing one is a fault too.
+    // Pointers are listed before index records, so a publish in flight
+    // cannot look like one. A `/1` with no index record is a pointer from
+    // before envelopes.
     for p in &pointers {
-        if let (Some(claimed), Some(actual)) = (&p.index_hash, canonical.get(&p.catalog_hash)) {
-            anyhow::ensure!(
+        let (key, hash) = (&p.key, &p.catalog_hash);
+        match (&p.index_hash, canonical.get(hash)) {
+            (Some(claimed), Some(actual)) => anyhow::ensure!(
                 claimed == actual,
-                "{}: indexHash {claimed} does not match the index of catalog {} ({actual})",
-                p.key,
-                p.catalog_hash
-            );
+                "{key}: indexHash {claimed} does not match the index of catalog {hash} ({actual})"
+            ),
+            (Some(claimed), None) => anyhow::bail!(
+                "{key}: indexHash {claimed} names catalog {hash}, which has no index record"
+            ),
+            (None, _) => {}
         }
     }
     Ok(Catalogs { pointers, indexes })
@@ -299,7 +307,7 @@ mod tests {
     }
 
     /// A `/2` pointer signs its index: a live index record that no longer
-    /// hashes to its `indexHash` fails the scan.
+    /// hashes to its `indexHash`, or none at all, fails the scan.
     #[tokio::test]
     async fn scan_refuses_a_2_pointer_whose_index_does_not_match() {
         let m = MemObjects::default();
@@ -329,10 +337,12 @@ mod tests {
         assert!(err.contains("catalog-pointers/u1"), "{err}");
         assert!(err.contains("indexHash"), "{err}");
 
-        // A `/2` pointer at a catalog with no index record is a pointer
-        // from before envelopes, as for `/1`.
-        let pre_envelope = MemObjects::default();
-        pre_envelope.insert(
+        // A `/2` pointer exists only after its write-once index record, so
+        // one at a catalog with no index record is a fault, not a pointer
+        // from before envelopes (those are `/1`).
+        let missing = MemObjects::default();
+        publish(&missing, "u2", 1, b"doc-2", &[&h("cc")]);
+        missing.insert(
             "catalog-pointers/u3",
             serde_json::to_vec(&crate::catalog_v2::test_support::bundle(
                 "u3",
@@ -342,8 +352,9 @@ mod tests {
             ))
             .unwrap(),
         );
-        let catalogs = scan(&pre_envelope).await.unwrap();
-        assert_eq!(catalogs.live_hashes(&catalogs.pointers[0]), None);
+        let err = scan(&missing).await.unwrap_err().to_string();
+        assert!(err.contains("catalog-pointers/u3"), "{err}");
+        assert!(err.contains("no index record"), "{err}");
     }
 
     #[tokio::test]
