@@ -232,46 +232,54 @@ fn subject(key: &str, body: &[u8]) -> anyhow::Result<(String, SubjectRequest)> {
 }
 
 /// Suspensions, blocks and catalog blocks, through the node's own record
-/// types; active ones make the view.
+/// types; active ones make the view. Their keys are what the node writes:
+/// a suspension's and a catalog block's a canonical subject, a block's a
+/// lowercase hash. Any other key fails the read: the node looks records
+/// up by canonical subject and lowercase hash, so one named otherwise has
+/// no effect there, and the sweep must not decide on it either.
 async fn moderation<O: ObjectStore>(store: &O) -> anyhow::Result<ModerationView> {
     let mut view = ModerationView::default();
     for (ObjectInfo { key, .. }, body) in bodies(store, &moderation_prefix(SUSPENSIONS)).await? {
-        let s =
-            moderation_record::<Suspension>(&key, &body, SUSPENSIONS, "subject", |s| &s.subject)?;
+        let s = moderation_record::<Suspension>(&key, &body, SUSPENSIONS, SUBJECT, |s| &s.subject)?;
         if s.lifted_at.is_none() && s.hide_catalog {
-            view.hidden
-                .insert(canonical_subject(&s.subject).to_string());
+            view.hidden.insert(s.subject);
         }
     }
     for (ObjectInfo { key, .. }, body) in bodies(store, &moderation_prefix(BLOCKS)).await? {
-        let b = moderation_record::<Block>(&key, &body, BLOCKS, "hash", |b| &b.hash)?;
+        let b = moderation_record::<Block>(&key, &body, BLOCKS, HASH, |b| &b.hash)?;
         if b.lifted_at.is_none() {
-            view.blocked.insert(b.hash.to_ascii_lowercase());
+            view.blocked.insert(b.hash);
         }
     }
     for (ObjectInfo { key, .. }, body) in bodies(store, &moderation_prefix(CATALOG_BLOCKS)).await? {
-        let b = moderation_record::<CatalogBlock>(&key, &body, CATALOG_BLOCKS, "subject", |b| {
+        let b = moderation_record::<CatalogBlock>(&key, &body, CATALOG_BLOCKS, SUBJECT, |b| {
             &b.subject
         })?;
         if b.lifted_at.is_none() {
-            let subject = canonical_subject(&b.subject).to_string();
-            view.catalog_blocked.insert(subject.clone());
-            view.hidden.insert(subject);
+            view.catalog_blocked.insert(b.subject.clone());
+            view.hidden.insert(b.subject);
         }
     }
     Ok(view)
 }
 
-/// `moderation/<kind>/<name>`, whose body's `what` (`name_of`) is `name`.
+/// A moderation key's name: what the body names it, and how it must read.
+type Name = (&'static str, fn(&str) -> anyhow::Result<&str>);
+const SUBJECT: Name = ("subject", canonical);
+const HASH: Name = ("hash", lower_hex);
+
+/// `moderation/<kind>/<name>`, with `name` as `valid` has it (a canonical
+/// subject, a lowercase hash), whose body's `what` (`name_of`) is `name`.
 fn moderation_record<T: DeserializeOwned>(
     key: &str,
     body: &[u8],
     kind: &str,
-    what: &str,
+    (what, valid): Name,
     name_of: fn(&T) -> &String,
 ) -> anyhow::Result<T> {
     let parse = || {
         let [name] = names(key, &moderation_prefix(kind))?;
+        let name = valid(name)?;
         let record: T = serde_json::from_slice(body)?;
         same(what, name_of(&record), name)?;
         anyhow::Ok(record)
@@ -487,11 +495,10 @@ mod tests {
             "moderation/suspensions/s3",
             suspension("s3", true, Some(5)),
         );
-        let arkavo_2 = format!("arkavo:{U2}");
         put(
             &m,
-            &format!("moderation/suspensions/{arkavo_2}"),
-            suspension(&arkavo_2, true, None),
+            &format!("moderation/suspensions/{U2}"),
+            suspension(U2, true, None),
         );
         put(
             &m,
@@ -502,11 +509,6 @@ mod tests {
             &m,
             &format!("moderation/blocks/{}", h("b2")),
             block(&h("b2"), Some(5)),
-        );
-        put(
-            &m,
-            &format!("moderation/blocks/{}", h("B3")),
-            block(&h("B3"), None),
         );
         put(
             &m,
@@ -530,16 +532,12 @@ mod tests {
     async fn read_builds_the_view() {
         let snapshot = read(&populated()).await.unwrap();
         let view = &snapshot.moderation;
-        assert_eq!(
-            view.blocked,
-            HashSet::from([h("b1"), h("b3")]),
-            "active blocks only, lowercase"
-        );
+        assert_eq!(view.blocked, HashSet::from([h("b1")]), "active blocks only");
         assert_eq!(view.catalog_blocked, HashSet::from(["c1".to_string()]));
         assert_eq!(
             view.hidden,
             HashSet::from(["c1".to_string(), "s1".to_string(), U2.to_string()]),
-            "active catalog blocks and hideCatalog suspensions, canonical"
+            "active catalog blocks and hideCatalog suspensions"
         );
 
         assert_eq!(
@@ -691,6 +689,32 @@ mod tests {
             (
                 transition_key("u1", &transition_name(1, &h("d1"))),
                 serde_json::to_value(uppercase).unwrap(),
+            ),
+            // Moderation keys are canonical subjects and lowercase hashes,
+            // even when the body names exactly what the key names.
+            (
+                format!("moderation/suspensions/{arkavo}"),
+                suspension(&arkavo, true, None),
+            ),
+            (
+                format!("moderation/catalog-blocks/{arkavo}"),
+                catalog_block(&arkavo, None),
+            ),
+            (
+                "moderation/suspensions/a..b".to_string(),
+                suspension("a..b", true, None),
+            ),
+            (
+                format!("moderation/blocks/{}", h("B3")),
+                block(&h("B3"), None),
+            ),
+            (
+                "moderation/blocks/not-a-hash".to_string(),
+                block("not-a-hash", None),
+            ),
+            (
+                format!("moderation/blocks/{}", h("b")),
+                block(&h("b"), None),
             ),
             // A moderation record names what its key names.
             (
