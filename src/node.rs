@@ -24,6 +24,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::Config;
 use crate::ingest::{self, IngestError};
 use crate::moderation::{BlobOwner, PublishGate, now_secs};
+use crate::ownership::OwnerStore;
 use crate::s3_serve::{Object, Refusal, S3Server};
 use crate::secret_key;
 use crate::staging::{PendingPush, Staging};
@@ -290,7 +291,8 @@ async fn run_ingest_loop(
                             if wait_and_ingest(hash, msg.rx, connection_id, pending, &ingester).await
                                 && let Some((subject, endpoint)) = owner
                             {
-                                record_owner(&ingester.s3_client, hash, subject, endpoint).await;
+                                record_owner(ingester.s3_client.as_ref(), hash, subject, endpoint)
+                                    .await;
                             }
                         });
                     }
@@ -345,9 +347,12 @@ async fn run_ingest_loop(
 /// cannot make the node send S3 a lookup per hash.
 const MAX_FETCH_HASHES: usize = 64;
 
-/// Record who pushed a blob, so a suspension can be traced to content.
+/// Record who owns the recording: the account whose push of it was first
+/// ingested. The record is created only if none exists and is never
+/// overwritten, so a later push of the same hash, by anyone, leaves it as
+/// it was.
 async fn record_owner(
-    s3_client: &S3Client,
+    owners: &dyn OwnerStore,
     hash: iroh_blobs::Hash,
     subject: String,
     endpoint: iroh::EndpointId,
@@ -359,11 +364,14 @@ async fn record_owner(
         at: now_secs(),
     };
     let body = bytes::Bytes::from(serde_json::to_vec(&owner).expect("owner serializes"));
-    if let Err(e) = s3_client
-        .put_moderation_record("publishers", &owner.hash, body)
-        .await
-    {
-        warn!(%hash, error = %e, "Recording the blob's publisher failed");
+    match owners.create_owner(&owner.hash, body).await {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!(%hash, subject = %owner.subject, "The recording already has an owner; record kept");
+        }
+        Err(e) => {
+            warn!(%hash, error = %e, "Recording the blob's owner failed; it stays unowned until pushed again");
+        }
     }
 }
 
@@ -810,4 +818,34 @@ fn refuse(mut send: SendStream, code: VarInt, why: &'static str, hash: Option<ir
     let retry = code == ERR_LIMIT;
     info!(?hash, why, retry, "Fetch refused");
     send.reset(code).ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ownership::parse_owner;
+    use crate::ownership::test_support::MemOwners;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn record_owner_keeps_the_first_owner() {
+        let hash = iroh_blobs::Hash::new(b"a recording");
+        let hex = hash.to_hex().to_string();
+        let first = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let second = iroh::SecretKey::from_bytes(&[2; 32]).public();
+
+        let owners = MemOwners::default();
+        record_owner(&owners, hash, "u1".to_string(), first).await;
+        record_owner(&owners, hash, "u2".to_string(), second).await;
+        let stored = owners.get_owner(&hex).await.unwrap().expect("recorded");
+        let owner = parse_owner(&hex, &stored).unwrap();
+        assert_eq!(owner.subject, "u1");
+        assert_eq!(owner.endpoint_id, first.to_string());
+
+        // A store that is down only logs: no panic, nothing stored.
+        let down = MemOwners::default();
+        down.down.store(true, Ordering::Relaxed);
+        record_owner(&down, hash, "u1".to_string(), first).await;
+        assert!(down.records.lock().unwrap().is_empty());
+    }
 }

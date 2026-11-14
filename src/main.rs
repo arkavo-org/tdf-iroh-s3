@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -13,9 +14,12 @@ use tdf_iroh_s3::authz::{
 use tdf_iroh_s3::catalogs_api;
 use tdf_iroh_s3::catalogs_v2_api;
 use tdf_iroh_s3::config::{AuthzConfig, Config, PublishDecisions};
+use tdf_iroh_s3::deletion::operator::{self, Outcome, Requested};
+use tdf_iroh_s3::deletion::sweep::{Aborted, sweep};
 use tdf_iroh_s3::moderation::{self, Moderation, ModerationApi, PublishGate, PublishPolicy};
 use tdf_iroh_s3::node::TdfIrohNode;
 use tdf_iroh_s3::node_api;
+use tdf_iroh_s3::ownership::{self, OwnerStore, Released};
 use tdf_iroh_s3::publish_decision::PublishDecider;
 use tdf_iroh_s3::ssm;
 use tdf_iroh_s3::store::s3::S3Client;
@@ -30,28 +34,250 @@ use tdf_iroh_s3::tls;
 struct Cli {
     #[arg(short, long, default_value = "/etc/tdf-iroh-s3/config.toml")]
     config: PathBuf,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Create owner records for the recordings live catalogs list (a dry run
+    /// unless --write)
+    ///
+    /// For each recording a live catalog lists: no owner record and one
+    /// listing account → claim it for that account; listed by more than one
+    /// account, or owned by an account that doesn't list it → a conflict,
+    /// nothing written. Run before ownership is enforced, until the dry run
+    /// reports no conflicts. Exits 1 on any conflict.
+    ClaimOwners {
+        /// Create the records; without it, only report.
+        #[arg(long)]
+        write: bool,
+    },
+    /// Delete a recording's owner record if it names --subject
+    ///
+    /// Deletes every version, so the next push claims the recording. For an
+    /// account deleted without emptying its catalog. Exits 1 if nothing is
+    /// released.
+    ReleaseOwner {
+        /// The recording's BLAKE3 hash, 64 lowercase hex characters.
+        #[arg(long)]
+        hash: String,
+        /// The subject the record must name (compared canonically).
+        #[arg(long)]
+        subject: String,
+        /// Why; printed, not stored.
+        #[arg(long)]
+        reason: String,
+    },
+    /// Delete what owners and operators asked to delete, every version,
+    /// once it is due (a dry run unless --delete)
+    ///
+    /// Folds committed catalog transitions into deletion requests, then
+    /// deletes each recording, catalog envelope and subject that is due (a
+    /// subject's pointers, then its transitions), re-checking each just
+    /// before. One line per item, then counts. Anything unreadable aborts
+    /// the run before it writes anything. Exits 1 if the run aborts or any
+    /// item fails.
+    SweepDeletions {
+        /// Write and delete; without it, only report.
+        #[arg(long)]
+        delete: bool,
+    },
+    /// Ask the sweep to delete blocked recordings (--hash) or everything
+    /// an account published (--all)
+    ///
+    /// --hash: each hash must be a recording's (not a catalog envelope's)
+    /// with an active block; a scope-hash request for each. --all: the
+    /// subject must have an active catalog block and an active suspension;
+    /// a scope-subject request for every hash in the live index of each of
+    /// its pointers and every hash its owner records name, then a request
+    /// for the subject (its pointers and transitions). Nothing is written
+    /// unless every precondition holds. One line per key; sweep-deletions
+    /// --delete then deletes them. Exits 1 if refused.
+    RequestDeletion {
+        /// The account, compared canonically: keys carry `<uuid>` for
+        /// `arkavo:<uuid>`.
+        #[arg(long)]
+        subject: String,
+        /// Blocked recordings' BLAKE3 hashes, 64 lowercase hex characters.
+        #[arg(long, num_args = 1.., conflicts_with = "all", required_unless_present = "all")]
+        hash: Vec<String>,
+        /// Everything the subject published; needs its catalog block and
+        /// its suspension.
+        #[arg(long)]
+        all: bool,
+        /// Why; stored in each request.
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+/// `claim-owners`: one line per claim and per conflict, then counts.
+async fn claim_owners(config: &Config, write: bool) -> Result<()> {
+    let s3 = S3Client::from_config(&config.s3).await?;
+    let report = ownership::claim_owners(&s3, write, moderation::now_secs()).await?;
+    let verb = if write { "claimed" } else { "would claim" };
+    for (hash, subject) in &report.claimed {
+        println!("{verb} {hash} {subject}");
+    }
+    for conflict in &report.conflicts {
+        let owner = match &conflict.owner {
+            Some(owner) => format!("owner {owner}"),
+            None => "no owner record".to_string(),
+        };
+        println!(
+            "conflict {}: listed by {}; {owner}",
+            conflict.hash,
+            conflict.listers.join(", ")
+        );
+    }
+    println!(
+        "{} owned, {} {verb}, {} conflicts",
+        report.owned,
+        report.claimed.len(),
+        report.conflicts.len()
+    );
+    anyhow::ensure!(
+        report.conflicts.is_empty(),
+        "{} conflicts: ownership can't be enforced until there are none",
+        report.conflicts.len()
+    );
+    Ok(())
+}
+
+/// `release-owner`: what it did, or why it didn't.
+async fn release_owner(config: &Config, hash: &str, subject: &str, reason: &str) -> Result<()> {
+    anyhow::ensure!(!reason.trim().is_empty(), "--reason must not be empty");
+    let s3 = S3Client::from_config(&config.s3).await?;
+    match ownership::release_owner(&s3, hash, subject).await? {
+        Released::Deleted(versions) => {
+            println!("released {hash} from {subject} ({versions} versions): {reason}");
+            Ok(())
+        }
+        Released::NotOwner(owner) => {
+            println!("not released: {hash} is owned by {owner}, not {subject}");
+            anyhow::bail!("not released")
+        }
+        Released::NoRecord => {
+            println!("not released: {hash} has no owner record");
+            anyhow::bail!("not released")
+        }
+    }
+}
+
+/// `sweep-deletions`: the report, then counts. Exits 1 when any item
+/// failed, or when the run aborts: then the lines of what it did until
+/// then, without counts, and the error chain on stderr.
+async fn sweep_deletions(config: &Config, delete: bool) -> Result<()> {
+    let s3 = S3Client::from_config(&config.s3).await?;
+    let report = match sweep(&s3, delete, moderation::now_secs()).await {
+        Ok(report) => report,
+        Err(Aborted { report, error }) => {
+            for line in &report.lines {
+                println!("{line}");
+            }
+            eprintln!("sweep-deletions aborted: {error:#}");
+            std::process::exit(1);
+        }
+    };
+    println!("{report}");
+    if report.failures > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `request-deletion`: one line per key, then, for `--all`, its coverage.
+/// Exits 1 when refused (the error on stderr), with nothing written.
+async fn request_deletion(
+    config: &Config,
+    subject: &str,
+    hashes: &[String],
+    all: bool,
+    reason: &str,
+) -> Result<()> {
+    let s3 = S3Client::from_config(&config.s3).await?;
+    let now = moderation::now_secs();
+    let requested = if all {
+        operator::request_all(&s3, subject, reason, now).await?
+    } else {
+        operator::request_hashes(&s3, subject, hashes, reason, now).await?
+    };
+    let reason = reason.trim();
+    let other_scope = if all { "hash" } else { "subject" };
+    for Requested { key, outcome } in &requested {
+        match outcome {
+            Outcome::Requested => println!("requested {key}: {reason}"),
+            Outcome::Renewed => println!("requested {key} (replaces a deleted request): {reason}"),
+            Outcome::Rescoped => println!(
+                "requested {key} (replaces a pending scope-{other_scope} request): {reason}"
+            ),
+            Outcome::Exists => println!("exists {key}"),
+        }
+    }
+    if all {
+        println!("coverage: live indexes and owner records; add --hash for anything else");
+    }
+    Ok(())
+}
+
+/// The log filter when `RUST_LOG` isn't set. The service's: the store's
+/// garbage collector logs at info each time it skips a run, which it does
+/// every interval while no refused blob is waiting for deletion. An
+/// operator command's: `aws_config` logs the credentials it loads at info,
+/// access key ID included.
+fn default_filter(operator: bool) -> &'static str {
+    if operator {
+        "info,aws_config=warn"
+    } else {
+        "info,iroh_blobs::store::gc=warn"
+    }
+}
+
+/// Logs go to stdout for the service, which the CloudWatch agent ships
+/// from the journal, and to stderr for an operator command, whose stdout
+/// is only its report, to pipe or save.
+fn init_tracing(operator: bool) {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_filter(operator)));
+    let logs = tracing_subscriber::fmt().with_env_filter(filter);
+    if operator {
+        logs.with_writer(std::io::stderr)
+            .with_ansi(std::io::stderr().is_terminal())
+            .init();
+    } else {
+        logs.init();
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            // The store's garbage collector logs at info each time it skips
-            // a run, which it does every interval while no refused blob is
-            // waiting for deletion.
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,iroh_blobs::store::gc=warn")),
-        )
-        .init();
+    let cli = Cli::parse();
+    init_tracing(cli.command.is_some());
 
     // reqwest pulls in ring and axum-server pulls in aws-lc-rs; with both
     // compiled in, rustls needs the process default chosen explicitly.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let cli = Cli::parse();
     let config = Config::from_file(&cli.config)?;
     info!("Config loaded from {:?}", cli.config);
     info!("S3: {}:{}", config.s3.bucket, config.s3.region);
+    match cli.command {
+        Some(Command::ClaimOwners { write }) => return claim_owners(&config, write).await,
+        Some(Command::ReleaseOwner {
+            hash,
+            subject,
+            reason,
+        }) => return release_owner(&config, &hash, &subject, &reason).await,
+        Some(Command::SweepDeletions { delete }) => return sweep_deletions(&config, delete).await,
+        Some(Command::RequestDeletion {
+            subject,
+            hash,
+            all,
+            reason,
+        }) => return request_deletion(&config, &subject, &hash, all, &reason).await,
+        None => {}
+    }
     info!(
         "Required attributes: {:?}",
         config.validation.required_attributes
@@ -130,6 +356,7 @@ async fn main() -> Result<()> {
         }
         Some(Arc::new(
             PublishGate::new(view)
+                .with_owner_store(Arc::clone(&store) as Arc<dyn OwnerStore>)
                 .with_session_store(store)
                 .with_decider(Arc::clone(&decider))
                 .with_session_ttl(std::time::Duration::from_secs(

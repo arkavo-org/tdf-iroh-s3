@@ -1,20 +1,142 @@
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::RequestChecksumCalculation;
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::primitives::{ByteStream, DateTime};
 use bytes::Bytes;
+use std::future::Future;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::config::S3Config;
+use crate::object_store::{ObjectInfo, ObjectStore, VersionInfo};
 
 /// User metadata key holding a catalog document's owner
 /// (`x-amz-meta-owner`).
 pub const CATALOG_OWNER_METADATA: &str = "owner";
 
+/// Keys per page of an `ObjectStore` listing: S3's maximum.
+const DEFAULT_LIST_PAGE_SIZE: i32 = 1000;
+
 pub struct S3Client {
     client: Client,
     bucket: String,
     prefix: String,
+    list_page_size: i32,
+}
+
+/// The pauses before sending a conditional write again after S3's 409:
+/// at most three attempts in all.
+const CONFLICT_BACKOFF: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(500)];
+
+/// The HTTP status S3 answered with, if it answered.
+fn status<E>(e: &SdkError<E>) -> Option<u16> {
+    e.raw_response().map(|r| r.status().as_u16())
+}
+
+/// What a conditional write is conditional on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Condition {
+    /// `If-Match: <etag>`: the object is still the one read.
+    IfMatch,
+    /// `If-None-Match: *`: no object.
+    IfNoneMatch,
+}
+
+/// Whether a conditional write lost: 412, its condition failed; or, for
+/// `If-Match` only, 404 `NoSuchKey`, which S3 answers instead when the key
+/// has no current object (the one read was deleted since). Not 409 (see
+/// [`in_conflict`]), and not another 404, such as `NoSuchBucket`.
+fn lost_condition<E: ProvideErrorMetadata>(e: &SdkError<E>, condition: Condition) -> bool {
+    match status(e) {
+        Some(412) => true,
+        Some(404) => {
+            condition == Condition::IfMatch
+                && e.as_service_error().and_then(|se| se.code()) == Some("NoSuchKey")
+        }
+        _ => false,
+    }
+}
+
+/// Whether S3 answered a conditional write 409 (`ConditionalRequestConflict`):
+/// a conflicting conditional write to the same key is still in progress,
+/// so whether this one loses is unknown. S3 says to retry.
+fn in_conflict<E>(e: &SdkError<E>) -> bool {
+    status(e) == Some(409)
+}
+
+/// Send a conditional write on `condition`, `send` building it afresh
+/// for each attempt. `Ok(true)` when written, `Ok(false)` when it lost
+/// ([`lost_condition`]: 412, or an `If-Match`'s 404 `NoSuchKey`). A 409
+/// is sent again after each of [`CONFLICT_BACKOFF`]'s pauses; a 409 on
+/// the last attempt is `Err` (the outcome is unknown), never `Ok(false)`.
+/// Any other error is `Err` at once. `what` is the error's context.
+async fn send_conditional<T, E, F, Fut>(
+    what: &str,
+    condition: Condition,
+    mut send: F,
+) -> Result<bool>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, SdkError<E>>>,
+    E: std::error::Error + ProvideErrorMetadata + Send + Sync + 'static,
+{
+    let mut pauses = CONFLICT_BACKOFF.iter();
+    loop {
+        match send().await {
+            Ok(_) => return Ok(true),
+            Err(e) if lost_condition(&e, condition) => return Ok(false),
+            Err(e) if in_conflict(&e) => match pauses.next() {
+                Some(pause) => tokio::time::sleep(*pause).await,
+                None => {
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "{what}: S3 answered 409 {} times, a conflicting conditional write \
+                         to the key still in progress",
+                        CONFLICT_BACKOFF.len() + 1
+                    )));
+                }
+            },
+            Err(e) => return Err(anyhow::Error::new(e).context(what.to_string())),
+        }
+    }
+}
+
+/// The versions of exactly `key` in a listing of `key` as a prefix (which
+/// also returns `key…`), each paired with whether it is the current one.
+/// The current one goes last, so a delete that stops part-way leaves what
+/// readers see as it was: an older version never comes back.
+fn versions_of(key: &str, listed: Vec<(VersionInfo, bool)>) -> Vec<VersionInfo> {
+    let mut versions: Vec<(VersionInfo, bool)> =
+        listed.into_iter().filter(|(v, _)| v.key == key).collect();
+    versions.sort_by_key(|&(_, current)| current);
+    versions.into_iter().map(|(v, _)| v).collect()
+}
+
+/// [`versions_of`], only those `version_ids` names: the versions a caller
+/// listed and judged that are still there, the current one last.
+fn named_versions_of(
+    key: &str,
+    listed: Vec<(VersionInfo, bool)>,
+    version_ids: &[String],
+) -> Vec<VersionInfo> {
+    let mut versions = versions_of(key, listed);
+    versions.retain(|v| version_ids.contains(&v.version_id));
+    versions
+}
+
+/// A listed entry's write time in Unix seconds. Missing is an error: a
+/// made-up time could make a fresh write look old.
+fn unix_secs(modified: Option<&DateTime>, listed: &str) -> Result<i64> {
+    modified
+        .map(DateTime::secs)
+        .with_context(|| format!("S3 listed {listed} with no last-modified time"))
+}
+
+/// Whether a listing page of `prefix` says more pages follow. Missing
+/// `IsTruncated` is an error: read as the end of the listing, it could
+/// leave keys unlisted.
+fn more_pages(is_truncated: Option<bool>, prefix: &str) -> Result<bool> {
+    is_truncated.with_context(|| format!("S3 listed {prefix} with no IsTruncated"))
 }
 
 impl S3Client {
@@ -47,6 +169,7 @@ impl S3Client {
             client: Client::from_conf(builder.build()),
             bucket: config.bucket.clone(),
             prefix: config.prefix.clone(),
+            list_page_size: DEFAULT_LIST_PAGE_SIZE,
         })
     }
 
@@ -61,6 +184,7 @@ impl S3Client {
             client,
             bucket: bucket.to_string(),
             prefix: prefix.to_string(),
+            list_page_size: DEFAULT_LIST_PAGE_SIZE,
         }
     }
 
@@ -81,7 +205,112 @@ impl S3Client {
             client: Client::from_conf(config),
             bucket: bucket.to_string(),
             prefix: String::new(),
+            list_page_size: DEFAULT_LIST_PAGE_SIZE,
         }
+    }
+
+    /// Page `ObjectStore` listings by `n` keys instead of 1000, so tests
+    /// can make a listing span pages.
+    pub fn with_list_page_size(mut self, n: i32) -> Self {
+        self.list_page_size = n;
+        self
+    }
+
+    /// An `ObjectStore` key (relative to the `[s3] prefix`) as stored.
+    fn object_key(&self, key: &str) -> String {
+        format!("{}{}", self.prefix, key)
+    }
+
+    /// A key S3 listed for `prefix`, relative to the `[s3] prefix`. A key
+    /// outside the listing's prefix is an error.
+    fn relative_key(&self, listed: &str, prefix: &str) -> Result<String> {
+        listed
+            .strip_prefix(self.prefix.as_str())
+            .filter(|key| key.starts_with(prefix))
+            .map(str::to_string)
+            .with_context(|| {
+                format!(
+                    "S3 listed {listed}, outside the prefix {}{prefix}",
+                    self.prefix
+                )
+            })
+    }
+
+    /// Every version and delete marker under `prefix`, each with whether it
+    /// is the current one, across every page.
+    async fn list_versions_marked(&self, prefix: &str) -> Result<Vec<(VersionInfo, bool)>> {
+        let full = self.object_key(prefix);
+        let mut out = Vec::new();
+        let mut key_marker: Option<String> = None;
+        let mut version_id_marker: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_object_versions()
+                .bucket(&self.bucket)
+                .prefix(&full)
+                .max_keys(self.list_page_size);
+            if let Some(marker) = &key_marker {
+                req = req.key_marker(marker);
+            }
+            if let Some(marker) = &version_id_marker {
+                req = req.version_id_marker(marker);
+            }
+            let resp = req
+                .send()
+                .await
+                .with_context(|| format!("Failed to LIST versions under {full} in S3"))?;
+            let versions = resp.versions().iter().map(|v| {
+                (
+                    v.key(),
+                    v.version_id(),
+                    v.last_modified(),
+                    v.is_latest(),
+                    false,
+                )
+            });
+            let markers = resp.delete_markers().iter().map(|m| {
+                (
+                    m.key(),
+                    m.version_id(),
+                    m.last_modified(),
+                    m.is_latest(),
+                    true,
+                )
+            });
+            for (key, version_id, modified, latest, delete_marker) in versions.chain(markers) {
+                let listed = key.context("S3 listed a version with no key")?;
+                let version_id = version_id
+                    .with_context(|| format!("S3 listed a version of {listed} with no ID"))?;
+                out.push((
+                    VersionInfo {
+                        key: self.relative_key(listed, prefix)?,
+                        version_id: version_id.to_string(),
+                        delete_marker,
+                        modified: unix_secs(modified, listed)?,
+                    },
+                    latest.unwrap_or(false),
+                ));
+            }
+            if !more_pages(resp.is_truncated(), &full)? {
+                break;
+            }
+            // Without both markers the next page could skip versions.
+            key_marker = Some(
+                resp.next_key_marker()
+                    .context("S3 cut a version listing short with no next key marker")?
+                    .to_string(),
+            );
+            version_id_marker = Some(
+                resp.next_version_id_marker()
+                    .context("S3 cut a version listing short with no next version ID marker")?
+                    .to_string(),
+            );
+        }
+        // S3 lists in key order, but the SDK splits each page into versions
+        // and delete markers. A stable sort restores key order.
+        out.sort_by(|(a, _), (b, _)| a.key.cmp(&b.key));
+        Ok(out)
     }
 
     pub fn blob_key(&self, hash_hex: &str) -> String {
@@ -115,6 +344,13 @@ impl S3Client {
     /// A creator's signed catalog pointer bundle (catalog v2).
     pub fn catalog_pointer_key(&self, sub: &str) -> String {
         format!("{}catalog-pointers/{}", self.prefix, sub)
+    }
+
+    /// One publish's transition record (`deletion::Transition`), named by
+    /// `deletion::transition_name`; `sub` as in the pointer key. Never
+    /// served: the deletion sweep reads it.
+    pub fn catalog_transition_key(&self, sub: &str, name: &str) -> String {
+        format!("{}catalog-transitions/{}/{}", self.prefix, sub, name)
     }
 
     pub async fn put_blob(&self, hash_hex: &str, data: Bytes) -> Result<()> {
@@ -491,18 +727,24 @@ impl S3Client {
 
     /// A creator's stored pointer bundle and its ETag.
     pub async fn get_catalog_pointer(&self, sub: &str) -> Result<Option<(Bytes, String)>> {
+        self.get_with_etag(&self.catalog_pointer_key(sub), "catalog pointer")
+            .await
+    }
+
+    /// The object at `key` (the full key) and its ETag, or `None`.
+    async fn get_with_etag(&self, key: &str, what: &str) -> Result<Option<(Bytes, String)>> {
         match self
             .client
             .get_object()
             .bucket(&self.bucket)
-            .key(self.catalog_pointer_key(sub))
+            .key(key)
             .send()
             .await
         {
             Ok(resp) => {
                 let etag = resp
                     .e_tag()
-                    .context("S3 GET of a catalog pointer returned no ETag")?
+                    .with_context(|| format!("S3 GET of a {what} returned no ETag"))?
                     .to_string();
                 let data = resp.body.collect().await?;
                 Ok(Some((data.into_bytes(), etag)))
@@ -511,27 +753,65 @@ impl S3Client {
                 if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
                     Ok(None)
                 } else {
-                    Err(anyhow::anyhow!(
-                        "Failed to GET catalog pointer from S3: {}",
-                        e
-                    ))
+                    Err(anyhow::anyhow!("Failed to GET {what} from S3: {}", e))
                 }
             }
         }
     }
 
-    /// Store a catalog's index record under `catalog-indexes/<hash>`.
-    pub async fn put_catalog_index(&self, hash_hex: &str, body: Bytes) -> Result<()> {
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(self.catalog_index_key(hash_hex))
-            .content_type("application/json")
-            .body(body.into())
+    /// Put `body` at `key` (the full key) only if the object there still
+    /// has the ETag `expected` (`If-Match`), or, with `None`, only if there
+    /// is none (`If-None-Match: *`), through `send_conditional`.
+    async fn put_if(
+        &self,
+        key: &str,
+        body: Bytes,
+        expected: Option<&str>,
+        what: &str,
+    ) -> Result<bool> {
+        let condition = match expected {
+            Some(_) => Condition::IfMatch,
+            None => Condition::IfNoneMatch,
+        };
+        send_conditional(&format!("Failed to PUT {what} to S3"), condition, || {
+            let put = self
+                .client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .content_type("application/json")
+                .body(body.clone().into());
+            match expected {
+                Some(etag) => put.if_match(etag),
+                None => put.if_none_match("*"),
+            }
             .send()
-            .await
-            .context("Failed to PUT catalog index to S3")?;
-        Ok(())
+        })
+        .await
+    }
+
+    /// Create a catalog's index record under `catalog-indexes/<hash>` only
+    /// if none exists (`If-None-Match: *`): one envelope has one index.
+    /// `false` when one already does; `Err` when a concurrent conditional
+    /// write to it is still in progress after the retries
+    /// (`send_conditional`).
+    pub async fn create_catalog_index(&self, hash_hex: &str, body: Bytes) -> Result<bool> {
+        let key = self.catalog_index_key(hash_hex);
+        send_conditional(
+            "Failed to create catalog index in S3",
+            Condition::IfNoneMatch,
+            || {
+                self.client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .content_type("application/json")
+                    .if_none_match("*")
+                    .body(body.clone().into())
+                    .send()
+            },
+        )
+        .await
     }
 
     /// A catalog's index record, or `None` (a catalog published before
@@ -554,41 +834,59 @@ impl S3Client {
         }
     }
 
+    /// Write a publish's transition record, after its index record and
+    /// before its document, outboard and pointer: only if none is stored
+    /// (`expected` `None`), or only if the stored one still has the ETag
+    /// `expected`. `false` when the condition failed, a replace of a
+    /// transition deleted since included; `Err` when a conflicting write is
+    /// still in progress after the retries.
+    pub async fn put_catalog_transition(
+        &self,
+        sub: &str,
+        name: &str,
+        body: Bytes,
+        expected: Option<&str>,
+    ) -> Result<bool> {
+        self.put_if(
+            &self.catalog_transition_key(sub, name),
+            body,
+            expected,
+            "catalog transition",
+        )
+        .await
+    }
+
+    /// A stored transition record and its ETag, or `None`.
+    pub async fn get_catalog_transition(
+        &self,
+        sub: &str,
+        name: &str,
+    ) -> Result<Option<(Bytes, String)>> {
+        self.get_with_etag(
+            &self.catalog_transition_key(sub, name),
+            "catalog transition",
+        )
+        .await
+    }
+
     /// Store a creator's pointer bundle only if the stored one is still
     /// `expected` (its ETag), or, with `None`, only if there is none.
-    /// `false` when another write got there first.
+    /// `false` when another write got there first, or the pointer was
+    /// deleted since it was read; `Err` when a conflicting write is still in
+    /// progress after the retries (`send_conditional`).
     pub async fn put_catalog_pointer(
         &self,
         sub: &str,
         body: Bytes,
         expected: Option<&str>,
     ) -> Result<bool> {
-        let put = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(self.catalog_pointer_key(sub))
-            .content_type("application/json")
-            .body(body.into());
-        let put = match expected {
-            Some(etag) => put.if_match(etag),
-            None => put.if_none_match("*"),
-        };
-        match put.send().await {
-            Ok(_) => Ok(true),
-            // 412: the condition failed; 409: a concurrent conditional
-            // write to the same key is in progress.
-            Err(e)
-                if e.raw_response()
-                    .is_some_and(|r| matches!(r.status().as_u16(), 409 | 412)) =>
-            {
-                Ok(false)
-            }
-            Err(e) => Err(anyhow::anyhow!(
-                "Failed to PUT catalog pointer to S3: {}",
-                e
-            )),
-        }
+        self.put_if(
+            &self.catalog_pointer_key(sub),
+            body,
+            expected,
+            "catalog pointer",
+        )
+        .await
     }
 
     pub async fn delete_blob(&self, hash_hex: &str) -> Result<()> {
@@ -625,6 +923,34 @@ impl S3Client {
             .await
             .context("Failed to PUT moderation record to S3")?;
         Ok(())
+    }
+
+    /// Create one moderation record (`moderation/<kind>/<key>`) only if
+    /// none exists (`If-None-Match: *`). `false` when one already does;
+    /// `Err` when a concurrent conditional write to it is still in progress
+    /// after the retries (`send_conditional`).
+    pub async fn create_moderation_record(
+        &self,
+        kind: &str,
+        key: &str,
+        body: Bytes,
+    ) -> Result<bool> {
+        let key = format!("{}{}", self.moderation_prefix(kind), key);
+        send_conditional(
+            "Failed to create moderation record in S3",
+            Condition::IfNoneMatch,
+            || {
+                self.client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .content_type("application/json")
+                    .if_none_match("*")
+                    .body(body.clone().into())
+                    .send()
+            },
+        )
+        .await
     }
 
     /// One moderation record (`moderation/<kind>/<key>`), or `None`.
@@ -682,5 +1008,430 @@ impl S3Client {
             }
         }
         Ok(out)
+    }
+}
+
+/// The bucket for the offline commands. Keys are relative to the `[s3]
+/// prefix`.
+impl ObjectStore for S3Client {
+    async fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>> {
+        let full = self.object_key(prefix);
+        let mut out = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&full)
+                .max_keys(self.list_page_size);
+            if let Some(token) = &continuation {
+                req = req.continuation_token(token);
+            }
+            let resp = req
+                .send()
+                .await
+                .with_context(|| format!("Failed to LIST {full} in S3"))?;
+            for obj in resp.contents() {
+                let listed = obj.key().context("S3 listed an object with no key")?;
+                out.push(ObjectInfo {
+                    key: self.relative_key(listed, prefix)?,
+                    modified: unix_secs(obj.last_modified(), listed)?,
+                });
+            }
+            if !more_pages(resp.is_truncated(), &full)? {
+                break;
+            }
+            continuation = Some(
+                resp.next_continuation_token()
+                    .context("S3 cut a listing short with no continuation token")?
+                    .to_string(),
+            );
+        }
+        Ok(out)
+    }
+
+    async fn list_versions(&self, prefix: &str) -> Result<Vec<VersionInfo>> {
+        Ok(self
+            .list_versions_marked(prefix)
+            .await?
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect())
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<Bytes>> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(self.object_key(key))
+            .send()
+            .await
+        {
+            Ok(resp) => Ok(Some(
+                resp.body
+                    .collect()
+                    .await
+                    .with_context(|| format!("Failed to read {key} from S3"))?
+                    .into_bytes(),
+            )),
+            Err(e) if e.as_service_error().is_some_and(|se| se.is_no_such_key()) => Ok(None),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("Failed to GET {key} from S3"))),
+        }
+    }
+
+    async fn head_owner(&self, key: &str) -> Result<Option<Option<String>>> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(self.object_key(key))
+            .send()
+            .await
+        {
+            Ok(head) => Ok(Some(
+                head.metadata()
+                    .and_then(|m| m.get(CATALOG_OWNER_METADATA))
+                    .cloned(),
+            )),
+            Err(e) if e.as_service_error().is_some_and(|se| se.is_not_found()) => Ok(None),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("Failed to HEAD {key} in S3"))),
+        }
+    }
+
+    async fn put(&self, key: &str, body: Bytes) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.object_key(key))
+            .body(body.into())
+            .send()
+            .await
+            .with_context(|| format!("Failed to PUT {key} to S3"))?;
+        Ok(())
+    }
+
+    async fn create(&self, key: &str, body: Bytes) -> Result<bool> {
+        let object_key = self.object_key(key);
+        send_conditional(
+            &format!("Failed to create {key} in S3"),
+            Condition::IfNoneMatch,
+            || {
+                self.client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(&object_key)
+                    .if_none_match("*")
+                    .body(body.clone().into())
+                    .send()
+            },
+        )
+        .await
+    }
+
+    /// Call 12: list `key`'s versions with `key` as the prefix, keep exact
+    /// matches, then one `DeleteObject` with `VersionId` per version and
+    /// delete marker, the current one last. A failure part-way leaves the
+    /// rest for the next run.
+    async fn delete_all_versions(&self, key: &str) -> Result<usize> {
+        let versions = versions_of(key, self.list_versions_marked(key).await?);
+        self.delete_each_version(key, &versions).await
+    }
+
+    /// Call 12 for the versions a caller listed and judged: list `key`'s
+    /// versions as [`delete_all_versions`](Self::delete_all_versions) does,
+    /// for which is current, keep those `version_ids` names, and delete
+    /// them the same way. One written since the caller listed isn't named,
+    /// and stays. No call at all when nothing is named.
+    async fn delete_versions(&self, key: &str, version_ids: &[String]) -> Result<usize> {
+        if version_ids.is_empty() {
+            return Ok(0);
+        }
+        let listed = self.list_versions_marked(key).await?;
+        let versions = named_versions_of(key, listed, version_ids);
+        self.delete_each_version(key, &versions).await
+    }
+}
+
+impl S3Client {
+    /// One `DeleteObject` with `VersionId` per version of `key`, in order.
+    async fn delete_each_version(&self, key: &str, versions: &[VersionInfo]) -> Result<usize> {
+        for v in versions {
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(self.object_key(key))
+                .version_id(&v.version_id)
+                .send()
+                .await
+                .with_context(|| {
+                    format!("Failed to DELETE version {} of {key} from S3", v.version_id)
+                })?;
+        }
+        Ok(versions.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn version(key: &str, id: &str, delete_marker: bool) -> VersionInfo {
+        VersionInfo {
+            key: key.to_string(),
+            version_id: id.to_string(),
+            delete_marker,
+            modified: 0,
+        }
+    }
+
+    #[test]
+    fn the_list_page_size_defaults_to_1000() {
+        let s3 = S3Client::new_mock("bucket", "us-east-1", "");
+        assert_eq!(s3.list_page_size, 1000);
+        assert_eq!(s3.with_list_page_size(2).list_page_size, 2);
+    }
+
+    #[test]
+    fn transitions_are_keyed_by_subject_and_name() {
+        let s3 = S3Client::new_mock("bucket", "us-east-1", "run-1/");
+        assert_eq!(
+            s3.catalog_transition_key("arkavo:u1", "00000000000000000007-ab"),
+            "run-1/catalog-transitions/arkavo:u1/00000000000000000007-ab"
+        );
+    }
+
+    #[test]
+    fn listed_keys_lose_the_s3_prefix() {
+        let s3 = S3Client::new_mock("bucket", "us-east-1", "run-1/");
+        assert_eq!(
+            s3.relative_key("run-1/blobs/aa", "blobs/").unwrap(),
+            "blobs/aa"
+        );
+        assert_eq!(s3.relative_key("run-1/blobs/aa", "").unwrap(), "blobs/aa");
+        assert!(s3.relative_key("run-2/blobs/aa", "blobs/").is_err());
+        assert!(s3.relative_key("blobs/aa", "blobs/").is_err());
+        assert!(s3.relative_key("run-1/manifests/aa", "blobs/").is_err());
+
+        let bare = S3Client::new_mock("bucket", "us-east-1", "");
+        assert_eq!(bare.relative_key("blobs/aa", "blobs/").unwrap(), "blobs/aa");
+    }
+
+    /// Call 12: a listing of `blobs/aa` as a prefix also returns
+    /// `blobs/aab`, which must survive. The current version goes last, so a
+    /// delete that stops part-way never brings back an older version.
+    #[test]
+    fn only_the_exact_key_is_deleted_its_current_version_last() {
+        let listed = vec![
+            (version("blobs/aa", "v3", false), true),
+            (version("blobs/aa", "v2", false), false),
+            (version("blobs/aab", "v9", false), true),
+            (version("blobs/aa", "v1", false), false),
+            (version("blobs/aa", "m1", true), false),
+        ];
+        let ids: Vec<String> = versions_of("blobs/aa", listed)
+            .into_iter()
+            .map(|v| v.version_id)
+            .collect();
+        assert_eq!(ids, ["v2", "v1", "m1", "v3"]);
+    }
+
+    /// A key whose current version is a delete marker: the marker goes last.
+    #[test]
+    fn a_current_delete_marker_is_deleted_last() {
+        let listed = vec![
+            (version("k", "v1", false), false),
+            (version("k", "m2", true), true),
+        ];
+        let ids: Vec<String> = versions_of("k", listed)
+            .into_iter()
+            .map(|v| v.version_id)
+            .collect();
+        assert_eq!(ids, ["v1", "m2"]);
+    }
+
+    /// Only the named versions, still the current one last; one written
+    /// since the caller listed isn't named, and isn't deleted.
+    #[test]
+    fn only_the_named_versions_are_deleted_the_current_one_last() {
+        let named = |ids: &[&str]| -> Vec<String> { ids.iter().map(|s| s.to_string()).collect() };
+        let ids = |versions: Vec<VersionInfo>| -> Vec<String> {
+            versions.into_iter().map(|v| v.version_id).collect()
+        };
+        let listed = || {
+            vec![
+                (version("blobs/aa", "v3", false), true),
+                (version("blobs/aa", "v2", false), false),
+                (version("blobs/aab", "v9", false), true),
+                (version("blobs/aa", "m1", true), false),
+            ]
+        };
+        assert_eq!(
+            ids(named_versions_of(
+                "blobs/aa",
+                listed(),
+                &named(&["v3", "m1", "v9"])
+            )),
+            ["m1", "v3"]
+        );
+        // `v3` was written after the caller listed: not named, kept.
+        assert_eq!(
+            ids(named_versions_of(
+                "blobs/aa",
+                listed(),
+                &named(&["v2", "m1", "v0"])
+            )),
+            ["v2", "m1"]
+        );
+    }
+
+    /// A page without `IsTruncated` is an error: read as the end of the
+    /// listing, it would leave keys unlisted, and the sweep would decide
+    /// on part of the bucket.
+    #[test]
+    fn a_listing_without_is_truncated_is_an_error() {
+        assert!(more_pages(Some(true), "blobs/").unwrap());
+        assert!(!more_pages(Some(false), "blobs/").unwrap());
+        let err = more_pages(None, "run-1/blobs/").unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("IsTruncated") && err.contains("run-1/blobs/"),
+            "{err}"
+        );
+    }
+
+    /// A PutObject that S3 answered with `status`; a 404 as S3 answers an
+    /// `If-Match` on a missing key, `NoSuchKey`.
+    fn failed(status: u16) -> SdkError<aws_sdk_s3::operation::put_object::PutObjectError> {
+        failed_with(status, (status == 404).then_some("NoSuchKey"))
+    }
+
+    /// A PutObject that S3 answered with `status` and error `code`.
+    fn failed_with(
+        status: u16,
+        code: Option<&str>,
+    ) -> SdkError<aws_sdk_s3::operation::put_object::PutObjectError> {
+        use aws_sdk_s3::config::http::HttpResponse;
+        use aws_sdk_s3::error::ErrorMetadata;
+        use aws_sdk_s3::operation::put_object::PutObjectError;
+        use aws_sdk_s3::primitives::SdkBody;
+
+        let raw = HttpResponse::new(status.try_into().unwrap(), SdkBody::empty());
+        let mut meta = ErrorMetadata::builder().message("x");
+        if let Some(code) = code {
+            meta = meta.code(code);
+        }
+        SdkError::service_error(PutObjectError::generic(meta.build()), raw)
+    }
+
+    /// `send_conditional` (`If-None-Match: *`) against S3 answering
+    /// `statuses` in turn (200 is a write): its result, how many attempts
+    /// it made and how long it took.
+    async fn conditional(statuses: &[u16]) -> (Result<bool>, usize, std::time::Duration) {
+        conditional_on(Condition::IfNoneMatch, statuses).await
+    }
+
+    /// [`conditional`] for a write conditional on `condition`.
+    async fn conditional_on(
+        condition: Condition,
+        statuses: &[u16],
+    ) -> (Result<bool>, usize, std::time::Duration) {
+        let mut answers = statuses.iter().copied();
+        let mut attempts = 0;
+        let started = tokio::time::Instant::now();
+        let result = send_conditional("Failed to PUT k", condition, || {
+            attempts += 1;
+            let status = answers.next().expect("no attempt left");
+            std::future::ready(match status {
+                200 => Ok(()),
+                _ => Err(failed(status)),
+            })
+        })
+        .await;
+        (result, attempts, started.elapsed())
+    }
+
+    /// 409 is not "lost": a conflicting conditional write is still in
+    /// progress, and S3 says to retry.
+    #[test]
+    fn a_412_is_lost_and_a_409_is_not_under_either_condition() {
+        for condition in [Condition::IfMatch, Condition::IfNoneMatch] {
+            assert!(lost_condition(&failed(412), condition));
+            assert!(!lost_condition(&failed(409), condition));
+            assert!(!lost_condition(&failed(403), condition));
+            assert!(!lost_condition(&failed(500), condition));
+        }
+    }
+
+    /// S3 answers an `If-Match` on a key with no current object 404
+    /// `NoSuchKey`, not 412: the object it was conditioned on is gone, so
+    /// the write lost. Not for `If-None-Match: *`, which never gets one,
+    /// nor for another 404 (the bucket is missing).
+    #[test]
+    fn an_if_match_on_a_missing_key_is_lost() {
+        assert!(lost_condition(&failed(404), Condition::IfMatch));
+        assert!(!lost_condition(&failed(404), Condition::IfNoneMatch));
+        let no_bucket = failed_with(404, Some("NoSuchBucket"));
+        assert!(!lost_condition(&no_bucket, Condition::IfMatch));
+        assert!(!lost_condition(&failed_with(404, None), Condition::IfMatch));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_404_on_an_if_match_is_lost_without_a_retry() {
+        let (result, attempts, took) = conditional_on(Condition::IfMatch, &[404]).await;
+        assert!(!result.unwrap());
+        assert_eq!(attempts, 1);
+        assert_eq!(took, std::time::Duration::ZERO);
+
+        let (result, attempts, _) = conditional_on(Condition::IfNoneMatch, &[404]).await;
+        assert_eq!(result.unwrap_err().to_string(), "Failed to PUT k");
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_conditional_write_is_sent_again_after_a_409() {
+        let (result, attempts, took) = conditional(&[409, 200]).await;
+        assert!(result.unwrap());
+        assert_eq!(attempts, 2);
+        assert_eq!(took, std::time::Duration::from_millis(100));
+
+        // The conflicting write won meanwhile: lost.
+        let (result, attempts, _) = conditional(&[409, 409, 412]).await;
+        assert!(!result.unwrap());
+        assert_eq!(attempts, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_409_on_every_attempt_is_an_error_not_lost() {
+        let (result, attempts, took) = conditional(&[409, 409, 409]).await;
+        let e = result.unwrap_err();
+        assert_eq!(attempts, 3);
+        assert_eq!(took, std::time::Duration::from_millis(600));
+        let shown = e.to_string();
+        assert!(shown.starts_with("Failed to PUT k: "), "{shown}");
+        assert!(shown.contains("409"), "{shown}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_412_is_lost_without_a_retry() {
+        let (result, attempts, took) = conditional(&[412]).await;
+        assert!(!result.unwrap());
+        assert_eq!(attempts, 1);
+        assert_eq!(took, std::time::Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn other_errors_fail_without_a_retry() {
+        for status in [403, 500, 503] {
+            let (result, attempts, took) = conditional(&[status]).await;
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "Failed to PUT k",
+                "{status}"
+            );
+            assert_eq!(attempts, 1, "{status}");
+            assert_eq!(took, std::time::Duration::ZERO, "{status}");
+        }
     }
 }

@@ -30,6 +30,12 @@ pub trait TagStore: Send + Sync + 'static {
         &self,
         hash_hex: &str,
     ) -> impl Future<Output = anyhow::Result<Option<Bytes>>> + Send;
+    /// A recording's owner record (`moderation/publishers/<hash>`, read with
+    /// `ownership::parse_owner`); `None` when the recording has none.
+    fn get_blob_owner(
+        &self,
+        hash_hex: &str,
+    ) -> impl Future<Output = anyhow::Result<Option<Bytes>>> + Send;
     fn get_catalog_document(
         &self,
         hash_hex: &str,
@@ -53,18 +59,40 @@ pub trait TagStore: Send + Sync + 'static {
         hash_hex: &str,
         outboard: Bytes,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
-    /// Store a catalog's index record (`catalog-indexes/<hash>`), never
-    /// served.
-    fn put_catalog_index(
+    /// Create a catalog's index record (`catalog-indexes/<hash>`, never
+    /// served) only if none exists: one envelope has one index. `false`
+    /// when one already does; `Err` when it can't be created, a concurrent
+    /// create of it still in flight after the retries included.
+    fn create_catalog_index(
         &self,
         hash_hex: &str,
         body: Bytes,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    ) -> impl Future<Output = anyhow::Result<bool>> + Send;
     /// A catalog's index record; `None` for a catalog stored without one.
     fn get_catalog_index(
         &self,
         hash_hex: &str,
     ) -> impl Future<Output = anyhow::Result<Option<Bytes>>> + Send;
+    /// Write a publish's transition record
+    /// (`catalog-transitions/<sub>/<name>`, never served) only if none is
+    /// stored (`expected` `None`: `If-None-Match: *`), or only if the stored
+    /// one still has the ETag `expected` (`If-Match`). `false` when the
+    /// condition failed, a replace of one deleted since included; `Err`
+    /// when it can't be written, a conflicting write still in progress
+    /// after the retries included.
+    fn put_catalog_transition(
+        &self,
+        sub: &str,
+        name: &str,
+        body: Bytes,
+        expected: Option<&str>,
+    ) -> impl Future<Output = anyhow::Result<bool>> + Send;
+    /// A stored transition record and its ETag.
+    fn get_catalog_transition(
+        &self,
+        sub: &str,
+        name: &str,
+    ) -> impl Future<Output = anyhow::Result<Option<StoredTransition>>> + Send;
     /// A creator's stored catalog v2 pointer bundle.
     fn get_catalog_pointer(
         &self,
@@ -72,7 +100,8 @@ pub trait TagStore: Send + Sync + 'static {
     ) -> impl Future<Output = anyhow::Result<Option<StoredPointer>>> + Send;
     /// Store a creator's pointer bundle only if the stored one still has
     /// the ETag `expected` (with `None`: only if none is stored). `false`
-    /// when another write got there first.
+    /// when another write got there first, or the pointer was deleted
+    /// since it was read.
     fn put_catalog_pointer(
         &self,
         sub: &str,
@@ -84,6 +113,13 @@ pub trait TagStore: Send + Sync + 'static {
 /// A stored catalog v2 pointer bundle and the version it was read at.
 #[derive(Debug, Clone)]
 pub struct StoredPointer {
+    pub body: Bytes,
+    pub etag: String,
+}
+
+/// A stored transition record and the ETag it was read at.
+#[derive(Debug, Clone)]
+pub struct StoredTransition {
     pub body: Bytes,
     pub etag: String,
 }
@@ -116,6 +152,11 @@ impl TagStore for crate::store::s3::S3Client {
         Self::get_manifest(self, hash_hex).await
     }
 
+    async fn get_blob_owner(&self, hash_hex: &str) -> anyhow::Result<Option<Bytes>> {
+        self.get_moderation_record(crate::ownership::PUBLISHERS, hash_hex)
+            .await
+    }
+
     async fn get_catalog_document(&self, hash_hex: &str) -> anyhow::Result<Option<StoredDocument>> {
         Ok(Self::get_catalog_document(self, hash_hex)
             .await?
@@ -141,12 +182,32 @@ impl TagStore for crate::store::s3::S3Client {
         Self::put_catalog_outboard(self, hash_hex, outboard).await
     }
 
-    async fn put_catalog_index(&self, hash_hex: &str, body: Bytes) -> anyhow::Result<()> {
-        Self::put_catalog_index(self, hash_hex, body).await
+    async fn create_catalog_index(&self, hash_hex: &str, body: Bytes) -> anyhow::Result<bool> {
+        Self::create_catalog_index(self, hash_hex, body).await
     }
 
     async fn get_catalog_index(&self, hash_hex: &str) -> anyhow::Result<Option<Bytes>> {
         Self::get_catalog_index(self, hash_hex).await
+    }
+
+    async fn put_catalog_transition(
+        &self,
+        sub: &str,
+        name: &str,
+        body: Bytes,
+        expected: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        Self::put_catalog_transition(self, sub, name, body, expected).await
+    }
+
+    async fn get_catalog_transition(
+        &self,
+        sub: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<StoredTransition>> {
+        Ok(Self::get_catalog_transition(self, sub, name)
+            .await?
+            .map(|(body, etag)| StoredTransition { body, etag }))
     }
 
     async fn get_catalog_pointer(&self, sub: &str) -> anyhow::Result<Option<StoredPointer>> {
@@ -260,8 +321,12 @@ pub(crate) mod test_support {
     use std::collections::HashMap;
     use tokio::sync::Mutex;
 
-    /// In-memory ingested blobs (hash → size), catalog documents, indexes
-    /// and pointers.
+    /// Another request's writes, run by a `MemStore` hook in the middle of
+    /// a call (`MemStore::commit_pointer`, `MemStore::store_transition`).
+    pub type StoreHook = Box<dyn FnOnce(&MemStore) + Send>;
+
+    /// In-memory ingested blobs (hash → size), owner records, catalog
+    /// documents, indexes, transitions and pointers.
     #[derive(Default)]
     pub struct MemStore {
         pub blobs: Mutex<HashMap<String, u64>>,
@@ -269,6 +334,10 @@ pub(crate) mod test_support {
         pub manifests: Mutex<HashMap<String, Bytes>>,
         /// How many times `get_manifest` was asked.
         pub manifest_reads: std::sync::atomic::AtomicUsize,
+        /// hash → owner record body, as stored at `moderation/publishers/`.
+        pub owners: Mutex<HashMap<String, Bytes>>,
+        /// How many times `get_blob_owner` was asked.
+        pub owner_reads: std::sync::atomic::AtomicUsize,
         pub catalog_documents: Mutex<HashMap<String, StoredDocument>>,
         /// How many times `blob_size` was asked (one S3 HEAD each).
         pub blob_lookups: std::sync::atomic::AtomicUsize,
@@ -276,17 +345,81 @@ pub(crate) mod test_support {
         pub down: std::sync::atomic::AtomicBool,
         pub catalog_outboards: Mutex<HashMap<String, Bytes>>,
         pub catalog_indexes: Mutex<HashMap<String, Bytes>>,
+        /// `"<sub>/<name>"` → transition record body.
+        pub transitions: Mutex<std::collections::BTreeMap<String, Bytes>>,
+        /// The next transition write fails, as an unreachable store would.
+        pub fail_next_transition: std::sync::atomic::AtomicBool,
+        /// The next conditional replace of a transition (`If-Match`) loses
+        /// without writing, as if another write had replaced it since it was
+        /// read.
+        pub lose_next_transition_replace: std::sync::atomic::AtomicBool,
         /// sub → (bundle, version). The version stands in for S3's ETag.
         pub catalog_pointers: Mutex<HashMap<String, (Bytes, u64)>>,
         pub pointer_versions: std::sync::atomic::AtomicU64,
         /// The next conditional pointer write loses, as if another publish
         /// had moved the pointer since it was read.
         pub lose_next_pointer_race: std::sync::atomic::AtomicBool,
+        /// The next pointer read answers this (bundle, version) instead of
+        /// what is stored: a publish that read the pointer before other
+        /// publishes moved it, and resumes only now.
+        pub stale_next_pointer_read: std::sync::Mutex<Option<(Bytes, u64)>>,
+        /// Runs once, right after the next transition read: between
+        /// `write_transition`'s transition read and its pointer re-read, as
+        /// another request's writes landing there would.
+        pub after_next_transition_read: std::sync::Mutex<Option<StoreHook>>,
+        /// Runs once, right after the next pointer read.
+        pub after_next_pointer_read: std::sync::Mutex<Option<StoreHook>>,
+        /// The next index record create reports one already there, without
+        /// writing, though none is stored: as if the record were deleted
+        /// between the create and its read.
+        pub lose_next_index_create: std::sync::atomic::AtomicBool,
+        /// The next index record create fails without writing.
+        pub fail_next_index_create: std::sync::atomic::AtomicBool,
+        /// The next catalog document write fails without writing.
+        pub fail_next_document_write: std::sync::atomic::AtomicBool,
+        /// The next catalog outboard write fails without writing.
+        pub fail_next_outboard_write: std::sync::atomic::AtomicBool,
     }
 
     impl MemStore {
         pub fn new() -> Self {
             Self::default()
+        }
+
+        /// Store `body` as `sub`'s pointer at a new version, as a publish
+        /// that committed would. For hooks, which run with no store lock
+        /// held.
+        pub fn commit_pointer(&self, sub: &str, body: Bytes) {
+            let v = self
+                .pointer_versions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.catalog_pointers
+                .try_lock()
+                .expect("no pointer lock held")
+                .insert(sub.to_string(), (body, v));
+        }
+
+        /// Store `body` as the transition under `key` (`"<sub>/<name>"`).
+        /// For hooks, which run with no store lock held.
+        pub fn store_transition(&self, key: &str, body: Bytes) {
+            self.transitions
+                .try_lock()
+                .expect("no transition lock held")
+                .insert(key.to_string(), body);
+        }
+
+        /// Run the hook in `slot`, if one is set, once.
+        fn run_hook(&self, slot: &std::sync::Mutex<Option<StoreHook>>) {
+            let hook = slot.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(self);
+            }
+        }
+
+        /// A stored transition's ETag: its body's hash, quoted, as S3's
+        /// for a single-part upload depends only on the body.
+        pub fn transition_etag(body: &Bytes) -> String {
+            format!("\"{}\"", blake3::hash(body).to_hex())
         }
 
         /// Record `hash` as ingested with `size` bytes.
@@ -301,6 +434,20 @@ pub(crate) mod test_support {
                 .lock()
                 .await
                 .insert(hash.to_string(), Bytes::from(manifest));
+        }
+
+        /// Record `subject`, exactly as given, as the owner of `hash`.
+        pub async fn own(&self, hash: &str, subject: &str) {
+            let record = crate::ownership::BlobOwner {
+                hash: hash.to_string(),
+                subject: subject.to_string(),
+                endpoint_id: "e".repeat(64),
+                at: 1,
+            };
+            self.owners.lock().await.insert(
+                hash.to_string(),
+                Bytes::from(serde_json::to_vec(&record).expect("record serializes")),
+            );
         }
 
         fn up(&self) -> anyhow::Result<()> {
@@ -324,6 +471,12 @@ pub(crate) mod test_support {
             self.manifest_reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(self.manifests.lock().await.get(hash_hex).cloned())
+        }
+        async fn get_blob_owner(&self, hash_hex: &str) -> anyhow::Result<Option<Bytes>> {
+            self.up()?;
+            self.owner_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self.owners.lock().await.get(hash_hex).cloned())
         }
         async fn get_catalog_document(
             &self,
@@ -353,6 +506,12 @@ pub(crate) mod test_support {
             owner: &str,
         ) -> anyhow::Result<()> {
             self.up()?;
+            anyhow::ensure!(
+                !self
+                    .fail_next_document_write
+                    .swap(false, std::sync::atomic::Ordering::Relaxed),
+                "document write failed"
+            );
             self.catalog_documents.lock().await.insert(
                 hash_hex.to_string(),
                 StoredDocument {
@@ -368,35 +527,113 @@ pub(crate) mod test_support {
             outboard: Bytes,
         ) -> anyhow::Result<()> {
             self.up()?;
+            anyhow::ensure!(
+                !self
+                    .fail_next_outboard_write
+                    .swap(false, std::sync::atomic::Ordering::Relaxed),
+                "outboard write failed"
+            );
             self.catalog_outboards
                 .lock()
                 .await
                 .insert(hash_hex.to_string(), outboard);
             Ok(())
         }
-        async fn put_catalog_index(&self, hash_hex: &str, body: Bytes) -> anyhow::Result<()> {
+        /// As S3's `If-None-Match: *`: the first body stays.
+        async fn create_catalog_index(&self, hash_hex: &str, body: Bytes) -> anyhow::Result<bool> {
             self.up()?;
-            self.catalog_indexes
+            anyhow::ensure!(
+                !self
+                    .fail_next_index_create
+                    .swap(false, std::sync::atomic::Ordering::Relaxed),
+                "index create failed"
+            );
+            if self
+                .lose_next_index_create
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                return Ok(false);
+            }
+            match self
+                .catalog_indexes
                 .lock()
                 .await
-                .insert(hash_hex.to_string(), body);
-            Ok(())
+                .entry(hash_hex.to_string())
+            {
+                std::collections::hash_map::Entry::Occupied(_) => Ok(false),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(body);
+                    Ok(true)
+                }
+            }
         }
         async fn get_catalog_index(&self, hash_hex: &str) -> anyhow::Result<Option<Bytes>> {
             self.up()?;
             Ok(self.catalog_indexes.lock().await.get(hash_hex).cloned())
         }
-        async fn get_catalog_pointer(&self, sub: &str) -> anyhow::Result<Option<StoredPointer>> {
+        /// As S3's conditional put: `If-None-Match: *`, or `If-Match` the
+        /// ETag [`MemStore::transition_etag`] gives.
+        async fn put_catalog_transition(
+            &self,
+            sub: &str,
+            name: &str,
+            body: Bytes,
+            expected: Option<&str>,
+        ) -> anyhow::Result<bool> {
             self.up()?;
-            Ok(self
-                .catalog_pointers
+            anyhow::ensure!(
+                !self
+                    .fail_next_transition
+                    .swap(false, std::sync::atomic::Ordering::Relaxed),
+                "transition write failed"
+            );
+            if expected.is_some()
+                && self
+                    .lose_next_transition_replace
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                return Ok(false);
+            }
+            let key = format!("{sub}/{name}");
+            let mut transitions = self.transitions.lock().await;
+            let current = transitions.get(&key).map(Self::transition_etag);
+            if current.as_deref() != expected {
+                return Ok(false);
+            }
+            transitions.insert(key, body);
+            Ok(true)
+        }
+        async fn get_catalog_transition(
+            &self,
+            sub: &str,
+            name: &str,
+        ) -> anyhow::Result<Option<StoredTransition>> {
+            self.up()?;
+            let found = self
+                .transitions
                 .lock()
                 .await
-                .get(sub)
-                .map(|(body, v)| StoredPointer {
+                .get(&format!("{sub}/{name}"))
+                .map(|body| StoredTransition {
                     body: body.clone(),
-                    etag: format!("\"{v}\""),
-                }))
+                    etag: Self::transition_etag(body),
+                });
+            self.run_hook(&self.after_next_transition_read);
+            Ok(found)
+        }
+        async fn get_catalog_pointer(&self, sub: &str) -> anyhow::Result<Option<StoredPointer>> {
+            self.up()?;
+            let stale = self.stale_next_pointer_read.lock().unwrap().take();
+            let found = match stale {
+                Some(read) => Some(read),
+                None => self.catalog_pointers.lock().await.get(sub).cloned(),
+            }
+            .map(|(body, v)| StoredPointer {
+                body,
+                etag: format!("\"{v}\""),
+            });
+            self.run_hook(&self.after_next_pointer_read);
+            Ok(found)
         }
         /// As S3's conditional put: `If-Match` the version, or
         /// `If-None-Match: *`.

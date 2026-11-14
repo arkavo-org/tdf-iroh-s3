@@ -39,7 +39,9 @@ use tracing::{info, warn};
 
 use crate::auth::{AuthError, CwtVerifier, VerifiedClaims, VerifyOpts, subject_id_bind};
 use crate::authz::{ChainEntity, EntityKind};
+use crate::creator_catalog::{Object, object_from_slice};
 use crate::entity_chain;
+use crate::ownership::{OwnerStore, parse_owner};
 use crate::publish_decision::{
     PublishDecider, PublishDecisions, StoredEntity, Verdict, log_shadow, strip_tokens,
 };
@@ -47,11 +49,11 @@ use crate::publish_decision::{
 pub const DEFAULT_PUBLISH_ENTITLEMENT: &str =
     "https://patreon.arkavo.com/attr/arkavo-creator/value/publish";
 
-const SUSPENSIONS: &str = "suspensions";
-const BLOCKS: &str = "blocks";
+pub(crate) const SUSPENSIONS: &str = "suspensions";
+pub(crate) const BLOCKS: &str = "blocks";
 /// `moderation/catalog-blocks/<subject>`: a sibling of `blocks/`, because
 /// records are listed recursively and would otherwise be read as blocks.
-const CATALOG_BLOCKS: &str = "catalog-blocks";
+pub(crate) const CATALOG_BLOCKS: &str = "catalog-blocks";
 const AUDIT: &str = "audit";
 const MAX_REASON_CHARS: usize = 1_000;
 
@@ -75,6 +77,17 @@ pub fn valid_subject(s: &str) -> bool {
         && !s.contains("..")
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'.' | b'_' | b'@' | b'-'))
+}
+
+/// A subject that is canonical itself: valid, and its own canonical form.
+/// Every per-subject key the sweep reads strictly must be one: a
+/// suspension's, a catalog block's, a deletion request's. A key is written
+/// as `canonical_subject(sub)`, so a subject is keyable only when
+/// `is_canonical_subject(canonical_subject(sub))`: `arkavo:arkavo:<uuid>`
+/// is not (its canonical form `arkavo:<uuid>` isn't canonical), nor is
+/// `arkavo:` alone.
+pub fn is_canonical_subject(s: &str) -> bool {
+    valid_subject(s) && canonical_subject(s) == s
 }
 
 pub fn valid_hash(h: &str) -> bool {
@@ -189,13 +202,21 @@ impl SessionStore for crate::store::s3::S3Client {
 /// `moderation/sessions/<endpoint>`.
 const SESSIONS: &str = "sessions";
 
-/// How long a push waits for the session store before it is refused.
+/// How long a push waits for the session store, or for its recording's
+/// owner record (an owner lookup permit included), before it is refused.
 const SESSION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Session lookups at once. A push that finds them all busy is refused:
-/// a peer with no session must not be able to make the node send S3 a
-/// request per push.
+/// Session lookups at once, for pushes whose session this gate doesn't hold.
+/// A push that finds them all busy is refused: a peer with no session must
+/// not be able to make the node send S3 a request per push.
 const SESSION_LOOKUPS: usize = 16;
+
+/// Owner lookups at once. Every push the other checks accept sends S3 one
+/// owner read; a push that finds them all busy waits for one, within the
+/// same [`SESSION_LOOKUP_TIMEOUT`] as its read. Kept apart from
+/// [`SESSION_LOOKUPS`], so pushes with no session can't hold the permits a
+/// publisher's push needs.
+const OWNER_LOOKUPS: usize = 16;
 
 /// How long an endpoint whose lookup found no live session is refused
 /// without asking the store again.
@@ -415,7 +436,7 @@ impl Moderation {
     pub async fn reload<S: ModerationStore>(&self, store: &S) -> anyhow::Result<()> {
         let mut suspensions = HashMap::new();
         for raw in store.list_records(SUSPENSIONS).await? {
-            match serde_json::from_slice::<Suspension>(&raw) {
+            match object_from_slice::<Suspension>(&raw) {
                 Ok(s) if s.lifted_at.is_none() => {
                     suspensions.insert(s.subject.clone(), s);
                 }
@@ -425,7 +446,7 @@ impl Moderation {
         }
         let mut blocks = HashMap::new();
         for raw in store.list_records(BLOCKS).await? {
-            match serde_json::from_slice::<Block>(&raw) {
+            match object_from_slice::<Block>(&raw) {
                 Ok(b) if b.lifted_at.is_none() => {
                     blocks.insert(b.hash.clone(), b);
                 }
@@ -435,7 +456,7 @@ impl Moderation {
         }
         let mut catalog_blocks = HashMap::new();
         for raw in store.list_records(CATALOG_BLOCKS).await? {
-            match serde_json::from_slice::<CatalogBlock>(&raw) {
+            match object_from_slice::<CatalogBlock>(&raw) {
                 Ok(b) if b.lifted_at.is_none() => {
                     catalog_blocks.insert(b.subject.clone(), b);
                 }
@@ -487,6 +508,7 @@ pub struct PublishGate {
     connections: Mutex<HashMap<u64, EndpointId>>,
     store: Option<Arc<dyn SessionStore>>,
     lookups: tokio::sync::Semaphore,
+    owner_lookups: tokio::sync::Semaphore,
     /// Endpoints whose last lookup found no live session, and when.
     misses: Mutex<HashMap<EndpointId, Instant>>,
     decider: Arc<PublishDecider>,
@@ -496,6 +518,8 @@ pub struct PublishGate {
     /// Tags session records; set from the endpoint's key once it is bound.
     /// Until then no record is stored or accepted.
     record_key: OnceLock<RecordKey>,
+    /// Who owns each recording. `None` skips the owner check.
+    owners: Option<Arc<dyn OwnerStore>>,
 }
 
 /// Why a push was refused.
@@ -504,6 +528,10 @@ pub enum PushRefusal {
     NoSession,
     Suspended,
     Blocked,
+    /// Another account owns the recording.
+    OwnedByAnother,
+    /// The recording's owner record couldn't be read in time, or parsed.
+    OwnerUnknown,
 }
 
 impl PublishGate {
@@ -514,12 +542,14 @@ impl PublishGate {
             connections: Mutex::new(HashMap::new()),
             store: None,
             lookups: tokio::sync::Semaphore::new(SESSION_LOOKUPS),
+            owner_lookups: tokio::sync::Semaphore::new(OWNER_LOOKUPS),
             misses: Mutex::new(HashMap::new()),
             decider: Arc::new(PublishDecider::default()),
             session_ttl: Duration::from_secs(
                 crate::config::PublishingConfig::default().session_ttl_secs,
             ),
             record_key: OnceLock::new(),
+            owners: None,
         }
     }
 
@@ -555,7 +585,7 @@ impl PublishGate {
             warn!(%endpoint, "No session record key yet; stored session refused");
             return None;
         };
-        let Ok(sealed) = serde_json::from_slice::<SealedRecord>(body) else {
+        let Ok(sealed) = object_from_slice::<SealedRecord>(body) else {
             warn!(%endpoint, "Session record unreadable or untagged; refused");
             return None;
         };
@@ -592,6 +622,13 @@ impl PublishGate {
     /// Look up sessions this gate does not hold in `store`.
     pub fn with_session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Refuse a push of a recording another account owns, as `store`'s
+    /// owner records say.
+    pub fn with_owner_store(mut self, store: Arc<dyn OwnerStore>) -> Self {
+        self.owners = Some(store);
         self
     }
 
@@ -748,7 +785,48 @@ impl PublishGate {
             return Err(PushRefusal::Blocked);
         }
         self.decided_session(&subject, chain.as_deref())?;
+        self.owner_allows(&subject, hash_hex).await?;
         Ok((subject, endpoint))
+    }
+
+    /// Whether `subject` may push `hash_hex`: not when another account owns
+    /// it. An unowned recording may be pushed (ingest then claims it). The
+    /// push waits for an owner lookup permit, then reads the owner record,
+    /// both within one [`SESSION_LOOKUP_TIMEOUT`]. A record that can't be
+    /// read in that time, or parsed, refuses the push. Checked last, so a
+    /// push refused otherwise costs no read; skipped without an owner store.
+    async fn owner_allows(&self, subject: &str, hash_hex: &str) -> Result<(), PushRefusal> {
+        let Some(owners) = self.owners.as_ref() else {
+            return Ok(());
+        };
+        // One budget for the permit wait and the read together.
+        let deadline = tokio::time::Instant::now() + SESSION_LOOKUP_TIMEOUT;
+        let Ok(Ok(_permit)) = tokio::time::timeout_at(deadline, self.owner_lookups.acquire()).await
+        else {
+            warn!(%subject, hash = %hash_hex, "Owner lookups busy until the timeout; push refused");
+            return Err(PushRefusal::OwnerUnknown);
+        };
+        let body = match tokio::time::timeout_at(deadline, owners.get_owner(hash_hex)).await {
+            Ok(Ok(Some(body))) => body,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(e)) => {
+                warn!(%subject, hash = %hash_hex, error = format!("{e:#}"), "Owner lookup failed; push refused");
+                return Err(PushRefusal::OwnerUnknown);
+            }
+            Err(_) => {
+                warn!(%subject, hash = %hash_hex, "Owner lookup timed out; push refused");
+                return Err(PushRefusal::OwnerUnknown);
+            }
+        };
+        let owner = parse_owner(hash_hex, &body).map_err(|e| {
+            warn!(%subject, hash = %hash_hex, error = format!("{e:#}"), "Owner record unreadable; push refused");
+            PushRefusal::OwnerUnknown
+        })?;
+        if canonical_subject(&owner.subject) != canonical_subject(subject) {
+            warn!(%subject, hash = %hash_hex, owner = %owner.subject, "Recording owned by another account; push refused");
+            return Err(PushRefusal::OwnedByAnother);
+        }
+        Ok(())
     }
 
     /// A push is decided by its session (tdf-iroh-s3#44): the decision
@@ -1070,7 +1148,7 @@ fn verify_possession(
 async fn open_session<S: ModerationStore>(
     State(s): State<Arc<ModerationApi<S>>>,
     headers: HeaderMap,
-    Json(body): Json<SessionRequest>,
+    Json(Object(body)): Json<Object<SessionRequest>>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let (claims, chain) = s
         .policy
@@ -1201,15 +1279,17 @@ async fn suspend<S: ModerationStore>(
     State(s): State<Arc<ModerationApi<S>>>,
     Path(subject): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<ActionRequest>,
+    Json(Object(body)): Json<Object<ActionRequest>>,
 ) -> ApiResult<Json<Suspension>> {
     let by = s
         .policy
         .operator(&s.verifier, &headers)
         .await
         .map_err(fail)?;
+    // Stored under its canonical form, which must be canonical itself, as
+    // the sweep's strict read requires of the key.
     let subject = canonical_subject(&subject).to_string();
-    if !valid_subject(&subject) {
+    if !is_canonical_subject(&subject) {
         return Err(fail((StatusCode::BAD_REQUEST, "invalid subject")));
     }
     let record = Suspension {
@@ -1275,7 +1355,7 @@ async fn block<S: ModerationStore>(
     State(s): State<Arc<ModerationApi<S>>>,
     Path(hash): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<ActionRequest>,
+    Json(Object(body)): Json<Object<ActionRequest>>,
 ) -> ApiResult<Json<Block>> {
     let by = s
         .policy
@@ -1350,15 +1430,17 @@ async fn block_catalog<S: ModerationStore>(
     State(s): State<Arc<ModerationApi<S>>>,
     Path(subject): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<ActionRequest>,
+    Json(Object(body)): Json<Object<ActionRequest>>,
 ) -> ApiResult<Json<CatalogBlock>> {
     let by = s
         .policy
         .operator(&s.verifier, &headers)
         .await
         .map_err(fail)?;
+    // Stored under its canonical form, which must be canonical itself, as
+    // the sweep's strict read requires of the key.
     let subject = canonical_subject(&subject).to_string();
-    if !valid_subject(&subject) {
+    if !is_canonical_subject(&subject) {
         return Err(fail((StatusCode::BAD_REQUEST, "invalid subject")));
     }
     if body.hide_catalog {
@@ -1486,6 +1568,7 @@ mod tests {
     use super::test_support::MemModeration;
     use super::*;
     use crate::auth::test_support::{keypair, mint_map};
+    use crate::ownership::test_support::MemOwners;
     use axum::body::Body;
     use axum::http::Request;
     use ciborium::value::Value;
@@ -1974,6 +2057,281 @@ mod tests {
         assert!(h.gate.authorize_push(1, &"a".repeat(64)).await.is_ok());
     }
 
+    /// The session's account, as the token names it.
+    const OWNER_UUID: &str = "6f0c2a4e-9b1d-4c3e-8f7a-2d5b6e1c0a93";
+
+    /// A hash pushed in the owner tests.
+    fn owned_hash() -> String {
+        "b".repeat(64)
+    }
+
+    /// The owner record ingest would write for `hash`, naming `subject`.
+    fn owner_record(hash: &str, subject: &str) -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&BlobOwner {
+                hash: hash.to_string(),
+                subject: subject.to_string(),
+                endpoint_id: endpoint().to_string(),
+                at: 1,
+            })
+            .unwrap(),
+        )
+    }
+
+    /// A gate holding a session for `arkavo:<uuid>` on connection 1, with
+    /// `owners` as its owner store when given.
+    fn owner_gate(owners: Option<&Arc<MemOwners>>) -> PublishGate {
+        let mut gate = PublishGate::new(Arc::new(Moderation::default()));
+        if let Some(owners) = owners {
+            gate = gate.with_owner_store(Arc::clone(owners) as Arc<dyn OwnerStore>);
+        }
+        let ep = endpoint();
+        gate.open_session(
+            ep,
+            &format!("arkavo:{OWNER_UUID}"),
+            Duration::from_secs(600),
+        );
+        gate.connected(1, Some(ep));
+        gate
+    }
+
+    fn seed_owner(owners: &MemOwners, hash: &str, body: Bytes) {
+        owners
+            .records
+            .lock()
+            .unwrap()
+            .insert(hash.to_string(), body);
+    }
+
+    #[tokio::test]
+    async fn a_push_of_another_accounts_recording_is_refused() {
+        let owners = Arc::new(MemOwners::default());
+        let hash = owned_hash();
+        seed_owner(&owners, &hash, owner_record(&hash, "u2"));
+        let gate = owner_gate(Some(&owners));
+        assert_eq!(
+            gate.authorize_push(1, &hash).await,
+            Err(PushRefusal::OwnedByAnother)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_owner_may_push_again() {
+        let hash = owned_hash();
+        // The record names the account canonically, as ingest writes it, or
+        // with the token's prefix: both are the session's account.
+        for named in [OWNER_UUID.to_string(), format!("arkavo:{OWNER_UUID}")] {
+            let owners = Arc::new(MemOwners::default());
+            seed_owner(&owners, &hash, owner_record(&hash, &named));
+            let gate = owner_gate(Some(&owners));
+            let (sub, _) = gate.authorize_push(1, &hash).await.expect(&named);
+            assert_eq!(sub, OWNER_UUID);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unowned_recording_may_be_pushed() {
+        let owners = Arc::new(MemOwners::default());
+        let gate = owner_gate(Some(&owners));
+        let (sub, _) = gate.authorize_push(1, &owned_hash()).await.unwrap();
+        assert_eq!(sub, OWNER_UUID);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_owner_refuses_the_push() {
+        use std::sync::atomic::Ordering;
+        let hash = owned_hash();
+
+        let down = Arc::new(MemOwners::default());
+        down.down.store(true, Ordering::Relaxed);
+        let gate = owner_gate(Some(&down));
+        assert_eq!(
+            gate.authorize_push(1, &hash).await,
+            Err(PushRefusal::OwnerUnknown),
+            "store down"
+        );
+
+        for (body, why) in [
+            (Bytes::from_static(b"not json"), "garbage"),
+            (owner_record(&"c".repeat(64), "u2"), "names another hash"),
+            (owner_record(&hash, "a/b"), "invalid subject"),
+        ] {
+            let owners = Arc::new(MemOwners::default());
+            seed_owner(&owners, &hash, body);
+            let gate = owner_gate(Some(&owners));
+            assert_eq!(
+                gate.authorize_push(1, &hash).await,
+                Err(PushRefusal::OwnerUnknown),
+                "{why}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_owner_lookup_refuses_the_push() {
+        use std::sync::atomic::Ordering;
+        let owners = Arc::new(MemOwners::default());
+        owners.hang.store(true, Ordering::Relaxed);
+        let gate = owner_gate(Some(&owners));
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            gate.authorize_push(1, &owned_hash()).await,
+            Err(PushRefusal::OwnerUnknown)
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= SESSION_LOOKUP_TIMEOUT && waited < SESSION_LOOKUP_TIMEOUT * 2,
+            "{waited:?}"
+        );
+    }
+
+    /// Every owner lookup permit held past the budget: the push waits the
+    /// whole budget for one, then is refused without a lookup, though the
+    /// recording has no owner.
+    #[tokio::test(start_paused = true)]
+    async fn owner_lookups_busy_past_the_budget_refuse_the_push() {
+        let owners = Arc::new(MemOwners::default());
+        let gate = owner_gate(Some(&owners));
+        let _all = gate
+            .owner_lookups
+            .try_acquire_many(OWNER_LOOKUPS as u32)
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            gate.authorize_push(1, &owned_hash()).await,
+            Err(PushRefusal::OwnerUnknown)
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= SESSION_LOOKUP_TIMEOUT && waited < SESSION_LOOKUP_TIMEOUT * 2,
+            "{waited:?}"
+        );
+    }
+
+    /// A permit freed within the budget: the push waits for it, then looks
+    /// the owner up, and is allowed for a record naming the pusher or none.
+    #[tokio::test(start_paused = true)]
+    async fn a_push_waits_for_an_owner_lookup_permit() {
+        let hash = owned_hash();
+        let freed = Duration::from_secs(4);
+        for (record, why) in [
+            (Some(owner_record(&hash, OWNER_UUID)), "owned by the pusher"),
+            (None, "no owner record"),
+        ] {
+            let owners = Arc::new(MemOwners::default());
+            if let Some(body) = record {
+                seed_owner(&owners, &hash, body);
+            }
+            let gate = owner_gate(Some(&owners));
+            let _others = gate
+                .owner_lookups
+                .try_acquire_many(OWNER_LOOKUPS as u32 - 1)
+                .unwrap();
+            let last = gate.owner_lookups.try_acquire().unwrap();
+            let started = tokio::time::Instant::now();
+            let (pushed, ()) = tokio::join!(gate.authorize_push(1, &hash), async move {
+                tokio::time::sleep(freed).await;
+                drop(last);
+            });
+            let (sub, _) = pushed.expect(why);
+            assert_eq!(sub, OWNER_UUID, "{why}");
+            let waited = started.elapsed();
+            assert!(
+                waited >= freed && waited < SESSION_LOOKUP_TIMEOUT,
+                "{why}: {waited:?}"
+            );
+        }
+    }
+
+    /// The permit wait and the lookup share one budget: a 3 s wait for a
+    /// permit, then a 3 s lookup, is refused at 5 s, though each alone fits.
+    #[tokio::test(start_paused = true)]
+    async fn the_permit_wait_and_the_lookup_share_one_budget() {
+        let hash = owned_hash();
+        let owners = Arc::new(MemOwners::default());
+        seed_owner(&owners, &hash, owner_record(&hash, OWNER_UUID));
+        let part = Duration::from_secs(3);
+        *owners.delay.lock().unwrap() = part;
+        let gate = owner_gate(Some(&owners));
+
+        // The lookup alone fits the budget.
+        let (sub, _) = gate.authorize_push(1, &hash).await.unwrap();
+        assert_eq!(sub, OWNER_UUID);
+
+        let _others = gate
+            .owner_lookups
+            .try_acquire_many(OWNER_LOOKUPS as u32 - 1)
+            .unwrap();
+        let last = gate.owner_lookups.try_acquire().unwrap();
+        let started = tokio::time::Instant::now();
+        let (pushed, ()) = tokio::join!(gate.authorize_push(1, &hash), async move {
+            tokio::time::sleep(part).await;
+            drop(last);
+        });
+        assert_eq!(pushed, Err(PushRefusal::OwnerUnknown));
+        let waited = started.elapsed();
+        assert!(
+            waited >= SESSION_LOOKUP_TIMEOUT && waited < part * 2,
+            "{waited:?}"
+        );
+    }
+
+    /// Pushes with no session keep session lookups busy; they must not
+    /// refuse a publisher's push, whose session is held.
+    #[tokio::test]
+    async fn busy_session_lookups_do_not_block_owner_lookups() {
+        let owners = Arc::new(MemOwners::default());
+        let hash = owned_hash();
+        seed_owner(&owners, &hash, owner_record(&hash, OWNER_UUID));
+        let gate = owner_gate(Some(&owners));
+        let _all = gate
+            .lookups
+            .try_acquire_many(SESSION_LOOKUPS as u32)
+            .unwrap();
+        let (sub, _) = gate.authorize_push(1, &hash).await.unwrap();
+        assert_eq!(sub, OWNER_UUID);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_an_owner_store_the_check_is_skipped() {
+        let gate = owner_gate(None);
+        // Not even an owner lookup permit is needed, so none is waited for.
+        let _all = gate
+            .owner_lookups
+            .try_acquire_many(OWNER_LOOKUPS as u32)
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let (sub, _) = gate.authorize_push(1, &owned_hash()).await.unwrap();
+        assert_eq!(sub, OWNER_UUID);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// The owner check runs last: a push the session, a suspension or a
+    /// block refuses costs no owner read.
+    #[tokio::test]
+    async fn the_owner_check_runs_after_the_other_refusals() {
+        use std::sync::atomic::Ordering;
+        let owners = Arc::new(MemOwners::default());
+        owners.down.store(true, Ordering::Relaxed);
+        let hash = owned_hash();
+
+        let gate = owner_gate(Some(&owners));
+        assert_eq!(
+            gate.authorize_push(2, &hash).await,
+            Err(PushRefusal::NoSession)
+        );
+        gate.moderation.block_for_test(&hash);
+        assert_eq!(
+            gate.authorize_push(1, &hash).await,
+            Err(PushRefusal::Blocked)
+        );
+        gate.moderation.suspend_for_test(OWNER_UUID, false);
+        assert_eq!(
+            gate.authorize_push(1, &hash).await,
+            Err(PushRefusal::Suspended)
+        );
+    }
+
     #[tokio::test]
     async fn sessions_need_the_entitlement_audience_and_a_person() {
         let h = harness();
@@ -2151,6 +2509,54 @@ mod tests {
         }
     }
 
+    /// A per-subject record is stored under the subject's canonical form,
+    /// and only when that form is canonical itself, as the sweep's strict
+    /// read requires of the key ([`is_canonical_subject`]):
+    /// `arkavo:arkavo:<uuid>` would be stored as `arkavo:<uuid>`, which
+    /// every sweep would refuse. It is refused before anything is written,
+    /// its audit record included.
+    #[tokio::test]
+    async fn a_subject_whose_canonical_form_is_not_canonical_is_refused() {
+        const UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+        let body = Some(serde_json::json!({ "reason": "x" }));
+        let routes = [
+            ("suspensions", SUSPENSIONS),
+            ("blocks/catalogs", CATALOG_BLOCKS),
+        ];
+        let h = harness();
+        for (route, _) in routes {
+            let uri = format!("/moderation/{route}/arkavo:arkavo:{UUID}");
+            let (status, reply) = call(&h.app, "PUT", &uri, &operator(), body.clone()).await;
+            assert_eq!(
+                (status, reply["error"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("invalid subject")),
+                "{uri}"
+            );
+        }
+        assert!(h.store.records.lock().unwrap().is_empty());
+        assert!(h.gate.moderation.active_suspensions().is_empty());
+        assert!(h.gate.moderation.active_catalog_blocks().is_empty());
+
+        // `<uuid>` and `arkavo:<uuid>` are still one account, keyed `<uuid>`.
+        for sub in [UUID.to_string(), format!("arkavo:{UUID}")] {
+            let h = harness();
+            for (route, kind) in routes {
+                let uri = format!("/moderation/{route}/{sub}");
+                let (status, reply) = call(&h.app, "PUT", &uri, &operator(), body.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{uri} {reply}");
+                assert_eq!(reply["subject"], UUID, "{uri}");
+                assert!(
+                    h.store
+                        .records
+                        .lock()
+                        .unwrap()
+                        .contains_key(&format!("{kind}/{UUID}")),
+                    "{uri}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_failed_write_changes_nothing() {
         let h = harness();
@@ -2165,6 +2571,110 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(!h.gate.moderation.is_suspended("u1"));
+    }
+
+    /// Request bodies and stored records are JSON objects: the same values
+    /// as an array, which a derived struct also reads, are refused.
+    #[tokio::test]
+    async fn requests_and_records_as_arrays_are_refused() {
+        use crate::creator_catalog::test_support::array_form;
+        let h = harness();
+        let sk = key();
+        let ep = sk.public();
+        let tok = creator("u1");
+        let session = format!("sessions/{ep}");
+        let body = signed(&sk, &tok).unwrap();
+        let array = serde_json::json!([body["endpointId"], body["timestamp"], body["signature"]]);
+        let (status, _) = call(&h.app, "POST", "/publish/sessions", &tok, Some(array)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!h.store.records.lock().unwrap().contains_key(&session));
+        let (status, _) = call(&h.app, "POST", "/publish/sessions", &tok, Some(body)).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // The stored session record, its tagged bytes kept as they are.
+        let raw = h.store.records.lock().unwrap()[&session].clone();
+        assert!(h.gate.unseal(&ep, &raw).is_some());
+        let sealed: SealedRecord = serde_json::from_slice(&raw).unwrap();
+        let array = format!(
+            "[{},{},{}]",
+            serde_json::to_string(&sealed.kid).unwrap(),
+            sealed.record.get(),
+            serde_json::to_string(&sealed.tag).unwrap()
+        );
+        assert!(h.gate.unseal(&ep, array.as_bytes()).is_none());
+
+        // An operator's action.
+        let (status, _) = call(
+            &h.app,
+            "PUT",
+            "/moderation/suspensions/u2",
+            &operator(),
+            Some(serde_json::json!(["repeated violations", null, true])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!h.gate.moderation.is_suspended("u2"));
+
+        // Stored suspensions, blocks and catalog blocks.
+        let store = MemModeration::default();
+        let suspension = Suspension {
+            subject: "u3".into(),
+            reason: "r".into(),
+            report_id: None,
+            hide_catalog: true,
+            by: "client:m".into(),
+            at: 1,
+            lifted_by: None,
+            lifted_at: None,
+        };
+        let block = Block {
+            hash: "ab".repeat(32),
+            reason: "r".into(),
+            report_id: None,
+            by: "client:m".into(),
+            at: 1,
+            lifted_by: None,
+            lifted_at: None,
+        };
+        let catalog_block = CatalogBlock {
+            subject: "u4".into(),
+            reason: "r".into(),
+            report_id: None,
+            by: "client:m".into(),
+            at: 1,
+            lifted_by: None,
+            lifted_at: None,
+        };
+        let m = Moderation::default();
+        for as_array in [false, true] {
+            for (kind, key, record) in [
+                (SUSPENSIONS, "u3", serde_json::to_vec(&suspension).unwrap()),
+                (
+                    BLOCKS,
+                    block.hash.as_str(),
+                    serde_json::to_vec(&block).unwrap(),
+                ),
+                (
+                    CATALOG_BLOCKS,
+                    "u4",
+                    serde_json::to_vec(&catalog_block).unwrap(),
+                ),
+            ] {
+                let record = if as_array {
+                    array_form(&record)
+                } else {
+                    record
+                };
+                store
+                    .put_record(kind, key, Bytes::from(record))
+                    .await
+                    .unwrap();
+            }
+            m.reload(&store).await.unwrap();
+            assert_eq!(m.is_suspended("u3"), !as_array);
+            assert_eq!(m.is_blocked(&block.hash), !as_array);
+            assert_eq!(m.catalog_hidden("u4"), !as_array);
+        }
     }
 
     #[tokio::test]

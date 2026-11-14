@@ -14,8 +14,10 @@
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::marker::PhantomData;
 
 /// Largest catalog document (the envelope ZTDF), in bytes: 4 MiB, room for
 /// 1000 entries with their metadata TDFs inline.
@@ -66,7 +68,7 @@ pub fn parse_index(index: serde_json::Value) -> Result<Vec<CreatorCatalogEntry>,
 }
 
 fn entry(raw: serde_json::Value) -> Result<CreatorCatalogEntry, String> {
-    let e: CreatorCatalogEntry = serde_json::from_value(raw).map_err(|e| e.to_string())?;
+    let e: CreatorCatalogEntry = object(raw).map_err(|e| e.to_string())?;
     if !valid_identifier(&e.content_id, MAX_CONTENT_ID_BYTES) {
         return Err(format!(
             "contentID must be 1-{MAX_CONTENT_ID_BYTES} bytes of [A-Za-z0-9:._@-] without \"..\""
@@ -86,6 +88,35 @@ fn entry(raw: serde_json::Value) -> Result<CreatorCatalogEntry, String> {
         ));
     }
     Ok(e)
+}
+
+/// The canonical index a `/2` pointer's `indexHash` covers, built from the
+/// parsed entries, never from the bytes received: entries sorted by the
+/// UTF-8 bytes of `contentID`, each written as
+/// `{"contentID":"<id>","version":<n>,"payloadHash":"<hex>","payloadSize":<n>}`
+/// with keys in exactly that order, joined with `,` inside `[` `]`, no
+/// whitespace. The empty index is `[]`. Nothing is escaped: a parsed
+/// `contentID` is `[A-Za-z0-9:._@-]` and `payloadHash` lowercase hex.
+/// ArkavoKit and Creator produce the same bytes.
+pub fn canonical_index(entries: &[CreatorCatalogEntry]) -> String {
+    let mut sorted: Vec<&CreatorCatalogEntry> = entries.iter().collect();
+    sorted.sort_by(|a, b| a.content_id.as_bytes().cmp(b.content_id.as_bytes()));
+    let body: Vec<String> = sorted
+        .into_iter()
+        .map(|e| {
+            format!(
+                r#"{{"contentID":"{}","version":{},"payloadHash":"{}","payloadSize":{}}}"#,
+                e.content_id, e.version, e.payload_hash, e.payload_size
+            )
+        })
+        .collect();
+    format!("[{}]", body.join(","))
+}
+
+/// A `/2` pointer's `indexHash`: the lowercase hex **SHA-256** of
+/// [`canonical_index`] (while `catalogHash` and `payloadHash` are BLAKE3).
+pub fn index_hash(entries: &[CreatorCatalogEntry]) -> String {
+    hex::encode(Sha256::digest(canonical_index(entries).as_bytes()))
 }
 
 /// `owner` and `contentID`: `[A-Za-z0-9:._@-]{1,max}`, never `.` and never
@@ -137,6 +168,50 @@ pub fn is_utc_timestamp(s: &str) -> bool {
         _ => return false,
     };
     (1..=days_in_month).contains(&day) && hour <= 23 && minute <= 59 && second <= 59
+}
+
+/// Deserializes `T` from a JSON object only. A derived struct also reads a
+/// JSON array of its fields in order, and `deny_unknown_fields` doesn't
+/// stop that; the contract says object, and ArkavoKit refuses the array.
+/// Every request body and stored record the node parses into a struct
+/// goes through this: as `deserialize_with` on a struct-typed field, on a
+/// `serde_json::Value`, through [`object_from_slice`], or as [`Object`].
+/// Anything else fails with `invalid type: …, expected a JSON object`.
+pub(crate) fn object<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<T, D::Error> {
+    struct ObjectVisitor<T>(PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjectVisitor<T> {
+        type Value = T;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a JSON object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+            T::deserialize(de::value::MapAccessDeserializer::new(map))
+        }
+    }
+
+    d.deserialize_map(ObjectVisitor(PhantomData))
+}
+
+/// `serde_json::from_slice`, through [`object`]: the whole input is one
+/// JSON object, trailing whitespace allowed.
+pub(crate) fn object_from_slice<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> serde_json::Result<T> {
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let value = object(&mut de)?;
+    de.end()?;
+    Ok(value)
+}
+
+/// `T`, read through [`object`]: for an extractor (`Json<Object<T>>`) or
+/// an optional field.
+pub(crate) struct Object<T>(pub T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        object(d).map(Object)
+    }
 }
 
 /// Deserializes any JSON value, failing on an object that repeats a key.
@@ -202,8 +277,9 @@ impl<'de> Visitor<'de> for NoDuplicateKeysVisitor {
 pub(crate) mod test_support {
     /// ArkavoKit's shared catalog vectors of `kind`
     /// (`Tests/ArkavoCatalogTests/Vectors/catalog-vectors.json`), so the node
-    /// and the Swift readers agree: (name, valid, bytes).
-    pub fn vectors(kind: &str) -> Vec<(String, bool, Vec<u8>)> {
+    /// and the Swift readers agree: (name, valid, bytes, `indexHash`, which
+    /// only some `index` vectors carry).
+    pub fn vectors(kind: &str) -> Vec<(String, bool, Vec<u8>, Option<String>)> {
         use base64::Engine as _;
         let file: serde_json::Value = serde_json::from_str(include_str!(
             "../tests/fixtures/arkavo-catalog-vectors.json"
@@ -226,11 +302,42 @@ pub(crate) mod test_support {
                     v["name"].as_str().unwrap().to_string(),
                     v["valid"].as_bool().unwrap(),
                     bytes,
+                    v.get("indexHash").map(|h| h.as_str().unwrap().to_string()),
                 )
             })
             .collect();
         assert!(!vectors.is_empty(), "no {kind} vectors");
         vectors
+    }
+
+    /// The values of `object`, a JSON object's bytes, as a JSON array in
+    /// the object's key order: what a derived struct also reads, field by
+    /// field, unless it is parsed through [`super::object`].
+    pub fn array_form(object: &[u8]) -> Vec<u8> {
+        struct InOrder(Vec<serde_json::Value>);
+        impl<'de> serde::Deserialize<'de> for InOrder {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct V;
+                impl<'de> serde::de::Visitor<'de> for V {
+                    type Value = InOrder;
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str("a JSON object")
+                    }
+                    fn visit_map<A: serde::de::MapAccess<'de>>(
+                        self,
+                        mut map: A,
+                    ) -> Result<InOrder, A::Error> {
+                        let mut values = Vec::new();
+                        while let Some((_, v)) = map.next_entry::<String, serde_json::Value>()? {
+                            values.push(v);
+                        }
+                        Ok(InOrder(values))
+                    }
+                }
+                d.deserialize_map(V)
+            }
+        }
+        serde_json::to_vec(&serde_json::from_slice::<InOrder>(object).unwrap().0).unwrap()
     }
 
     /// The `payloadSize` of [`entry`].
@@ -433,10 +540,99 @@ mod tests {
     }
 
     #[test]
+    fn an_index_entry_as_an_array_is_refused() {
+        assert!(parse(&index(vec![entry("rec-1", &hash())])).is_ok());
+        // The fields in order: only the shape is wrong.
+        let array = json!(["rec-1", 1, hash(), test_support::PAYLOAD_SIZE]);
+        let why = reason(&index(vec![array]));
+        assert!(why.starts_with("entries[0]."), "{why}");
+        assert!(why.contains("expected a JSON object"), "{why}");
+        // Every other non-object entry too.
+        for bad in [json!("rec-1"), json!(1), json!(null), json!([])] {
+            assert!(parse(&index(vec![bad.clone()])).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn arkavo_kit_index_vectors_agree() {
-        for (name, valid, bytes) in test_support::vectors("index") {
+        for (name, valid, bytes, _) in test_support::vectors("index") {
             assert_eq!(parse(&bytes).is_ok(), valid, "{name}: {:?}", parse(&bytes));
         }
+    }
+
+    /// Every `index` vector carrying `indexHash` hashes to it, as the route
+    /// parses it.
+    #[test]
+    fn arkavo_kit_index_hash_vectors_agree() {
+        let mut checked = 0;
+        for (name, valid, bytes, expected) in test_support::vectors("index") {
+            let Some(expected) = expected else {
+                continue;
+            };
+            assert!(valid, "{name}: a vector with indexHash is valid");
+            let entries = parse(&bytes).unwrap_or_else(|why| panic!("{name}: {why}"));
+            assert_eq!(index_hash(&entries), expected, "{name}");
+            checked += 1;
+        }
+        assert!(checked > 0, "no index vector carries indexHash");
+    }
+
+    fn catalog_entry(
+        content_id: &str,
+        version: u64,
+        payload_hash: String,
+        payload_size: u64,
+    ) -> CreatorCatalogEntry {
+        CreatorCatalogEntry {
+            content_id: content_id.into(),
+            version,
+            payload_hash,
+            payload_size,
+        }
+    }
+
+    /// The spec's `indexHash` vectors (deletion-requests design, Part 2),
+    /// which ArkavoKit and Creator reproduce byte for byte.
+    #[test]
+    fn index_hash_vectors() {
+        // empty
+        assert_eq!(canonical_index(&[]), "[]");
+        assert_eq!(
+            index_hash(&[]),
+            "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        );
+
+        // two, given out of order
+        let two = [
+            catalog_entry("rec-b", 1, "bb".repeat(32), 2048),
+            catalog_entry("rec-a", 3, "aa".repeat(32), 1024),
+        ];
+        let expected = format!(
+            r#"[{{"contentID":"rec-a","version":3,"payloadHash":"{}","payloadSize":1024}},{{"contentID":"rec-b","version":1,"payloadHash":"{}","payloadSize":2048}}]"#,
+            "aa".repeat(32),
+            "bb".repeat(32),
+        );
+        assert_eq!(canonical_index(&two), expected);
+        assert_eq!(
+            index_hash(&two),
+            "03f745d8d08d9e9e11cabf33d85e8beb452eb3a2b2e541f92e1703c1f4152df4"
+        );
+
+        // byte-order: UTF-8 bytes, so `A` < `-` < `.` < `:` < `@` < `_`
+        let byte_order: Vec<_> = ["a_1", "a@1", "A", "a:1", "a.1", "a-1"]
+            .into_iter()
+            .enumerate()
+            .map(|(n, id)| catalog_entry(id, 1, format!("{n:02x}").repeat(32), n as u64 + 1))
+            .collect();
+        let canonical = canonical_index(&byte_order);
+        assert!(
+            canonical.starts_with(r#"[{"contentID":"A","#),
+            "{canonical}"
+        );
+        assert_eq!(
+            index_hash(&byte_order),
+            "79129b9fa70e8ab5d0894d07098294de6dec2677c9df538b3eb05df98bd8ef18"
+        );
     }
 
     #[test]
