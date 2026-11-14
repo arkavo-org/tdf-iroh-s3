@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -220,23 +221,44 @@ async fn request_deletion(
     Ok(())
 }
 
+/// The log filter when `RUST_LOG` isn't set. The service's: the store's
+/// garbage collector logs at info each time it skips a run, which it does
+/// every interval while no refused blob is waiting for deletion. An
+/// operator command's: `aws_config` logs the credentials it loads at info,
+/// access key ID included.
+fn default_filter(operator: bool) -> &'static str {
+    if operator {
+        "info,aws_config=warn"
+    } else {
+        "info,iroh_blobs::store::gc=warn"
+    }
+}
+
+/// Logs go to stdout for the service, which the CloudWatch agent ships
+/// from the journal, and to stderr for an operator command, whose stdout
+/// is only its report, to pipe or save.
+fn init_tracing(operator: bool) {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_filter(operator)));
+    let logs = tracing_subscriber::fmt().with_env_filter(filter);
+    if operator {
+        logs.with_writer(std::io::stderr)
+            .with_ansi(std::io::stderr().is_terminal())
+            .init();
+    } else {
+        logs.init();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            // The store's garbage collector logs at info each time it skips
-            // a run, which it does every interval while no refused blob is
-            // waiting for deletion.
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,iroh_blobs::store::gc=warn")),
-        )
-        .init();
+    let cli = Cli::parse();
+    init_tracing(cli.command.is_some());
 
     // reqwest pulls in ring and axum-server pulls in aws-lc-rs; with both
     // compiled in, rustls needs the process default chosen explicitly.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let cli = Cli::parse();
     let config = Config::from_file(&cli.config)?;
     info!("Config loaded from {:?}", cli.config);
     info!("S3: {}:{}", config.s3.bucket, config.s3.region);

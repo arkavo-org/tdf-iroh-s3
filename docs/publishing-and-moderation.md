@@ -214,6 +214,8 @@ A dropped recording falls due 7 days after the publish that dropped it, and a su
 
 Each command needs the node's config (`--config`, for the bucket and prefix) and operator credentials ([IAM for deletion](#iam-for-deletion)). Subjects compare in canonical form: `arkavo:<uuid>` and `<uuid>` are one account, and request keys carry `<uuid>`.
 
+Each prints its report on stdout and nothing else, so it can be piped or saved; its logs and errors go to stderr. `RUST_LOG` sets the log filter; without it, `info` with `aws_config` at `warn`, so the credentials the AWS SDK loads, access key ID included, aren't logged.
+
 | Command | Use |
 |---|---|
 | `sweep-deletions [--delete]` | Weekly: fold transitions into requests and delete what is due. A dry run without `--delete`. |
