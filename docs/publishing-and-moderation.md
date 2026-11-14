@@ -206,7 +206,7 @@ The publish writes no request. The sweep acts only on a committed transition, on
 
 ### The grace and the weekly sweep
 
-A dropped recording falls due 7 days after the publish that dropped it, and a superseded envelope 7 days after it was replaced. A publish that lists the recording again before then cancels the request. The first sweep after a publish folds its transition, and the first sweep once a request is due deletes it. With a weekly sweep that is about 14 days at worst.
+A dropped recording falls due 7 days after the publish that dropped it, and a superseded envelope 7 days after it was replaced. A publish that lists the recording again before then cancels the request. So does pushing the recording again after the drop, whether a catalog lists it or not: the sweep checks for such a push before it deletes. The first sweep after a publish folds its transition, and the first sweep once a request is due deletes it. With a weekly sweep that is about 14 days at worst.
 
 **The 30-day promise depends on running `sweep-deletions --delete` at least weekly.** Nothing runs it automatically.
 
@@ -233,11 +233,15 @@ A run:
 1. **Reads strictly** every pointer, index record, transition and deletion request, and the suspensions, blocks, catalog blocks and owner records it decides on (not sessions or audit records). Anything it can't read or parse aborts the run before it writes anything: exit 1, with `sweep-deletions aborted: <error>`, naming the key, on stderr. So does a `/2` pointer whose index record doesn't match its `indexHash`, and a moderation record whose key isn't what the node writes: a canonical subject (`<uuid>`, not `arkavo:<uuid>`) for a suspension or catalog block, 64 lowercase hex characters for a block.
 2. **Folds** each pointer's committed transitions into requests, oldest first: a dropped hash makes `recordings/<sub>/<hash>` pending from that publish's time (the newest drop wins), an added hash cancels it, and a replaced envelope makes `envelopes/<hash>` pending. The folded transitions are deleted. A transition no pointer reaches, older than 7 days, whose subject's pointer has a `seq` at least its own, lost its publish and is deleted unfolded (`deleted transition <sub>/<name>: lost its publish`); any other unreachable one is kept and reported.
 3. **Observes** envelopes: a hash under `catalog-documents/`, `catalog-outboards/` or `catalog-indexes/` that no pointer names and no request tracks gets an `envelopes/` request, superseded now.
-4. **Deletes** what is due (below), with `--delete`, item by item: subjects (their pointers), then recordings, then envelopes. Just before each item it reads everything again. An item no longer due is kept. One whose requester's catalog moved since the first read is deferred to the next run, which folds the new transitions first. A failed item stays pending for the next run, and the run goes on.
+4. **Deletes** what is due (below), with `--delete`, item by item: subjects (their pointers), then recordings, then envelopes. Just before each item it reads everything again. An item no longer due is kept. One whose requester's catalog moved since the first read is deferred to the next run, which folds the new transitions first. Then it lists the item's versions:
+   - **A push after the drop cancels it.** If a recording's blob, manifest or owner record has a version written after the drop that has it due, the owner pushed it again (Creator pushes before it publishes, so a publish that failed leaves exactly this). The run deletes none of it and deletes the drop's request instead (`pushed again recording <hash>`; a dry run lists to check, and reports the same line). An outboard doesn't count: the node writes one itself. An operator's request for the hash still deletes it: scope `subject` while the catalog block stands. Scope `hash` needs a block, and the node refuses a blocked recording's push.
+   - **Otherwise it deletes exactly the versions it listed.** A version written after the listing stays. A push that lands then is in the hour the tombstone's verification covers (step 5), which deletes it again as a write in flight.
+
+   A failed item stays pending for the next run, and the run goes on. A failed listing aborts the run, like any failed read.
 5. **Verifies tombstones.** A deleted item's request stays, marked `deleted` with `deletedAt`, until a run at least an hour later checks its objects. The hour counts from when the tombstone was written, by S3's clock (the request's last-modified time), not from `deletedAt`, which is the run's start on the operator's clock: a long run deletes items well after it starts.
    - an object a new push or publish writes, written more than an hour after the tombstone, is fresh: a recording's blob, manifest or owner record, an envelope's document or index record, a subject's pointer. The tombstone goes, and the objects stay. An outboard never counts: the node writes one itself when it serves a blob or envelope that lacks it;
    - a recording listed again, or an envelope current again: the tombstone goes, the objects stay;
-   - any other object (one written within that hour, by a write in flight during the delete, or an outboard): deleted again (`recreated`), and the tombstone stays;
+   - any other object (one written within that hour, by a write in flight during the delete, or an outboard): deleted again (`recreated`), and the tombstone stays. A push after the drop doesn't hold it back here: a write within the hour after the delete was in flight, whoever's owner record it carries. Again only the versions listed for the check are deleted; one written after that listing is left for the next run to judge;
    - nothing left: the tombstone goes.
 
 The requests live under `deletion-requests/`, written only by the sweep and `request-deletion`, subjects canonical. Below, *listed* means in the live index of any pointer, whatever its catalog's visibility, except the pointers of an account being deleted (a pending `subjects/` request whose catalog block stands).
@@ -252,7 +256,7 @@ The requests live under `deletion-requests/`, written only by the sweep and `req
 
 `state` is `pending` or `deleted`; `source` is `transition` or `observed`. A recording whose owner record names another account, or that has none, is kept for manual handling, and so is an envelope whose owner is unknown.
 
-Deleting removes every version and delete marker of:
+Deleting removes every version and delete marker of the following, as listed just before the delete (a version written after the listing stays), the current one last, so a delete that stops part way never brings an older version back:
 
 - a recording: `blobs/<hash>` first, so nothing is served once anything is gone, then `outboards/<hash>`, `manifests/<hash>` and `moderation/publishers/<hash>`. Ownership ends: the next push claims the recording.
 - a subject: each of its pointers, under either key (`catalog-pointers/arkavo:<uuid>`, `catalog-pointers/<uuid>`). Its envelopes are no longer current, so the same run records them, and they are due 7 days later.
@@ -263,20 +267,20 @@ Then the request is marked `deleted`. Suspension, block, catalog-block and audit
 **Output,** on stdout:
 
 - one line per transition that lost its publish: `deleted transition <sub>/<name>: lost its publish` (`would delete` in a dry run), not counted;
-- one line per due item, in the order taken: `deleted <item>` (`would delete` in a dry run), `kept <item>: <why>`, `deferred <item>: catalog changed`, `failed <item>: <error>`;
+- one line per due item, in the order taken: `deleted <item>` (`would delete` in a dry run), `kept <item>: <why>`, `pushed again <item>` (a recording whose drop a push cancelled, in a dry run too; counted as kept), `deferred <item>: catalog changed`, `failed <item>: <error>`;
 - one per tombstoned item checked: `verified <item>`, `fresh <item>`, `listed again <item>`, `current again <item>`, `recreated <item>`, or `kept <item>: <why>` (in a dry run `would verify <item>`, `would forget <item>: <why>`, `would delete again <item>`);
 - `kept <request>: <why>` for each pending request not due, and `kept transition <sub>/<name>: <why>` for each transition kept;
 - `deleted recording <hash> is listed again` or `deleted envelope <hash> is current again` for a deleted item a catalog names again, or `failed final read: <error>` if the read for these lines fails (a failure, counted: every delete is done by then);
 - last, the counts: `<n> deleted, <n> kept, <n> deferred, <n> failed` (`would delete` in a dry run).
 
-A run that aborts after its first read (a fold write fails, or a re-read before an item or for the tombstones) prints the lines of what it did until then, without counts, then `sweep-deletions aborted: <error>` on stderr.
+A run that aborts after its first read (a fold write fails, or a re-read or listing before an item or for the tombstones) prints the lines of what it did until then, without counts, then `sweep-deletions aborted: <error>` on stderr.
 
 An `<item>` is `recording <hash>`, `subject <sub>` or `envelope <hash>`; a `<request>` is `recording <sub>/<hash>`, `operator <sub>/<hash>`, `subject <sub>` or `envelope <hash>`. A `<why>` is one of `within grace`, `still listed`, `still current`, `blocked`, `owner is not the requester`, `no owner record`, `block lifted`, `catalog block lifted`, `owner hidden`, `unknown owner`, `no longer due`, `a pointer still names it`, `envelopes pending`, `catalog changed`; a transition's is `younger than grace`, `seq above the current pointer`, `no pointer` or `a cycle in its chain`. It exits 1 if the run aborts, any item failed, or the final read failed.
 
 **Running it.**
 
 - Run only one `sweep-deletions` at a time: two runs would fold, write, delete and verify the same records at once.
-- A `--delete` run reads the whole bucket again before each due item (16 records at a time), so it costs about one full read per due item. A dry run reads it about twice.
+- A `--delete` run reads the whole bucket again before each due item (16 records at a time), then lists the item's versions, so it costs about one full read per due item. A dry run reads it about twice, and lists each due recording's versions.
 - When a run reports `deferred`, run it again promptly: the requester published during the run, and the next run folds that publish first. A deferred item isn't deleted before then, and that wait counts against the 30 days.
 
 #### `request-deletion`
@@ -324,8 +328,9 @@ A creator whose entitlement lapsed, who is suspended, or whom the decision servi
 - Drops before this shipped are not requests: recordings hidden then stay stored, also after their creator deletes their account. On request, use `request-deletion`.
 - A creator who hides from a Mac without the recording's archive can undo the Hide only within the 7 days: afterwards re-listing needs a push.
 - A publish that lists a hash again between an item's re-check and its delete leaves a listed recording that answers as gone. The sweep reports it: `deleted recording <hash> is listed again`.
+- A push that lands while the sweep deletes the recording (after it lists the versions, before it marks the request deleted) survives that delete, but the tombstone's verification an hour later deletes it again as a write in flight, unless a catalog lists it by then. Push it again after that.
 - A blocked envelope is kept while its block stands: `request-deletion --hash` refuses an envelope's hash, and the sweep holds a blocked envelope (`kept envelope <hash>: blocked`).
-- Not deleted at all: recordings pushed but never listed, outside `request-deletion`; leftovers of removed features other than envelopes (`/1` tags, `catalog-index/`, `campaign-creators/`); copies outside the node (what viewers or peers already fetched, the KAS, identity, CloudWatch logs).
+- Not deleted at all: recordings pushed but never listed (one pushed again after its drop among them), outside `request-deletion`; leftovers of removed features other than envelopes (`/1` tags, `catalog-index/`, `campaign-creators/`); copies outside the node (what viewers or peers already fetched, the KAS, identity, CloudWatch logs).
 
 ### IAM for deletion
 
