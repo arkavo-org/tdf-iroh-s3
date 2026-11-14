@@ -108,8 +108,9 @@ pub fn observe(
 pub enum Item {
     /// Recording `hash`: `blobs/`, `outboards/`, `manifests/` and its owner
     /// record. `requests` are the keys ([`super::recording_key`],
-    /// [`super::operator_key`]) of every request due for it, sorted: the
-    /// ones the sweep marks `deleted`.
+    /// [`super::operator_key`]) of every pending request for it, of any
+    /// subject, due or not, sorted. Deletion is per hash, so deleting it
+    /// satisfies them all, and the sweep marks each `deleted`.
     Recording { hash: String, requests: Vec<String> },
     /// Subject (canonical): its pointers in `S`, then `subjects/<sub>`.
     Subject(String),
@@ -139,17 +140,43 @@ pub struct Decision {
     /// Each pending request not due, as `(id, why)`, by id:
     /// `recording <sub>/<hash>`, `operator <sub>/<hash>`, `subject <sub>`
     /// or `envelope <hash>`. `why` is the first rule it fails, in the
-    /// spec's order.
+    /// spec's order. A request for a recording hash that is due is not
+    /// here: its [`Item::Recording`] names it.
     pub kept: Vec<(String, String)>,
+}
+
+/// One recording hash's pending requests, `recordings/` and `operator/`
+/// of every subject.
+#[derive(Default)]
+struct HashRequests {
+    /// Their keys.
+    keys: Vec<String>,
+    /// Those not due on their own, as `(id, why)`.
+    kept: Vec<(String, &'static str)>,
+}
+
+impl HashRequests {
+    fn add(&mut self, key: String, id: String, kept: Option<&'static str>) {
+        self.keys.push(key);
+        if let Some(why) = kept {
+            self.kept.push((id, why));
+        }
+    }
+
+    /// Whether any of them is due, which makes the hash due.
+    fn any_due(&self) -> bool {
+        self.kept.len() < self.keys.len()
+    }
 }
 
 /// Spec 3.4 step 5: every pending request in `requests`, due or kept.
 ///
 /// Deletion is per hash: a recording hash due under any of its requests is
-/// one [`Item::Recording`] naming those requests, and its other requests
-/// are reported as kept.
+/// one [`Item::Recording`] naming every pending request for it, and none
+/// of them is reported kept. A hash none of whose requests is due reports
+/// each of them.
 pub fn due(snapshot: &Snapshot, requests: &Requests, view: &View, now: i64) -> Decision {
-    let mut recordings: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    let mut recordings: BTreeMap<&str, HashRequests> = BTreeMap::new();
     let mut items = Vec::new();
     let mut kept = Vec::new();
 
@@ -157,24 +184,31 @@ pub fn due(snapshot: &Snapshot, requests: &Requests, view: &View, now: i64) -> D
         if r.state != State::Pending {
             continue;
         }
-        match recording_kept(snapshot, view, sub, hash, r, now) {
-            None => recordings
-                .entry(hash)
-                .or_default()
-                .push(recording_key(sub, hash)),
-            Some(why) => kept.push((format!("recording {sub}/{hash}"), why)),
-        }
+        recordings.entry(hash).or_default().add(
+            recording_key(sub, hash),
+            format!("recording {sub}/{hash}"),
+            recording_kept(snapshot, view, sub, hash, r, now),
+        );
     }
     for ((sub, hash), r) in &requests.operator {
         if r.state != State::Pending {
             continue;
         }
-        match operator_kept(snapshot, view, sub, hash, r) {
-            None => recordings
-                .entry(hash)
-                .or_default()
-                .push(operator_key(sub, hash)),
-            Some(why) => kept.push((format!("operator {sub}/{hash}"), why)),
+        recordings.entry(hash).or_default().add(
+            operator_key(sub, hash),
+            format!("operator {sub}/{hash}"),
+            operator_kept(snapshot, view, sub, hash, r),
+        );
+    }
+    for (hash, mut requested) in recordings {
+        if requested.any_due() {
+            requested.keys.sort();
+            items.push(Item::Recording {
+                hash: hash.to_string(),
+                requests: requested.keys,
+            });
+        } else {
+            kept.append(&mut requested.kept);
         }
     }
     for (sub, r) in &requests.subjects {
@@ -202,13 +236,6 @@ pub fn due(snapshot: &Snapshot, requests: &Requests, view: &View, now: i64) -> D
         }
     }
 
-    items.extend(recordings.into_iter().map(|(hash, mut requests)| {
-        requests.sort();
-        Item::Recording {
-            hash: hash.to_string(),
-            requests,
-        }
-    }));
     items.sort_by_cached_key(Item::id);
     kept.sort();
     Decision {
@@ -244,7 +271,9 @@ fn recording_kept(
 
 /// `operator/<sub>/<hash>`. Scope `hash`: while `hash`'s block stands, at
 /// once, listed or not. Scope `subject`: while `sub`'s catalog block
-/// stands, `hash` is in no listing, and its owner record names `sub`.
+/// stands, `hash` is in no listing and not blocked, and its owner record
+/// names `sub`. Moderation keeps a blocked hash while its block stands
+/// (decision 3), so only a scope-`hash` request deletes one.
 fn operator_kept(
     snapshot: &Snapshot,
     view: &View,
@@ -260,6 +289,8 @@ fn operator_kept(
                 Some(CATALOG_BLOCK_LIFTED)
             } else if view.l.contains(hash) {
                 Some(STILL_LISTED)
+            } else if moderation.blocked.contains(hash) {
+                Some(BLOCKED)
             } else {
                 not_owned_by(&snapshot.owners, hash, sub)
             }
@@ -310,12 +341,14 @@ fn envelope_owner<'a>(r: &'a EnvelopeRequest, catalogs: &'a Catalogs) -> Option<
 }
 
 /// Whether an operator asked for everything `subject` published, which
-/// releases its envelopes from its hidden catalog: a pending `subjects/`
-/// request. A tombstone doesn't count, so an envelope first observed on
-/// the run that deleted its subject's pointers stays held while the
-/// catalog block stands.
+/// releases its envelopes from its hidden catalog: a `subjects/` record in
+/// any state. A tombstone counts: the envelopes current when the subject's
+/// pointers were deleted are observed on that run and fall due after
+/// their grace (spec 3.4 step 6), and tombstone verification keeps a
+/// `subjects/` tombstone while a pending envelope request names its
+/// subject.
 fn everything_requested(requests: &Requests, subject: &str) -> bool {
-    pending_subject(requests, subject)
+    requests.subjects.contains_key(subject)
 }
 
 fn pending_subject(requests: &Requests, subject: &str) -> bool {
@@ -639,30 +672,83 @@ mod tests {
         assert!(out.kept.is_empty(), "{:?}", out.kept);
     }
 
-    /// Deletion is per hash: a hash due under one request is due, and only
-    /// its due requests are named (and marked). The others are reported.
+    /// Deletion is per hash: a hash due under one request is due, and its
+    /// item names every pending request for it, due or kept, of any
+    /// subject. The deletion satisfies them all, so none is reported kept.
     #[test]
-    fn a_hash_due_under_one_request_and_kept_under_another() {
+    fn a_due_hash_names_every_pending_request_for_it() {
         let mut s = Snapshot::default();
         owns(&mut s, &h("a1"), "u1");
         s.moderation.blocked.insert(h("a1"));
         let mut r = Requests::default();
+        // Kept on its own: blocked.
         recording(&mut r, "u1", &h("a1"), NOW - GRACE);
         operator(&mut r, "u1", &h("a1"), Scope::Hash);
         // Another subject's request for the same hash: still one item.
         operator(&mut r, "u2", &h("a1"), Scope::Hash);
+        // A tombstone is not pending, so not named.
+        operator(&mut r, "u3", &h("a1"), Scope::Hash);
+        let done = r.operator.get_mut(&("u3".into(), h("a1"))).unwrap();
+        (done.state, done.deleted_at) = (State::Deleted, Some(1));
 
         let out = decide(&s, &r);
         assert_eq!(
             out.due,
             [rec(
                 &h("a1"),
-                &[operator_key("u1", &h("a1")), operator_key("u2", &h("a1"))]
+                &[
+                    operator_key("u1", &h("a1")),
+                    operator_key("u2", &h("a1")),
+                    recording_key("u1", &h("a1")),
+                ]
+            )]
+        );
+        assert!(out.kept.is_empty(), "{:?}", out.kept);
+
+        // A due recording request, and another subject's scope-subject
+        // request whose catalog block is lifted.
+        let mut s = Snapshot::default();
+        owns(&mut s, &h("a1"), "u1");
+        let mut r = Requests::default();
+        recording(&mut r, "u1", &h("a1"), NOW - GRACE);
+        operator(&mut r, "u2", &h("a1"), Scope::Subject);
+        // A hash none of whose requests is due reports each of them.
+        recording(&mut r, "u1", &h("a2"), NOW);
+        operator(&mut r, "u2", &h("a2"), Scope::Subject);
+
+        let out = decide(&s, &r);
+        assert_eq!(
+            out.due,
+            [rec(
+                &h("a1"),
+                &[operator_key("u2", &h("a1")), recording_key("u1", &h("a1"))]
             )]
         );
         assert_eq!(
             out.kept,
-            [kept(format!("recording u1/{}", h("a1")), "blocked")]
+            [
+                kept(format!("operator u2/{}", h("a2")), "catalog block lifted"),
+                kept(format!("recording u1/{}", h("a2")), "within grace"),
+            ]
+        );
+    }
+
+    /// Moderation keeps a blocked hash while its block stands (decision
+    /// 3): only a scope-`hash` request deletes it.
+    #[test]
+    fn operator_subject_scope_keeps_a_blocked_hash() {
+        let mut s = Snapshot::default();
+        catalog_block(&mut s, U);
+        owns(&mut s, &h("a1"), U);
+        s.moderation.blocked.insert(h("a1"));
+        let mut r = Requests::default();
+        operator(&mut r, U, &h("a1"), Scope::Subject);
+
+        let out = decide(&s, &r);
+        assert!(out.due.is_empty(), "{:?}", out.due);
+        assert_eq!(
+            out.kept,
+            [kept(format!("operator {U}/{}", h("a1")), "blocked")]
         );
     }
 
@@ -858,19 +944,23 @@ mod tests {
     }
 
     /// With every object gone, an unknown owner holds nothing back: the
-    /// sweep deletes nothing and marks the request `deleted`. The other
-    /// conditions still apply.
+    /// sweep deletes nothing and marks the request `deleted`. Only that
+    /// hold is waived: grace, `C`, a block and a hidden owner still keep it.
     #[test]
     fn an_envelope_whose_objects_are_gone_is_due() {
         let mut s = Snapshot::default();
         point(&mut s, "u3", &h("e3"), &[]);
         s.moderation.blocked.insert(h("e4"));
+        catalog_block(&mut s, U);
         let past = NOW - GRACE;
         let mut r = Requests::default();
         envelope(&mut r, &h("e1"), None, past);
         envelope(&mut r, &h("e2"), None, past + 1);
         envelope(&mut r, &h("e3"), None, past);
         envelope(&mut r, &h("e4"), None, past);
+        // A known owner, hidden, with no `subjects/` record.
+        envelope(&mut r, &h("e5"), Some(U), past);
+        assert!(s.envelope_objects.is_empty());
 
         let out = decide(&s, &r);
         assert_eq!(out.due, [Item::Envelope(h("e1"))]);
@@ -881,29 +971,39 @@ mod tests {
                 kept(id("e2"), "within grace"),
                 kept(id("e3"), "still current"),
                 kept(id("e4"), "blocked"),
+                kept(id("e5"), "owner hidden"),
             ]
         );
     }
 
-    /// Only a pending `subjects/` request releases a hidden owner's
-    /// envelopes; a tombstone doesn't.
+    /// A `subjects/` record in any state releases a hidden owner's
+    /// envelopes: a deleted subject's envelopes are observed on the run
+    /// that deletes its pointers, and fall due once their grace ends, with
+    /// the subject's tombstone still there (spec 3.4 step 6).
     #[test]
-    fn a_subject_tombstone_does_not_release_a_hidden_owners_envelope() {
+    fn a_subject_tombstone_releases_a_hidden_owners_envelope() {
         let mut s = Snapshot::default();
         catalog_block(&mut s, U);
+        catalog_block(&mut s, U2);
         let mut r = Requests::default();
         subject(&mut r, U);
         let done = r.subjects.get_mut(U).unwrap();
         done.state = State::Deleted;
         done.deleted_at = Some(NOW - GRACE);
         envelope(&mut r, &h("e1"), Some(U), NOW - GRACE);
-        s.envelope_objects = BTreeSet::from([h("e1")]);
+        envelope(&mut r, &h("e2"), Some(U), NOW - GRACE + 1);
+        // Hidden, with no `subjects/` record.
+        envelope(&mut r, &h("e3"), Some(U2), NOW - GRACE);
+        s.envelope_objects = BTreeSet::from([h("e1"), h("e2"), h("e3")]);
 
         let out = decide(&s, &r);
-        assert!(out.due.is_empty(), "{:?}", out.due);
+        assert_eq!(out.due, [Item::Envelope(h("e1"))]);
         assert_eq!(
             out.kept,
-            [kept(format!("envelope {}", h("e1")), "owner hidden")]
+            [
+                kept(format!("envelope {}", h("e2")), "within grace"),
+                kept(format!("envelope {}", h("e3")), "owner hidden"),
+            ]
         );
     }
 
