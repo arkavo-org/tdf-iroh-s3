@@ -302,6 +302,10 @@ pub(crate) mod test_support {
         /// The next index record create loses without writing, as if a
         /// concurrent create of the same record were still in flight.
         pub lose_next_index_create: std::sync::atomic::AtomicBool,
+        /// The next index record create fails without writing.
+        pub fail_next_index_create: std::sync::atomic::AtomicBool,
+        /// The next catalog document write fails without writing.
+        pub fail_next_document_write: std::sync::atomic::AtomicBool,
     }
 
     impl MemStore {
@@ -393,6 +397,12 @@ pub(crate) mod test_support {
             owner: &str,
         ) -> anyhow::Result<()> {
             self.up()?;
+            anyhow::ensure!(
+                !self
+                    .fail_next_document_write
+                    .swap(false, std::sync::atomic::Ordering::Relaxed),
+                "document write failed"
+            );
             self.catalog_documents.lock().await.insert(
                 hash_hex.to_string(),
                 StoredDocument {
@@ -417,6 +427,12 @@ pub(crate) mod test_support {
         /// As S3's `If-None-Match: *`: the first body stays.
         async fn create_catalog_index(&self, hash_hex: &str, body: Bytes) -> anyhow::Result<bool> {
             self.up()?;
+            anyhow::ensure!(
+                !self
+                    .fail_next_index_create
+                    .swap(false, std::sync::atomic::Ordering::Relaxed),
+                "index create failed"
+            );
             if self
                 .lose_next_index_create
                 .swap(false, std::sync::atomic::Ordering::Relaxed)

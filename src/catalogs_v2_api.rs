@@ -9,13 +9,14 @@
 //!   (`catalog_metadata::check_envelope`); the node never decrypts it and
 //!   checks the recordings it lists through the index, which it stores
 //!   once per envelope at `catalog-indexes/<hash>` (`If-None-Match: *`;
-//!   another index for the same envelope is a 409) and never serves. The
-//!   document is stored under `catalog-documents/<blake3>` with its BAO
-//!   outboard, so it is served over iroh; the bundle replaces
-//!   `catalog-pointers/<sub>` only when its `seq` is greater than the
-//!   stored one's, and only when the stored pointer is still the base named
-//!   by `If-Match` / `If-None-Match` (tdf-iroh-s3#29; 412 otherwise), one of
-//!   which is required (428 without).
+//!   another index for the same envelope is a 409, and nothing is written)
+//!   and never serves. The index is written first, then the document under
+//!   `catalog-documents/<blake3>` with its BAO outboard, so it is served
+//!   over iroh; then the bundle, which replaces `catalog-pointers/<sub>`
+//!   only when its `seq` is greater than the stored one's, and only when
+//!   the stored pointer is still the base named by `If-Match` /
+//!   `If-None-Match` (tdf-iroh-s3#29; 412 otherwise), one of which is
+//!   required (428 without).
 //! - `GET /v2/catalogs/{sub}` — a token, then the catalog decision: whether
 //!   the reader may open the envelope's attribute (403 otherwise). The
 //!   stored bundle, with `ETag: "<seq>"`, which readers verify themselves
@@ -505,11 +506,14 @@ async fn put_catalog<S: TagStore>(
     }
     let expected = current.as_ref().map(|(stored, _)| stored.etag.as_str());
 
-    // 8. The document, its outboard and its index first, so a stored
+    // 8. The index record, then the document and its outboard, so a stored
     //    pointer never names a document that cannot be served or decided;
     //    then the pointer, only if nobody else moved it meanwhile. The index
     //    record is created once: one envelope has one index, so a publish
-    //    that lost can't rewrite the committed pointer's index.
+    //    that lost can't rewrite the committed pointer's index, nor the
+    //    envelope's owner metadata. A record whose document write then
+    //    fails is named by no pointer, and a retry of this publish
+    //    completes it.
     let outboard = crate::ingest::compute_outboard(
         &document[..],
         document.len() as u64,
@@ -523,14 +527,6 @@ async fn put_catalog<S: TagStore>(
         entries: index,
     };
     let entries = entries.len();
-    api.store
-        .put_catalog_document(&hash, Bytes::from(document), &sub)
-        .await
-        .map_err(|e| storage_unavailable("Catalog document write", e))?;
-    api.store
-        .put_catalog_outboard(&hash, Bytes::from(outboard))
-        .await
-        .map_err(|e| storage_unavailable("Catalog outboard write", e))?;
     let created = api
         .store
         .create_catalog_index(
@@ -563,6 +559,14 @@ async fn put_catalog<S: TagStore>(
             ));
         }
     }
+    api.store
+        .put_catalog_document(&hash, Bytes::from(document), &sub)
+        .await
+        .map_err(|e| storage_unavailable("Catalog document write", e))?;
+    api.store
+        .put_catalog_outboard(&hash, Bytes::from(outboard))
+        .await
+        .map_err(|e| storage_unavailable("Catalog outboard write", e))?;
     let bundle = serde_json::to_vec(&req.bundle).expect("bundle serializes");
     let written = api
         .store
@@ -831,7 +835,8 @@ mod tests {
             sub: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<(), StatusRefusal>> + Send + 'a>> {
             assert_eq!(credential_id, v2::CREDENTIAL_ID);
-            assert_eq!(sub, SUB);
+            // The two accounts the tests publish as.
+            assert!(sub == SUB || sub == READER, "{sub}");
             let answer = self.0.lock().unwrap().clone();
             Box::pin(async move { answer })
         }
@@ -1945,7 +1950,95 @@ mod tests {
         let r = publish(&h, 1, &document).await;
         assert_eq!((r.status, r.error().as_str()), conflict);
         assert_eq!(h.store.catalog_indexes.lock().await[&hash], theirs);
+        // Refused before the envelope and its outboard are written.
+        assert!(h.store.catalog_documents.lock().await.is_empty());
+        assert!(h.store.catalog_outboards.lock().await.is_empty());
         assert!(h.store.catalog_pointers.lock().await.is_empty());
+    }
+
+    /// Another account publishing the same envelope bytes with its own index
+    /// gets the 409 before anything of its publish is written: the envelope
+    /// keeps its publisher as owner, which `owner_hidden` and the deletion
+    /// sweep read.
+    #[tokio::test]
+    async fn another_accounts_index_leaves_the_envelope_as_published() {
+        let h = ingested().await;
+        let document = envelope(1);
+        let hash = hash_of(&document);
+        assert_eq!(publish(&h, 1, &document).await.status, StatusCode::OK);
+        let outboard = h.store.catalog_outboards.lock().await[&hash].clone();
+
+        // READER's token also names campaign 12345678 as its creator's, and
+        // its index lists a recording of its own.
+        ingest(&h, 2).await;
+        h.store.own(&payload(2), READER).await;
+        let theirs = json!([entry("rec-2", &payload(2))]);
+        let bundle = v2::bundle(READER, 1, &document, Some(&hash_of_index(&theirs)));
+        let r = put(
+            &h,
+            READER,
+            &token(READER),
+            body_with(&document, &bundle, theirs),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (
+                StatusCode::CONFLICT,
+                "catalog document already published with another index"
+            )
+        );
+
+        {
+            let docs = h.store.catalog_documents.lock().await;
+            assert_eq!(docs[&hash].body, Bytes::from(document.clone()));
+            assert_eq!(docs[&hash].owner.as_deref(), Some(SUB));
+        }
+        assert_eq!(h.store.catalog_outboards.lock().await[&hash], outboard);
+        assert!(!h.store.catalog_pointers.lock().await.contains_key(READER));
+        assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"1\"");
+    }
+
+    /// The index record is created first, so a document write that fails
+    /// after it leaves a record no pointer names, which nothing serves, and
+    /// the same publish sent again completes.
+    #[tokio::test]
+    async fn a_publish_whose_document_write_failed_completes_on_retry() {
+        let h = ingested().await;
+        let document = envelope(1);
+        let hash = hash_of(&document);
+        h.store
+            .fail_next_document_write
+            .store(true, Ordering::Relaxed);
+        let r = publish(&h, 1, &document).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::BAD_GATEWAY, "storage unavailable")
+        );
+        let record = h
+            .store
+            .catalog_indexes
+            .lock()
+            .await
+            .get(&hash)
+            .cloned()
+            .expect("the index record is created before the document");
+        assert!(h.store.catalog_documents.lock().await.is_empty());
+        assert!(h.store.catalog_outboards.lock().await.is_empty());
+        assert!(h.store.catalog_pointers.lock().await.is_empty());
+        assert_eq!(get(&h, SUB).await.status, StatusCode::NOT_FOUND);
+
+        let r = publish(&h, 1, &document).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        assert_eq!(
+            h.store.catalog_documents.lock().await[&hash]
+                .owner
+                .as_deref(),
+            Some(SUB)
+        );
+        assert!(h.store.catalog_outboards.lock().await.contains_key(&hash));
+        assert_eq!(h.store.catalog_indexes.lock().await[&hash], record);
+        assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"1\"");
     }
 
     #[tokio::test]
@@ -1990,8 +2083,16 @@ mod tests {
             .store(true, Ordering::Relaxed);
         let r = publish(&h, 1, &envelope(1)).await;
         assert_eq!((r.status, r.error().as_str()), unavailable);
-        assert!(h.store.catalog_indexes.lock().await.is_empty());
-        assert!(h.store.catalog_pointers.lock().await.is_empty());
+        assert_nothing_stored(&h).await;
+
+        // The create fails.
+        let h = ingested().await;
+        h.store
+            .fail_next_index_create
+            .store(true, Ordering::Relaxed);
+        let r = publish(&h, 1, &envelope(1)).await;
+        assert_eq!((r.status, r.error().as_str()), unavailable);
+        assert_nothing_stored(&h).await;
 
         // The record there doesn't parse.
         let h = ingested().await;
@@ -2005,6 +2106,8 @@ mod tests {
         let r = publish(&h, 1, &envelope(1)).await;
         assert_eq!((r.status, r.error().as_str()), unavailable);
         assert_eq!(h.store.catalog_indexes.lock().await[&hash], garbage);
+        assert!(h.store.catalog_documents.lock().await.is_empty());
+        assert!(h.store.catalog_outboards.lock().await.is_empty());
         assert!(h.store.catalog_pointers.lock().await.is_empty());
     }
 

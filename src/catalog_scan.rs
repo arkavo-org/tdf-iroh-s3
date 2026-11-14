@@ -357,6 +357,27 @@ mod tests {
         assert!(err.contains("no index record"), "{err}");
     }
 
+    /// A publish creates its index record before the envelope and the
+    /// pointer, so one whose envelope write failed leaves a record no
+    /// pointer names: read like any other, and no pointer's live index.
+    #[tokio::test]
+    async fn an_index_record_no_pointer_names_is_no_fault() {
+        let m = MemObjects::default();
+        publish_2(&m, "u1", 1, b"doc", &[&h("aa")]);
+        let orphan = blake3::hash(b"never written").to_hex().to_string();
+        m.insert(
+            &format!("{INDEXES}{orphan}"),
+            serde_json::to_vec(&test_support::index_record("u2", &[&h("bb")])).unwrap(),
+        );
+        let catalogs = scan(&m).await.unwrap();
+        assert_eq!(catalogs.pointers.len(), 1);
+        assert_eq!(
+            catalogs.live_hashes(&catalogs.pointers[0]),
+            Some(&BTreeSet::from([h("aa")]))
+        );
+        assert_eq!(catalogs.indexes[&orphan].owner, "u2");
+    }
+
     #[tokio::test]
     async fn a_failed_read_fails_the_scan() {
         use crate::object_store::mem::Op;
