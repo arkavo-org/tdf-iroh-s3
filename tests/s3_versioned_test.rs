@@ -1,6 +1,6 @@
 //! `ObjectStore for S3Client` against a real versioned bucket: conditional
-//! creates, version listing across pages and version deletion (plan call
-//! 12). Every test is ignored, and passes without touching S3 when
+//! creates, delete markers, version listing across pages and version
+//! deletion (plan call 12). Every test is ignored, and passes without touching S3 when
 //! `TDF_IROH_S3_VERSIONED_BUCKET` or `AWS_REGION` is unset:
 //!
 //! ```text
@@ -16,7 +16,7 @@ use futures::FutureExt;
 use std::collections::{BTreeSet, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tdf_iroh_s3::object_store::ObjectStore;
+use tdf_iroh_s3::object_store::{ObjectStore, VersionInfo};
 use tdf_iroh_s3::store::s3::S3Client;
 
 /// A client on the scratch bucket under a prefix no other test or run
@@ -95,6 +95,56 @@ async fn conditional_create_after_version_deletion() {
 
         assert!(s3.create(&key, body("third")).await.unwrap());
         assert_eq!(s3.get(&key).await.unwrap(), Some(body("third")));
+    })
+    .catch_unwind()
+    .await;
+    clean_up(&s3, outcome).await;
+}
+
+/// A plain `DeleteObject` leaves a delete marker, as a node's delete or an
+/// operator's console delete would: it is listed as a marker, leaves no
+/// current object, `create` writes over it, and `delete_all_versions`
+/// counts and removes it with the key's versions. A plain delete of a key
+/// that never held an object leaves a lone marker, removed the same way.
+#[tokio::test]
+#[ignore = "needs a real versioned bucket: TDF_IROH_S3_VERSIONED_BUCKET"]
+async fn a_delete_marker_is_listed_created_over_and_deleted() {
+    let Some(s3) = scratch("delete-marker").await else {
+        return;
+    };
+    let outcome = AssertUnwindSafe(async {
+        let hash = "ef".repeat(32);
+        let (blob, outboard) = (format!("blobs/{hash}"), format!("outboards/{hash}"));
+        s3.put(&blob, body("blob")).await.unwrap();
+        // Plain deletes of `blobs/<hash>` and of `outboards/<hash>`, which
+        // was never written.
+        s3.delete_blob(&hash).await.unwrap();
+
+        let markers =
+            |versions: &[VersionInfo]| versions.iter().filter(|v| v.delete_marker).count();
+        let versions = s3.list_versions(&blob).await.unwrap();
+        assert_eq!(versions.len(), 2, "{versions:?}");
+        assert_eq!(markers(&versions), 1, "{versions:?}");
+        assert!(versions.iter().all(|v| v.key == blob && v.modified > 0));
+        assert_eq!(s3.get(&blob).await.unwrap(), None);
+        assert_eq!(s3.head_owner(&blob).await.unwrap(), None);
+        assert!(
+            s3.list(&blob).await.unwrap().is_empty(),
+            "no current object"
+        );
+        let lone = s3.list_versions(&outboard).await.unwrap();
+        assert_eq!(lone.len(), 1, "{lone:?}");
+        assert_eq!(markers(&lone), 1, "{lone:?}");
+
+        assert!(s3.create(&blob, body("again")).await.unwrap());
+        assert_eq!(s3.get(&blob).await.unwrap(), Some(body("again")));
+        let versions = s3.list_versions(&blob).await.unwrap();
+        assert_eq!(versions.len(), 3, "{versions:?}");
+        assert_eq!(markers(&versions), 1, "{versions:?}");
+
+        assert_eq!(s3.delete_all_versions(&blob).await.unwrap(), 3);
+        assert_eq!(s3.delete_all_versions(&outboard).await.unwrap(), 1);
+        assert!(s3.list_versions("").await.unwrap().is_empty());
     })
     .catch_unwind()
     .await;
