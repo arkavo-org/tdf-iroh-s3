@@ -64,6 +64,13 @@ const RECORDING_OBJECTS: [&str; 4] = [
 /// An envelope's objects, deleted in this order.
 const ENVELOPE_OBJECTS: [&str; 3] = [DOCUMENTS, "catalog-outboards/", INDEXES];
 
+/// The objects of a recording a new push writes, and of an envelope a new
+/// publish writes: what makes a tombstone fresh (spec 3.4 step 7, rule 1).
+/// Never an outboard: the node writes one itself when it serves a blob or
+/// envelope that lacks it.
+const PUSHED_OBJECTS: [&str; 3] = ["blobs/", "manifests/", "moderation/publishers/"];
+const PUBLISHED_OBJECTS: [&str; 2] = [DOCUMENTS, INDEXES];
+
 /// Why an item due at the first read is kept when the fresh decision
 /// names no reason for it.
 const NO_LONGER_DUE: &str = "no longer due";
@@ -222,7 +229,15 @@ pub async fn sweep<O: ObjectStore>(store: &O, delete: bool, now: i64) -> anyhow:
             report.deleted(&item.id());
         }
     }
-    verify_tombstones(store, delete, &requests, &mut baseline, now, &mut report).await?;
+    verify_tombstones(
+        store,
+        delete,
+        (&requests, &snapshot.request_written),
+        &mut baseline,
+        now,
+        &mut report,
+    )
+    .await?;
 
     for (id, why) in &decision.kept {
         report.kept(id, why);
@@ -602,13 +617,16 @@ async fn delete_item<O: ObjectStore>(
 
 /// Spec 3.4 step 7: verify each tombstoned item whose newest tombstone is
 /// at least [`VERIFY_AFTER`] old (any in-flight push, backfill or publish
-/// has finished by then), in [`in_deletion_order`]. Its objects are the
-/// versions of its keys that aren't delete markers: a recording's
-/// [`RECORDING_OBJECTS`], an envelope's [`ENVELOPE_OBJECTS`], a subject's
-/// pointer keys (both forms of it). In the spec's order:
-/// 1. an object written more than [`VERIFY_AFTER`] after the delete is
-///    fresh (a new push, publish or pointer): forget the tombstones, keep
-///    everything;
+/// has finished by then), in [`in_deletion_order`]. A tombstone's age, and
+/// the delete it measures from, is its record's own write time (S3's
+/// `LastModified`), not its `deletedAt`: that is the run's start, on the
+/// operator's clock, and a long run deletes items well after it. Its
+/// objects are the versions of its keys that aren't delete markers: a
+/// recording's [`RECORDING_OBJECTS`], an envelope's [`ENVELOPE_OBJECTS`],
+/// a subject's pointer keys (both forms of it). In the spec's order:
+/// 1. one a new push or publish writes ([`PUSHED_OBJECTS`],
+///    [`PUBLISHED_OBJECTS`], a pointer) written more than [`VERIFY_AFTER`]
+///    after the delete is fresh: forget the tombstones, keep everything;
 /// 2. a recording in `L`, or an envelope in `C`: forget them, keep the
 ///    objects. `L` and `C` leave out a deleted subject's late pointers
 ///    ([`late_pointers`]);
@@ -621,16 +639,17 @@ async fn delete_item<O: ObjectStore>(
 /// that owner is pending: it releases those envelopes from a hidden
 /// catalog (`due::everything_requested`).
 ///
-/// It reads the bucket again first: with `delete`, the requests too; in a
-/// dry run, which wrote nothing, it takes `unwritten` (the folded and
-/// observed requests) instead, and changes nothing. A recording's
-/// tombstones (`recordings/` and `operator/`, of any subject) are verified
-/// together, by hash. `Err` when a read fails; a failed delete is reported
-/// and the run goes on.
+/// It reads the bucket again first: with `delete`, the requests and their
+/// write times too; in a dry run, which wrote nothing, it takes
+/// `unwritten` (the folded and observed requests, and the first read's
+/// write times) instead, and changes nothing. A recording's tombstones
+/// (`recordings/` and `operator/`, of any subject) are verified together,
+/// by hash. `Err` when a read fails; a failed delete is reported and the
+/// run goes on.
 async fn verify_tombstones<O: ObjectStore>(
     store: &O,
     delete: bool,
-    unwritten: &Requests,
+    unwritten: (&Requests, &BTreeMap<String, i64>),
     baseline: &mut Pointers,
     now: i64,
     report: &mut Report,
@@ -638,16 +657,23 @@ async fn verify_tombstones<O: ObjectStore>(
     let read = snapshot::read(store)
         .await
         .context("the verify read failed")?;
-    let requests = if delete { &read.requests } else { unwritten };
+    let (requests, written) = if delete {
+        (&read.requests, &read.request_written)
+    } else {
+        unwritten
+    };
     // For rule 2 only. A pointer rule 3 deletes again (now, or once its
     // subject's tombstone is old enough) lists and names nothing: were its
     // recordings and envelope forgotten here, their objects would outlive
     // it with no request left to delete them.
-    let late = late_pointers(store, requests, &read.moderation).await?;
+    let late = late_pointers(store, requests, written, &read.moderation).await?;
     let view = due::view_except(&read.catalogs, requests, &read.moderation, &late);
-    let mut groups: Vec<Tombstones> = tombstones(requests)
+    let mut groups: Vec<Tombstones> = tombstones(requests, written)
         .into_iter()
-        .filter(|t| t.deleted_at.saturating_add(VERIFY_AFTER) <= now)
+        .filter(|t| {
+            t.written
+                .is_some_and(|w| w.saturating_add(VERIFY_AFTER) <= now)
+        })
         .collect();
     groups.sort_by_cached_key(|t| deletion_order(&t.item));
 
@@ -656,8 +682,14 @@ async fn verify_tombstones<O: ObjectStore>(
         let objects = objects(store, &group.item)
             .await
             .with_context(|| format!("verifying {id}"))?;
-        let written_by = group.deleted_at.saturating_add(VERIFY_AFTER);
-        let forget = if objects.iter().any(|v| v.modified > written_by) {
+        let written_by = group
+            .written
+            .unwrap_or(i64::MAX)
+            .saturating_add(VERIFY_AFTER);
+        let fresh = objects
+            .iter()
+            .any(|v| v.modified > written_by && pushed_or_published(&group.item, &v.key));
+        let forget = if fresh {
             Some(FRESH)
         } else {
             match &group.item {
@@ -697,8 +729,9 @@ struct Tombstones {
     /// What they cover. A recording's `requests` are their keys.
     item: Item,
     tombstones: Vec<Tombstone>,
-    /// The newest `deletedAt` among them.
-    deleted_at: i64,
+    /// When the newest of their records was written (S3's clock); `None`
+    /// when one's write time is unknown, and then the item waits.
+    written: Option<i64>,
 }
 
 /// One tombstone, by the names in its request key.
@@ -757,33 +790,34 @@ impl Tombstone {
 }
 
 /// Every tombstone in `requests`, by item: a recording's by hash, of any
-/// subject and either kind.
-fn tombstones(requests: &Requests) -> Vec<Tombstones> {
-    let dated = |state, at: Option<i64>| at.filter(|_| state == State::Deleted);
-    let mut recordings: BTreeMap<&String, Vec<(Tombstone, i64)>> = BTreeMap::new();
+/// subject and either kind. `written` holds each record's write time, by
+/// key.
+fn tombstones(requests: &Requests, written: &BTreeMap<String, i64>) -> Vec<Tombstones> {
+    let mut recordings: BTreeMap<&String, Vec<Tombstone>> = BTreeMap::new();
     for ((sub, hash), r) in &requests.recordings {
-        if let Some(at) = dated(r.state, r.deleted_at) {
+        if r.state == State::Deleted {
             let t = Tombstone::Recording(sub.clone(), hash.clone());
-            recordings.entry(hash).or_default().push((t, at));
+            recordings.entry(hash).or_default().push(t);
         }
     }
     for ((sub, hash), r) in &requests.operator {
-        if let Some(at) = dated(r.state, r.deleted_at) {
+        if r.state == State::Deleted {
             let t = Tombstone::Operator(sub.clone(), hash.clone());
-            recordings.entry(hash).or_default().push((t, at));
+            recordings.entry(hash).or_default().push(t);
         }
     }
-    let group = |item: Item, tombstones: Vec<(Tombstone, i64)>| Tombstones {
+    let group = |item: Item, tombstones: Vec<Tombstone>| Tombstones {
         item,
-        deleted_at: tombstones
+        written: tombstones
             .iter()
-            .map(|(_, at)| *at)
-            .fold(i64::MIN, i64::max),
-        tombstones: tombstones.into_iter().map(|(t, _)| t).collect(),
+            .map(|t| written.get(&t.key()).copied())
+            .collect::<Option<Vec<i64>>>()
+            .and_then(|times| times.into_iter().max()),
+        tombstones,
     };
     let mut out = Vec::new();
     for (hash, tombstones) in recordings {
-        let mut keys: Vec<String> = tombstones.iter().map(|(t, _)| t.key()).collect();
+        let mut keys: Vec<String> = tombstones.iter().map(Tombstone::key).collect();
         keys.sort();
         let item = Item::Recording {
             hash: hash.clone(),
@@ -792,15 +826,15 @@ fn tombstones(requests: &Requests) -> Vec<Tombstones> {
         out.push(group(item, tombstones));
     }
     for (hash, r) in &requests.envelopes {
-        if let Some(at) = dated(r.state, r.deleted_at) {
+        if r.state == State::Deleted {
             let t = Tombstone::Envelope(hash.clone());
-            out.push(group(Item::Envelope(hash.clone()), vec![(t, at)]));
+            out.push(group(Item::Envelope(hash.clone()), vec![t]));
         }
     }
     for (sub, r) in &requests.subjects {
-        if let Some(at) = dated(r.state, r.deleted_at) {
+        if r.state == State::Deleted {
             let t = Tombstone::Subject(sub.clone());
-            out.push(group(Item::Subject(sub.clone()), vec![(t, at)]));
+            out.push(group(Item::Subject(sub.clone()), vec![t]));
         }
     }
     out
@@ -823,6 +857,18 @@ async fn objects<O: ObjectStore>(store: &O, item: &Item) -> anyhow::Result<Vec<V
     Ok(versions)
 }
 
+/// Whether `key`, one of `item`'s objects, is one a new push or publish
+/// writes (rule 1): a recording's [`PUSHED_OBJECTS`], an envelope's
+/// [`PUBLISHED_OBJECTS`], a subject's pointers.
+fn pushed_or_published(item: &Item, key: &str) -> bool {
+    let prefixes: &[&str] = match item {
+        Item::Recording { .. } => &PUSHED_OBJECTS,
+        Item::Envelope(_) => &PUBLISHED_OBJECTS,
+        Item::Subject(_) => &[POINTERS],
+    };
+    prefixes.iter().any(|p| key.starts_with(p))
+}
+
 /// A recording's or an envelope's object keys, in the order they are
 /// deleted; none for a subject.
 fn object_keys(item: &Item) -> Vec<String> {
@@ -837,21 +883,28 @@ fn object_keys(item: &Item) -> Vec<String> {
 /// The keys of the pointers rule 3 deletes again, now or once their
 /// subject's tombstone is [`VERIFY_AFTER`] old: those of a subject with a
 /// `subjects/` tombstone of any age whose catalog block stands, whose
-/// current version was written by the tombstone's `deletedAt` +
-/// [`VERIFY_AFTER`] (an in-flight publish). One written later is a
-/// returning creator's, and counts.
+/// current version was written by [`VERIFY_AFTER`] after the tombstone was
+/// (`written`, by key: an in-flight publish). One written later is a
+/// returning creator's, and counts. A tombstone whose write time is
+/// unknown makes every pointer of its subject late: rule 2 then forgets
+/// nothing on their account.
 async fn late_pointers<O: ObjectStore>(
     store: &O,
     requests: &Requests,
+    written: &BTreeMap<String, i64>,
     moderation: &ModerationView,
 ) -> anyhow::Result<BTreeSet<String>> {
     let written_by: BTreeMap<&str, i64> = requests
         .subjects
         .iter()
-        .filter(|(sub, _)| moderation.catalog_blocked.contains(sub.as_str()))
-        .filter_map(|(sub, r)| {
-            let at = r.deleted_at.filter(|_| r.state == State::Deleted)?;
-            Some((sub.as_str(), at.saturating_add(VERIFY_AFTER)))
+        .filter(|(sub, r)| {
+            r.state == State::Deleted && moderation.catalog_blocked.contains(sub.as_str())
+        })
+        .map(|(sub, _)| {
+            let by = written
+                .get(&subject_key(sub))
+                .map_or(i64::MAX, |w| w.saturating_add(VERIFY_AFTER));
+            (sub.as_str(), by)
         })
         .collect();
     if written_by.is_empty() {
@@ -1077,6 +1130,14 @@ mod tests {
         byte.repeat(32)
     }
 
+    /// A bucket whose clock reads `NOW`, the time the runs here pass: what
+    /// a run writes, its tombstones included, is stamped as S3 would.
+    fn bucket() -> MemObjects {
+        let m = MemObjects::default();
+        m.set_now(NOW);
+        m
+    }
+
     fn arkavo(uuid: &str) -> String {
         format!("arkavo:{uuid}")
     }
@@ -1299,7 +1360,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_dry_run_changes_nothing() {
-        let m = MemObjects::default();
+        let m = bucket();
         let (p, q) = (h("a1"), h("a2"));
         // Folding writes a request and an envelope request, and deletes
         // two transitions.
@@ -1342,7 +1403,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_due_recording_loses_every_version_in_order() {
-        let m = MemObjects::default();
+        let m = bucket();
         let p = h("a1");
         recording(&m, &p, U);
         request(&m, U, &p, NOW - GRACE);
@@ -1364,7 +1425,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_due_envelope_is_deleted() {
-        let m = MemObjects::default();
+        let m = bucket();
         publish_2(&m, U, 2, b"doc-2", &[]);
         let e = envelope(&m, U, b"doc-1");
         envelope_request(&m, &e, U, NOW - GRACE);
@@ -1385,7 +1446,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_due_subject_loses_its_pointers() {
-        let m = MemObjects::default();
+        let m = bucket();
         // Both pointer keys of `U`, and another account's.
         publish_2(&m, &arkavo(U), 1, b"doc-a", &[]);
         publish_2(&m, U, 1, b"doc-b", &[]);
@@ -1410,7 +1471,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_relisted_recording_is_dropped_at_the_recheck() {
-        let m = MemObjects::default();
+        let m = bucket();
         let p = h("a1");
         let [_, second] = dropped(&m, &p);
         // Once the run has decided, another catalog lists it.
@@ -1434,7 +1495,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_moved_pointer_defers_the_item() {
-        let m = MemObjects::default();
+        let m = bucket();
         let p = h("a1");
         let [_, second] = dropped(&m, &p);
         // Once the run has decided, `U` publishes again.
@@ -1465,7 +1526,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_delete_leaves_the_item_pending() {
-        let m = MemObjects::default();
+        let m = bucket();
         let (p, q) = (h("a1"), h("a2"));
         for hash in [&p, &q] {
             recording(&m, hash, U);
@@ -1499,7 +1560,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreadable_record_aborts_before_any_write() {
-        let m = MemObjects::default();
+        let m = bucket();
         dropped(&m, &h("a1"));
         recording(&m, &h("a2"), U);
         request(&m, U, &h("a2"), NOW - GRACE);
@@ -1517,7 +1578,7 @@ mod tests {
     /// failed read of it aborts with nothing written either.
     #[tokio::test]
     async fn an_unreadable_document_owner_aborts_before_any_write() {
-        let m = MemObjects::default();
+        let m = bucket();
         dropped(&m, &h("a1"));
         let e = envelope(&m, U, b"doc-0");
         m.fail_on(&format!("catalog-documents/{e}"), Op::Get);
@@ -1530,7 +1591,7 @@ mod tests {
 
     #[tokio::test]
     async fn transitions_are_deleted_only_after_their_requests_are_written() {
-        let m = MemObjects::default();
+        let m = bucket();
         let p = h("a1");
         let [first, second] = dropped(&m, &p);
         m.fail_on(&recording_key(U, &p), Op::Put);
@@ -1554,7 +1615,7 @@ mod tests {
     /// lost ones. Unreachable transitions it keeps are reported.
     #[tokio::test]
     async fn the_fold_is_written_then_its_transitions_deleted() {
-        let m = MemObjects::default();
+        let m = bucket();
         let (p, r) = (h("a1"), h("a3"));
         // A stored request for `r`, which publish 2 lists again.
         request(&m, U, &r, NOW - 500);
@@ -1644,7 +1705,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_observed_envelope_takes_its_documents_owner() {
-        let m = MemObjects::default();
+        let m = bucket();
         let e1 = envelope(&m, &arkavo(U), b"doc-1");
         // Only an outboard left: no document to name an owner.
         let e2 = h("e2");
@@ -1676,7 +1737,7 @@ mod tests {
     /// recordings and envelopes are deleted in the same run.
     #[tokio::test]
     async fn items_go_subject_then_recording_then_envelope() {
-        let m = MemObjects::default();
+        let m = bucket();
         let p = h("a1");
         recording(&m, &p, U);
         publish_2(&m, U, 1, b"doc-u", &[&p]);
@@ -1730,7 +1791,7 @@ mod tests {
     /// subject first.
     #[tokio::test]
     async fn an_envelope_a_pointer_still_names_is_kept() {
-        let m = MemObjects::default();
+        let m = bucket();
         publish_2(&m, U, 1, b"doc-u", &[]);
         let e = catalog(b"doc-u");
         m.insert_with_owner(&format!("catalog-documents/{e}"), "doc-u", U);
@@ -1781,7 +1842,7 @@ mod tests {
     /// not. The block that made it due is kept.
     #[tokio::test]
     async fn a_deleted_recording_marks_every_request_for_it() {
-        let m = MemObjects::default();
+        let m = bucket();
         let p = h("a1");
         recording(&m, &p, U);
         // Within grace on its own.
@@ -1823,7 +1884,7 @@ mod tests {
     /// reported, not acted on.
     #[tokio::test]
     async fn a_deleted_recording_listed_again_is_reported() {
-        let m = MemObjects::default();
+        let m = bucket();
         let p = h("a1");
         recording(&m, &p, U);
         request(&m, U, &p, NOW - GRACE);
@@ -1844,7 +1905,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_recheck_aborts() {
-        let m = MemObjects::default();
+        let m = bucket();
         let p = h("a1");
         let [_, second] = dropped(&m, &p);
         let key = recording_key(U, &p);
@@ -1871,8 +1932,11 @@ mod tests {
         const AT: i64 = T + VERIFY_AFTER;
 
         /// `recordings/<sub>/<hash>`, deleted at `T`, requested a grace
-        /// period before (so it was due then, and would be again).
+        /// period before (so it was due then, and would be again). Each
+        /// tombstone here is written at its `deletedAt`, as a run writes
+        /// it, and leaves the bucket's clock there.
         fn tombstone(m: &MemObjects, sub: &str, hash: &str) {
+            m.set_now(T);
             put(
                 m,
                 &recording_key(sub, hash),
@@ -1889,6 +1953,7 @@ mod tests {
 
         /// `operator/<sub>/<hash>`, scope `hash`, deleted at `deleted_at`.
         fn operator_tombstone(m: &MemObjects, sub: &str, hash: &str, deleted_at: i64) {
+            m.set_now(deleted_at);
             put(
                 m,
                 &operator_key(sub, hash),
@@ -1906,6 +1971,7 @@ mod tests {
 
         /// `envelopes/<hash>` of `owner`, deleted at `deleted_at`.
         fn envelope_tombstone(m: &MemObjects, hash: &str, owner: &str, deleted_at: i64) {
+            m.set_now(deleted_at);
             put(
                 m,
                 &envelope_key(hash),
@@ -1927,6 +1993,7 @@ mod tests {
 
         /// `subjects/<sub>`, deleted at `deleted_at`.
         fn subject_tombstone_at(m: &MemObjects, sub: &str, deleted_at: i64) {
+            m.set_now(deleted_at);
             put(
                 m,
                 &subject_key(sub),
@@ -2058,6 +2125,137 @@ mod tests {
             }
             let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
             assert_eq!(r.state, State::Deleted);
+        }
+
+        /// Step 7 measures from the tombstone's own write (its S3 time),
+        /// not the run's `now`: a run that reaches an item two hours in
+        /// writes its tombstone then. Its `deletedAt` stays the run's.
+        #[tokio::test]
+        async fn a_long_runs_tombstone_counts_from_its_own_write() {
+            let m = MemObjects::default();
+            m.set_now(NOW);
+            let p = h("a1");
+            recording(&m, &p, U);
+            request(&m, U, &p, NOW - GRACE);
+            let late = NOW + 2 * VERIFY_AFTER;
+            m.on_before_delete(&format!("moderation/publishers/{p}"), move |m| {
+                m.set_now(late)
+            });
+            let report = sweep(&m, true, NOW).await.unwrap();
+            assert!(has(&report, &format!("deleted recording {p}")), "{report}");
+            let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
+            assert_eq!((r.state, r.deleted_at), (State::Deleted, Some(NOW)));
+
+            // An hour after the run's `now`, but not after the write.
+            let report = sweep(&m, true, NOW + VERIFY_AFTER).await.unwrap();
+            assert!(report.lines.is_empty(), "{report}");
+            assert!(m.get(&recording_key(U, &p)).await.unwrap().is_some());
+
+            // A push in flight lands just after the delete: deleted again,
+            // not fresh.
+            m.set_now(late + 10);
+            m.insert(&format!("blobs/{p}"), "blob");
+            let report = sweep(&m, true, late + VERIFY_AFTER).await.unwrap();
+            assert!(
+                has(&report, &format!("recreated recording {p}")),
+                "{report}"
+            );
+            assert!(gone(&m, &format!("blobs/{p}")).await);
+            assert!(m.get(&recording_key(U, &p)).await.unwrap().is_some());
+        }
+
+        /// Write `key`'s current body again at `at`: a tombstone a long
+        /// run wrote well after its `deletedAt`.
+        async fn rewrite_at(m: &MemObjects, key: &str, at: i64) {
+            let body = m.get(key).await.unwrap().unwrap();
+            m.set_now(at);
+            m.insert(key, body);
+        }
+
+        /// Of a hash's tombstones, the newest write counts.
+        #[tokio::test]
+        async fn a_hashs_newest_tombstone_write_counts() {
+            let m = MemObjects::default();
+            let p = h("a1");
+            tombstone(&m, U, &p);
+            operator_tombstone(&m, U2, &p, T);
+            // Its `deletedAt` is as old, its write an hour newer.
+            rewrite_at(&m, &operator_key(U2, &p), AT).await;
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(report.lines.is_empty(), "{report}");
+            assert!(m.deletes().is_empty());
+        }
+
+        /// A subject's tombstone too: a pointer an in-flight publish wrote
+        /// just after a late delete is deleted again, and, while its
+        /// catalog block stands, lists nothing meanwhile (rule 2), so the
+        /// recording it lists is deleted again too.
+        #[tokio::test]
+        async fn a_late_subject_tombstone_counts_from_its_own_write() {
+            let m = MemObjects::default();
+            let p = h("a1");
+            let late = T + 2 * VERIFY_AFTER;
+            subject_tombstone(&m, U);
+            tombstone(&m, U, &p);
+            rewrite_at(&m, &subject_key(U), late).await;
+            rewrite_at(&m, &recording_key(U, &p), late).await;
+            catalog_block(&m, U);
+            m.set_now(late + 10);
+            recording(&m, &p, U);
+            publish_2(&m, U, 1, b"doc-late", &[&p]);
+
+            let report = sweep(&m, true, late + VERIFY_AFTER).await.unwrap();
+            assert!(has(&report, &format!("recreated subject {U}")), "{report}");
+            assert!(
+                has(&report, &format!("recreated recording {p}")),
+                "{report}"
+            );
+            assert!(gone(&m, &format!("catalog-pointers/{U}")).await);
+            for key in recording_keys(&p) {
+                assert!(gone(&m, &key).await, "{key}");
+            }
+            assert!(m.get(&recording_key(U, &p)).await.unwrap().is_some());
+        }
+
+        /// Rule 1 counts only what a new push or publish writes. The node
+        /// writes an outboard itself when it serves a blob or envelope
+        /// that lacks one, so a newer outboard alone is a late write,
+        /// deleted again; a newer manifest or document is fresh.
+        #[tokio::test]
+        async fn a_newer_outboard_alone_is_not_fresh() {
+            let m = MemObjects::default();
+            let (p, e) = (h("a1"), h("e1"));
+            tombstone(&m, U, &p);
+            envelope_tombstone(&m, &e, U, T);
+            m.set_now(AT + 1);
+            m.insert(&format!("outboards/{p}"), "outboard");
+            m.insert(&format!("catalog-outboards/{e}"), "outboard");
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(
+                has(&report, &format!("recreated recording {p}")),
+                "{report}"
+            );
+            assert!(has(&report, &format!("recreated envelope {e}")), "{report}");
+            assert!(gone(&m, &format!("outboards/{p}")).await);
+            assert!(gone(&m, &format!("catalog-outboards/{e}")).await);
+
+            let m = MemObjects::default();
+            tombstone(&m, U, &p);
+            envelope_tombstone(&m, &e, U, T);
+            m.set_now(AT + 1);
+            m.insert(&format!("manifests/{p}"), "{}");
+            m.insert_with_owner(&format!("catalog-documents/{e}"), "doc", U);
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(has(&report, &format!("fresh recording {p}")), "{report}");
+            assert!(has(&report, &format!("fresh envelope {e}")), "{report}");
+            assert!(
+                m.deletes()
+                    .iter()
+                    .all(|k| k.starts_with("deletion-requests/"))
+            );
         }
 
         #[tokio::test]
@@ -2386,6 +2584,7 @@ mod tests {
             let m = MemObjects::default();
             let (p, q) = (h("a1"), h("a2"));
             let [_, second] = dropped(&m, &p);
+            m.set_now(NOW - VERIFY_AFTER);
             put(
                 &m,
                 &recording_key(U, &q),

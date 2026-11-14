@@ -23,7 +23,7 @@ use crate::moderation::{
     BLOCKS, Block, CATALOG_BLOCKS, CatalogBlock, SUSPENSIONS, Suspension, canonical_subject,
     valid_subject,
 };
-use crate::object_store::ObjectStore;
+use crate::object_store::{ObjectInfo, ObjectStore};
 use crate::ownership::{PUBLISHERS, parse_owner};
 
 /// Where a catalog envelope's objects live, each keyed by its catalog
@@ -43,6 +43,11 @@ pub struct Snapshot {
     /// ([`super::transition_key`]), `<sub>` the pointer key's.
     pub transitions: BTreeMap<String, Transition>,
     pub requests: Requests,
+    /// When each request record's current version was written, by its
+    /// full key (`deletion-requests/...`): S3's `LastModified`, Unix
+    /// seconds. A tombstone's is when its item was deleted, on S3's clock,
+    /// which tombstone verification measures from (spec 3.4 step 7).
+    pub request_written: BTreeMap<String, i64>,
     pub moderation: ModerationView,
     /// Each owner record (`moderation/publishers/<hash>`): hash → its
     /// subject, canonical.
@@ -94,13 +99,14 @@ pub async fn read<O: ObjectStore>(store: &O) -> anyhow::Result<Snapshot> {
     let envelope_objects = envelope_objects(store).await?;
     let catalogs = catalog_scan::scan(store).await?;
     let transitions = transitions(store).await?;
-    let requests = requests(store).await?;
+    let (requests, request_written) = requests(store).await?;
     let moderation = moderation(store).await?;
     let owners = owners(store).await?;
     Ok(Snapshot {
         catalogs,
         transitions,
         requests,
+        request_written,
         moderation,
         owners,
         envelope_objects,
@@ -127,7 +133,7 @@ async fn envelope_objects<O: ObjectStore>(store: &O) -> anyhow::Result<BTreeSet<
 
 async fn transitions<O: ObjectStore>(store: &O) -> anyhow::Result<BTreeMap<String, Transition>> {
     let mut transitions = BTreeMap::new();
-    for (key, body) in bodies(store, TRANSITIONS).await? {
+    for (ObjectInfo { key, .. }, body) in bodies(store, TRANSITIONS).await? {
         let transition = transition(&key, &body).with_context(|| format!("{key} unreadable"))?;
         transitions.insert(key, transition);
     }
@@ -154,27 +160,33 @@ fn transition(key: &str, body: &[u8]) -> anyhow::Result<Transition> {
     Ok(t)
 }
 
-async fn requests<O: ObjectStore>(store: &O) -> anyhow::Result<Requests> {
+/// Every request, and when each record was written, by key.
+async fn requests<O: ObjectStore>(store: &O) -> anyhow::Result<(Requests, BTreeMap<String, i64>)> {
     let mut requests = Requests::default();
-    for (key, body) in bodies(store, RECORDINGS).await? {
+    let mut written = BTreeMap::new();
+    for (ObjectInfo { key, modified }, body) in bodies(store, RECORDINGS).await? {
         let (names, request) =
             recording(&key, &body).with_context(|| format!("{key} unreadable"))?;
         requests.recordings.insert(names, request);
+        written.insert(key, modified);
     }
-    for (key, body) in bodies(store, ENVELOPES).await? {
+    for (ObjectInfo { key, modified }, body) in bodies(store, ENVELOPES).await? {
         let (hash, request) = envelope(&key, &body).with_context(|| format!("{key} unreadable"))?;
         requests.envelopes.insert(hash, request);
+        written.insert(key, modified);
     }
-    for (key, body) in bodies(store, OPERATOR).await? {
+    for (ObjectInfo { key, modified }, body) in bodies(store, OPERATOR).await? {
         let (names, request) =
             operator(&key, &body).with_context(|| format!("{key} unreadable"))?;
         requests.operator.insert(names, request);
+        written.insert(key, modified);
     }
-    for (key, body) in bodies(store, SUBJECTS).await? {
+    for (ObjectInfo { key, modified }, body) in bodies(store, SUBJECTS).await? {
         let (sub, request) = subject(&key, &body).with_context(|| format!("{key} unreadable"))?;
         requests.subjects.insert(sub, request);
+        written.insert(key, modified);
     }
-    Ok(requests)
+    Ok((requests, written))
 }
 
 fn recording(key: &str, body: &[u8]) -> anyhow::Result<((String, String), RecordingRequest)> {
@@ -219,7 +231,7 @@ fn subject(key: &str, body: &[u8]) -> anyhow::Result<(String, SubjectRequest)> {
 /// types; active ones make the view.
 async fn moderation<O: ObjectStore>(store: &O) -> anyhow::Result<ModerationView> {
     let mut view = ModerationView::default();
-    for (key, body) in bodies(store, &moderation_prefix(SUSPENSIONS)).await? {
+    for (ObjectInfo { key, .. }, body) in bodies(store, &moderation_prefix(SUSPENSIONS)).await? {
         let s =
             moderation_record::<Suspension>(&key, &body, SUSPENSIONS, "subject", |s| &s.subject)?;
         if s.lifted_at.is_none() && s.hide_catalog {
@@ -227,13 +239,13 @@ async fn moderation<O: ObjectStore>(store: &O) -> anyhow::Result<ModerationView>
                 .insert(canonical_subject(&s.subject).to_string());
         }
     }
-    for (key, body) in bodies(store, &moderation_prefix(BLOCKS)).await? {
+    for (ObjectInfo { key, .. }, body) in bodies(store, &moderation_prefix(BLOCKS)).await? {
         let b = moderation_record::<Block>(&key, &body, BLOCKS, "hash", |b| &b.hash)?;
         if b.lifted_at.is_none() {
             view.blocked.insert(b.hash.to_ascii_lowercase());
         }
     }
-    for (key, body) in bodies(store, &moderation_prefix(CATALOG_BLOCKS)).await? {
+    for (ObjectInfo { key, .. }, body) in bodies(store, &moderation_prefix(CATALOG_BLOCKS)).await? {
         let b = moderation_record::<CatalogBlock>(&key, &body, CATALOG_BLOCKS, "subject", |b| {
             &b.subject
         })?;
@@ -266,7 +278,7 @@ fn moderation_record<T: DeserializeOwned>(
 /// Owner records, through [`parse_owner`]: hash → canonical subject.
 async fn owners<O: ObjectStore>(store: &O) -> anyhow::Result<HashMap<String, String>> {
     let mut owners = HashMap::new();
-    for (key, body) in bodies(store, &moderation_prefix(PUBLISHERS)).await? {
+    for (ObjectInfo { key, .. }, body) in bodies(store, &moderation_prefix(PUBLISHERS)).await? {
         let parse = || {
             let [hash] = names(&key, &moderation_prefix(PUBLISHERS))?;
             let owner = parse_owner(lower_hex(hash)?, &body)?;
@@ -282,22 +294,26 @@ fn moderation_prefix(kind: &str) -> String {
     format!("moderation/{kind}/")
 }
 
-/// Every object listed under `prefix`, with its body. A read that fails,
-/// or finds the object gone since the listing, names the key.
-async fn bodies<O: ObjectStore>(store: &O, prefix: &str) -> anyhow::Result<Vec<(String, Bytes)>> {
+/// Every object listed under `prefix`, as listed (its key and write
+/// time), with its body. A read that fails, or finds the object gone since
+/// the listing, names the key.
+async fn bodies<O: ObjectStore>(
+    store: &O,
+    prefix: &str,
+) -> anyhow::Result<Vec<(ObjectInfo, Bytes)>> {
     let mut out = Vec::new();
     for listed in store
         .list(prefix)
         .await
         .with_context(|| format!("listing {prefix} failed"))?
     {
-        let key = listed.key;
+        let key = &listed.key;
         let body = store
-            .get(&key)
+            .get(key)
             .await
             .with_context(|| format!("{key} unreadable"))?
             .with_context(|| format!("{key} vanished during the read"))?;
-        out.push((key, body));
+        out.push((listed, body));
     }
     Ok(out)
 }
@@ -362,7 +378,7 @@ mod tests {
     };
     use crate::object_store::mem::{MemObjects, Op};
     use serde_json::json;
-    use std::collections::{BTreeSet, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
     const U: &str = "550e8400-e29b-41d4-a716-446655440000";
     const U2: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
@@ -423,6 +439,8 @@ mod tests {
             serde_json::to_vec(&transition(&arkavo, 2, &h("d2"))).unwrap(),
         );
 
+        // The requests are written at 7.
+        m.set_now(7);
         put(
             &m,
             &recording_key(U, &h("aa")),
@@ -549,6 +567,16 @@ mod tests {
             Some(20)
         );
         assert_eq!(requests.subjects.keys().collect::<Vec<_>>(), ["c1"]);
+        assert_eq!(
+            snapshot.request_written,
+            BTreeMap::from([
+                (recording_key(U, &h("aa")), 7),
+                (envelope_key(&h("e1")), 7),
+                (operator_key("u2", &h("b1")), 7),
+                (subject_key("c1"), 7),
+            ]),
+            "each request record's write time, by key"
+        );
 
         assert_eq!(snapshot.catalogs.pointers.len(), 1);
         assert_eq!(snapshot.catalogs.pointers[0].subject, U);
