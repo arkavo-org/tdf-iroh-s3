@@ -48,11 +48,11 @@ use crate::publish_decision::{
 pub const DEFAULT_PUBLISH_ENTITLEMENT: &str =
     "https://patreon.arkavo.com/attr/arkavo-creator/value/publish";
 
-const SUSPENSIONS: &str = "suspensions";
-const BLOCKS: &str = "blocks";
+pub(crate) const SUSPENSIONS: &str = "suspensions";
+pub(crate) const BLOCKS: &str = "blocks";
 /// `moderation/catalog-blocks/<subject>`: a sibling of `blocks/`, because
 /// records are listed recursively and would otherwise be read as blocks.
-const CATALOG_BLOCKS: &str = "catalog-blocks";
+pub(crate) const CATALOG_BLOCKS: &str = "catalog-blocks";
 const AUDIT: &str = "audit";
 const MAX_REASON_CHARS: usize = 1_000;
 
