@@ -257,6 +257,16 @@ fn pointer_etag(seq: u64) -> String {
     format!("\"{seq}\"")
 }
 
+/// Whether `GET /v2/catalogs/{sub}` hides `sub`'s stored pointer at
+/// `catalog_hash` from every reader: its owner is hidden (an active catalog
+/// block, or a suspension with `hideCatalog`), or its catalog is blocked.
+/// `GET` serves no pointer at a catalog without an index record either
+/// (from before envelopes). `PUT`'s preconditions see what `GET` serves, so
+/// both decide with this.
+fn pointer_hidden<S: TagStore>(api: &ApiState<S>, sub: &str, catalog_hash: &str) -> bool {
+    owner_hidden(api, Some(sub)) || is_blocked(api, catalog_hash)
+}
+
 /// The base a publish names, in one of the two forms Creator sends
 /// (`docs/creator-catalogs.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -494,12 +504,13 @@ async fn put_catalog<S: TagStore>(
         None => false,
     };
     let current_seq = current.as_ref().filter(|_| live).map(|(_, info)| info.seq);
-    // Preconditions see what `GET` serves: a pointer whose catalog is
-    // blocked reads as none, so a client that got the 404 can publish with
-    // `If-None-Match: *`.
+    // Preconditions see what `GET` serves: a pointer it hides (a hidden
+    // owner, a blocked catalog) reads as none, so a client that got the 404
+    // can publish with `If-None-Match: *`. The seq above is still the
+    // stored one's.
     let served_seq = current
         .as_ref()
-        .filter(|(_, info)| live && !is_blocked(api, &info.catalog_hash))
+        .filter(|(_, info)| live && !pointer_hidden(api, &sub, &info.catalog_hash))
         .map(|(_, info)| info.seq);
     if !precondition.holds(served_seq.map(pointer_etag).as_deref()) {
         return Err(reject(
@@ -748,9 +759,6 @@ async fn get_pointer<S: TagStore>(
         return Err(fail(StatusCode::BAD_REQUEST, "invalid subject"));
     }
     let not_found = || fail(StatusCode::NOT_FOUND, "catalog not found");
-    if owner_hidden(api, Some(&sub)) {
-        return Err(not_found());
-    }
     let stored = match api.store.get_catalog_pointer(&sub).await {
         Ok(Some(stored)) => stored,
         Ok(None) => return Err(not_found()),
@@ -760,7 +768,7 @@ async fn get_pointer<S: TagStore>(
         seq, catalog_hash, ..
     } = stored_pointer(&stored.body)
         .map_err(|e| storage_unavailable("Catalog pointer parse", e))?;
-    if is_blocked(api, &catalog_hash) {
+    if pointer_hidden(api, &sub, &catalog_hash) {
         return Err(not_found());
     }
     // A pointer at a catalog from before envelopes has no attribute to
@@ -1649,6 +1657,48 @@ mod tests {
         let r = publish_if(&h, 4, &fresh, header::IF_NONE_MATCH, "*").await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
         assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"4\"");
+    }
+
+    /// The stored pointer's seq, as the node stored it.
+    async fn stored_seq(h: &Harness) -> u64 {
+        stored_pointer(&h.store.catalog_pointers.lock().await[SUB].0)
+            .unwrap()
+            .seq
+    }
+
+    /// A creator whose catalog is blocked, unsuspended, still publishes:
+    /// `GET` answers 404, so preconditions see no pointer, but the seq must
+    /// still exceed the stored one.
+    #[tokio::test]
+    async fn a_catalog_blocked_creator_reads_as_none_to_preconditions() {
+        let fresh = envelope(2);
+        // Unblocked, the stored pointer is the base.
+        let h = ingested().await;
+        assert_eq!(publish(&h, 3, &envelope(1)).await.status, StatusCode::OK);
+        let r = publish_if(&h, 4, &fresh, header::IF_NONE_MATCH, "*").await;
+        assert_precondition_failed(&h, r, &fresh, 1).await;
+        let r = publish_if(&h, 4, &fresh, header::IF_MATCH, "\"3\"").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        assert_eq!(stored_seq(&h).await, 4);
+
+        // Blocked: the 404 path.
+        let h = ingested().await;
+        assert_eq!(publish(&h, 3, &envelope(1)).await.status, StatusCode::OK);
+        h.moderation.block_catalog_for_test(SUB);
+        assert_eq!(get(&h, SUB).await.status, StatusCode::NOT_FOUND);
+        let r = publish_if(&h, 4, &fresh, header::IF_MATCH, "\"3\"").await;
+        assert_precondition_failed(&h, r, &fresh, 1).await;
+        for seq in [2, 3] {
+            let r = publish_if(&h, seq, &fresh, header::IF_NONE_MATCH, "*").await;
+            assert_eq!(
+                (r.status, r.error().as_str()),
+                (StatusCode::CONFLICT, "seq must be greater than 3")
+            );
+        }
+        let r = publish_if(&h, 4, &fresh, header::IF_NONE_MATCH, "*").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        assert_eq!(stored_seq(&h).await, 4);
+        assert_eq!(get(&h, SUB).await.status, StatusCode::NOT_FOUND);
     }
 
     /// Exactly one of `If-Match: "<seq>"` or `If-None-Match: *`, each one
