@@ -1,20 +1,52 @@
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::RequestChecksumCalculation;
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::primitives::{ByteStream, DateTime};
 use bytes::Bytes;
 use std::path::Path;
 
 use crate::config::S3Config;
+use crate::object_store::{ObjectInfo, ObjectStore, VersionInfo};
 
 /// User metadata key holding a catalog document's owner
 /// (`x-amz-meta-owner`).
 pub const CATALOG_OWNER_METADATA: &str = "owner";
 
+/// Keys per page of an `ObjectStore` listing: S3's maximum.
+const DEFAULT_LIST_PAGE_SIZE: i32 = 1000;
+
 pub struct S3Client {
     client: Client,
     bucket: String,
     prefix: String,
+    list_page_size: i32,
+}
+
+/// Whether a conditional write lost: 412, the condition failed, or 409, a
+/// concurrent conditional write to the same key is in progress.
+fn lost_condition<E>(e: &SdkError<E>) -> bool {
+    e.raw_response()
+        .is_some_and(|r| matches!(r.status().as_u16(), 409 | 412))
+}
+
+/// The versions of exactly `key` in a listing of `key` as a prefix (which
+/// also returns `key…`), each paired with whether it is the current one.
+/// The current one goes last, so a delete that stops part-way leaves what
+/// readers see as it was: an older version never comes back.
+fn versions_of(key: &str, listed: Vec<(VersionInfo, bool)>) -> Vec<VersionInfo> {
+    let mut versions: Vec<(VersionInfo, bool)> =
+        listed.into_iter().filter(|(v, _)| v.key == key).collect();
+    versions.sort_by_key(|&(_, current)| current);
+    versions.into_iter().map(|(v, _)| v).collect()
+}
+
+/// A listed entry's write time in Unix seconds. Missing is an error: a
+/// made-up time could make a fresh write look old.
+fn unix_secs(modified: Option<&DateTime>, listed: &str) -> Result<i64> {
+    modified
+        .map(DateTime::secs)
+        .with_context(|| format!("S3 listed {listed} with no last-modified time"))
 }
 
 impl S3Client {
@@ -47,6 +79,7 @@ impl S3Client {
             client: Client::from_conf(builder.build()),
             bucket: config.bucket.clone(),
             prefix: config.prefix.clone(),
+            list_page_size: DEFAULT_LIST_PAGE_SIZE,
         })
     }
 
@@ -61,6 +94,7 @@ impl S3Client {
             client,
             bucket: bucket.to_string(),
             prefix: prefix.to_string(),
+            list_page_size: DEFAULT_LIST_PAGE_SIZE,
         }
     }
 
@@ -81,7 +115,112 @@ impl S3Client {
             client: Client::from_conf(config),
             bucket: bucket.to_string(),
             prefix: String::new(),
+            list_page_size: DEFAULT_LIST_PAGE_SIZE,
         }
+    }
+
+    /// Page `ObjectStore` listings by `n` keys instead of 1000, so tests
+    /// can make a listing span pages.
+    pub fn with_list_page_size(mut self, n: i32) -> Self {
+        self.list_page_size = n;
+        self
+    }
+
+    /// An `ObjectStore` key (relative to the `[s3] prefix`) as stored.
+    fn object_key(&self, key: &str) -> String {
+        format!("{}{}", self.prefix, key)
+    }
+
+    /// A key S3 listed for `prefix`, relative to the `[s3] prefix`. A key
+    /// outside the listing's prefix is an error.
+    fn relative_key(&self, listed: &str, prefix: &str) -> Result<String> {
+        listed
+            .strip_prefix(self.prefix.as_str())
+            .filter(|key| key.starts_with(prefix))
+            .map(str::to_string)
+            .with_context(|| {
+                format!(
+                    "S3 listed {listed}, outside the prefix {}{prefix}",
+                    self.prefix
+                )
+            })
+    }
+
+    /// Every version and delete marker under `prefix`, each with whether it
+    /// is the current one, across every page.
+    async fn list_versions_marked(&self, prefix: &str) -> Result<Vec<(VersionInfo, bool)>> {
+        let full = self.object_key(prefix);
+        let mut out = Vec::new();
+        let mut key_marker: Option<String> = None;
+        let mut version_id_marker: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_object_versions()
+                .bucket(&self.bucket)
+                .prefix(&full)
+                .max_keys(self.list_page_size);
+            if let Some(marker) = &key_marker {
+                req = req.key_marker(marker);
+            }
+            if let Some(marker) = &version_id_marker {
+                req = req.version_id_marker(marker);
+            }
+            let resp = req
+                .send()
+                .await
+                .with_context(|| format!("Failed to LIST versions under {full} in S3"))?;
+            let versions = resp.versions().iter().map(|v| {
+                (
+                    v.key(),
+                    v.version_id(),
+                    v.last_modified(),
+                    v.is_latest(),
+                    false,
+                )
+            });
+            let markers = resp.delete_markers().iter().map(|m| {
+                (
+                    m.key(),
+                    m.version_id(),
+                    m.last_modified(),
+                    m.is_latest(),
+                    true,
+                )
+            });
+            for (key, version_id, modified, latest, delete_marker) in versions.chain(markers) {
+                let listed = key.context("S3 listed a version with no key")?;
+                let version_id = version_id
+                    .with_context(|| format!("S3 listed a version of {listed} with no ID"))?;
+                out.push((
+                    VersionInfo {
+                        key: self.relative_key(listed, prefix)?,
+                        version_id: version_id.to_string(),
+                        delete_marker,
+                        modified: unix_secs(modified, listed)?,
+                    },
+                    latest.unwrap_or(false),
+                ));
+            }
+            if resp.is_truncated() != Some(true) {
+                break;
+            }
+            // Without both markers the next page could skip versions.
+            key_marker = Some(
+                resp.next_key_marker()
+                    .context("S3 cut a version listing short with no next key marker")?
+                    .to_string(),
+            );
+            version_id_marker = Some(
+                resp.next_version_id_marker()
+                    .context("S3 cut a version listing short with no next version ID marker")?
+                    .to_string(),
+            );
+        }
+        // S3 lists in key order, but the SDK splits each page into versions
+        // and delete markers. A stable sort restores key order.
+        out.sort_by(|(a, _), (b, _)| a.key.cmp(&b.key));
+        Ok(out)
     }
 
     pub fn blob_key(&self, hash_hex: &str) -> String {
@@ -576,18 +715,8 @@ impl S3Client {
         };
         match put.send().await {
             Ok(_) => Ok(true),
-            // 412: the condition failed; 409: a concurrent conditional
-            // write to the same key is in progress.
-            Err(e)
-                if e.raw_response()
-                    .is_some_and(|r| matches!(r.status().as_u16(), 409 | 412)) =>
-            {
-                Ok(false)
-            }
-            Err(e) => Err(anyhow::anyhow!(
-                "Failed to PUT catalog pointer to S3: {}",
-                e
-            )),
+            Err(e) if lost_condition(&e) => Ok(false),
+            Err(e) => Err(anyhow::Error::new(e).context("Failed to PUT catalog pointer to S3")),
         }
     }
 
@@ -628,7 +757,8 @@ impl S3Client {
     }
 
     /// Create one moderation record (`moderation/<kind>/<key>`) only if
-    /// none exists (`If-None-Match: *`). `false` when one already does.
+    /// none exists (`If-None-Match: *`). `false` when one already does, or
+    /// when a concurrent conditional write to it is in progress.
     pub async fn create_moderation_record(
         &self,
         kind: &str,
@@ -647,18 +777,10 @@ impl S3Client {
             .await
         {
             Ok(_) => Ok(true),
-            // 412: the record exists; 409: a concurrent conditional write
-            // to the same key is in progress.
-            Err(e)
-                if e.raw_response()
-                    .is_some_and(|r| matches!(r.status().as_u16(), 409 | 412)) =>
-            {
-                Ok(false)
+            Err(e) if lost_condition(&e) => Ok(false),
+            Err(e) => {
+                Err(anyhow::Error::new(e).context("Failed to create moderation record in S3"))
             }
-            Err(e) => Err(anyhow::anyhow!(
-                "Failed to create moderation record in S3: {}",
-                e
-            )),
         }
     }
 
@@ -717,5 +839,231 @@ impl S3Client {
             }
         }
         Ok(out)
+    }
+}
+
+/// The bucket for the offline commands. Keys are relative to the `[s3]
+/// prefix`.
+impl ObjectStore for S3Client {
+    async fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>> {
+        let full = self.object_key(prefix);
+        let mut out = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&full)
+                .max_keys(self.list_page_size);
+            if let Some(token) = &continuation {
+                req = req.continuation_token(token);
+            }
+            let resp = req
+                .send()
+                .await
+                .with_context(|| format!("Failed to LIST {full} in S3"))?;
+            for obj in resp.contents() {
+                let listed = obj.key().context("S3 listed an object with no key")?;
+                out.push(ObjectInfo {
+                    key: self.relative_key(listed, prefix)?,
+                    modified: unix_secs(obj.last_modified(), listed)?,
+                });
+            }
+            if resp.is_truncated() != Some(true) {
+                break;
+            }
+            continuation = Some(
+                resp.next_continuation_token()
+                    .context("S3 cut a listing short with no continuation token")?
+                    .to_string(),
+            );
+        }
+        Ok(out)
+    }
+
+    async fn list_versions(&self, prefix: &str) -> Result<Vec<VersionInfo>> {
+        Ok(self
+            .list_versions_marked(prefix)
+            .await?
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect())
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<Bytes>> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(self.object_key(key))
+            .send()
+            .await
+        {
+            Ok(resp) => Ok(Some(
+                resp.body
+                    .collect()
+                    .await
+                    .with_context(|| format!("Failed to read {key} from S3"))?
+                    .into_bytes(),
+            )),
+            Err(e) if e.as_service_error().is_some_and(|se| se.is_no_such_key()) => Ok(None),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("Failed to GET {key} from S3"))),
+        }
+    }
+
+    async fn head_owner(&self, key: &str) -> Result<Option<Option<String>>> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(self.object_key(key))
+            .send()
+            .await
+        {
+            Ok(head) => Ok(Some(
+                head.metadata()
+                    .and_then(|m| m.get(CATALOG_OWNER_METADATA))
+                    .cloned(),
+            )),
+            Err(e) if e.as_service_error().is_some_and(|se| se.is_not_found()) => Ok(None),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("Failed to HEAD {key} in S3"))),
+        }
+    }
+
+    async fn put(&self, key: &str, body: Bytes) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.object_key(key))
+            .body(body.into())
+            .send()
+            .await
+            .with_context(|| format!("Failed to PUT {key} to S3"))?;
+        Ok(())
+    }
+
+    async fn create(&self, key: &str, body: Bytes) -> Result<bool> {
+        match self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.object_key(key))
+            .if_none_match("*")
+            .body(body.into())
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) if lost_condition(&e) => Ok(false),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("Failed to create {key} in S3"))),
+        }
+    }
+
+    /// Call 12: list `key`'s versions with `key` as the prefix, keep exact
+    /// matches, then one `DeleteObject` with `VersionId` per version and
+    /// delete marker, the current one last. A failure part-way leaves the
+    /// rest for the next run.
+    async fn delete_all_versions(&self, key: &str) -> Result<usize> {
+        let versions = versions_of(key, self.list_versions_marked(key).await?);
+        for v in &versions {
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(self.object_key(key))
+                .version_id(&v.version_id)
+                .send()
+                .await
+                .with_context(|| {
+                    format!("Failed to DELETE version {} of {key} from S3", v.version_id)
+                })?;
+        }
+        Ok(versions.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn version(key: &str, id: &str, delete_marker: bool) -> VersionInfo {
+        VersionInfo {
+            key: key.to_string(),
+            version_id: id.to_string(),
+            delete_marker,
+            modified: 0,
+        }
+    }
+
+    #[test]
+    fn the_list_page_size_defaults_to_1000() {
+        let s3 = S3Client::new_mock("bucket", "us-east-1", "");
+        assert_eq!(s3.list_page_size, 1000);
+        assert_eq!(s3.with_list_page_size(2).list_page_size, 2);
+    }
+
+    #[test]
+    fn listed_keys_lose_the_s3_prefix() {
+        let s3 = S3Client::new_mock("bucket", "us-east-1", "run-1/");
+        assert_eq!(
+            s3.relative_key("run-1/blobs/aa", "blobs/").unwrap(),
+            "blobs/aa"
+        );
+        assert_eq!(s3.relative_key("run-1/blobs/aa", "").unwrap(), "blobs/aa");
+        assert!(s3.relative_key("run-2/blobs/aa", "blobs/").is_err());
+        assert!(s3.relative_key("blobs/aa", "blobs/").is_err());
+        assert!(s3.relative_key("run-1/manifests/aa", "blobs/").is_err());
+
+        let bare = S3Client::new_mock("bucket", "us-east-1", "");
+        assert_eq!(bare.relative_key("blobs/aa", "blobs/").unwrap(), "blobs/aa");
+    }
+
+    /// Call 12: a listing of `blobs/aa` as a prefix also returns
+    /// `blobs/aab`, which must survive. The current version goes last, so a
+    /// delete that stops part-way never brings back an older version.
+    #[test]
+    fn only_the_exact_key_is_deleted_its_current_version_last() {
+        let listed = vec![
+            (version("blobs/aa", "v3", false), true),
+            (version("blobs/aa", "v2", false), false),
+            (version("blobs/aab", "v9", false), true),
+            (version("blobs/aa", "v1", false), false),
+            (version("blobs/aa", "m1", true), false),
+        ];
+        let ids: Vec<String> = versions_of("blobs/aa", listed)
+            .into_iter()
+            .map(|v| v.version_id)
+            .collect();
+        assert_eq!(ids, ["v2", "v1", "m1", "v3"]);
+    }
+
+    /// A key whose current version is a delete marker: the marker goes last.
+    #[test]
+    fn a_current_delete_marker_is_deleted_last() {
+        let listed = vec![
+            (version("k", "v1", false), false),
+            (version("k", "m2", true), true),
+        ];
+        let ids: Vec<String> = versions_of("k", listed)
+            .into_iter()
+            .map(|v| v.version_id)
+            .collect();
+        assert_eq!(ids, ["v1", "m2"]);
+    }
+
+    #[test]
+    fn a_lost_condition_is_409_or_412_only() {
+        use aws_sdk_s3::config::http::HttpResponse;
+        use aws_sdk_s3::operation::put_object::PutObjectError;
+        use aws_sdk_s3::primitives::SdkBody;
+
+        let failed = |status: u16| -> SdkError<PutObjectError> {
+            let raw = HttpResponse::new(status.try_into().unwrap(), SdkBody::empty());
+            SdkError::service_error(PutObjectError::unhandled("x"), raw)
+        };
+        assert!(lost_condition(&failed(412)));
+        assert!(lost_condition(&failed(409)));
+        assert!(!lost_condition(&failed(403)));
+        assert!(!lost_condition(&failed(500)));
     }
 }
