@@ -6,7 +6,8 @@
 //! the served base catalog and what it added. The offline sweep folds only
 //! committed transitions, those reachable from a current pointer by `base`
 //! links, into deletion requests; a transition from a publish that lost the
-//! pointer race is never reachable.
+//! pointer race is never reachable. Deleting an account deletes its
+//! transitions, its publish history, with its pointers.
 //!
 //! The requests (spec 3.2) live under `deletion-requests/`, written only by
 //! the sweep and the operator commands. Their keys carry canonical subjects
@@ -157,7 +158,8 @@ pub struct OperatorRequest {
 }
 
 /// `deletion-requests/subjects/<sub>`: an operator asked for everything
-/// `sub` published to go (`request-deletion --all`), its pointers included.
+/// `sub` published to go (`request-deletion --all`), its pointers and its
+/// transitions included.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubjectRequest {

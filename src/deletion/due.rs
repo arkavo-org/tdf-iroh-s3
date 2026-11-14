@@ -137,7 +137,9 @@ pub enum Item {
     /// than the push restarts its grace from it (`sweep::pushed_again`);
     /// otherwise it deletes exactly the versions it listed.
     Recording { hash: String, requests: Vec<String> },
-    /// Subject (canonical): its pointers in `S`, then `subjects/<sub>`.
+    /// Subject (canonical): its pointers in `S`, then every transition
+    /// under either of its keys (`catalog-transitions/<sub>/`), then
+    /// `subjects/<sub>`.
     Subject(String),
     /// Envelope hash: `catalog-documents/`, `catalog-outboards/`,
     /// `catalog-indexes/`, then `envelopes/<hash>`.

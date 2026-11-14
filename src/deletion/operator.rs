@@ -15,8 +15,8 @@
 //!   re-checks both (`due::all_lifted`). Writes a scope-`subject`
 //!   `operator/<sub>/<hash>` for every hash in a live index of the
 //!   account's pointers and every hash its owner records name, then
-//!   `subjects/<sub>`, which deletes its pointers. That is its whole
-//!   coverage: anything else needs `--hash`.
+//!   `subjects/<sub>`, which deletes its pointers and its transitions.
+//!   That is its whole coverage: anything else needs `--hash`.
 //!
 //! Both read the bucket strictly first ([`snapshot::read`]) and check every
 //! precondition before they write anything, so an unreadable record or an

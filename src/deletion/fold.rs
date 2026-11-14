@@ -7,6 +7,12 @@
 //! deleted), applies the chains oldest first, and sorts every transition
 //! no pointer reaches into lost (deleted unfolded) or kept.
 //!
+//! A deleted account's transitions go with it: the sweep deletes them
+//! with its pointers. One written after that, by a publish in flight when
+//! the account was deleted, is lost whatever its age, while the account's
+//! `subjects/` tombstone stands and it has no pointer: never folded, so a
+//! deleted account's publish history isn't kept forever (`no pointer`).
+//!
 //! Requests are per canonical subject, and one subject can have two
 //! pointer keys (`arkavo:<uuid>` and `<uuid>`). So a subject's chains
 //! apply as one sequence in time order, each chain still oldest first:
@@ -40,6 +46,8 @@ const YOUNG: &str = "younger than grace";
 /// Why an unreachable transition is kept: its publish may still land.
 const AHEAD: &str = "seq above the current pointer";
 /// Why an unreachable transition is kept: nothing says its publish lost.
+/// Its account's deletion does, when the account has a `deleted`
+/// `subjects/` record and no pointer under either key: then it is lost.
 const NO_POINTER: &str = "no pointer";
 /// Why a chain is kept unfolded: its `base` links never end.
 const CYCLE: &str = "a cycle in its chain";
@@ -69,7 +77,10 @@ pub struct Fold {
     pub folded: Vec<String>,
     /// Transitions no pointer reaches, at least [`GRACE`] old, whose
     /// subject's current pointer has a `seq` at least theirs: publishes
-    /// that lost the pointer race. Deleted unfolded.
+    /// that lost the pointer race. And, whatever their age, those whose
+    /// canonical subject has a `deleted` `subjects/` record and no pointer
+    /// under either key: publishes in flight when the sweep deleted the
+    /// account, which took its transitions. Deleted unfolded.
     pub lost: Vec<String>,
     /// Transitions left as they are, with why: unreachable ones not yet
     /// lost, and each transition of a chain whose `base` links cycle.
@@ -128,12 +139,21 @@ pub fn fold(snapshot: &Snapshot, now: i64) -> Fold {
         .iter()
         .map(|p| (pointer_sub(p), p.seq))
         .collect();
+    // Canonical subjects with a pointer under either key.
+    let pointed: HashSet<&str> = catalogs
+        .pointers
+        .iter()
+        .map(|p| canonical_subject(pointer_sub(p)))
+        .collect();
     let mut lost = Vec::new();
     for (key, t) in transitions {
         if reached.contains(key) {
             continue;
         }
-        let why = if t.at.saturating_add(GRACE) > now {
+        let subject = canonical_subject(&t.subject);
+        let why = if deleted_account(stored, subject) && !pointed.contains(subject) {
+            None
+        } else if t.at.saturating_add(GRACE) > now {
             Some(YOUNG)
         } else {
             match current.get(t.subject.as_str()) {
@@ -161,6 +181,15 @@ pub fn fold(snapshot: &Snapshot, now: i64) -> Fold {
         lost,
         kept,
     }
+}
+
+/// Whether `subject` (canonical) has a `deleted` `subjects/` record: the
+/// sweep deleted the account, its transitions with its pointers.
+fn deleted_account(requests: &Requests, subject: &str) -> bool {
+    requests
+        .subjects
+        .get(subject)
+        .is_some_and(|r| r.state == State::Deleted)
 }
 
 /// Transitions of one pointer's chain, with their keys.
@@ -308,8 +337,8 @@ mod tests {
     use super::*;
     use crate::catalog_scan::{POINTERS, ScannedPointer};
     use crate::deletion::{
-        EnvelopeRequest, GRACE, RecordingRequest, Source, State, Transition, TransitionBase,
-        transition_key, transition_name,
+        EnvelopeRequest, GRACE, RecordingRequest, Source, State, SubjectRequest, Transition,
+        TransitionBase, transition_key, transition_name,
     };
     use crate::moderation::canonical_subject;
 
@@ -749,6 +778,84 @@ mod tests {
         assert_eq!(kept, expected);
         assert!(out.lost.is_empty());
         assert!(out.requests.recordings.is_empty());
+    }
+
+    /// `subjects/<sub>`, deleted (a tombstone) or pending.
+    fn subject_request(s: &mut Snapshot, sub: &str, state: State) {
+        s.requests.subjects.insert(
+            sub.to_string(),
+            SubjectRequest {
+                subject: sub.to_string(),
+                requested_at: 1,
+                reason: "account closed".into(),
+                state,
+                deleted_at: (state == State::Deleted).then_some(NOW - 10),
+            },
+        );
+    }
+
+    /// A transition no pointer reaches whose account was deleted (a
+    /// `deleted` `subjects/` record, and no pointer under either key) is a
+    /// publish that was in flight when the sweep deleted the account: lost,
+    /// whatever its age, under either key.
+    #[test]
+    fn a_deleted_subjects_transition_is_lost_at_any_age() {
+        let p = h("a1");
+        let arkavo = format!("arkavo:{U}");
+        let young = losing(U, 2, NOW, &[&p]);
+        let old = losing(&arkavo, 1, NOW - 2 * GRACE, &[&p]);
+        // Another account's, with no record: kept, as ever.
+        let other = losing("u2", 1, NOW - 2 * GRACE, &[&p]);
+        let keys = [key_of(&young), key_of(&old), key_of(&other)];
+        let snapshot = |record: Option<State>| {
+            let mut s = Snapshot::default();
+            for t in [&young, &old, &other] {
+                store(&mut s, t.clone());
+            }
+            if let Some(state) = record {
+                subject_request(&mut s, U, state);
+            }
+            s
+        };
+
+        let out = fold(&snapshot(Some(State::Deleted)), NOW);
+        let mut lost = vec![keys[0].clone(), keys[1].clone()];
+        lost.sort();
+        assert_eq!(out.lost, lost);
+        assert_eq!(out.kept, [(keys[2].clone(), "no pointer")]);
+        assert!(out.folded.is_empty());
+        assert!(
+            out.requests.recordings.is_empty(),
+            "a lost transition is never applied"
+        );
+
+        // A pending record, or none: `no pointer` and `younger than grace`
+        // keep their meaning.
+        for record in [Some(State::Pending), None] {
+            let out = fold(&snapshot(record), NOW);
+            assert!(out.lost.is_empty(), "{record:?}: {:?}", out.lost);
+            let mut kept = out.kept.clone();
+            kept.sort();
+            let mut expected = vec![
+                (keys[0].clone(), "younger than grace"),
+                (keys[1].clone(), "no pointer"),
+                (keys[2].clone(), "no pointer"),
+            ];
+            expected.sort();
+            assert_eq!(kept, expected, "{record:?}");
+        }
+
+        // A pointer under either key: the account is back, or its late
+        // pointer is still to be deleted again. The usual rules hold.
+        let mut s = snapshot(Some(State::Deleted));
+        point(&mut s, &arkavo, 1);
+        let out = fold(&s, NOW);
+        assert_eq!(out.lost, [keys[1].clone()], "seq at most the pointer's");
+        assert!(
+            out.kept.contains(&(keys[0].clone(), "younger than grace")),
+            "{:?}",
+            out.kept
+        );
     }
 
     #[test]
