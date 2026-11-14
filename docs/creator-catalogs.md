@@ -162,7 +162,7 @@ The lists below are complete. `invalid hash` and `storage unavailable` are this 
 - **502:** `storage unavailable` when the owner record can't be read; `invalid token` when the node can't fetch the key set to check the token.
 - **503:** *`pdp` only:* `decision service unavailable`.
 
-On a node with `[publishing] required = false` only the token is checked, without the audience: its refusals are 401 `missing bearer token` or `invalid token`, 502 `invalid token`, and the route's own 400 `invalid hash` and 502 `storage unavailable`.
+On a node with `[publishing] required = false` only the token is checked, without the audience: its refusals are 401 `missing bearer token` or `invalid token`, 502 `invalid token`, and the route's own 400 `invalid hash`.
 
 ### `GET /node`: the node's iroh identity
 
