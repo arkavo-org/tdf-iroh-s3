@@ -16,6 +16,7 @@ use tdf_iroh_s3::config::{AuthzConfig, Config, PublishDecisions};
 use tdf_iroh_s3::moderation::{self, Moderation, ModerationApi, PublishGate, PublishPolicy};
 use tdf_iroh_s3::node::TdfIrohNode;
 use tdf_iroh_s3::node_api;
+use tdf_iroh_s3::ownership::OwnerStore;
 use tdf_iroh_s3::publish_decision::PublishDecider;
 use tdf_iroh_s3::ssm;
 use tdf_iroh_s3::store::s3::S3Client;
@@ -130,6 +131,7 @@ async fn main() -> Result<()> {
         }
         Some(Arc::new(
             PublishGate::new(view)
+                .with_owner_store(Arc::clone(&store) as Arc<dyn OwnerStore>)
                 .with_session_store(store)
                 .with_decider(Arc::clone(&decider))
                 .with_session_ttl(std::time::Duration::from_secs(

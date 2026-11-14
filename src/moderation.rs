@@ -40,6 +40,7 @@ use tracing::{info, warn};
 use crate::auth::{AuthError, CwtVerifier, VerifiedClaims, VerifyOpts, subject_id_bind};
 use crate::authz::{ChainEntity, EntityKind};
 use crate::entity_chain;
+use crate::ownership::{OwnerStore, parse_owner};
 use crate::publish_decision::{
     PublishDecider, PublishDecisions, StoredEntity, Verdict, log_shadow, strip_tokens,
 };
@@ -189,12 +190,13 @@ impl SessionStore for crate::store::s3::S3Client {
 /// `moderation/sessions/<endpoint>`.
 const SESSIONS: &str = "sessions";
 
-/// How long a push waits for the session store before it is refused.
+/// How long a push waits for the session store, or for its recording's
+/// owner record, before it is refused.
 const SESSION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Session lookups at once. A push that finds them all busy is refused:
-/// a peer with no session must not be able to make the node send S3 a
-/// request per push.
+/// Session and owner lookups at once. A push that finds them all busy is
+/// refused: a peer must not be able to make the node send S3 a request per
+/// push.
 const SESSION_LOOKUPS: usize = 16;
 
 /// How long an endpoint whose lookup found no live session is refused
@@ -496,6 +498,8 @@ pub struct PublishGate {
     /// Tags session records; set from the endpoint's key once it is bound.
     /// Until then no record is stored or accepted.
     record_key: OnceLock<RecordKey>,
+    /// Who owns each recording. `None` skips the owner check.
+    owners: Option<Arc<dyn OwnerStore>>,
 }
 
 /// Why a push was refused.
@@ -504,6 +508,10 @@ pub enum PushRefusal {
     NoSession,
     Suspended,
     Blocked,
+    /// Another account owns the recording.
+    OwnedByAnother,
+    /// The recording's owner record couldn't be read in time, or parsed.
+    OwnerUnknown,
 }
 
 impl PublishGate {
@@ -520,6 +528,7 @@ impl PublishGate {
                 crate::config::PublishingConfig::default().session_ttl_secs,
             ),
             record_key: OnceLock::new(),
+            owners: None,
         }
     }
 
@@ -592,6 +601,13 @@ impl PublishGate {
     /// Look up sessions this gate does not hold in `store`.
     pub fn with_session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Refuse a push of a recording another account owns, as `store`'s
+    /// owner records say.
+    pub fn with_owner_store(mut self, store: Arc<dyn OwnerStore>) -> Self {
+        self.owners = Some(store);
         self
     }
 
@@ -748,7 +764,46 @@ impl PublishGate {
             return Err(PushRefusal::Blocked);
         }
         self.decided_session(&subject, chain.as_deref())?;
+        self.owner_allows(&subject, hash_hex).await?;
         Ok((subject, endpoint))
+    }
+
+    /// Whether `subject` may push `hash_hex`: not when another account owns
+    /// it. An unowned recording may be pushed (ingest then claims it). An
+    /// owner record that can't be read in time, or parsed, refuses the push,
+    /// and so does finding every lookup busy. Checked last, so a push refused
+    /// otherwise costs no read; skipped without an owner store.
+    async fn owner_allows(&self, subject: &str, hash_hex: &str) -> Result<(), PushRefusal> {
+        let Some(owners) = self.owners.as_ref() else {
+            return Ok(());
+        };
+        let Ok(_permit) = self.lookups.try_acquire() else {
+            warn!(%subject, hash = %hash_hex, "Owner lookups busy; push refused");
+            return Err(PushRefusal::OwnerUnknown);
+        };
+        let body = match tokio::time::timeout(SESSION_LOOKUP_TIMEOUT, owners.get_owner(hash_hex))
+            .await
+        {
+            Ok(Ok(Some(body))) => body,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(e)) => {
+                warn!(%subject, hash = %hash_hex, error = format!("{e:#}"), "Owner lookup failed; push refused");
+                return Err(PushRefusal::OwnerUnknown);
+            }
+            Err(_) => {
+                warn!(%subject, hash = %hash_hex, "Owner lookup timed out; push refused");
+                return Err(PushRefusal::OwnerUnknown);
+            }
+        };
+        let owner = parse_owner(hash_hex, &body).map_err(|e| {
+            warn!(%subject, hash = %hash_hex, error = format!("{e:#}"), "Owner record unreadable; push refused");
+            PushRefusal::OwnerUnknown
+        })?;
+        if canonical_subject(&owner.subject) != canonical_subject(subject) {
+            warn!(%subject, hash = %hash_hex, owner = %owner.subject, "Recording owned by another account; push refused");
+            return Err(PushRefusal::OwnedByAnother);
+        }
+        Ok(())
     }
 
     /// A push is decided by its session (tdf-iroh-s3#44): the decision
@@ -1486,6 +1541,7 @@ mod tests {
     use super::test_support::MemModeration;
     use super::*;
     use crate::auth::test_support::{keypair, mint_map};
+    use crate::ownership::test_support::MemOwners;
     use axum::body::Body;
     use axum::http::Request;
     use ciborium::value::Value;
@@ -1972,6 +2028,187 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED);
         h.gate.connected(1, Some(sk.public()));
         assert!(h.gate.authorize_push(1, &"a".repeat(64)).await.is_ok());
+    }
+
+    /// The session's account, as the token names it.
+    const OWNER_UUID: &str = "6f0c2a4e-9b1d-4c3e-8f7a-2d5b6e1c0a93";
+
+    /// A hash pushed in the owner tests.
+    fn owned_hash() -> String {
+        "b".repeat(64)
+    }
+
+    /// The owner record ingest would write for `hash`, naming `subject`.
+    fn owner_record(hash: &str, subject: &str) -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&BlobOwner {
+                hash: hash.to_string(),
+                subject: subject.to_string(),
+                endpoint_id: endpoint().to_string(),
+                at: 1,
+            })
+            .unwrap(),
+        )
+    }
+
+    /// A gate holding a session for `arkavo:<uuid>` on connection 1, with
+    /// `owners` as its owner store when given.
+    fn owner_gate(owners: Option<&Arc<MemOwners>>) -> PublishGate {
+        let mut gate = PublishGate::new(Arc::new(Moderation::default()));
+        if let Some(owners) = owners {
+            gate = gate.with_owner_store(Arc::clone(owners) as Arc<dyn OwnerStore>);
+        }
+        let ep = endpoint();
+        gate.open_session(
+            ep,
+            &format!("arkavo:{OWNER_UUID}"),
+            Duration::from_secs(600),
+        );
+        gate.connected(1, Some(ep));
+        gate
+    }
+
+    fn seed_owner(owners: &MemOwners, hash: &str, body: Bytes) {
+        owners
+            .records
+            .lock()
+            .unwrap()
+            .insert(hash.to_string(), body);
+    }
+
+    #[tokio::test]
+    async fn a_push_of_another_accounts_recording_is_refused() {
+        let owners = Arc::new(MemOwners::default());
+        let hash = owned_hash();
+        seed_owner(&owners, &hash, owner_record(&hash, "u2"));
+        let gate = owner_gate(Some(&owners));
+        assert_eq!(
+            gate.authorize_push(1, &hash).await,
+            Err(PushRefusal::OwnedByAnother)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_owner_may_push_again() {
+        let hash = owned_hash();
+        // The record names the account canonically, as ingest writes it, or
+        // with the token's prefix: both are the session's account.
+        for named in [OWNER_UUID.to_string(), format!("arkavo:{OWNER_UUID}")] {
+            let owners = Arc::new(MemOwners::default());
+            seed_owner(&owners, &hash, owner_record(&hash, &named));
+            let gate = owner_gate(Some(&owners));
+            let (sub, _) = gate.authorize_push(1, &hash).await.expect(&named);
+            assert_eq!(sub, OWNER_UUID);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unowned_recording_may_be_pushed() {
+        let owners = Arc::new(MemOwners::default());
+        let gate = owner_gate(Some(&owners));
+        let (sub, _) = gate.authorize_push(1, &owned_hash()).await.unwrap();
+        assert_eq!(sub, OWNER_UUID);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_owner_refuses_the_push() {
+        use std::sync::atomic::Ordering;
+        let hash = owned_hash();
+
+        let down = Arc::new(MemOwners::default());
+        down.down.store(true, Ordering::Relaxed);
+        let gate = owner_gate(Some(&down));
+        assert_eq!(
+            gate.authorize_push(1, &hash).await,
+            Err(PushRefusal::OwnerUnknown),
+            "store down"
+        );
+
+        for (body, why) in [
+            (Bytes::from_static(b"not json"), "garbage"),
+            (owner_record(&"c".repeat(64), "u2"), "names another hash"),
+            (owner_record(&hash, "a/b"), "invalid subject"),
+        ] {
+            let owners = Arc::new(MemOwners::default());
+            seed_owner(&owners, &hash, body);
+            let gate = owner_gate(Some(&owners));
+            assert_eq!(
+                gate.authorize_push(1, &hash).await,
+                Err(PushRefusal::OwnerUnknown),
+                "{why}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_owner_lookup_refuses_the_push() {
+        use std::sync::atomic::Ordering;
+        let owners = Arc::new(MemOwners::default());
+        owners.hang.store(true, Ordering::Relaxed);
+        let gate = owner_gate(Some(&owners));
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            gate.authorize_push(1, &owned_hash()).await,
+            Err(PushRefusal::OwnerUnknown)
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= SESSION_LOOKUP_TIMEOUT && waited < SESSION_LOOKUP_TIMEOUT * 2,
+            "{waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_owner_lookups_refuse_the_push() {
+        let owners = Arc::new(MemOwners::default());
+        let gate = owner_gate(Some(&owners));
+        let _all = gate
+            .lookups
+            .try_acquire_many(SESSION_LOOKUPS as u32)
+            .unwrap();
+        // Refused without a lookup, though the recording has no owner.
+        assert_eq!(
+            gate.authorize_push(1, &owned_hash()).await,
+            Err(PushRefusal::OwnerUnknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn without_an_owner_store_the_check_is_skipped() {
+        let gate = owner_gate(None);
+        // Not even a lookup permit is needed.
+        let _all = gate
+            .lookups
+            .try_acquire_many(SESSION_LOOKUPS as u32)
+            .unwrap();
+        let (sub, _) = gate.authorize_push(1, &owned_hash()).await.unwrap();
+        assert_eq!(sub, OWNER_UUID);
+    }
+
+    /// The owner check runs last: a push the session, a suspension or a
+    /// block refuses costs no owner read.
+    #[tokio::test]
+    async fn the_owner_check_runs_after_the_other_refusals() {
+        use std::sync::atomic::Ordering;
+        let owners = Arc::new(MemOwners::default());
+        owners.down.store(true, Ordering::Relaxed);
+        let hash = owned_hash();
+
+        let gate = owner_gate(Some(&owners));
+        assert_eq!(
+            gate.authorize_push(2, &hash).await,
+            Err(PushRefusal::NoSession)
+        );
+        gate.moderation.block_for_test(&hash);
+        assert_eq!(
+            gate.authorize_push(1, &hash).await,
+            Err(PushRefusal::Blocked)
+        );
+        gate.moderation.suspend_for_test(OWNER_UUID, false);
+        assert_eq!(
+            gate.authorize_push(1, &hash).await,
+            Err(PushRefusal::Suspended)
+        );
     }
 
     #[tokio::test]
