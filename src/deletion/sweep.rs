@@ -16,10 +16,11 @@
 //! 3. each due item: subjects (their pointers), then recordings, then
 //!    envelopes, so a subject's pointer goes before its envelope.
 //!    Immediately before each, the run reads everything again and decides
-//!    again: an item no longer due is kept, and one whose requester's
-//!    catalog moved since the first read is deferred to the next run,
-//!    which folds the new transitions first. A failure leaves the item
-//!    pending, and the run goes on.
+//!    again: an item no longer due is kept, and so is an envelope a stored
+//!    pointer still names (its subject's pointer delete failed); one whose
+//!    requester's catalog moved since the first read is deferred to the
+//!    next run, which folds the new transitions first. A failure leaves
+//!    the item pending, and the run goes on.
 //!
 //! Never delete what the owner didn't ask to delete; never act on
 //! unreadable state; a dry run writes nothing.
@@ -59,6 +60,9 @@ const ENVELOPE_OBJECTS: [&str; 3] = [DOCUMENTS, "catalog-outboards/", INDEXES];
 /// Why an item due at the first read is kept when the fresh decision
 /// names no reason for it.
 const NO_LONGER_DUE: &str = "no longer due";
+
+/// Why a due envelope is kept at its re-check: a stored pointer names it.
+const POINTER_NAMES_IT: &str = "a pointer still names it";
 
 /// What a run did, or in a dry run would do. [`fmt::Display`] prints
 /// [`lines`](Self::lines), then `N deleted, N kept, N deferred, N failed`
@@ -373,6 +377,21 @@ async fn recheck<O: ObjectStore>(
     let Some(item) = decision.due.iter().find(|i| i.id() == id).cloned() else {
         return Ok(Recheck::Kept(kept_reason(&decision, item)));
     };
+    // An envelope any stored pointer names stays, even one in `S` (a
+    // subject being deleted, whose pointers are outside `C`): its pointer
+    // delete may have failed this run. Deleting the index record a `/2`
+    // pointer names would make every later strict read fail ("no index
+    // record"), this run's final read and every sweep and `claim-owners`
+    // after it. The next run retries the subject first.
+    if let Item::Envelope(hash) = &item
+        && fresh
+            .catalogs
+            .pointers
+            .iter()
+            .any(|p| &p.catalog_hash == hash)
+    {
+        return Ok(Recheck::Kept(POINTER_NAMES_IT.to_string()));
+    }
     let current = Pointers::of(&fresh.catalogs);
     if requesters(&item, &fresh)
         .iter()
@@ -1235,6 +1254,59 @@ mod tests {
         );
         let r: OperatorRequest = record(&m, &operator_key(U, &p)).await;
         assert_eq!((r.state, r.deleted_at), (State::Deleted, Some(NOW)));
+    }
+
+    /// A subject whose pointer delete fails keeps the envelope that pointer
+    /// names, though that envelope is due in the same run (its pointer is in
+    /// `S`, so not in `C`): deleting the index record of a live `/2` pointer
+    /// would make every later strict read fail. The next run retries the
+    /// subject first.
+    #[tokio::test]
+    async fn an_envelope_a_pointer_still_names_is_kept() {
+        let m = MemObjects::default();
+        publish_2(&m, U, 1, b"doc-u", &[]);
+        let e = catalog(b"doc-u");
+        m.insert_with_owner(&format!("catalog-documents/{e}"), "doc-u", U);
+        m.insert(&format!("catalog-outboards/{e}"), "outboard");
+        catalog_block(&m, U);
+        subject_request(&m, U);
+        // Observed on an earlier run, a grace period ago.
+        put(
+            &m,
+            &envelope_key(&e),
+            EnvelopeRequest {
+                hash: e.clone(),
+                owner: Some(U.into()),
+                superseded_at: NOW - GRACE,
+                source: Source::Observed,
+                state: State::Pending,
+                deleted_at: None,
+            },
+        );
+        let pointer = format!("catalog-pointers/{U}");
+        m.fail_on(&pointer, Op::Delete);
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        let failed = report
+            .lines
+            .iter()
+            .position(|l| l.starts_with(&format!("failed subject {U}: ")))
+            .unwrap_or_else(|| panic!("{report}"));
+        let kept = report
+            .lines
+            .iter()
+            .position(|l| *l == format!("kept envelope {e}: a pointer still names it"))
+            .unwrap_or_else(|| panic!("{report}"));
+        assert!(failed < kept, "{report}");
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.deleted, 0, "{report}");
+        for key in envelope_keys(&e) {
+            assert!(m.get(&key).await.unwrap().is_some(), "{key}");
+        }
+        assert!(m.get(&pointer).await.unwrap().is_some());
+        let r: EnvelopeRequest = record(&m, &envelope_key(&e)).await;
+        assert_eq!(r.state, State::Pending);
+        snapshot::read(&m).await.unwrap();
     }
 
     /// Deletion is per hash: a recording due under one request marks every
