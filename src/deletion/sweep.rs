@@ -1169,7 +1169,7 @@ async fn delete_versions<O: ObjectStore>(store: &O, key: &str) -> anyhow::Result
 mod tests {
     use super::*;
     use crate::catalog_scan::test_support::{index_record, publish_2};
-    use crate::catalog_v2::test_support::pointer_bytes;
+    use crate::catalog_v2::test_support::{bundle, pointer_bytes};
     use crate::deletion::{
         EnvelopeRequest, GRACE, OperatorRequest, RecordingRequest, Scope, Source, State,
         SubjectRequest, Transition, TransitionBase, envelope_key, operator_key, recording_key,
@@ -1913,6 +1913,46 @@ mod tests {
         assert!(m.get(&pointer).await.unwrap().is_some());
         let r: EnvelopeRequest = record(&m, &envelope_key(&e)).await;
         assert_eq!(r.state, State::Pending);
+        snapshot::read(&m).await.unwrap();
+    }
+
+    /// A request past its grace for an envelope a stored pointer names (in
+    /// `C`) deletes nothing of it: not its document, outboard or index
+    /// record. The node's `GET` and `PUT` each read a pointer whose catalog
+    /// has no index record as one from before envelopes, on their own
+    /// paths, so they agree only while no current envelope loses its index
+    /// record. Both a `/2` pointer and one from before envelopes.
+    #[tokio::test]
+    async fn a_due_request_for_a_current_envelope_deletes_nothing() {
+        let m = bucket();
+        // `U`'s `/2` catalog: its index record, pointer, document, outboard.
+        publish_2(&m, U, 1, b"doc-u", &[]);
+        let e = catalog(b"doc-u");
+        m.insert_with_owner(&format!("catalog-documents/{e}"), "doc-u", U);
+        m.insert(&format!("catalog-outboards/{e}"), "outboard");
+        // `U2`'s pointer from before envelopes: no index record.
+        let old = catalog(b"doc-old");
+        m.insert(
+            &format!("{POINTERS}{U2}"),
+            serde_json::to_vec(&bundle(U2, 3, b"doc-old", None)).unwrap(),
+        );
+        m.insert_with_owner(&format!("catalog-documents/{old}"), "doc-old", U2);
+        envelope_request(&m, &e, U, NOW - GRACE);
+        envelope_request(&m, &old, U2, NOW - GRACE);
+        let before = versions(&m).await;
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        for hash in [&e, &old] {
+            assert!(
+                has(&report, &format!("kept envelope {hash}: still current")),
+                "{report}"
+            );
+            let r: EnvelopeRequest = record(&m, &envelope_key(hash)).await;
+            assert_eq!(r.state, State::Pending);
+        }
+        assert_eq!((report.deleted, report.failures), (0, 0), "{report}");
+        assert!(m.deletes().is_empty(), "{report}");
+        assert_eq!(versions(&m).await, before, "every object and version");
         snapshot::read(&m).await.unwrap();
     }
 
