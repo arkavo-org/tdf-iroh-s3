@@ -557,10 +557,16 @@ async fn put_catalog<S: TagStore>(
     //    envelope has one index, so a publish that lost can't rewrite the
     //    committed pointer's index, nor the envelope's owner metadata, and
     //    its 409 or 502 writes nothing else, no transition either. The
-    //    transition is created only if none is under its key
-    //    (`write_transition`): a duplicate of this publish keeps the one
-    //    there, so it can't rewrite a transition the original commits. The
-    //    document and its outboard come before the pointer, so a stored
+    //    transition is created only if none is under its key; one there is
+    //    replaced only while the stored pointer is still the one this
+    //    publish read (`write_transition`), so a stalled copy can't rewrite
+    //    a transition another copy committed. `write_transition`'s own 502s
+    //    come after the index create, which is harmless: they need a
+    //    transition already under this key, so these pointer bytes were
+    //    sent before, and the pointer signs the envelope's hash and its
+    //    `indexHash`, so that attempt created this same record and this
+    //    create was a retry that wrote nothing. The document and its
+    //    outboard come before the pointer, so a stored
     //    pointer never names a document that cannot be served or decided;
     //    the pointer is written only if nobody else moved it meanwhile.
     //    What a publish wrote before a later write failed, or before its
@@ -643,7 +649,7 @@ async fn put_catalog<S: TagStore>(
             ));
         }
     }
-    write_transition(api, &sub, &transition).await?;
+    write_transition(api, &sub, &transition, expected).await?;
     api.store
         .put_catalog_document(&hash, Bytes::from(document), &sub)
         .await
@@ -675,33 +681,34 @@ async fn put_catalog<S: TagStore>(
 
 /// Store this publish's `transition` under its key
 /// (`catalog-transitions/<sub>/<seq>-<pointer digest>`), only if none is
-/// there. The key names one signed pointer, so one already there is from
-/// the same pointer bytes, sent over a base whose `seq` (0 for none) says
-/// which of the two to keep:
-/// - the same `seq`: the same base, so this publish's own, from a retry or
-///   a duplicate sent while the original was in flight. It stays as it is,
-///   its `at` and `dropped` too: a duplicate can't rewrite a transition the
-///   original commits.
-/// - a lower `seq` than this publish's base: the same pointer was first
-///   sent over a base that has moved since (its pointer write lost, or its
-///   `If-Match` changed). It is replaced, only if it is still what was read
-///   (`If-Match`), so the pointer this publish commits names its real base.
-/// - a higher `seq`: this publish stalled since it read its base, and the
-///   same pointer was sent again over a newer one meanwhile. That
-///   transition stays, and this publish is answered as a lost transition
-///   write.
+/// there. The key names one signed pointer, so one already there came from
+/// the same pointer bytes, sent before: a retry, a duplicate, or an
+/// attempt over a base that has moved since. Which base it names doesn't
+/// say whether to keep it (seqs don't order bases across a pointer from
+/// before envelopes); the stored pointer does:
+/// - still `expected`, the ETag this publish's pointer write is
+///   conditioned on (`None`: no pointer): replace it with this publish's
+///   transition (its base, a fresh `at`, its `dropped`), only if it is
+///   still what was read (`If-Match`). This publish's pointer commits only
+///   if the stored one is still `expected` then too, so when it commits,
+///   the transition under its key names its base.
+/// - moved (perhaps to this very pointer, through a duplicate that
+///   committed): keep it, and answer as a lost write. This publish's
+///   pointer write would lose anyway.
 ///
-/// One that can't be read or parsed, a replace that loses, or a stalled
-/// publish is 502 `storage unavailable`.
+/// The transition is read before the pointer, so a transition another
+/// copy of this publish writes after the pointer check makes the replace
+/// lose. One that can't be read, the pointer unreadable, a moved pointer
+/// or a replace that loses is 502 `storage unavailable`.
 async fn write_transition<S: TagStore>(
     api: &ApiState<S>,
     sub: &str,
     transition: &Transition,
+    expected: Option<&str>,
 ) -> Result<(), ApiError> {
     let name = transition_name(transition.seq, &transition.pointer);
     let body = Bytes::from(serde_json::to_vec(transition).expect("transition serializes"));
     let write = |e| storage_unavailable("Catalog transition write", e);
-    let read = |e| storage_unavailable("Catalog transition read", e);
     if api
         .store
         .put_catalog_transition(sub, &name, body.clone(), None)
@@ -710,6 +717,7 @@ async fn write_transition<S: TagStore>(
     {
         return Ok(());
     }
+    let read = |e| storage_unavailable("Catalog transition read", e);
     let stored = api
         .store
         .get_catalog_transition(sub, &name)
@@ -720,20 +728,15 @@ async fn write_transition<S: TagStore>(
                 "transition {sub}/{name} exists but can't be read"
             ))
         })?;
-    let existing: Transition = serde_json::from_slice(&stored.body)
-        .map_err(|e| storage_unavailable("Catalog transition parse", e.into()))?;
-    let base_seq = |t: &Transition| t.base.as_ref().map_or(0, |base| base.seq);
-    match base_seq(transition).cmp(&base_seq(&existing)) {
-        std::cmp::Ordering::Equal => return Ok(()),
-        std::cmp::Ordering::Less => {
-            return Err(write(anyhow::anyhow!(
-                "transition {sub}/{name} is over base seq {}, newer than this publish's {}: \
-                 a stalled publish",
-                base_seq(&existing),
-                base_seq(transition)
-            )));
-        }
-        std::cmp::Ordering::Greater => {}
+    let pointer = api
+        .store
+        .get_catalog_pointer(sub)
+        .await
+        .map_err(|e| storage_unavailable("Catalog pointer read", e))?;
+    if pointer.as_ref().map(|p| p.etag.as_str()) != expected {
+        return Err(write(anyhow::anyhow!(
+            "transition {sub}/{name} kept: the pointer moved since this publish read it"
+        )));
     }
     let replaced = api
         .store
@@ -2804,45 +2807,73 @@ mod tests {
         format!("{SUB}/{}", transition_name(seq, &digest))
     }
 
-    /// A duplicate of a publish still in flight, over the same base, finds
-    /// the original's transition and keeps it byte for byte (its `at` and
-    /// `dropped` too): it can't rewrite a transition the original commits.
+    /// A pointer from before envelopes at `seq` (no index record), stored
+    /// at version 99, and the `base` a publish over it records.
+    async fn store_pre_envelope_pointer(h: &Harness, seq: u64) -> Option<TransitionBase> {
+        let old = b"{\"schema\":\"arkavo.creator-catalog/1\"}".to_vec();
+        let stored = serde_json::to_vec(&v2::bundle(SUB, seq, &old, None)).unwrap();
+        h.store
+            .catalog_pointers
+            .lock()
+            .await
+            .insert(SUB.into(), (Bytes::from(stored), 99));
+        Some(TransitionBase {
+            seq,
+            catalog_hash: hash_of(&old),
+            pointer: hex::encode(Sha256::digest(v2::pointer_bytes(SUB, seq, &old, None))),
+        })
+    }
+
+    /// Two copies of one publish over the same base, the original in
+    /// flight. The duplicate finds the original's transition with the
+    /// pointer still the base both read: it replaces it (a fresh `at`, the
+    /// same base) and commits. The original then finds the pointer moved
+    /// to that same pointer: it keeps the transition and answers 502, and a
+    /// read of the pointer shows its own `pointer` served.
     #[tokio::test]
-    async fn a_duplicate_over_the_same_base_keeps_the_first_transition() {
+    async fn concurrent_duplicates_over_the_same_base_both_end_correct() {
         let h = ingested().await;
-        ingest(&h, 2).await;
-        let (first, both) = (envelope(1), json!([rec(1), rec(2)]));
-        let r = publish_index(&h, 1, &first, both.clone()).await;
-        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let first = envelope(1);
+        assert_eq!(publish(&h, 1, &first).await.status, StatusCode::OK);
+        // What both copies read at their step 7.
+        let read = h.store.catalog_pointers.lock().await[SUB].clone();
 
         // The original wrote its transition and is still writing the rest.
-        let (second, kept) = (envelope(2), json!([rec(1)]));
+        let second = envelope(2);
         let original = Transition {
             subject: SUB.into(),
             seq: 2,
             catalog_hash: hash_of(&second),
-            pointer: digest_of(&signed(2, &second, &kept)),
-            base: base(1, &first, &both),
+            pointer: digest_of(&signed(2, &second, &index())),
+            base: base(1, &first, &index()),
             at: 1_000,
-            dropped: vec![payload(2)],
+            dropped: vec![],
             added: vec![],
         };
-        let original = Bytes::from(serde_json::to_vec(&original).unwrap());
-        let key = transition_key(2, &second, &kept);
-        h.store
-            .transitions
-            .lock()
-            .await
-            .insert(key.clone(), original.clone());
-        // Since then, payload(2) was blocked: the duplicate would drop
-        // nothing.
-        h.moderation.block_for_test(&payload(2));
+        let key = transition_key(2, &second, &index());
+        h.store.transitions.lock().await.insert(
+            key.clone(),
+            Bytes::from(serde_json::to_vec(&original).unwrap()),
+        );
 
-        let r = publish_index_if(&h, 2, &second, &kept, (header::IF_MATCH, "\"1\"")).await;
+        let before = now_secs();
+        let r = publish_if(&h, 2, &second, header::IF_MATCH, "\"1\"").await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
-        assert_eq!(h.store.transitions.lock().await[&key], original);
-        assert_eq!(h.store.transitions.lock().await.len(), 2);
-        assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"2\"");
+        let t = transition(&h, 2, &second, &index()).await;
+        assert_eq!(t.base, base(1, &first, &index()));
+        assert!(t.at >= before, "the duplicate's own `at`");
+        let committed = h.store.transitions.lock().await.clone();
+
+        // The original resumes from its step 7 read.
+        *h.store.stale_next_pointer_read.lock().unwrap() = Some(read);
+        let r = publish_if(&h, 2, &second, header::IF_MATCH, "\"1\"").await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::BAD_GATEWAY, "storage unavailable")
+        );
+        assert_eq!(*h.store.transitions.lock().await, committed);
+        let served: Bundle = serde_json::from_slice(&get(&h, SUB).await.body).unwrap();
+        assert_eq!(served.pointer, signed(2, &second, &index()).pointer);
     }
 
     /// The same signed pointer sent again over a base that moved since its
@@ -2874,12 +2905,39 @@ mod tests {
         assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"3\"");
     }
 
-    /// A publish stalled since it read seq 1 resumes after the same signed
-    /// pointer was sent again over seq 2 and committed. The transition
-    /// over the newer base stays as it is; the stalled publish is answered
-    /// as a lost transition write (502), and the pointer stays.
+    /// The re-review's equal-seq trace. Over a pointer from before
+    /// envelopes at seq 5 there is no seq floor: ours (seq 6) loses its
+    /// pointer race to theirs at seq 5 too, then is sent again over theirs.
+    /// Its transition is replaced and names its actual predecessor, theirs,
+    /// not the pointer from before envelopes at the same seq.
     #[tokio::test]
-    async fn a_stalled_publish_over_an_older_base_keeps_the_newer_transition() {
+    async fn over_a_pre_envelope_base_the_transition_names_the_actual_predecessor() {
+        let h = ingested().await;
+        let old = store_pre_envelope_pointer(&h, 5).await;
+        let (theirs, ours) = (envelope(2), envelope(3));
+        h.store
+            .lose_next_pointer_race
+            .store(true, Ordering::Relaxed);
+        let r = publish_if(&h, 6, &ours, header::IF_NONE_MATCH, "*").await;
+        assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.error());
+        assert_eq!(transition(&h, 6, &ours, &index()).await.base, old);
+
+        let r = publish_if(&h, 5, &theirs, header::IF_NONE_MATCH, "*").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let r = publish_if(&h, 6, &ours, header::IF_MATCH, "\"5\"").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let t = transition(&h, 6, &ours, &index()).await;
+        assert_eq!(t.base, base(5, &theirs, &index()));
+        assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"6\"");
+    }
+
+    /// A publish stalled since it read seq 1 resumes after the same signed
+    /// pointer was sent again over seq 2 and committed. The pointer moved
+    /// from what it read, so the committed transition stays as it is, the
+    /// stalled publish is answered as a lost transition write (502), and
+    /// the pointer stays.
+    #[tokio::test]
+    async fn a_stalled_publish_keeps_the_committed_transition() {
         let h = ingested().await;
         let first = envelope(1);
         assert_eq!(publish(&h, 1, &first).await.status, StatusCode::OK);
@@ -2909,12 +2967,77 @@ mod tests {
         assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"3\"");
     }
 
-    /// A transition under this publish's key that can't be replaced: one
-    /// replaced again since it was read, or one that doesn't parse. 502,
-    /// and neither it nor the pointer changes.
+    /// The re-review's stall trace: a publish stalled since it read a
+    /// pointer from before envelopes at seq 12 resumes after theirs (seq 1)
+    /// and then the same signed pointer, sent again over theirs, committed.
+    /// Its base seq is the higher, but the pointer moved from what it read:
+    /// the committed transition stays, and the stalled publish gets 502.
     #[tokio::test]
-    async fn a_transition_that_cannot_be_replaced_is_502() {
-        for unreadable in [false, true] {
+    async fn a_stalled_publish_over_a_pre_envelope_base_keeps_the_committed_transition() {
+        let h = ingested().await;
+        store_pre_envelope_pointer(&h, 12).await;
+        let read = h.store.catalog_pointers.lock().await[SUB].clone();
+
+        let (theirs, ours) = (envelope(2), envelope(3));
+        let r = publish_if(&h, 1, &theirs, header::IF_NONE_MATCH, "*").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let r = publish_if(&h, 3, &ours, header::IF_MATCH, "\"1\"").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let committed = h.store.transitions.lock().await.clone();
+        assert_eq!(
+            transition(&h, 3, &ours, &index()).await.base,
+            base(1, &theirs, &index())
+        );
+        let stored = h.store.catalog_pointers.lock().await[SUB].clone();
+
+        *h.store.stale_next_pointer_read.lock().unwrap() = Some(read);
+        let r = publish_if(&h, 3, &ours, header::IF_NONE_MATCH, "*").await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::BAD_GATEWAY, "storage unavailable")
+        );
+        assert_eq!(*h.store.transitions.lock().await, committed);
+        assert_eq!(h.store.catalog_pointers.lock().await[SUB], stored);
+    }
+
+    /// A publish whose document write failed, sent again days later: its
+    /// transition is replaced with a fresh `at`, so the creator's grace to
+    /// undo a drop runs from the publish that commits.
+    #[tokio::test]
+    async fn a_resend_after_a_502_refreshes_the_transitions_at() {
+        let h = ingested().await;
+        assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
+        let second = envelope(2);
+        h.store
+            .fail_next_document_write
+            .store(true, Ordering::Relaxed);
+        let r = publish(&h, 2, &second).await;
+        assert_eq!(r.status, StatusCode::BAD_GATEWAY, "{}", r.error());
+
+        // Days pass: the stored transition is as old as that attempt.
+        let key = transition_key(2, &second, &index());
+        let mut first_attempt = transition(&h, 2, &second, &index()).await;
+        first_attempt.at -= 3 * 24 * 60 * 60;
+        h.store.transitions.lock().await.insert(
+            key.clone(),
+            Bytes::from(serde_json::to_vec(&first_attempt).unwrap()),
+        );
+
+        let before = now_secs();
+        let r = publish(&h, 2, &second).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let t = transition(&h, 2, &second, &index()).await;
+        assert!(t.at >= before, "{} < {before}", t.at);
+        assert_eq!(t.base, first_attempt.base);
+    }
+
+    /// A transition under this publish's key, the pointer still what it
+    /// read. One replaced since it was read: the replace loses, 502, and
+    /// neither it nor the pointer changes. One that doesn't parse (the node
+    /// wrote it, so a storage fault): replaced like any other.
+    #[tokio::test]
+    async fn a_lost_transition_replace_is_502() {
+        for garbled in [false, true] {
             let h = ingested().await;
             let first = envelope(1);
             assert_eq!(publish(&h, 1, &first).await.status, StatusCode::OK);
@@ -2929,7 +3052,7 @@ mod tests {
             assert_eq!(r.status, StatusCode::OK, "{}", r.error());
 
             let key = transition_key(3, &ours, &index());
-            if unreadable {
+            if garbled {
                 h.store
                     .transitions
                     .lock()
@@ -2943,10 +3066,15 @@ mod tests {
             let before = h.store.transitions.lock().await.clone();
             let stored = h.store.catalog_pointers.lock().await[SUB].clone();
             let r = publish_if(&h, 3, &ours, header::IF_MATCH, "\"2\"").await;
+            if garbled {
+                assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+                let t = transition(&h, 3, &ours, &index()).await;
+                assert_eq!(t.base, base(2, &theirs, &index()));
+                continue;
+            }
             assert_eq!(
                 (r.status, r.error().as_str()),
-                (StatusCode::BAD_GATEWAY, "storage unavailable"),
-                "unreadable: {unreadable}"
+                (StatusCode::BAD_GATEWAY, "storage unavailable")
             );
             assert_eq!(*h.store.transitions.lock().await, before);
             assert_eq!(h.store.catalog_pointers.lock().await[SUB], stored);
