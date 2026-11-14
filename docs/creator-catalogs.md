@@ -173,6 +173,14 @@ Creator reads the node to push to from this route. The iOS viewer does not. The 
 
 To remove a recording, Creator publishes the catalog without its entry. The TDF stays on the node, but no catalog lists it.
 
+### Ownership
+
+The first account to push a recording owns it. When the node ingests a push, it records the pusher's subject as the owner of that BLAKE3 hash, unless the hash already has an owner. It never overwrites an owner. On a node with `[publishing] required = false` nothing is owned and nothing below applies.
+
+- **A push of another account's recording is refused,** the same way as a push without a session (step 3), so the pusher may see no error.
+- **A catalog may list only its publisher's recordings.** `PUT /v2/catalogs/<sub>` refuses an index that names another account's recording with 403 `recording belongs to another account`. A recording with no owner gets 422 `recording has no owner: push it again`. Both name the entries in `contentIDs`.
+- **A recording with no owner is claimed by its next push.** Push it again, then publish again. `GET /blobs/<hash>` answers 200 for the recording before the push is ingested too, so it doesn't show the claim.
+
 ## Reading a catalog and downloading (viewer)
 
 1. **Find the current catalog.** `GET https://iroh.arkavo.net/v2/catalogs/<sub>` with `Authorization: Bearer <Arkavo CWT>` (see [`GET /v2/catalogs/{sub}`](#get-v2catalogssub-read-the-pointer)). A 403 `not entitled to catalog` means the viewer doesn't hold the creator's campaign: prompt them to follow it on Patreon. A viewer that knows only a campaign takes its creator from the token's `arkavo_patreon` membership (authnz-rs#128); the node has no campaign lookup.
@@ -292,11 +300,15 @@ The node checks the following in order:
 | Nothing blocked: the envelope's hash, no entry's `payloadHash` | 403 `content is blocked` |
 | Every `payloadHash` is an ingested blob | 422 `payload <hash> is not ingested`, the first missing one in entry order |
 | Every entry's `payloadSize` equals the ingested blob's size, each entry checked, also entries that share a payload | 422 `payload <hash> size does not match` |
+| No entry's recording belongs to another account: its [owner](#ownership), if it has one, is `{sub}`. Subjects are compared canonically, so `arkavo:<uuid>` and `<uuid>` are one account. Skipped on a node with `[publishing] required = false`. | 403 `recording belongs to another account`, with `contentIDs`; 502 `storage unavailable` when an owner record can't be read |
+| Every entry's recording has an owner. Checked only when no entry belongs to another account; skipped on a node with `[publishing] required = false`. Push the recording again: the push claims it. | 422 `recording has no owner: push it again`, with `contentIDs` |
 | Every recording's manifest is stored (at ingest) and readable. A recording ingested before the node stored manifests has none: push it again. | 422 `payload <hash> manifest is not stored` or `… manifest is unreadable` |
 | Every entry's recording policy names the envelope's attribute | 422 `entry <contentID> policy does not include the catalog attribute` |
 | The passkey credential is still the subject's, according to the IdP's status route | 403 `passkey credential unknown`, `… revoked` or `… belongs to another subject`; 502 `credential status unavailable` |
 | The stored pointer is the base named by `If-Match` or `If-None-Match`, if either is sent | 412 `catalog changed since it was read` |
 | `seq` is greater than the stored one | 409 `seq must be greater than <n>` |
+
+The two owner refusals also carry `contentIDs`: the `contentID` of every entry refused, sorted, including every entry that names the same payload. For example: `{"error":"recording belongs to another account","contentIDs":["rec-a","rec-b"]}`. Every other refusal in the table is `{"error":"…"}` alone.
 
 The node then stores the envelope at `catalog-documents/<blake3>` with its BAO outboard at `catalog-outboards/<blake3>`, the index at `catalog-indexes/<blake3>` (never served), then the bundle at `catalog-pointers/<sub>`. The pointer is written only if no other publish replaced it in the meantime; otherwise 409 `seq must be greater than the stored seq: another publish won`. Read the pointer again and retry.
 

@@ -377,9 +377,10 @@ async fn put_catalog<S: TagStore>(
     }
 
     // 5. The index: the recordings the envelope lists, which the node can't
-    //    read. Nothing blocked, every payload ingested at its size with a
-    //    stored manifest, each recording carrying the envelope's attribute.
-    //    The metadata TDFs inside the envelope are Creator's to check.
+    //    read. Nothing blocked, every payload ingested at its size, owned by
+    //    the publisher (gated only), with a stored manifest, each recording
+    //    carrying the envelope's attribute. The metadata TDFs inside the
+    //    envelope are Creator's to check.
     let index = req.index.clone();
     let entries = creator_catalog::parse_index(req.index).map_err(|why| {
         reject(
@@ -390,9 +391,12 @@ async fn put_catalog<S: TagStore>(
     if is_blocked(api, &hash) {
         return Err(reject(StatusCode::FORBIDDEN, "content is blocked".into()));
     }
-    check_payloads(api, &entries, &attribute)
+    check_payloads(api, &entries, &attribute, &claims.sub)
         .await
-        .map_err(|(status, msg)| reject(status, msg))?;
+        .map_err(|refusal| {
+            warn!(%sub, status = %refusal.status, reason = %refusal.error, "Catalog v2 publish rejected");
+            refusal.into_response_parts()
+        })?;
 
     // 6. The passkey is still this subject's.
     state
@@ -986,7 +990,8 @@ mod tests {
         get_as(h, sub, Some(&token(READER))).await
     }
 
-    /// payload(n), a campaign recording, with its stored manifest.
+    /// payload(n), a campaign recording, with its stored manifest, owned by
+    /// the publisher (`SUB`).
     async fn ingest(h: &Harness, n: u8) {
         h.store
             .ingest_with_manifest(
@@ -995,6 +1000,7 @@ mod tests {
                 manifest(recording_policy(), &[KAS]),
             )
             .await;
+        h.store.own(&payload(n), SUB).await;
     }
 
     async fn ingested() -> Harness {
@@ -1229,6 +1235,7 @@ mod tests {
         h.store
             .ingest_with_manifest(&payload(1), PAYLOAD_SIZE, manifest(policy, &[KAS]))
             .await;
+        h.store.own(&payload(1), SUB).await;
         let document = envelope_tdf(envelope_policy(&creator), CATALOG_MIME_TYPE, b"x");
         let r = publish(&h, 1, &document).await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
@@ -1327,6 +1334,38 @@ mod tests {
         let r = publish_index(&h, 1, &envelope(1), json!([])).await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
         assert!(h.store.catalog_pointers.lock().await.contains_key(SUB));
+    }
+
+    #[tokio::test]
+    async fn a_publish_refusal_carries_content_ids() {
+        let h = harness();
+        ingest(&h, 1).await;
+        // MemStore's `own` replaces the record: payload(1) is READER's.
+        h.store.own(&payload(1), READER).await;
+        let r = publish(&h, 1, &envelope(1)).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            r.json(),
+            json!({ "error": "recording belongs to another account", "contentIDs": ["rec-1"] })
+        );
+
+        h.store.owners.lock().await.clear();
+        let r = publish(&h, 1, &envelope(1)).await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            r.json(),
+            json!({ "error": "recording has no owner: push it again", "contentIDs": ["rec-1"] })
+        );
+
+        // Any other refusal is `error` alone.
+        let r = publish_index(&h, 1, &envelope(1), json!([entry("rec-2", &payload(2))])).await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            r.json(),
+            json!({ "error": format!("payload {} is not ingested", payload(2)) })
+        );
+        assert!(h.store.catalog_documents.lock().await.is_empty());
+        assert!(h.store.catalog_pointers.lock().await.is_empty());
     }
 
     #[tokio::test]

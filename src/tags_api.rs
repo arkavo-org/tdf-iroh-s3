@@ -30,6 +30,12 @@ pub trait TagStore: Send + Sync + 'static {
         &self,
         hash_hex: &str,
     ) -> impl Future<Output = anyhow::Result<Option<Bytes>>> + Send;
+    /// A recording's owner record (`moderation/publishers/<hash>`, read with
+    /// `ownership::parse_owner`); `None` when the recording has none.
+    fn get_blob_owner(
+        &self,
+        hash_hex: &str,
+    ) -> impl Future<Output = anyhow::Result<Option<Bytes>>> + Send;
     fn get_catalog_document(
         &self,
         hash_hex: &str,
@@ -114,6 +120,11 @@ impl TagStore for crate::store::s3::S3Client {
 
     async fn get_manifest(&self, hash_hex: &str) -> anyhow::Result<Option<Bytes>> {
         Self::get_manifest(self, hash_hex).await
+    }
+
+    async fn get_blob_owner(&self, hash_hex: &str) -> anyhow::Result<Option<Bytes>> {
+        self.get_moderation_record(crate::ownership::PUBLISHERS, hash_hex)
+            .await
     }
 
     async fn get_catalog_document(&self, hash_hex: &str) -> anyhow::Result<Option<StoredDocument>> {
@@ -260,8 +271,8 @@ pub(crate) mod test_support {
     use std::collections::HashMap;
     use tokio::sync::Mutex;
 
-    /// In-memory ingested blobs (hash → size), catalog documents, indexes
-    /// and pointers.
+    /// In-memory ingested blobs (hash → size), owner records, catalog
+    /// documents, indexes and pointers.
     #[derive(Default)]
     pub struct MemStore {
         pub blobs: Mutex<HashMap<String, u64>>,
@@ -269,6 +280,10 @@ pub(crate) mod test_support {
         pub manifests: Mutex<HashMap<String, Bytes>>,
         /// How many times `get_manifest` was asked.
         pub manifest_reads: std::sync::atomic::AtomicUsize,
+        /// hash → owner record body, as stored at `moderation/publishers/`.
+        pub owners: Mutex<HashMap<String, Bytes>>,
+        /// How many times `get_blob_owner` was asked.
+        pub owner_reads: std::sync::atomic::AtomicUsize,
         pub catalog_documents: Mutex<HashMap<String, StoredDocument>>,
         /// How many times `blob_size` was asked (one S3 HEAD each).
         pub blob_lookups: std::sync::atomic::AtomicUsize,
@@ -303,6 +318,20 @@ pub(crate) mod test_support {
                 .insert(hash.to_string(), Bytes::from(manifest));
         }
 
+        /// Record `subject`, exactly as given, as the owner of `hash`.
+        pub async fn own(&self, hash: &str, subject: &str) {
+            let record = crate::ownership::BlobOwner {
+                hash: hash.to_string(),
+                subject: subject.to_string(),
+                endpoint_id: "e".repeat(64),
+                at: 1,
+            };
+            self.owners.lock().await.insert(
+                hash.to_string(),
+                Bytes::from(serde_json::to_vec(&record).expect("record serializes")),
+            );
+        }
+
         fn up(&self) -> anyhow::Result<()> {
             anyhow::ensure!(
                 !self.down.load(std::sync::atomic::Ordering::Relaxed),
@@ -324,6 +353,12 @@ pub(crate) mod test_support {
             self.manifest_reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(self.manifests.lock().await.get(hash_hex).cloned())
+        }
+        async fn get_blob_owner(&self, hash_hex: &str) -> anyhow::Result<Option<Bytes>> {
+            self.up()?;
+            self.owner_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self.owners.lock().await.get(hash_hex).cloned())
         }
         async fn get_catalog_document(
             &self,

@@ -9,7 +9,8 @@
 //! [`check_payloads`] holds the per-entry publish checks `PUT
 //! /v2/catalogs/{sub}` runs on a catalog's index: the recordings it lists. On an ungated node
 //! (`[publishing] required = false`) nothing is blocked (moderation records
-//! are only loaded when gated).
+//! are only loaded when gated) and recordings' owners are not checked (no
+//! owner records are written there).
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -24,6 +25,8 @@ use tracing::warn;
 
 use crate::catalog_metadata;
 use crate::creator_catalog::{CreatorCatalogEntry, is_lower_hex_hash};
+use crate::moderation::canonical_subject;
+use crate::ownership::parse_owner;
 use crate::tags_api::{ApiState, TagStore, is_blocked};
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
@@ -40,6 +43,38 @@ fn storage_unavailable(what: &str, e: anyhow::Error) -> ApiError {
 /// How many blob existence checks one catalog upload runs at a time.
 const INGEST_CHECK_CONCURRENCY: usize = 16;
 
+/// Why [`check_payloads`] refuses an index: the status, the `error` string
+/// and, for the two owner refusals only, every offending entry's
+/// `contentID`, sorted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PayloadRefusal {
+    pub status: StatusCode,
+    pub error: String,
+    pub content_ids: Option<Vec<String>>,
+}
+
+impl From<(StatusCode, String)> for PayloadRefusal {
+    fn from((status, error): (StatusCode, String)) -> Self {
+        Self {
+            status,
+            error,
+            content_ids: None,
+        }
+    }
+}
+
+impl PayloadRefusal {
+    /// The reply: `{"error": …}`, with `"contentIDs": […]` when the refusal
+    /// names entries.
+    pub(crate) fn into_response_parts(self) -> ApiError {
+        let mut body = serde_json::json!({ "error": self.error });
+        if let Some(ids) = self.content_ids {
+            body["contentIDs"] = serde_json::json!(ids);
+        }
+        (self.status, Json(body))
+    }
+}
+
 pub fn router<S: TagStore>(state: Arc<ApiState<S>>) -> Router {
     Router::new()
         .route("/catalog-documents/{hash}", get(get_catalog_document::<S>))
@@ -53,6 +88,9 @@ pub fn router<S: TagStore>(state: Arc<ApiState<S>>) -> Router {
 ///   missing one in entry order);
 /// - every entry's size equal to that blob's (422 `payload <hash> size does
 ///   not match`);
+/// - on a gated node, every recording owned by `publisher` (403 `recording
+///   belongs to another account`, else 422 `recording has no owner: push it
+///   again`, each with `contentIDs`; see [`check_owners`]);
 /// - every recording's manifest stored at ingest (422 `payload <hash>
 ///   manifest is not stored`) and readable (`… manifest is unreadable`);
 /// - every recording's policy names `attribute`, the envelope's (422 `entry
@@ -66,9 +104,10 @@ pub(crate) async fn check_payloads<S: TagStore>(
     state: &ApiState<S>,
     entries: &[CreatorCatalogEntry],
     attribute: &str,
-) -> Result<(), (StatusCode, String)> {
+    publisher: &str,
+) -> Result<(), PayloadRefusal> {
     if entries.iter().any(|e| is_blocked(state, &e.payload_hash)) {
-        return Err((StatusCode::FORBIDDEN, "content is blocked".to_string()));
+        return Err((StatusCode::FORBIDDEN, "content is blocked".to_string()).into());
     }
 
     let sizes = look_up(state, hashes(entries), |store, hash| async move {
@@ -95,7 +134,12 @@ pub(crate) async fn check_payloads<S: TagStore>(
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("payload {} size does not match", e.payload_hash),
-        ));
+        )
+            .into());
+    }
+
+    if state.publishing.is_some() {
+        check_owners(state, entries, publisher).await?;
     }
 
     let manifests = look_up(state, hashes(entries), |store, hash| async move {
@@ -128,9 +172,75 @@ pub(crate) async fn check_payloads<S: TagStore>(
                 "entry {} policy does not include the catalog attribute",
                 e.content_id
             ),
-        ));
+        )
+            .into());
     }
     Ok(())
+}
+
+/// Every entry's recording is `publisher`'s, by its owner record
+/// (`moderation/publishers/<hash>`), comparing canonical subjects. Any entry
+/// of another account gives 403 `recording belongs to another account`;
+/// only when there is none, any entry without an owner gives 422 `recording
+/// has no owner: push it again` (a push claims it). Both name every such
+/// entry's `contentID`, sorted. A record that can't be read or parsed is 502
+/// `storage unavailable`.
+async fn check_owners<S: TagStore>(
+    state: &ApiState<S>,
+    entries: &[CreatorCatalogEntry],
+    publisher: &str,
+) -> Result<(), PayloadRefusal> {
+    let owners = look_up(state, hashes(entries), |store, hash| async move {
+        let unavailable = || (StatusCode::BAD_GATEWAY, "storage unavailable".to_string());
+        match store.get_blob_owner(&hash).await {
+            Ok(Some(bytes)) => match parse_owner(&hash, &bytes) {
+                Ok(owner) => Ok(Some(owner.subject)),
+                Err(e) => {
+                    warn!(%hash, error = format!("{e:#}"), "Owner record unreadable");
+                    Err(unavailable())
+                }
+            },
+            Ok(None) => Ok(None),
+            Err(e) => {
+                warn!(%hash, error = %e, "Owner record read failed");
+                Err(unavailable())
+            }
+        }
+    })
+    .await?;
+
+    let publisher = canonical_subject(publisher);
+    let mut another = Vec::new();
+    let mut unowned = Vec::new();
+    for e in entries {
+        match owners.get(&e.payload_hash).and_then(Option::as_deref) {
+            Some(owner) if canonical_subject(owner) == publisher => {}
+            Some(_) => another.push(e.content_id.clone()),
+            None => unowned.push(e.content_id.clone()),
+        }
+    }
+    let (status, error, mut content_ids) = if !another.is_empty() {
+        (
+            StatusCode::FORBIDDEN,
+            "recording belongs to another account",
+            another,
+        )
+    } else if !unowned.is_empty() {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "recording has no owner: push it again",
+            unowned,
+        )
+    } else {
+        return Ok(());
+    };
+    content_ids.sort();
+    content_ids.dedup();
+    Err(PayloadRefusal {
+        status,
+        error: error.to_string(),
+        content_ids: Some(content_ids),
+    })
 }
 
 /// The distinct recording hashes `entries` name, in entry order.
@@ -146,7 +256,7 @@ fn hashes(entries: &[CreatorCatalogEntry]) -> Vec<String> {
 
 /// Run `f` for each hash, at most [`INGEST_CHECK_CONCURRENCY`] at a time,
 /// and stop at the first refusal in `hashes` order.
-async fn look_up<S, T, F, Fut>(
+pub(crate) async fn look_up<S, T, F, Fut>(
     state: &ApiState<S>,
     hashes: Vec<String>,
     f: F,
@@ -330,8 +440,15 @@ mod tests {
         format!("{n:02x}").repeat(32)
     }
 
-    /// Ingest payload(n), a campaign recording, with its stored manifest.
+    /// Ingest payload(n), a campaign recording, with its stored manifest,
+    /// owned by the publisher (`SUB`).
     async fn ingest(h: &Harness, n: u8) {
+        ingest_unowned(h, n).await;
+        h.store.own(&payload(n), SUB).await;
+    }
+
+    /// As [`ingest`], with no owner record.
+    async fn ingest_unowned(h: &Harness, n: u8) {
         h.store
             .ingest_with_manifest(
                 &payload(n),
@@ -350,16 +467,42 @@ mod tests {
         index(vec![entry("rec-1", &payload(1))])
     }
 
-    async fn check(
-        h: &Harness,
-        entries: &[CreatorCatalogEntry],
-    ) -> Result<(), (StatusCode, String)> {
-        check_payloads(&h.state, entries, CAMPAIGN).await
+    /// `entries` checked against the campaign, published by `SUB`.
+    async fn check(h: &Harness, entries: &[CreatorCatalogEntry]) -> Result<(), PayloadRefusal> {
+        check_as(h, entries, SUB).await
     }
 
-    fn unprocessable(msg: String) -> Result<(), (StatusCode, String)> {
-        Err((StatusCode::UNPROCESSABLE_ENTITY, msg))
+    async fn check_as(
+        h: &Harness,
+        entries: &[CreatorCatalogEntry],
+        publisher: &str,
+    ) -> Result<(), PayloadRefusal> {
+        check_payloads(&h.state, entries, CAMPAIGN, publisher).await
     }
+
+    fn refused(status: StatusCode, msg: impl Into<String>) -> Result<(), PayloadRefusal> {
+        Err((status, msg.into()).into())
+    }
+
+    fn unprocessable(msg: String) -> Result<(), PayloadRefusal> {
+        refused(StatusCode::UNPROCESSABLE_ENTITY, msg)
+    }
+
+    /// An owner refusal naming `content_ids`.
+    fn refused_naming(
+        status: StatusCode,
+        msg: &str,
+        content_ids: &[&str],
+    ) -> Result<(), PayloadRefusal> {
+        Err(PayloadRefusal {
+            status,
+            error: msg.to_string(),
+            content_ids: Some(content_ids.iter().map(|id| id.to_string()).collect()),
+        })
+    }
+
+    const ANOTHER: &str = "recording belongs to another account";
+    const NO_OWNER: &str = "recording has no owner: push it again";
 
     struct Reply {
         status: StatusCode,
@@ -428,7 +571,7 @@ mod tests {
         h.moderation.block_for_test(&payload(1));
         assert_eq!(
             check(&h, &one()).await,
-            Err((StatusCode::FORBIDDEN, "content is blocked".to_string()))
+            refused(StatusCode::FORBIDDEN, "content is blocked")
         );
         // An ungated node blocks nothing.
         let h = harness(false);
@@ -504,6 +647,7 @@ mod tests {
         ]);
         assert_eq!(check(&h, &entries).await, Ok(()));
         assert_eq!(h.store.blob_lookups.load(Relaxed), 2);
+        assert_eq!(h.store.owner_reads.load(Relaxed), 2);
         assert_eq!(h.store.manifest_reads.load(Relaxed), 2);
     }
 
@@ -511,6 +655,7 @@ mod tests {
     async fn every_manifest_must_be_stored_and_readable() {
         let h = harness(true);
         h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
+        h.store.own(&payload(1), SUB).await;
         assert_eq!(
             check(&h, &one()).await,
             unprocessable(format!("payload {} manifest is not stored", payload(1)))
@@ -527,7 +672,7 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
             check(&h, &one()).await,
-            Err((StatusCode::BAD_GATEWAY, "storage unavailable".to_string()))
+            refused(StatusCode::BAD_GATEWAY, "storage unavailable")
         );
     }
 
@@ -537,7 +682,7 @@ mod tests {
         ingest(&h, 1).await;
         let other = "https://patreon.arkavo.com/attr/campaign/value/99";
         assert_eq!(
-            check_payloads(&h.state, &one(), other).await,
+            check_payloads(&h.state, &one(), other, SUB).await,
             unprocessable("entry rec-1 policy does not include the catalog attribute".into())
         );
 
@@ -547,6 +692,7 @@ mod tests {
         h.store
             .ingest_with_manifest(&payload(2), PAYLOAD_SIZE, manifest(other_policy, &[KAS]))
             .await;
+        h.store.own(&payload(2), SUB).await;
         let entries = index(vec![
             entry("rec-1", &payload(1)),
             entry("rec-2", &payload(2)),
@@ -555,6 +701,162 @@ mod tests {
             check(&h, &entries).await,
             unprocessable("entry rec-2 policy does not include the catalog attribute".into())
         );
+    }
+
+    #[tokio::test]
+    async fn a_recording_of_another_account_is_refused() {
+        let h = harness(true);
+        ingest_unowned(&h, 1).await;
+        h.store.own(&payload(1), "u2").await;
+        ingest(&h, 2).await;
+        // Every entry naming it, sorted: one hash under two contentIDs.
+        let entries = index(vec![
+            entry("rec-b", &payload(1)),
+            entry("rec-a", &payload(1)),
+            entry("rec-c", &payload(2)),
+        ]);
+        assert_eq!(
+            check(&h, &entries).await,
+            refused_naming(StatusCode::FORBIDDEN, ANOTHER, &["rec-a", "rec-b"])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unowned_recording_must_be_pushed_again() {
+        let h = harness(true);
+        ingest_unowned(&h, 1).await;
+        assert_eq!(
+            check(&h, &one()).await,
+            refused_naming(StatusCode::UNPROCESSABLE_ENTITY, NO_OWNER, &["rec-1"])
+        );
+        // Every entry naming it, sorted.
+        let entries = index(vec![
+            entry("rec-z", &payload(1)),
+            entry("rec-1", &payload(1)),
+        ]);
+        assert_eq!(
+            check(&h, &entries).await,
+            refused_naming(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                NO_OWNER,
+                &["rec-1", "rec-z"]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn another_owner_outranks_no_owner() {
+        let h = harness(true);
+        ingest_unowned(&h, 1).await;
+        ingest_unowned(&h, 2).await;
+        h.store.own(&payload(2), "u2").await;
+        // The unowned entry comes first; the other account's still answers.
+        let entries = index(vec![
+            entry("rec-1", &payload(1)),
+            entry("rec-2", &payload(2)),
+        ]);
+        assert_eq!(
+            check(&h, &entries).await,
+            refused_naming(StatusCode::FORBIDDEN, ANOTHER, &["rec-2"])
+        );
+    }
+
+    #[tokio::test]
+    async fn the_owner_check_is_canonical() {
+        // `arkavo:<uuid>` and `<uuid>` are one account, either way round.
+        let h = harness(true);
+        ingest(&h, 1).await;
+        assert_eq!(check_as(&h, &one(), &format!("arkavo:{SUB}")).await, Ok(()));
+
+        let h = harness(true);
+        ingest_unowned(&h, 1).await;
+        h.store.own(&payload(1), &format!("arkavo:{SUB}")).await;
+        assert_eq!(check(&h, &one()).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_owner_is_502() {
+        let h = harness(true);
+        ingest_unowned(&h, 1).await;
+        h.store
+            .owners
+            .lock()
+            .await
+            .insert(payload(1), Bytes::from_static(b"x"));
+        assert_eq!(
+            check(&h, &one()).await,
+            refused(StatusCode::BAD_GATEWAY, "storage unavailable")
+        );
+        // A record naming another hash is not this recording's.
+        let h = harness(true);
+        ingest_unowned(&h, 1).await;
+        h.store.own(&payload(9), SUB).await;
+        let misfiled = h.store.owners.lock().await[&payload(9)].clone();
+        h.store.owners.lock().await.insert(payload(1), misfiled);
+        assert_eq!(
+            check(&h, &one()).await,
+            refused(StatusCode::BAD_GATEWAY, "storage unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ungated_node_skips_the_owner_check() {
+        let h = harness(false);
+        ingest_unowned(&h, 1).await;
+        assert_eq!(check(&h, &one()).await, Ok(()));
+        h.store.own(&payload(1), "u2").await;
+        assert_eq!(check(&h, &one()).await, Ok(()));
+        assert_eq!(
+            h.store
+                .owner_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn the_owner_check_follows_the_size_check() {
+        let h = harness(true);
+        ingest_unowned(&h, 1).await;
+        let mut wrong = entry("rec-1", &payload(1));
+        wrong["payloadSize"] = json!(PAYLOAD_SIZE + 1);
+        assert_eq!(
+            check(&h, &index(vec![wrong])).await,
+            unprocessable(format!("payload {} size does not match", payload(1)))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_owner_check_precedes_the_manifest_check() {
+        // Another account's recording with no stored manifest: the owner
+        // refusal answers.
+        let h = harness(true);
+        h.store.ingest(&payload(1), PAYLOAD_SIZE).await;
+        h.store.own(&payload(1), "u2").await;
+        assert_eq!(
+            check(&h, &one()).await,
+            refused_naming(StatusCode::FORBIDDEN, ANOTHER, &["rec-1"])
+        );
+    }
+
+    #[test]
+    fn only_an_owner_refusal_carries_content_ids() {
+        let refusal = PayloadRefusal {
+            status: StatusCode::FORBIDDEN,
+            error: ANOTHER.to_string(),
+            content_ids: Some(vec!["rec-a".into(), "rec-b".into()]),
+        };
+        let (status, Json(body)) = refusal.into_response_parts();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body,
+            json!({ "error": ANOTHER, "contentIDs": ["rec-a", "rec-b"] })
+        );
+
+        let refusal = PayloadRefusal::from((StatusCode::FORBIDDEN, "content is blocked".into()));
+        let (status, Json(body)) = refusal.into_response_parts();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({ "error": "content is blocked" }));
     }
 
     #[tokio::test]
