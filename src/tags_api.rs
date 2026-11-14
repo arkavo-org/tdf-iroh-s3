@@ -77,8 +77,9 @@ pub trait TagStore: Send + Sync + 'static {
     /// (`catalog-transitions/<sub>/<name>`, never served) only if none is
     /// stored (`expected` `None`: `If-None-Match: *`), or only if the stored
     /// one still has the ETag `expected` (`If-Match`). `false` when the
-    /// condition failed; `Err` when it can't be written, a conflicting
-    /// write still in progress after the retries included.
+    /// condition failed, a replace of one deleted since included; `Err`
+    /// when it can't be written, a conflicting write still in progress
+    /// after the retries included.
     fn put_catalog_transition(
         &self,
         sub: &str,
@@ -99,7 +100,8 @@ pub trait TagStore: Send + Sync + 'static {
     ) -> impl Future<Output = anyhow::Result<Option<StoredPointer>>> + Send;
     /// Store a creator's pointer bundle only if the stored one still has
     /// the ETag `expected` (with `None`: only if none is stored). `false`
-    /// when another write got there first.
+    /// when another write got there first, or the pointer was deleted
+    /// since it was read.
     fn put_catalog_pointer(
         &self,
         sub: &str,

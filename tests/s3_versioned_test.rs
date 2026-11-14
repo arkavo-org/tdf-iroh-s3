@@ -277,9 +277,9 @@ async fn a_concurrent_conditional_create_reports_false() {
 /// A publish's transition (`put_catalog_transition`), as `write_transition`
 /// uses it: created only if none is there, replaced only over the ETag it
 /// was read at. A replace over a stale ETag writes nothing and reports
-/// `false` (412). A replace where no object is: S3 answers 404, not 412,
-/// so it is an error, where the route's test store reports `false`; both
-/// end as 502, and neither writes.
+/// `false` (412). So does a replace where no object is (one deleted since
+/// it was read): S3 answers that 404 `NoSuchKey`, not 412, and it counts
+/// as lost, as in the route's test store.
 #[tokio::test]
 #[ignore = "needs a real versioned bucket: TDF_IROH_S3_VERSIONED_BUCKET"]
 async fn a_transition_is_created_once_and_replaced_over_its_etag() {
@@ -292,8 +292,7 @@ async fn a_transition_is_created_once_and_replaced_over_its_etag() {
         let missing = s3
             .put_catalog_transition(sub, name, body("ghost"), Some("\"0123\""))
             .await;
-        eprintln!("If-Match where no object is: {missing:?}");
-        assert!(!matches!(missing, Ok(true)), "{missing:?}");
+        assert!(matches!(missing, Ok(false)), "{missing:?}");
         assert_eq!(s3.get_catalog_transition(sub, name).await.unwrap(), None);
 
         assert!(

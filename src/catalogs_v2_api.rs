@@ -749,7 +749,7 @@ async fn write_transition<S: TagStore>(
         .map_err(write)?;
     if !replaced {
         return Err(write(anyhow::anyhow!(
-            "transition {sub}/{name} was replaced since it was read"
+            "transition {sub}/{name} was replaced or deleted since it was read"
         )));
     }
     Ok(())
