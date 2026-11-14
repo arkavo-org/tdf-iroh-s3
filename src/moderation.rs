@@ -191,7 +191,7 @@ impl SessionStore for crate::store::s3::S3Client {
 const SESSIONS: &str = "sessions";
 
 /// How long a push waits for the session store, or for its recording's
-/// owner record, before it is refused.
+/// owner record (an owner lookup permit included), before it is refused.
 const SESSION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Session lookups at once, for pushes whose session this gate doesn't hold.
@@ -200,7 +200,8 @@ const SESSION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_LOOKUPS: usize = 16;
 
 /// Owner lookups at once. Every push the other checks accept sends S3 one
-/// owner read; a push that finds them all busy is refused. Kept apart from
+/// owner read; a push that finds them all busy waits for one, within the
+/// same [`SESSION_LOOKUP_TIMEOUT`] as its read. Kept apart from
 /// [`SESSION_LOOKUPS`], so pushes with no session can't hold the permits a
 /// publisher's push needs.
 const OWNER_LOOKUPS: usize = 16;
@@ -777,21 +778,23 @@ impl PublishGate {
     }
 
     /// Whether `subject` may push `hash_hex`: not when another account owns
-    /// it. An unowned recording may be pushed (ingest then claims it). An
-    /// owner record that can't be read in time, or parsed, refuses the push,
-    /// and so does finding every owner lookup busy. Checked last, so a push
-    /// refused otherwise costs no read; skipped without an owner store.
+    /// it. An unowned recording may be pushed (ingest then claims it). The
+    /// push waits for an owner lookup permit, then reads the owner record,
+    /// both within one [`SESSION_LOOKUP_TIMEOUT`]. A record that can't be
+    /// read in that time, or parsed, refuses the push. Checked last, so a
+    /// push refused otherwise costs no read; skipped without an owner store.
     async fn owner_allows(&self, subject: &str, hash_hex: &str) -> Result<(), PushRefusal> {
         let Some(owners) = self.owners.as_ref() else {
             return Ok(());
         };
-        let Ok(_permit) = self.owner_lookups.try_acquire() else {
-            warn!(%subject, hash = %hash_hex, "Owner lookups busy; push refused");
+        // One budget for the permit wait and the read together.
+        let deadline = tokio::time::Instant::now() + SESSION_LOOKUP_TIMEOUT;
+        let Ok(Ok(_permit)) = tokio::time::timeout_at(deadline, self.owner_lookups.acquire()).await
+        else {
+            warn!(%subject, hash = %hash_hex, "Owner lookups busy until the timeout; push refused");
             return Err(PushRefusal::OwnerUnknown);
         };
-        let body = match tokio::time::timeout(SESSION_LOOKUP_TIMEOUT, owners.get_owner(hash_hex))
-            .await
-        {
+        let body = match tokio::time::timeout_at(deadline, owners.get_owner(hash_hex)).await {
             Ok(Ok(Some(body))) => body,
             Ok(Ok(None)) => return Ok(()),
             Ok(Err(e)) => {
@@ -2166,18 +2169,94 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn busy_owner_lookups_refuse_the_push() {
+    /// Every owner lookup permit held past the budget: the push waits the
+    /// whole budget for one, then is refused without a lookup, though the
+    /// recording has no owner.
+    #[tokio::test(start_paused = true)]
+    async fn owner_lookups_busy_past_the_budget_refuse_the_push() {
         let owners = Arc::new(MemOwners::default());
         let gate = owner_gate(Some(&owners));
         let _all = gate
             .owner_lookups
             .try_acquire_many(OWNER_LOOKUPS as u32)
             .unwrap();
-        // Refused without a lookup, though the recording has no owner.
+        let started = tokio::time::Instant::now();
         assert_eq!(
             gate.authorize_push(1, &owned_hash()).await,
             Err(PushRefusal::OwnerUnknown)
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= SESSION_LOOKUP_TIMEOUT && waited < SESSION_LOOKUP_TIMEOUT * 2,
+            "{waited:?}"
+        );
+    }
+
+    /// A permit freed within the budget: the push waits for it, then looks
+    /// the owner up, and is allowed for a record naming the pusher or none.
+    #[tokio::test(start_paused = true)]
+    async fn a_push_waits_for_an_owner_lookup_permit() {
+        let hash = owned_hash();
+        let freed = Duration::from_secs(4);
+        for (record, why) in [
+            (Some(owner_record(&hash, OWNER_UUID)), "owned by the pusher"),
+            (None, "no owner record"),
+        ] {
+            let owners = Arc::new(MemOwners::default());
+            if let Some(body) = record {
+                seed_owner(&owners, &hash, body);
+            }
+            let gate = owner_gate(Some(&owners));
+            let _others = gate
+                .owner_lookups
+                .try_acquire_many(OWNER_LOOKUPS as u32 - 1)
+                .unwrap();
+            let last = gate.owner_lookups.try_acquire().unwrap();
+            let started = tokio::time::Instant::now();
+            let (pushed, ()) = tokio::join!(gate.authorize_push(1, &hash), async move {
+                tokio::time::sleep(freed).await;
+                drop(last);
+            });
+            let (sub, _) = pushed.expect(why);
+            assert_eq!(sub, OWNER_UUID, "{why}");
+            let waited = started.elapsed();
+            assert!(
+                waited >= freed && waited < SESSION_LOOKUP_TIMEOUT,
+                "{why}: {waited:?}"
+            );
+        }
+    }
+
+    /// The permit wait and the lookup share one budget: a 3 s wait for a
+    /// permit, then a 3 s lookup, is refused at 5 s, though each alone fits.
+    #[tokio::test(start_paused = true)]
+    async fn the_permit_wait_and_the_lookup_share_one_budget() {
+        let hash = owned_hash();
+        let owners = Arc::new(MemOwners::default());
+        seed_owner(&owners, &hash, owner_record(&hash, OWNER_UUID));
+        let part = Duration::from_secs(3);
+        *owners.delay.lock().unwrap() = part;
+        let gate = owner_gate(Some(&owners));
+
+        // The lookup alone fits the budget.
+        let (sub, _) = gate.authorize_push(1, &hash).await.unwrap();
+        assert_eq!(sub, OWNER_UUID);
+
+        let _others = gate
+            .owner_lookups
+            .try_acquire_many(OWNER_LOOKUPS as u32 - 1)
+            .unwrap();
+        let last = gate.owner_lookups.try_acquire().unwrap();
+        let started = tokio::time::Instant::now();
+        let (pushed, ()) = tokio::join!(gate.authorize_push(1, &hash), async move {
+            tokio::time::sleep(part).await;
+            drop(last);
+        });
+        assert_eq!(pushed, Err(PushRefusal::OwnerUnknown));
+        let waited = started.elapsed();
+        assert!(
+            waited >= SESSION_LOOKUP_TIMEOUT && waited < part * 2,
+            "{waited:?}"
         );
     }
 
@@ -2197,16 +2276,18 @@ mod tests {
         assert_eq!(sub, OWNER_UUID);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn without_an_owner_store_the_check_is_skipped() {
         let gate = owner_gate(None);
-        // Not even an owner lookup permit is needed.
+        // Not even an owner lookup permit is needed, so none is waited for.
         let _all = gate
             .owner_lookups
             .try_acquire_many(OWNER_LOOKUPS as u32)
             .unwrap();
+        let started = tokio::time::Instant::now();
         let (sub, _) = gate.authorize_push(1, &owned_hash()).await.unwrap();
         assert_eq!(sub, OWNER_UUID);
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     /// The owner check runs last: a push the session, a suspension or a

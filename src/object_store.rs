@@ -55,8 +55,9 @@ pub trait ObjectStore: Send + Sync + 'static {
     fn put(&self, key: &str, body: Bytes) -> impl Future<Output = anyhow::Result<()>> + Send;
 
     /// Write `key` only if it has no current object (`If-None-Match: *`).
-    /// `false` when one exists, or when a concurrent conditional write to
-    /// the key is in progress; nothing is written then.
+    /// `false` when one exists; nothing is written then. `Err` when a
+    /// concurrent conditional write to the key is still in progress after
+    /// the retries (S3's 409): whether one exists is unknown.
     fn create(&self, key: &str, body: Bytes) -> impl Future<Output = anyhow::Result<bool>> + Send;
 
     /// Delete every version and every delete marker of exactly `key`, and
