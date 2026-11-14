@@ -2,9 +2,14 @@
 //! pointer the creator signs with their passkey, and the IdP attests which
 //! passkey belongs to which subject.
 //!
-//! - **Pointer**: the exact bytes of an `arkavo.catalog-pointer/1` JSON
-//!   object naming the catalog document's BLAKE3 hash and size, with a
-//!   sequence number. Signed as-is, never re-serialized.
+//! - **Pointer**: the exact bytes of an `arkavo.catalog-pointer/2` JSON
+//!   object naming the catalog document's BLAKE3 hash and size and the
+//!   SHA-256 of its canonical index (`indexHash`,
+//!   `creator_catalog::index_hash`), so the passkey covers the clear index
+//!   too, with a sequence number. Signed as-is, never re-serialized.
+//!   `arkavo.catalog-pointer/1` is the same without `indexHash`; stored
+//!   `/1` pointers still parse, so `GET` serves them and a publish reads
+//!   them as its base.
 //! - **Assertion**: a WebAuthn assertion (RP `identity.arkavo.net`) whose
 //!   challenge is SHA-256 of the pointer bytes.
 //! - **Credential**: the IdP's COSE_Sign1 attestation binding the
@@ -30,7 +35,11 @@ use crate::creator_catalog::{
     valid_identifier,
 };
 
-pub const POINTER_SCHEMA: &str = "arkavo.catalog-pointer/1";
+/// The pointer schema a publish carries: seven keys, `indexHash` among
+/// them.
+pub const POINTER_SCHEMA: &str = "arkavo.catalog-pointer/2";
+/// The pointer schema before `indexHash`: exactly six keys. Still read.
+pub const POINTER_SCHEMA_1: &str = "arkavo.catalog-pointer/1";
 
 /// Content type an attestation may carry in its protected header.
 pub const CREDENTIAL_CONTENT_TYPE: &str = "application/arkavo-passkey-credential+cbor";
@@ -72,7 +81,7 @@ impl Passkeys {
     }
 }
 
-/// A parsed `arkavo.catalog-pointer/1`.
+/// A parsed `arkavo.catalog-pointer/2` or `/1`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Pointer {
@@ -81,7 +90,17 @@ pub struct Pointer {
     pub seq: u64,
     pub catalog_hash: String,
     pub catalog_size: u64,
+    /// Lowercase hex SHA-256 of the canonical index: `Some` exactly when
+    /// `schema` is `/2`.
+    #[serde(default, deserialize_with = "present")]
+    pub index_hash: Option<String>,
     pub issued_at: String,
+}
+
+/// A key that is present holds a string: `null` is refused, not read as
+/// absent, so a `/1` with `"indexHash":null` has seven keys.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(d).map(Some)
 }
 
 /// Parse and validate pointer bytes. The error is the reason reported as
@@ -93,8 +112,21 @@ pub fn parse_pointer(bytes: &[u8]) -> Result<Pointer, String> {
     std::str::from_utf8(bytes).map_err(|_| "pointer is not UTF-8".to_string())?;
     serde_json::from_slice::<NoDuplicateKeys>(bytes).map_err(|e| format!("pointer: {e}"))?;
     let p: Pointer = serde_json::from_slice(bytes).map_err(|e| format!("pointer: {e}"))?;
-    if p.schema != POINTER_SCHEMA {
-        return Err(format!("pointer schema must be \"{POINTER_SCHEMA}\""));
+    match p.schema.as_str() {
+        POINTER_SCHEMA => match &p.index_hash {
+            None => return Err(format!("pointer \"{POINTER_SCHEMA}\" requires indexHash")),
+            Some(h) if !is_lower_hex_hash(h) => {
+                return Err("pointer indexHash must be 64 lowercase hex characters".to_string());
+            }
+            Some(_) => {}
+        },
+        POINTER_SCHEMA_1 if p.index_hash.is_some() => {
+            return Err(format!(
+                "pointer \"{POINTER_SCHEMA_1}\" must not carry indexHash"
+            ));
+        }
+        POINTER_SCHEMA_1 => {}
+        _ => return Err(format!("pointer schema must be \"{POINTER_SCHEMA}\"")),
     }
     if !valid_identifier(&p.owner, MAX_OWNER_BYTES) {
         return Err(format!(
@@ -531,9 +563,21 @@ pub(crate) mod test_support {
             .unwrap()
     }
 
-    pub fn pointer_bytes(owner: &str, seq: u64, document: &[u8]) -> Vec<u8> {
+    /// Pointer bytes for `owner`'s `document` at `seq`: `/1` when
+    /// `index_hash` is `None`, else `/2` with `"indexHash"` between
+    /// `catalogSize` and `issuedAt`.
+    pub fn pointer_bytes(
+        owner: &str,
+        seq: u64,
+        document: &[u8],
+        index_hash: Option<&str>,
+    ) -> Vec<u8> {
+        let (version, index_hash) = match index_hash {
+            None => (1, String::new()),
+            Some(h) => (2, format!(r#""indexHash":"{h}","#)),
+        };
         format!(
-            r#"{{"schema":"arkavo.catalog-pointer/1","owner":"{owner}","seq":{seq},"catalogHash":"{}","catalogSize":{},"issuedAt":"2026-10-19T01:02:03Z"}}"#,
+            r#"{{"schema":"arkavo.catalog-pointer/{version}","owner":"{owner}","seq":{seq},"catalogHash":"{}","catalogSize":{},{index_hash}"issuedAt":"2026-10-19T01:02:03Z"}}"#,
             blake3::hash(document).to_hex(),
             document.len()
         )
@@ -577,10 +621,11 @@ pub(crate) mod test_support {
 
     pub const CREDENTIAL_ID: &[u8] = b"cred-1";
 
-    /// A complete, valid bundle for `owner`'s `document` at `seq`.
-    pub fn bundle(owner: &str, seq: u64, document: &[u8]) -> Bundle {
+    /// A complete, valid bundle for `owner`'s `document` at `seq`, its
+    /// pointer as [`pointer_bytes`] makes it.
+    pub fn bundle(owner: &str, seq: u64, document: &[u8], index_hash: Option<&str>) -> Bundle {
         let pk = passkey(9);
-        let pointer = pointer_bytes(owner, seq, document);
+        let pointer = pointer_bytes(owner, seq, document, index_hash);
         let assertion = AssertionParts::for_pointer(&pointer).sign(&pk, CREDENTIAL_ID);
         let credential = sign_credential(
             credential_payload(owner, CREDENTIAL_ID, pk.verifying_key(), vec![]),
@@ -616,8 +661,8 @@ mod tests {
 
     /// A bundle whose assertion is re-signed after `edit` changes its parts.
     fn with_assertion(edit: impl FnOnce(&mut AssertionParts)) -> Bundle {
-        let mut b = bundle("u1", 1, DOC);
-        let pointer = pointer_bytes("u1", 1, DOC);
+        let mut b = bundle("u1", 1, DOC, None);
+        let pointer = pointer_bytes("u1", 1, DOC, None);
         let mut parts = AssertionParts::for_pointer(&pointer);
         edit(&mut parts);
         b.assertion = parts.sign(&passkey(9), CREDENTIAL_ID);
@@ -625,7 +670,7 @@ mod tests {
     }
 
     fn with_credential(payload: Vec<u8>) -> Bundle {
-        let mut b = bundle("u1", 1, DOC);
+        let mut b = bundle("u1", 1, DOC, None);
         b.credential = URL_SAFE_NO_PAD.encode(sign_credential(payload, &idp_key(), IDP_KID));
         b
     }
@@ -640,7 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_valid_chain_verifies() {
-        let v = verify(&bundle("u1", 7, DOC)).await.unwrap();
+        let v = verify(&bundle("u1", 7, DOC, None)).await.unwrap();
         assert_eq!(v.pointer.seq, 7);
         assert_eq!(
             v.pointer.catalog_hash,
@@ -652,7 +697,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_untagged_attestation_verifies() {
-        let mut b = bundle("u1", 1, DOC);
+        let mut b = bundle("u1", 1, DOC, None);
         let tagged = URL_SAFE_NO_PAD.decode(&b.credential).unwrap();
         assert_eq!(tagged[0], 0xD2);
         b.credential = URL_SAFE_NO_PAD.encode(&tagged[1..]);
@@ -661,7 +706,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_pointer_owner_must_be_the_subject() {
-        let b = bundle("u2", 1, DOC);
+        let b = bundle("u2", 1, DOC, None);
         assert!(reason(verify(&b).await).contains("pointer owner"));
     }
 
@@ -678,29 +723,29 @@ mod tests {
 
     #[tokio::test]
     async fn the_assertion_must_use_the_attested_credential() {
-        let mut b = bundle("u1", 1, DOC);
+        let mut b = bundle("u1", 1, DOC, None);
         b.assertion.credential_id = URL_SAFE_NO_PAD.encode(b"cred-2");
         assert!(reason(verify(&b).await).contains("credentialId"));
     }
 
     #[tokio::test]
     async fn a_different_passkey_does_not_verify() {
-        let mut b = bundle("u1", 1, DOC);
-        let pointer = pointer_bytes("u1", 1, DOC);
+        let mut b = bundle("u1", 1, DOC, None);
+        let pointer = pointer_bytes("u1", 1, DOC, None);
         b.assertion = AssertionParts::for_pointer(&pointer).sign(&passkey(10), CREDENTIAL_ID);
         assert!(reason(verify(&b).await).contains("signature does not verify"));
     }
 
     #[tokio::test]
     async fn the_challenge_must_be_the_pointer_hash() {
-        let other = pointer_bytes("u1", 2, DOC);
+        let other = pointer_bytes("u1", 2, DOC, None);
         let b = with_assertion(|p| *p = AssertionParts::for_pointer(&other));
         assert!(reason(verify(&b).await).contains("challenge"));
     }
 
     #[tokio::test]
     async fn the_origin_type_and_cross_origin_are_checked() {
-        let pointer = pointer_bytes("u1", 1, DOC);
+        let pointer = pointer_bytes("u1", 1, DOC, None);
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(&pointer));
         for (cd, want) in [
             (
@@ -747,7 +792,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_raw_signature_is_not_der() {
-        let mut b = bundle("u1", 1, DOC);
+        let mut b = bundle("u1", 1, DOC, None);
         let der = URL_SAFE_NO_PAD.decode(&b.assertion.signature).unwrap();
         let raw = Signature::from_der(&der).unwrap().to_bytes();
         b.assertion.signature = URL_SAFE_NO_PAD.encode(raw);
@@ -756,7 +801,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_attestation_from_another_key_is_refused() {
-        let mut b = bundle("u1", 1, DOC);
+        let mut b = bundle("u1", 1, DOC, None);
         let pk = passkey(9);
         let forged = sign_credential(
             credential_payload("u1", CREDENTIAL_ID, pk.verifying_key(), vec![]),
@@ -778,7 +823,7 @@ mod tests {
     async fn the_attestation_content_type_is_required() {
         let pk = passkey(9);
         for ct in [None, Some("application/cwt")] {
-            let mut b = bundle("u1", 1, DOC);
+            let mut b = bundle("u1", 1, DOC, None);
             b.credential = URL_SAFE_NO_PAD.encode(sign_credential_as(
                 credential_payload("u1", CREDENTIAL_ID, pk.verifying_key(), vec![]),
                 &idp_key(),
@@ -864,7 +909,7 @@ mod tests {
     #[tokio::test]
     async fn a_bundle_with_the_golden_attestation_verifies() {
         let credential_id: Vec<u8> = (0u8..16).collect();
-        let pointer = pointer_bytes(GOLDEN_SUB, 1, DOC);
+        let pointer = pointer_bytes(GOLDEN_SUB, 1, DOC, None);
         let mut b = Bundle {
             pointer: URL_SAFE_NO_PAD.encode(&pointer),
             assertion: AssertionParts::for_pointer(&pointer).sign(&passkey(7), &credential_id),
@@ -885,24 +930,89 @@ mod tests {
         assert!(err.to_string().contains("signature"), "{err}");
     }
 
-    #[test]
-    fn pointer_rules() {
-        let ok = pointer_bytes("u1", 1, DOC);
-        parse_pointer(&ok).unwrap();
-        let cases: [(&str, &str); 6] = [
-            (r#""seq":1"#, r#""seq":0"#),
-            (r#""seq":1"#, r#""seq":1.0"#),
-            ("2026-10-19T01:02:03Z", "2026-10-19T01:02:03.000Z"),
-            (r#""owner":"u1""#, r#""owner":"a/b""#),
-            (r#"{"schema""#, r#"{"extra":1,"schema""#),
-            (r#""seq":1"#, r#""seq":1,"seq":2"#),
-        ];
-        let text = String::from_utf8(ok).unwrap();
-        for (from, to) in cases {
+    /// What every pointer schema refuses: (`from`, `to`) edits of a valid
+    /// pointer's text.
+    const POINTER_CASES: [(&str, &str); 6] = [
+        (r#""seq":1"#, r#""seq":0"#),
+        (r#""seq":1"#, r#""seq":1.0"#),
+        ("2026-10-19T01:02:03Z", "2026-10-19T01:02:03.000Z"),
+        (r#""owner":"u1""#, r#""owner":"a/b""#),
+        (r#"{"schema""#, r#"{"extra":1,"schema""#),
+        (r#""seq":1"#, r#""seq":1,"seq":2"#),
+    ];
+
+    fn refuses_pointer_cases(text: &str) {
+        for (from, to) in POINTER_CASES {
             let bad = text.replacen(from, to, 1);
             assert_ne!(bad, text, "{to}");
             assert!(parse_pointer(bad.as_bytes()).is_err(), "{to}");
         }
+    }
+
+    #[test]
+    fn pointer_1_still_parses() {
+        let ok = pointer_bytes("u1", 1, DOC, None);
+        let p = parse_pointer(&ok).unwrap();
+        assert_eq!(p.schema, POINTER_SCHEMA_1);
+        assert_eq!(p.index_hash, None);
+        refuses_pointer_cases(&String::from_utf8(ok).unwrap());
+    }
+
+    #[test]
+    fn pointer_2_rules() {
+        let h = "4f".repeat(32);
+        let ok = pointer_bytes("u1", 1, DOC, Some(&h));
+        let p = parse_pointer(&ok).unwrap();
+        assert_eq!(p.schema, POINTER_SCHEMA);
+        assert_eq!(p.index_hash.as_deref(), Some(h.as_str()));
+        let text = String::from_utf8(ok).unwrap();
+        refuses_pointer_cases(&text);
+
+        // `/2` requires `indexHash`, 64 lowercase hex, once; `/1` refuses it.
+        let field = format!(r#""indexHash":"{h}","#);
+        let as_1 = text.replacen("catalog-pointer/2", "catalog-pointer/1", 1);
+        let refused = [
+            ("/2 without indexHash", text.replacen(&field, "", 1)),
+            ("uppercase", text.replacen(&h, &h.to_uppercase(), 1)),
+            ("63 characters", text.replacen(&h, &h[1..], 1)),
+            (
+                "repeated indexHash",
+                text.replacen(&field, &format!("{field}{field}"), 1),
+            ),
+            ("/1 with indexHash", as_1.clone()),
+        ];
+        for (name, bad) in refused {
+            assert_ne!(bad, text, "{name}");
+            let why = parse_pointer(bad.as_bytes()).unwrap_err();
+            assert!(why.contains("indexHash"), "{name}: {why}");
+        }
+
+        // A null `indexHash` is a seventh key, not an absent one.
+        let null = r#""indexHash":null,"#;
+        for bad in [
+            text.replacen(&field, null, 1),
+            as_1.replacen(&field, null, 1),
+        ] {
+            assert!(bad.contains(null));
+            assert!(parse_pointer(bad.as_bytes()).is_err(), "{bad}");
+        }
+
+        // Any other schema, with or without `indexHash`.
+        for bad in [
+            text.replacen("catalog-pointer/2", "catalog-pointer/3", 1),
+            text.replacen("catalog-pointer/2", "catalog-pointer/3", 1)
+                .replacen(&field, "", 1),
+        ] {
+            assert_eq!(
+                parse_pointer(bad.as_bytes()).unwrap_err(),
+                r#"pointer schema must be "arkavo.catalog-pointer/2""#
+            );
+        }
+
+        // At most 1024 bytes, as `/1`.
+        let padded = |len: usize| format!("{}{text}", " ".repeat(len - text.len()));
+        parse_pointer(padded(1024).as_bytes()).unwrap();
+        assert!(parse_pointer(padded(1025).as_bytes()).is_err());
     }
 
     #[test]

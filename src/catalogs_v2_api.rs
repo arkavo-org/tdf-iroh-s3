@@ -226,6 +226,8 @@ struct PutRequest {
 pub(crate) struct StoredPointerInfo {
     pub seq: u64,
     pub catalog_hash: String,
+    /// The pointer's `indexHash`: `Some` for `/2`, `None` for `/1`.
+    pub index_hash: Option<String>,
     /// Lowercase hex SHA-256 of the signed pointer bytes.
     pub digest: String,
 }
@@ -239,6 +241,7 @@ pub(crate) fn stored_pointer(body: &[u8]) -> anyhow::Result<StoredPointerInfo> {
     Ok(StoredPointerInfo {
         seq: pointer.seq,
         catalog_hash: pointer.catalog_hash,
+        index_hash: pointer.index_hash,
         digest: hex::encode(Sha256::digest(&bytes)),
     })
 }
@@ -978,7 +981,7 @@ mod tests {
         name: header::HeaderName,
         value: &str,
     ) -> Reply {
-        let body = body(document, &v2::bundle(SUB, seq, document));
+        let body = body(document, &v2::bundle(SUB, seq, document, None));
         put_with(h, SUB, &token(SUB), body, &[(name, value)]).await
     }
 
@@ -992,7 +995,7 @@ mod tests {
         document: &[u8],
         index: serde_json::Value,
     ) -> Reply {
-        let body = body_with(document, &v2::bundle(SUB, seq, document), index);
+        let body = body_with(document, &v2::bundle(SUB, seq, document, None), index);
         put(h, SUB, &token(SUB), body).await
     }
 
@@ -1057,7 +1060,7 @@ mod tests {
         let h = ingested().await;
         let document = envelope(1);
         let hash = hash_of(&document);
-        let bundle = v2::bundle(SUB, 1, &document);
+        let bundle = v2::bundle(SUB, 1, &document, None);
 
         let r = put(&h, SUB, &token(SUB), body(&document, &bundle)).await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
@@ -1177,7 +1180,7 @@ mod tests {
         let h = ingested().await;
         // seq 12 at a document with no index record, as `/1` left it.
         let old = b"{\"schema\":\"arkavo.creator-catalog/1\"}".to_vec();
-        let bundle = serde_json::to_vec(&v2::bundle(SUB, 12, &old)).unwrap();
+        let bundle = serde_json::to_vec(&v2::bundle(SUB, 12, &old, None)).unwrap();
         h.store
             .catalog_pointers
             .lock()
@@ -1267,7 +1270,7 @@ mod tests {
     async fn a_campaign_catalog_comes_from_the_campaign_creator() {
         let h = ingested().await;
         let document = envelope(1);
-        let bundle = || body(&document, &v2::bundle(SUB, 1, &document));
+        let bundle = || body(&document, &v2::bundle(SUB, 1, &document, None));
         for patreon in [
             None,
             Some(patreon("consumer", None)),
@@ -1338,7 +1341,7 @@ mod tests {
             &h,
             SUB,
             &creator_of_99,
-            body(&document, &v2::bundle(SUB, 1, &document)),
+            body(&document, &v2::bundle(SUB, 1, &document, None)),
         )
         .await;
         assert_eq!(
@@ -1484,7 +1487,7 @@ mod tests {
             assert_precondition_failed(&h, r, &ours, 1).await;
         }
         let served: Bundle = serde_json::from_slice(&get(&h, SUB).await.body).unwrap();
-        assert_eq!(served, v2::bundle(SUB, 7, &theirs));
+        assert_eq!(served, v2::bundle(SUB, 7, &theirs, None));
 
         let r = publish_if(&h, 11, &ours, header::IF_MATCH, "\"6\", \"7\"").await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
@@ -1545,7 +1548,7 @@ mod tests {
         assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
         let other = envelope(2);
         let put = |none_match: &'static str| {
-            let body = body(&other, &v2::bundle(SUB, 2, &other));
+            let body = body(&other, &v2::bundle(SUB, 2, &other, None));
             let both = [
                 (header::IF_MATCH, "\"1\""),
                 (header::IF_NONE_MATCH, none_match),
@@ -1570,7 +1573,7 @@ mod tests {
                 .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {}", token(SUB)))
                 .header(name, header::HeaderValue::from_bytes(b"\"1\xff\"").unwrap())
-                .body(Body::from(body(&other, &v2::bundle(SUB, 2, &other))))
+                .body(Body::from(body(&other, &v2::bundle(SUB, 2, &other, None))))
                 .unwrap();
             let r = send(&h.app, req).await;
             assert_precondition_failed(&h, r, &other, 1).await;
@@ -1597,7 +1600,7 @@ mod tests {
             &h,
             SUB,
             &token("someone-else"),
-            body(&document, &v2::bundle(SUB, 1, &document)),
+            body(&document, &v2::bundle(SUB, 1, &document, None)),
         )
         .await;
         assert_eq!(r.status, StatusCode::FORBIDDEN);
@@ -1611,7 +1614,7 @@ mod tests {
             &h,
             SUB,
             &token(SUB),
-            body(&envelope(1), &v2::bundle(SUB, 1, &envelope(2))),
+            body(&envelope(1), &v2::bundle(SUB, 1, &envelope(2), None)),
         )
         .await;
         assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1622,9 +1625,9 @@ mod tests {
     async fn a_tampered_bundle_is_refused() {
         let h = ingested().await;
         let document = envelope(1);
-        let mut bundle = v2::bundle(SUB, 1, &document);
+        let mut bundle = v2::bundle(SUB, 1, &document, None);
         // Re-point a validly signed bundle at seq 9: the passkey signed seq 1.
-        let pointer = v2::pointer_bytes(SUB, 9, &document);
+        let pointer = v2::pointer_bytes(SUB, 9, &document, None);
         bundle.pointer = URL_SAFE_NO_PAD.encode(pointer);
         let r = put(&h, SUB, &token(SUB), body(&document, &bundle)).await;
         assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1691,7 +1694,7 @@ mod tests {
     async fn malformed_requests_are_refused() {
         let h = ingested().await;
         let document = envelope(1);
-        let bundle = v2::bundle(SUB, 1, &document);
+        let bundle = v2::bundle(SUB, 1, &document, None);
         let mut b: serde_json::Value = serde_json::from_slice(&body(&document, &bundle)).unwrap();
         b["document"] = serde_json::Value::String(
             base64::engine::general_purpose::URL_SAFE.encode(&document[..10]) + "=",
