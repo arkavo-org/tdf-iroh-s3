@@ -14,6 +14,7 @@
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -86,6 +87,35 @@ fn entry(raw: serde_json::Value) -> Result<CreatorCatalogEntry, String> {
         ));
     }
     Ok(e)
+}
+
+/// The canonical index a `/2` pointer's `indexHash` covers, built from the
+/// parsed entries, never from the bytes received: entries sorted by the
+/// UTF-8 bytes of `contentID`, each written as
+/// `{"contentID":"<id>","version":<n>,"payloadHash":"<hex>","payloadSize":<n>}`
+/// with keys in exactly that order, joined with `,` inside `[` `]`, no
+/// whitespace. The empty index is `[]`. Nothing is escaped: a parsed
+/// `contentID` is `[A-Za-z0-9:._@-]` and `payloadHash` lowercase hex.
+/// ArkavoKit and Creator produce the same bytes.
+pub fn canonical_index(entries: &[CreatorCatalogEntry]) -> String {
+    let mut sorted: Vec<&CreatorCatalogEntry> = entries.iter().collect();
+    sorted.sort_by(|a, b| a.content_id.as_bytes().cmp(b.content_id.as_bytes()));
+    let body: Vec<String> = sorted
+        .into_iter()
+        .map(|e| {
+            format!(
+                r#"{{"contentID":"{}","version":{},"payloadHash":"{}","payloadSize":{}}}"#,
+                e.content_id, e.version, e.payload_hash, e.payload_size
+            )
+        })
+        .collect();
+    format!("[{}]", body.join(","))
+}
+
+/// A `/2` pointer's `indexHash`: the lowercase hex **SHA-256** of
+/// [`canonical_index`] (while `catalogHash` and `payloadHash` are BLAKE3).
+pub fn index_hash(entries: &[CreatorCatalogEntry]) -> String {
+    hex::encode(Sha256::digest(canonical_index(entries).as_bytes()))
 }
 
 /// `owner` and `contentID`: `[A-Za-z0-9:._@-]{1,max}`, never `.` and never
@@ -437,6 +467,64 @@ mod tests {
         for (name, valid, bytes) in test_support::vectors("index") {
             assert_eq!(parse(&bytes).is_ok(), valid, "{name}: {:?}", parse(&bytes));
         }
+    }
+
+    fn catalog_entry(
+        content_id: &str,
+        version: u64,
+        payload_hash: String,
+        payload_size: u64,
+    ) -> CreatorCatalogEntry {
+        CreatorCatalogEntry {
+            content_id: content_id.into(),
+            version,
+            payload_hash,
+            payload_size,
+        }
+    }
+
+    /// The spec's `indexHash` vectors (deletion-requests design, Part 2),
+    /// which ArkavoKit and Creator reproduce byte for byte.
+    #[test]
+    fn index_hash_vectors() {
+        // empty
+        assert_eq!(canonical_index(&[]), "[]");
+        assert_eq!(
+            index_hash(&[]),
+            "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        );
+
+        // two, given out of order
+        let two = [
+            catalog_entry("rec-b", 1, "bb".repeat(32), 2048),
+            catalog_entry("rec-a", 3, "aa".repeat(32), 1024),
+        ];
+        let expected = format!(
+            r#"[{{"contentID":"rec-a","version":3,"payloadHash":"{}","payloadSize":1024}},{{"contentID":"rec-b","version":1,"payloadHash":"{}","payloadSize":2048}}]"#,
+            "aa".repeat(32),
+            "bb".repeat(32),
+        );
+        assert_eq!(canonical_index(&two), expected);
+        assert_eq!(
+            index_hash(&two),
+            "03f745d8d08d9e9e11cabf33d85e8beb452eb3a2b2e541f92e1703c1f4152df4"
+        );
+
+        // byte-order: UTF-8 bytes, so `A` < `-` < `.` < `:` < `@` < `_`
+        let byte_order: Vec<_> = ["a_1", "a@1", "A", "a:1", "a.1", "a-1"]
+            .into_iter()
+            .enumerate()
+            .map(|(n, id)| catalog_entry(id, 1, format!("{n:02x}").repeat(32), n as u64 + 1))
+            .collect();
+        let canonical = canonical_index(&byte_order);
+        assert!(
+            canonical.starts_with(r#"[{"contentID":"A","#),
+            "{canonical}"
+        );
+        assert_eq!(
+            index_hash(&byte_order),
+            "79129b9fa70e8ab5d0894d07098294de6dec2677c9df538b3eb05df98bd8ef18"
+        );
     }
 
     #[test]
