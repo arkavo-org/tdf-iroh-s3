@@ -164,7 +164,7 @@ curl -X PUT https://iroh.arkavo.net/moderation/blocks/<hash> \
   -d '{"reason":"hate speech","reportId":"6f9619ff-8b86-d011-b42d-00c04fc964ff"}'
 ```
 
-Subjects compare in canonical form: `arkavo:<id>` and a bare `<id>` are the same account.
+Subjects compare in canonical form: `arkavo:<id>` and a bare `<id>` are the same account. A suspension or catalog block is stored under the bare `<id>`, which must be canonical itself, as the sweep's strict read requires of the key ([`sweep-deletions`](#sweep-deletions), step 1): a `PUT` for `arkavo:arkavo:<id>`, whose canonical form `arkavo:<id>` isn't, is refused with 400 `invalid subject` before anything is written, as is a subject that isn't valid (`a..b`).
 
 ### Audit
 
@@ -230,7 +230,7 @@ tdf-iroh-s3 --config /etc/tdf-iroh-s3/config.toml sweep-deletions --delete  # wr
 
 A run:
 
-1. **Reads strictly** every pointer, index record, transition and deletion request, and the suspensions, blocks, catalog blocks and owner records it decides on (not sessions or audit records). Anything it can't read or parse aborts the run before it writes anything: exit 1, with `sweep-deletions aborted: <error>`, naming the key, on stderr. So does a `/2` pointer whose index record doesn't match its `indexHash`, and a moderation record whose key isn't what the node writes: a canonical subject (`<uuid>`, not `arkavo:<uuid>`) for a suspension or catalog block, 64 lowercase hex characters for a block.
+1. **Reads strictly** every pointer, index record, transition and deletion request, and the suspensions, blocks, catalog blocks and owner records it decides on (not sessions or audit records). Anything it can't read or parse aborts the run before it writes anything: exit 1, with `sweep-deletions aborted: <error>`, naming the key, on stderr. So do a `/2` pointer whose index record doesn't match its `indexHash`; a moderation record whose key isn't what the node writes (a canonical subject, `<uuid>` and not `arkavo:<uuid>`, for a suspension or catalog block; 64 lowercase hex characters for a block); and a transition whose subject's canonical form isn't canonical (`arkavo:arkavo:<uuid>`), since the fold keys its requests by that form.
 2. **Folds** each pointer's committed transitions into requests, oldest first: a dropped hash makes `recordings/<sub>/<hash>` pending from that publish's time (the newest drop wins), an added hash cancels it, and a replaced envelope makes `envelopes/<hash>` pending. The folded transitions are deleted. A transition no pointer reaches, older than 7 days, whose subject's pointer has a `seq` at least its own, lost its publish and is deleted unfolded (`deleted transition <sub>/<name>: lost its publish`). So, at any age, is one whose account was deleted (a `deleted` `subjects/<sub>` record) and has no pointer under either key: a publish in flight when the sweep deleted the account, which took its transitions. Any other unreachable one is kept and reported.
 3. **Observes** envelopes: a hash under `catalog-documents/`, `catalog-outboards/` or `catalog-indexes/` that no pointer names and no request tracks gets an `envelopes/` request, superseded now.
 4. **Deletes** what is due (below), with `--delete`, item by item: subjects (their pointers, then their transitions), then recordings, then envelopes. Just before each item it lists the item's versions, then reads everything again. An item no longer due is kept. One whose requester's catalog moved since the first read is deferred to the next run, which folds the new transitions first. Then:

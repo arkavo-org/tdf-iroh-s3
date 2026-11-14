@@ -78,6 +78,17 @@ pub fn valid_subject(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'.' | b'_' | b'@' | b'-'))
 }
 
+/// A subject that is canonical itself: valid, and its own canonical form.
+/// Every per-subject key the sweep reads strictly must be one: a
+/// suspension's, a catalog block's, a deletion request's. A key is written
+/// as `canonical_subject(sub)`, so a subject is keyable only when
+/// `is_canonical_subject(canonical_subject(sub))`: `arkavo:arkavo:<uuid>`
+/// is not (its canonical form `arkavo:<uuid>` isn't canonical), nor is
+/// `arkavo:` alone.
+pub fn is_canonical_subject(s: &str) -> bool {
+    valid_subject(s) && canonical_subject(s) == s
+}
+
 pub fn valid_hash(h: &str) -> bool {
     h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -1274,8 +1285,10 @@ async fn suspend<S: ModerationStore>(
         .operator(&s.verifier, &headers)
         .await
         .map_err(fail)?;
+    // Stored under its canonical form, which must be canonical itself, as
+    // the sweep's strict read requires of the key.
     let subject = canonical_subject(&subject).to_string();
-    if !valid_subject(&subject) {
+    if !is_canonical_subject(&subject) {
         return Err(fail((StatusCode::BAD_REQUEST, "invalid subject")));
     }
     let record = Suspension {
@@ -1423,8 +1436,10 @@ async fn block_catalog<S: ModerationStore>(
         .operator(&s.verifier, &headers)
         .await
         .map_err(fail)?;
+    // Stored under its canonical form, which must be canonical itself, as
+    // the sweep's strict read requires of the key.
     let subject = canonical_subject(&subject).to_string();
-    if !valid_subject(&subject) {
+    if !is_canonical_subject(&subject) {
         return Err(fail((StatusCode::BAD_REQUEST, "invalid subject")));
     }
     if body.hide_catalog {
@@ -2490,6 +2505,54 @@ mod tests {
         ] {
             let (status, _) = call(&h.app, "PUT", uri, &op, Some(body.clone())).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
+        }
+    }
+
+    /// A per-subject record is stored under the subject's canonical form,
+    /// and only when that form is canonical itself, as the sweep's strict
+    /// read requires of the key ([`is_canonical_subject`]):
+    /// `arkavo:arkavo:<uuid>` would be stored as `arkavo:<uuid>`, which
+    /// every sweep would refuse. It is refused before anything is written,
+    /// its audit record included.
+    #[tokio::test]
+    async fn a_subject_whose_canonical_form_is_not_canonical_is_refused() {
+        const UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+        let body = Some(serde_json::json!({ "reason": "x" }));
+        let routes = [
+            ("suspensions", SUSPENSIONS),
+            ("blocks/catalogs", CATALOG_BLOCKS),
+        ];
+        let h = harness();
+        for (route, _) in routes {
+            let uri = format!("/moderation/{route}/arkavo:arkavo:{UUID}");
+            let (status, reply) = call(&h.app, "PUT", &uri, &operator(), body.clone()).await;
+            assert_eq!(
+                (status, reply["error"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("invalid subject")),
+                "{uri}"
+            );
+        }
+        assert!(h.store.records.lock().unwrap().is_empty());
+        assert!(h.gate.moderation.active_suspensions().is_empty());
+        assert!(h.gate.moderation.active_catalog_blocks().is_empty());
+
+        // `<uuid>` and `arkavo:<uuid>` are still one account, keyed `<uuid>`.
+        for sub in [UUID.to_string(), format!("arkavo:{UUID}")] {
+            let h = harness();
+            for (route, kind) in routes {
+                let uri = format!("/moderation/{route}/{sub}");
+                let (status, reply) = call(&h.app, "PUT", &uri, &operator(), body.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{uri} {reply}");
+                assert_eq!(reply["subject"], UUID, "{uri}");
+                assert!(
+                    h.store
+                        .records
+                        .lock()
+                        .unwrap()
+                        .contains_key(&format!("{kind}/{UUID}")),
+                    "{uri}"
+                );
+            }
         }
     }
 

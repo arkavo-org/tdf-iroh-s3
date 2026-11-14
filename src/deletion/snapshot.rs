@@ -20,7 +20,7 @@ use crate::catalog_scan::{self, Catalogs};
 use crate::creator_catalog::is_lower_hex_hash;
 use crate::moderation::{
     BLOCKS, Block, CATALOG_BLOCKS, CatalogBlock, SUSPENSIONS, Suspension, canonical_subject,
-    valid_subject,
+    is_canonical_subject, valid_subject,
 };
 use crate::object_store::{ObjectInfo, ObjectStore, bodies};
 use crate::ownership::{PUBLISHERS, parse_owner};
@@ -138,10 +138,15 @@ async fn transitions<O: ObjectStore>(store: &O) -> anyhow::Result<BTreeMap<Strin
 }
 
 /// A transition, named for its own subject (byte for byte), `seq` and
-/// pointer digest, with lowercase hex hashes throughout.
+/// pointer digest, with lowercase hex hashes throughout. Its subject's
+/// canonical form must be canonical ([`is_canonical_subject`]): the fold
+/// keys the requests it writes by that form.
 fn transition(key: &str, body: &[u8]) -> anyhow::Result<Transition> {
     let [sub, name] = names(key, TRANSITIONS)?;
-    anyhow::ensure!(valid_subject(sub), "{sub} is not a subject");
+    anyhow::ensure!(
+        valid_subject(sub) && is_canonical_subject(canonical_subject(sub)),
+        "{sub} is not a subject whose canonical form is canonical"
+    );
     let t: Transition = serde_json::from_slice(body)?;
     same("subject", &t.subject, sub)?;
     same("name", &transition_name(t.seq, &t.pointer), name)?;
@@ -321,10 +326,12 @@ fn names<'a, const N: usize>(key: &'a str, prefix: &str) -> anyhow::Result<[&'a 
     Ok(names)
 }
 
-/// A request key's subject: valid, and already canonical.
+/// A request's or a moderation record's key subject: canonical
+/// ([`is_canonical_subject`], the predicate the moderation API and
+/// `request-deletion` check before they write one).
 fn canonical(sub: &str) -> anyhow::Result<&str> {
     anyhow::ensure!(
-        valid_subject(sub) && canonical_subject(sub) == sub,
+        is_canonical_subject(sub),
         "{sub} is not a canonical subject"
     );
     Ok(sub)
@@ -728,6 +735,67 @@ mod tests {
             put(&m, &key, body);
             let err = read(&m).await.expect_err(&key).to_string();
             assert!(err.contains(&key), "{key}: {err}");
+        }
+    }
+
+    /// A per-subject moderation key is read exactly when
+    /// [`is_canonical_subject`] accepts it: the predicate the moderation
+    /// API checks before it writes one, so the API never writes a key this
+    /// read refuses. `arkavo:arkavo:<uuid>` canonicalizes to
+    /// `arkavo:<uuid>`, which it refuses, as it does `arkavo:` alone.
+    #[tokio::test]
+    async fn moderation_keys_are_read_as_the_shared_predicate_has_them() {
+        let names = [
+            U.to_string(),
+            format!("arkavo:{U}"),
+            format!("arkavo:arkavo:{U}"),
+        ];
+        for written in names.iter().map(|name| canonical_subject(name)) {
+            for (kind, body) in [
+                ("suspensions", suspension(written, true, None)),
+                ("catalog-blocks", catalog_block(written, None)),
+            ] {
+                let key = format!("moderation/{kind}/{written}");
+                let m = populated();
+                put(&m, &key, body);
+                let result = read(&m).await;
+                assert_eq!(
+                    result.is_ok(),
+                    is_canonical_subject(written),
+                    "{key}: {:?}",
+                    result.err()
+                );
+            }
+        }
+    }
+
+    /// A transition's subject must canonicalize to a canonical subject
+    /// ([`is_canonical_subject`]): the fold keys the requests it writes by
+    /// that form, and a `recordings/arkavo:<uuid>/…` from a transition of
+    /// `arkavo:arkavo:<uuid>` would abort every later read. This read
+    /// refuses the transition first, before anything is written.
+    #[tokio::test]
+    async fn a_transitions_subject_must_canonicalize_to_a_canonical_one() {
+        for sub in [
+            U.to_string(),
+            format!("arkavo:{U}"),
+            format!("arkavo:arkavo:{U}"),
+        ] {
+            let readable = is_canonical_subject(canonical_subject(&sub));
+            let key = transition_key(&sub, &transition_name(1, &h("d1")));
+            let m = populated();
+            put(
+                &m,
+                &key,
+                serde_json::to_value(transition(&sub, 1, &h("d1"))).unwrap(),
+            );
+            match read(&m).await {
+                Ok(_) => assert!(readable, "{key} was read"),
+                Err(e) => {
+                    assert!(!readable, "{key}: {e:#}");
+                    assert!(e.to_string().contains(&key), "{key}: {e:#}");
+                }
+            }
         }
     }
 

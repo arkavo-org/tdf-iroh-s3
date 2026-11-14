@@ -31,7 +31,7 @@ use std::collections::{BTreeSet, HashSet};
 use super::snapshot::{self, Snapshot};
 use super::{OperatorRequest, Scope, State, SubjectRequest, operator_key, subject_key};
 use crate::creator_catalog::is_lower_hex_hash;
-use crate::moderation::{canonical_subject, valid_subject};
+use crate::moderation::{canonical_subject, is_canonical_subject, valid_subject};
 use crate::object_store::ObjectStore;
 
 /// What `request-deletion` did at one key.
@@ -240,14 +240,14 @@ async fn write<O: ObjectStore, T: Serialize>(
     Ok(Requested { key, outcome })
 }
 
-/// `subject`'s canonical form, which request keys carry. It must be a
-/// subject whose canonical form is one too, as the sweep's strict read
+/// `subject`'s canonical form, which request keys carry. It must be
+/// canonical itself ([`is_canonical_subject`]), as the sweep's strict read
 /// requires of a request key (`arkavo:` alone, or `arkavo:arkavo:<id>`,
 /// is not).
 fn canonical(subject: &str) -> anyhow::Result<&str> {
     let sub = canonical_subject(subject);
     anyhow::ensure!(
-        valid_subject(subject) && valid_subject(sub) && canonical_subject(sub) == sub,
+        valid_subject(subject) && is_canonical_subject(sub),
         "invalid subject {subject}"
     );
     Ok(sub)
