@@ -463,8 +463,8 @@ async fn put_catalog<S: TagStore>(
         })?;
 
     // 7. Merged from the stored pointer the request names as its base, in
-    //    one of the two forms (428 otherwise, before anything is read), and
-    //    newer than it.
+    //    one of the two forms (428 otherwise, before the stored pointer is
+    //    read), and newer than it.
     let Some(precondition) = Precondition::read(&headers) else {
         return Err(reject(
             StatusCode::PRECONDITION_REQUIRED,
