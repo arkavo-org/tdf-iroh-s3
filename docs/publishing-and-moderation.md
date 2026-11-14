@@ -188,7 +188,7 @@ Each suspension, block or catalog block is stored as a JSON object under `modera
 
 ## Deletion requests (operators)
 
-A recording its owner drops from their catalog is deleted from S3, every version, within 30 days of the publish that dropped it. So is a superseded catalog envelope, which carries every entry's metadata TDF, titles included. The creator's passkey-signed publish is the request; an operator-run sweep does the deleting. What Creator sees is in [creator-catalogs.md](creator-catalogs.md#removing-a-recording). The design is `docs/superpowers/specs/2026-11-13-deletion-requests-design.md`.
+A recording its owner drops from their catalog is deleted from S3, every version, within 30 days of the publish that dropped it, unless they push it again in the meantime. So is a superseded catalog envelope, which carries every entry's metadata TDF, titles included. The creator's passkey-signed publish is the request; an operator-run sweep does the deleting. What Creator sees is in [creator-catalogs.md](creator-catalogs.md#removing-a-recording). The design is `docs/superpowers/specs/2026-11-13-deletion-requests-design.md`.
 
 ### What a publish records
 
@@ -248,7 +248,7 @@ The requests live under `deletion-requests/`, written only by the sweep and `req
 
 | Request | Body | Due |
 |---|---|---|
-| `recordings/<sub>/<hash>`: the owner dropped it | `{"hash","subject","requestedAt","seq","state","deletedAt"?}` | 7 days after the drop, while the hash isn't listed or blocked and its owner record names `<sub>` |
+| `recordings/<sub>/<hash>`: the owner dropped it | `{"hash","subject","requestedAt","seq","state","deletedAt"?}` | 7 days after the drop, while the hash isn't listed or blocked and its owner record names `<sub>`; a push since the drop cancels it when the sweep takes it (`pushed again`) |
 | `operator/<sub>/<hash>`, scope `hash` | `{"hash","subject","requestedAt","reason","scope","state","deletedAt"?}` | while the hash's block stands: at once, listed or not, whoever owns it |
 | `operator/<sub>/<hash>`, scope `subject` | as above | while `<sub>`'s catalog block stands, the hash isn't listed or blocked, and its owner record names `<sub>` |
 | `subjects/<sub>` | `{"subject","requestedAt","reason","state","deletedAt"?}` | while `<sub>`'s catalog block stands |
