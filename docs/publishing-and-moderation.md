@@ -276,7 +276,7 @@ tdf-iroh-s3 --config /etc/tdf-iroh-s3/config.toml request-deletion \
 
 Exactly one of `--hash` and `--all` (both or neither is a usage error: exit 2). `--reason` is required and stored in each request. It reads the bucket as strictly as the sweep, and checks every precondition before it writes anything:
 
-- **`--hash`:** recordings only. Every hash, 64 lowercase hex characters, must have an active block. It writes `deletion-requests/operator/<sub>/<hash>` with scope `hash` for each, due at once while the block stands. Scope `hash` doesn't check the owner; file it under the recording's owner. To delete a recording that isn't blocked, block it first (`PUT /moderation/blocks/<hash>`).
+- **`--hash`:** recordings only. Every hash, 64 lowercase hex characters, must have an active block and must not be a catalog envelope's (one with an object under `catalog-documents/`, `catalog-outboards/` or `catalog-indexes/`): `<hash> is a catalog envelope: --hash deletes recordings only`. It writes `deletion-requests/operator/<sub>/<hash>` with scope `hash` for each, due at once while the block stands. Scope `hash` doesn't check the owner; file it under the recording's owner. To delete a recording that isn't blocked, block it first (`PUT /moderation/blocks/<hash>`).
 - **`--all`:** the subject must have an active catalog block. It writes a scope-`subject` `operator/<sub>/<hash>` for every hash in the live index of each of the subject's pointers (either key) and every hash whose owner record names the subject, then `deletion-requests/subjects/<sub>`, which deletes the subject's pointers. That is its whole coverage, and its last line says so.
 
 It prints one line per key:
@@ -286,7 +286,7 @@ It prints one line per key:
 - `requested <key> (replaces a deleted request): <reason>`: the item was deleted and its tombstone not yet verified; asking again replaces it;
 - `requested <key> (replaces a pending scope-subject request): <reason>`, from `--hash`: scope `subject` never deletes a blocked hash, so the request becomes scope `hash`. From `--all`, `(replaces a pending scope-hash request)`: the hash's block was lifted, so scope `hash` would never delete it.
 
-`--all` then prints `coverage: live indexes and owner records; add --hash for anything else`. A refusal (an invalid argument, an unreadable record, a hash without an active block, a subject without an active catalog block) prints the error on stderr, writes nothing, and exits 1; so does a storage error partway through the writes, after which a second run reads what the first wrote as `exists`. Operator requests have no grace: the next `sweep-deletions --delete` deletes them.
+`--all` then prints `coverage: live indexes and owner records; add --hash for anything else`. A refusal (an invalid argument, an unreadable record, a catalog envelope's hash, a hash without an active block, a subject without an active catalog block) comes before any write: it prints the error on stderr, writes nothing, and exits 1. A storage error partway through the writes also exits 1, with the error on stderr, but the requests written before it stay, unprinted, and the next sweep reads them; run the command again, and it reports them as `exists`. Operator requests have no grace: the next `sweep-deletions --delete` deletes them.
 
 ### Moderation keeps blocked content
 
@@ -309,7 +309,7 @@ A creator whose entitlement lapsed, who is suspended, whom the decision service 
 - Drops before this shipped are not requests: recordings hidden then stay stored, also after their creator deletes their account. On request, use `request-deletion`.
 - A creator who hides from a Mac without the recording's archive can undo the Hide only within the 7 days: afterwards re-listing needs a push.
 - A publish that lists a hash again between an item's re-check and its delete leaves a listed recording that answers as gone. The sweep reports it: `deleted recording <hash> is listed again`.
-- A blocked envelope is kept while its block stands: `request-deletion --hash` deletes recordings only, and the sweep holds a blocked envelope (`kept envelope <hash>: blocked`).
+- A blocked envelope is kept while its block stands: `request-deletion --hash` refuses an envelope's hash, and the sweep holds a blocked envelope (`kept envelope <hash>: blocked`).
 - A catalog-blocked creator who isn't suspended gets 412 on `If-None-Match: *`, because preconditions ignore the owner's hide. This predates deletion and needs its own fix.
 - Not deleted at all: recordings pushed but never listed, outside `request-deletion`; leftovers of removed features other than envelopes (`/1` tags, `catalog-index/`, `campaign-creators/`); copies outside the node (what viewers or peers already fetched, the KAS, identity, CloudWatch logs).
 
@@ -362,8 +362,8 @@ Ownership, pointer `/2` and deletion ship as three PRs that merge and deploy tog
    3. `sweep-deletions` (a dry run) completes: no unreadable record.
    4. The instance role can write `catalog-transitions/*` ([IAM for deletion](#iam-for-deletion)). The lifecycle rule can go on any time.
 4. **Deploy the node with no overlap:** no instance running the old code serves after a new one does. An old instance would overwrite owner records and accept `/1` publishes that write no transition, which breaks the chain the sweep follows. Then run `claim-owners` (a dry run) again. From here `/1` publishes get 422 `invalid bundle: pointer schema must be "arkavo.catalog-pointer/2"`, so Creator rc.2 and earlier TestFlight builds can't publish, update or hide.
-5. **Creator rc.3 publishes `/2`.** Before the switch, test rc.3 against this branch run outside production.
-6. **Run `sweep-deletions --delete` weekly** from then on (the runbook schedules it).
+5. **The Creator release that publishes `/2` ships.** Before the switch, test it against a node running this version outside production.
+6. **The operator schedules `sweep-deletions --delete` weekly** from then on, for example in the deploy runbook: nothing in the node runs it.
 
 ## Configuration
 

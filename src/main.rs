@@ -84,8 +84,8 @@ enum Command {
     /// Ask the sweep to delete blocked recordings (--hash) or everything
     /// an account published (--all)
     ///
-    /// --hash: each hash must have an active block; a scope-hash request
-    /// for each. --all: the subject must have an active catalog block; a
+    /// --hash: each hash must be a recording's (not a catalog envelope's)
+    /// with an active block; a scope-hash request for each. --all: the subject must have an active catalog block; a
     /// scope-subject request for every hash in the live index of each of
     /// its pointers and every hash its owner records name, then a request
     /// for the subject (its pointers). Nothing is written unless every

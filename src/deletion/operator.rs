@@ -3,7 +3,8 @@
 //!
 //! - [`request_hashes`] (`--hash`): moderation-blocked recordings, which
 //!   the sweep otherwise keeps while their block stands (decision 3).
-//!   Writes `operator/<sub>/<hash>`, scope `hash`.
+//!   Writes `operator/<sub>/<hash>`, scope `hash`. A catalog envelope's
+//!   hash is refused: the sweep deletes only a recording's objects for it.
 //! - [`request_all`] (`--all`): everything an account published, for a
 //!   creator who can't publish an empty catalog (decision 6). Its
 //!   precondition is the account's active catalog block. Writes a
@@ -55,8 +56,8 @@ pub struct Requested {
 /// `request-deletion --subject <subject> --hash <hash>...`: a scope-`hash`
 /// request for each hash, deduplicated, in hash order. `Err`, with nothing
 /// written, if the subject, a hash or the reason is invalid, if anything
-/// in the bucket is unreadable, or if a hash has no active block (the
-/// first such, in the order given).
+/// in the bucket is unreadable, or if a hash is a catalog envelope or has
+/// no active block (the first such, in the order given).
 pub async fn request_hashes<O: ObjectStore>(
     store: &O,
     subject: &str,
@@ -75,8 +76,18 @@ pub async fn request_hashes<O: ObjectStore>(
     }
     let snapshot = snapshot::read(store).await?;
     let blocked = &snapshot.moderation.blocked;
-    if let Some(hash) = hashes.iter().find(|hash| !blocked.contains(*hash)) {
-        anyhow::bail!("{hash} has no active block: --hash deletes only blocked content");
+    for hash in hashes {
+        // The sweep deletes a recording's objects for it, never an
+        // envelope's: an envelope's request would read as deleted while
+        // its document, titles included, stayed.
+        anyhow::ensure!(
+            !snapshot.envelope_objects.contains(hash),
+            "{hash} is a catalog envelope: --hash deletes recordings only"
+        );
+        anyhow::ensure!(
+            blocked.contains(hash),
+            "{hash} has no active block: --hash deletes only blocked content"
+        );
     }
     let mut out = Vec::new();
     for hash in hashes.iter().collect::<BTreeSet<_>>() {
@@ -688,6 +699,43 @@ mod tests {
             assert!(err.contains(&bad), "names the record: {err}");
         }
         assert_eq!(request_writes(&m).await, 1, "only the unreadable one");
+    }
+
+    /// `--hash` deletes a recording's objects only, so a blocked catalog
+    /// envelope is refused: the sweep would tombstone it as a deleted
+    /// recording and leave its document, titles included, in place.
+    #[tokio::test]
+    async fn hash_requests_refuse_a_catalog_envelope() {
+        let m = MemObjects::default();
+        publish_2(&m, U, 1, b"doc", &[&h("a1")]);
+        let envelope = blake3::hash(b"doc").to_hex().to_string();
+        block(&m, &h("a1"), None);
+        block(&m, &envelope, None);
+
+        let err = request_hashes(&m, U, &[h("a1"), envelope.clone()], WHY, NOW)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!("{envelope} is a catalog envelope: --hash deletes recordings only")
+        );
+        assert_eq!(request_writes(&m).await, 0, "nothing written");
+
+        // Any of its objects makes it one: here only its outboard is left.
+        let m = MemObjects::default();
+        let other = h("e1");
+        m.insert(&format!("catalog-outboards/{other}"), "");
+        block(&m, &other, None);
+        let err = request_hashes(&m, U, std::slice::from_ref(&other), WHY, NOW)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with(&format!("{other} is a catalog envelope")),
+            "{err}"
+        );
+        assert_eq!(request_writes(&m).await, 0, "nothing written");
     }
 
     #[tokio::test]
