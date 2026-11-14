@@ -177,7 +177,8 @@ pub struct Decision {
     /// `requests` are those, by [`Item::id`]. They are in `kept` too. When
     /// nothing of the recording is left, an earlier run deleted it and
     /// failed to mark these `deleted` (the sweep deletes the owner record
-    /// last): the sweep closes them then, as tombstones.
+    /// last), or a push failed after its outboard: the sweep closes them
+    /// then, deleting their records (and such an outboard).
     pub unowned: Vec<Item>,
 }
 

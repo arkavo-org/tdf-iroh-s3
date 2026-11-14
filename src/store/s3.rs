@@ -1355,7 +1355,7 @@ mod tests {
     /// 409 is not "lost": a conflicting conditional write is still in
     /// progress, and S3 says to retry.
     #[test]
-    fn a_lost_condition_is_412_only() {
+    fn a_412_is_lost_and_a_409_is_not_under_either_condition() {
         for condition in [Condition::IfMatch, Condition::IfNoneMatch] {
             assert!(lost_condition(&failed(412), condition));
             assert!(!lost_condition(&failed(409), condition));

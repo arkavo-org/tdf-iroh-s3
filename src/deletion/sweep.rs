@@ -30,12 +30,14 @@
 //!    ([`pushed_again`]). Only a listing cancels a drop. Otherwise it
 //!    deletes exactly the versions it listed, never one written since. A
 //!    failure leaves the item pending, and the run goes on;
-//! 4. each recording kept only for want of an owner record whose objects
-//!    are all gone ([`close`]): an earlier run deleted it but failed to
-//!    write its tombstone. Its requests become tombstones, deleting
-//!    nothing, after the same fresh re-check and a second listing; a push
-//!    meanwhile wins (its grace restarts next run). A dry run reports
-//!    these too, from its listing alone.
+//! 4. each recording kept only for want of an owner record with nothing
+//!    left but outboard versions older than its drop ([`close`]): an
+//!    earlier run deleted it but failed to write its tombstone, or a push
+//!    failed after its outboard. After the same fresh re-check and a
+//!    second listing, it deletes those outboard versions and the
+//!    requests' records, writing no tombstone (`closed <id>`). A write
+//!    meanwhile keeps them, and a push's grace restarts next run. A dry
+//!    run reports these too, from its listing alone.
 //!
 //! Then, in both modes, it verifies each tombstone at least
 //! [`VERIFY_AFTER`] old ([`verify_tombstones`], spec 3.4 step 7): it
@@ -123,9 +125,10 @@ pub struct Report {
     /// publish, not counted; then one line per due item, in the order the
     /// run takes them (`deleted <id>`, `would delete <id>`, `kept <id>:
     /// <why>`, `pushed again <id>` (in a dry run too), `deferred <id>:
-    /// catalog changed`, `failed <id>: <error>`); then `deleted <id>`
-    /// (`would delete <id>`) or `failed <id>: <error>` for each recording
-    /// whose requests [`close`] closed, by id, which aren't reported kept;
+    /// catalog changed`, `failed <id>: <error>`); then `closed <id>`
+    /// (`would close <id>`), not counted, or `failed <id>: <error>` for
+    /// each recording whose requests [`close`] closed, by id: a request it
+    /// closed, even one before a failure, isn't reported kept;
     /// then one line per tombstoned item verified, in the same order (`verified
     /// <id>`, `fresh <id>`, `listed again <id>`, `current again <id>`,
     /// `recreated <id>`, `kept <id>: <why>`, `failed <id>: <error>`; in a
@@ -138,8 +141,8 @@ pub struct Report {
     /// pointer names (spec 3.4 step 8), or `failed final read: <error>`.
     /// `<id>` is [`Item::id`]: `<kind> <name>`.
     pub lines: Vec<String>,
-    /// Items deleted, recordings closed with nothing left, and tombstoned
-    /// items deleted again (in a dry run: that would be).
+    /// Items deleted, and tombstoned items deleted again (in a dry run:
+    /// that would be).
     pub deleted: usize,
     /// Items, tombstoned items, requests and transitions kept, a recording
     /// pushed again among them.
@@ -196,6 +199,16 @@ impl Report {
         };
         let name = key.strip_prefix(TRANSITIONS).unwrap_or(key);
         self.lines.push(format!("{verb} transition {name}: {LOST}"));
+    }
+
+    /// A recording's stale requests closed ([`close`]): a line, not counted
+    /// (nothing of the recording was left to delete).
+    fn closed(&mut self, id: &str) {
+        self.lines.push(if self.dry_run {
+            format!("would close {id}")
+        } else {
+            format!("closed {id}")
+        });
     }
 
     /// A tombstone whose objects stayed gone, removed.
@@ -350,8 +363,10 @@ async fn run<O: ObjectStore>(
             let listed = list_keys(store, object_keys(item))
                 .await
                 .with_context(|| format!("checking {id}"))?;
-            if !any_object(&listed.versions) {
-                report.deleted(&id);
+            if earliest_request(&requests, item)
+                .is_some_and(|requested_at| closable(&listed.versions, requested_at))
+            {
+                report.closed(&id);
                 closed.extend(request_ids(&requests, item));
             }
         }
@@ -1037,28 +1052,28 @@ fn request_ids(requests: &Requests, item: &Item) -> Vec<String> {
     recordings.chain(operator).collect()
 }
 
-/// Whether any listed version is an object, not a delete marker.
-fn any_object(versions: &[VersionInfo]) -> bool {
-    versions.iter().any(|v| !v.delete_marker)
-}
-
 /// Close an unowned recording ([`due::Decision::unowned`]) that has
-/// nothing left: its requests, kept only for want of an owner record,
-/// passed every other rule, and an earlier run deleted the recording (its
-/// owner record last) but failed to mark them `deleted`. Like an
-/// envelope with no object left, they become tombstones, deleting nothing,
-/// reported as `deleted <id>`; verification then forgets them.
+/// nothing left ([`closable`]). Its requests, kept only for want of an
+/// owner record, passed every other rule: an earlier run deleted the
+/// recording (its owner record last) but failed to mark them `deleted`,
+/// or a push failed after its outboard, before the drop. The close deletes
+/// those outboard versions as listed, then the requests' records, and
+/// reports `closed <id>` (not counted). It writes no tombstone: the
+/// recording went in an earlier run, and a tombstone's verification hour
+/// would read a new push by the requester as in flight and delete it
+/// again.
 ///
-/// It lists the recording's objects (a delete marker is none) and stops at
-/// the first one, with no fresh read: an unowned recording that is still
-/// stored is kept, as the first decision reported it. Otherwise it reads
-/// everything again: the recording must still be unowned there, with its
-/// requester's catalog unmoved, and its pushed objects, listed once more
-/// after that read, must still show nothing. A push that lands meanwhile
-/// writes an object, and an owner record makes the request due, so the
-/// next run restarts its grace instead ([`pushed_again`]). The ids of the
-/// requests it closed. `Err` when the fresh read or a listing fails; a
-/// failed write is reported.
+/// It lists the recording's objects and stops at a blob, manifest or owner
+/// record, with no fresh read: an unowned recording still stored is kept,
+/// as the first decision reported it. Otherwise it reads everything again:
+/// the recording must still be unowned there, with its requester's
+/// catalog unmoved; then it lists the objects once more, and both listings
+/// must leave it [`closable`] by the fresh requests' `requestedAt`. A push
+/// that lands meanwhile writes an object that keeps it, and with an owner
+/// record makes the request due, so the next run restarts its grace
+/// ([`pushed_again`]). The ids of the requests it closed, also when a
+/// failed delete stops it part way (reported). `Err` when the fresh read or
+/// a listing fails.
 async fn close<O: ObjectStore>(
     store: &O,
     item: &Item,
@@ -1067,13 +1082,10 @@ async fn close<O: ObjectStore>(
     report: &mut Report,
 ) -> anyhow::Result<Vec<String>> {
     let id = item.id();
-    let Item::Recording { hash, .. } = item else {
-        return Ok(Vec::new());
-    };
     let listed = list_keys(store, object_keys(item))
         .await
         .with_context(|| format!("re-checking {id}"))?;
-    if any_object(&listed.versions) {
+    if newest_push(&listed.versions).is_some() {
         return Ok(Vec::new());
     }
     let fresh = snapshot::read(store)
@@ -1087,22 +1099,124 @@ async fn close<O: ObjectStore>(
     if held(&item, &fresh, baseline).is_some() {
         return Ok(Vec::new());
     }
-    let since = list_keys(store, pushed_keys(hash))
+    let since = list_keys(store, object_keys(&item))
         .await
         .with_context(|| format!("re-checking {id}"))?;
-    if any_object(&since.versions) {
+    let Some(requested_at) = earliest_request(&fresh.requests, &item) else {
+        return Ok(Vec::new());
+    };
+    if !closable(listed.versions.iter().chain(&since.versions), requested_at) {
         return Ok(Vec::new());
     }
-    match mark_deleted(store, &fresh.requests, &item, now).await {
-        Ok(ids) => {
-            report.deleted(&id);
-            Ok(ids)
-        }
-        Err(e) => {
-            report.failed(&id, &e);
-            Ok(Vec::new())
-        }
+    if let Err(e) = delete_outboards(store, &item, &listed.versions).await {
+        report.failed(&id, &e);
+        return Ok(Vec::new());
     }
+    let (closed, failed) = close_requests(store, &fresh.requests, &item).await;
+    match failed {
+        None => report.closed(&id),
+        Some(e) => report.failed(&id, &e),
+    }
+    Ok(closed)
+}
+
+/// Whether a recording's listed `versions` leave its unowned requests
+/// closable: no object but outboard versions written before
+/// `requested_at` (the earliest of the requests'), what a push whose
+/// upload failed after its outboard left before the drop. A blob, manifest
+/// or owner record keeps them, and so does an outboard written since: a
+/// push may be uploading (ingest writes the outboard first). A delete
+/// marker is no object.
+fn closable<'a>(versions: impl IntoIterator<Item = &'a VersionInfo>, requested_at: i64) -> bool {
+    versions
+        .into_iter()
+        .filter(|v| !v.delete_marker)
+        .all(|v| v.key.starts_with("outboards/") && v.modified < requested_at)
+}
+
+/// The earliest `requestedAt` of the requests a recording `item` names.
+fn earliest_request(requests: &Requests, item: &Item) -> Option<i64> {
+    let Item::Recording {
+        hash,
+        requests: keys,
+    } = item
+    else {
+        return None;
+    };
+    let recordings = requests
+        .recordings
+        .iter()
+        .filter(|((sub, h), _)| h == hash && keys.contains(&recording_key(sub, h)))
+        .map(|(_, r)| r.requested_at);
+    let operator = requests
+        .operator
+        .iter()
+        .filter(|((sub, h), _)| h == hash && keys.contains(&operator_key(sub, h)))
+        .map(|(_, r)| r.requested_at);
+    recordings.chain(operator).min()
+}
+
+/// Delete exactly the listed versions of a recording's outboard, if any
+/// were listed.
+async fn delete_outboards<O: ObjectStore>(
+    store: &O,
+    item: &Item,
+    listed: &[VersionInfo],
+) -> anyhow::Result<()> {
+    let Item::Recording { hash, .. } = item else {
+        return Ok(());
+    };
+    let key = format!("outboards/{hash}");
+    let ids: Vec<String> = listed
+        .iter()
+        .filter(|v| v.key == key)
+        .map(|v| v.version_id.clone())
+        .collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    store
+        .delete_versions(&key, &ids)
+        .await
+        .with_context(|| format!("deleting {key} failed"))?;
+    Ok(())
+}
+
+/// Delete the records of the requests a recording `item` names, in
+/// `requests` (the fresh read's): `recordings/` ones, then `operator/`
+/// ones. The ids of those deleted, as [`due::Decision::kept`] names them,
+/// and the failure that stopped it, if one did.
+async fn close_requests<O: ObjectStore>(
+    store: &O,
+    requests: &Requests,
+    item: &Item,
+) -> (Vec<String>, Option<anyhow::Error>) {
+    let Item::Recording {
+        hash,
+        requests: keys,
+    } = item
+    else {
+        return (Vec::new(), None);
+    };
+    let recordings = requests
+        .recordings
+        .keys()
+        .map(|(sub, h)| (recording_key(sub, h), format!("recording {sub}/{h}"), h));
+    let operator = requests
+        .operator
+        .keys()
+        .map(|(sub, h)| (operator_key(sub, h), format!("operator {sub}/{h}"), h));
+    let mut closed = Vec::new();
+    for (key, id, h) in recordings.chain(operator) {
+        if h != hash || !keys.contains(&key) {
+            continue;
+        }
+        if let Err(e) = delete_record(store, &key).await {
+            return (closed, Some(e));
+        }
+        closed.push(id);
+    }
+    (closed, None)
 }
 
 /// Spec 3.4 step 7: verify each tombstoned item whose newest tombstone is
@@ -3540,11 +3654,12 @@ mod tests {
 
     /// A request left pending after its recording was deleted (the
     /// tombstone write failed), with nothing pushed since, is closed: with
-    /// no object of the recording left, it becomes a tombstone, deleting
-    /// nothing, and verification then forgets it. A dry run reports it and
-    /// writes nothing.
+    /// no object of the recording left, its record is deleted, deleting
+    /// nothing else, and no tombstone starts a verification hour. So a new
+    /// push by the requester within that hour is not deleted again as an
+    /// in-flight write. A dry run reports it and writes nothing.
     #[tokio::test]
-    async fn a_stale_request_with_nothing_left_becomes_a_tombstone() {
+    async fn a_stale_request_with_nothing_left_is_closed() {
         let m = bucket();
         let p = h("a1");
         pushed(&m, &p, U);
@@ -3552,37 +3667,207 @@ mod tests {
         m.fail_on(&recording_key(U, &p), Op::Put);
         let report = sweep(&m, true, NOW).await.unwrap();
         assert_eq!(report.failures, 1, "{report}");
-        let deletes = m.deletes();
+        let mut deletes = m.deletes();
 
         let before = versions(&m).await;
         let report = sweep(&m, false, NOW).await.unwrap();
         assert_eq!(
             report.to_string(),
-            format!("would delete recording {p}\n1 would delete, 0 kept, 0 deferred, 0 failed")
+            format!("would close recording {p}\n0 would delete, 0 kept, 0 deferred, 0 failed")
         );
         assert_eq!(versions(&m).await, before);
 
         let report = sweep(&m, true, NOW).await.unwrap();
         assert_eq!(
             report.to_string(),
-            format!("deleted recording {p}\n1 deleted, 0 kept, 0 deferred, 0 failed")
+            format!("closed recording {p}\n0 deleted, 0 kept, 0 deferred, 0 failed")
         );
-        assert_eq!(m.deletes(), deletes, "nothing deleted");
-        let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
-        assert_eq!(
-            (r.state, r.deleted_at, r.requested_at),
-            (State::Deleted, Some(NOW), NOW - GRACE)
-        );
+        deletes.push(recording_key(U, &p));
+        assert_eq!(m.deletes(), deletes, "the request record only");
+        assert!(gone(&m, &recording_key(U, &p)).await);
 
-        let at = NOW + VERIFY_AFTER;
+        // A new push by the same account, within the hour.
+        m.set_now(NOW + 10);
+        recording(&m, &p, U);
+        let push = stored(&m).await;
+        let at = NOW + VERIFY_AFTER + 20;
         m.set_now(at);
         let report = sweep(&m, true, at).await.unwrap();
+        assert!(report.lines.is_empty(), "{report}");
+        assert_eq!(stored(&m).await, push);
+    }
+
+    /// A crash after the fold wrote a request but before it deleted the
+    /// transitions re-folds them next run, which may set the request
+    /// pending again; that run deletes the transitions, then closes it
+    /// again. It converges: nothing is left to set it again.
+    #[tokio::test]
+    async fn a_close_converges_after_a_refold() {
+        let m = bucket();
+        let p = h("a1");
+        // Dropped a grace ago; no object of it left.
+        let first = publish(&m, U, 1, b"doc-1", &[&p], None, NOW - 2 * GRACE, &[], &[&p]);
+        let second = publish(
+            &m,
+            U,
+            2,
+            b"doc-2",
+            &[],
+            Some(&first),
+            NOW - GRACE,
+            &[&p],
+            &[],
+        );
+        m.fail_on(&second.key, Op::Delete);
+        assert!(sweep(&m, true, NOW).await.is_err());
+        let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
+        assert_eq!(r.state, State::Pending);
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert!(has(&report, &format!("closed recording {p}")), "{report}");
+        assert!(gone(&m, &recording_key(U, &p)).await);
+        assert!(gone(&m, &second.key).await);
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert!(report.lines.iter().all(|l| !l.contains(&p)), "{report}");
+        assert!(gone(&m, &recording_key(U, &p)).await);
+    }
+
+    /// A push whose blob upload failed after its outboard leaves the
+    /// outboard alone. Older than the drop, it is deleted, those versions
+    /// exactly, and the request closed.
+    #[tokio::test]
+    async fn an_orphan_outboard_before_the_drop_is_deleted_and_the_request_closed() {
+        let m = bucket();
+        let p = h("a1");
+        let outboard = format!("outboards/{p}");
+        m.set_now(PUSHED_AT);
+        m.insert(&outboard, "outboard");
+        m.insert(&outboard, "outboard again");
+        m.set_now(NOW);
+        request(&m, U, &p, NOW - GRACE);
+
+        let before = versions(&m).await;
+        let report = sweep(&m, false, NOW).await.unwrap();
         assert_eq!(
-            report.lines,
-            [format!("verified recording {p}")],
+            report.to_string(),
+            format!("would close recording {p}\n0 would delete, 0 kept, 0 deferred, 0 failed")
+        );
+        assert_eq!(versions(&m).await, before);
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert_eq!(
+            report.to_string(),
+            format!("closed recording {p}\n0 deleted, 0 kept, 0 deferred, 0 failed")
+        );
+        assert!(gone(&m, &outboard).await);
+        assert!(gone(&m, &recording_key(U, &p)).await);
+        assert_eq!(m.deletes(), [outboard, recording_key(U, &p)]);
+    }
+
+    /// An outboard written after the drop may be an upload in progress
+    /// (ingest writes the outboard first): the request is kept, and so is
+    /// the outboard.
+    #[tokio::test]
+    async fn an_outboard_since_the_drop_keeps_the_request() {
+        let m = bucket();
+        let p = h("a1");
+        m.set_now(PUSHED_AT);
+        m.insert(&format!("outboards/{p}"), "outboard");
+        m.set_now(NOW - 10);
+        m.insert(&format!("outboards/{p}"), "outboard");
+        m.set_now(NOW);
+        request(&m, U, &p, NOW - GRACE);
+        let before = versions(&m).await;
+
+        for delete in [false, true] {
+            let report = sweep(&m, delete, NOW).await.unwrap();
+            assert_eq!(
+                report.lines,
+                [format!("kept recording {U}/{p}: no owner record")],
+                "{report}"
+            );
+        }
+        assert_eq!(versions(&m).await, before);
+        assert!(m.deletes().is_empty());
+    }
+
+    /// The second listing, after the close's fresh read, decides with the
+    /// first: a blob (here with no owner record, so the fresh decision
+    /// still has the recording unowned), or an outboard, written during
+    /// the fresh read keeps the request.
+    #[tokio::test]
+    async fn a_write_during_the_close_keeps_the_request() {
+        for object in ["blobs", "outboards"] {
+            let m = bucket();
+            let p = h("a1");
+            request(&m, U, &p, NOW - GRACE);
+            let t = publish(&m, U, 1, b"doc-u", &[], None, PUSHED_AT, &[], &[]);
+            let (key, written) = (recording_key(U, &p), format!("{object}/{p}"));
+            let landed = written.clone();
+            m.on_before_delete(&t.key, move |m| {
+                m.on_before_get(&key, move |m| m.insert(&landed, "written meanwhile"));
+            });
+
+            let report = sweep(&m, true, NOW).await.unwrap();
+            assert!(
+                report.lines.iter().all(|l| !l.starts_with("closed ")),
+                "{object}: {report}"
+            );
+            assert!(
+                has(&report, &format!("kept recording {U}/{p}: no owner record")),
+                "{object}: {report}"
+            );
+            let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
+            assert_eq!(r.state, State::Pending, "{object}");
+            assert!(m.get(&written).await.unwrap().is_some(), "{object}");
+        }
+    }
+
+    /// A close that fails part way reports what it closed: the request it
+    /// deleted isn't reported kept, the one it couldn't still is.
+    #[tokio::test]
+    async fn a_partial_close_reports_what_it_closed() {
+        let m = bucket();
+        let p = h("a1");
+        block_and_suspend(&m, U);
+        request(&m, U, &p, NOW - GRACE);
+        put(
+            &m,
+            &operator_key(U, &p),
+            OperatorRequest {
+                hash: p.clone(),
+                subject: U.into(),
+                requested_at: NOW - GRACE,
+                reason: "account closed".into(),
+                scope: Scope::Subject,
+                state: State::Pending,
+                deleted_at: None,
+            },
+        );
+        m.fail_on(&operator_key(U, &p), Op::Delete);
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert_eq!(report.failures, 1, "{report}");
+        let failed = format!("failed recording {p}: ");
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.starts_with(&failed) && l.contains(&operator_key(U, &p))),
+            "{report}"
+        );
+        assert!(
+            has(&report, &format!("kept operator {U}/{p}: no owner record")),
+            "{report}"
+        );
+        assert!(
+            !has(&report, &format!("kept recording {U}/{p}: no owner record")),
             "{report}"
         );
         assert!(gone(&m, &recording_key(U, &p)).await);
+        let r: OperatorRequest = record(&m, &operator_key(U, &p)).await;
+        assert_eq!(r.state, State::Pending);
     }
 
     /// A request kept for want of an owner record whose recording still
@@ -3612,7 +3897,7 @@ mod tests {
     /// close's fresh read, the restart rule wins: the request isn't closed,
     /// and the next run restarts its grace from the push.
     #[tokio::test]
-    async fn a_push_during_a_close_wins_over_the_tombstone() {
+    async fn a_push_during_a_close_wins_over_the_close() {
         let m = bucket();
         let p = h("a1");
         request(&m, U, &p, NOW - GRACE);
@@ -3623,7 +3908,7 @@ mod tests {
         });
 
         let report = sweep(&m, true, NOW).await.unwrap();
-        assert!(!has(&report, &format!("deleted recording {p}")), "{report}");
+        assert!(!has(&report, &format!("closed recording {p}")), "{report}");
         assert_eq!(report.failures, 0, "{report}");
         let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
         assert_eq!((r.state, r.requested_at), (State::Pending, NOW - GRACE));
