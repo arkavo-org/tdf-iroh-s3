@@ -110,6 +110,11 @@ const FINAL_READ: &str = "final read";
 /// Why a transition no pointer reaches is deleted unfolded.
 const LOST: &str = "lost its publish";
 
+/// Why an envelope this run observed is kept ([`due::observe`]): no
+/// request tracked it. With `--delete` the run records it, superseded now;
+/// a dry run doesn't, so each one observes it again.
+const OBSERVED: &str = "observed";
+
 /// Why a subject's tombstone is kept: an envelope request of that owner is
 /// pending, and the tombstone releases it while the owner's catalog block
 /// and suspension stand (`due::everything_requested`).
@@ -134,7 +139,9 @@ pub struct Report {
     /// `recreated <id>`, `kept <id>: <why>`, `failed <id>: <error>`; in a
     /// dry run `would verify <id>`, `would forget <id>: <why>`, `would
     /// delete again <id>`); then `kept <id>: <why>` for each pending
-    /// request not due, and for each transition the fold keeps that
+    /// request not due (`observed` for an envelope this run observed,
+    /// whose grace a dry run doesn't start), and for each transition the
+    /// fold keeps that
     /// survives the run: not one the run deleted with its subject (in a
     /// dry run: would delete), whichever step of the subject's delete
     /// failed; then
@@ -389,10 +396,18 @@ async fn run<O: ObjectStore>(
     )
     .await?;
 
+    let observed: BTreeSet<String> = observed
+        .iter()
+        .map(|r| Item::Envelope(r.hash.clone()).id())
+        .collect();
     for (id, why) in &decision.kept {
-        if !closed.contains(id) {
-            report.kept(id, why);
+        if closed.contains(id) {
+            continue;
         }
+        // Within grace, as one superseded now is, but its grace starts
+        // only once a `--delete` run records it.
+        let why = if observed.contains(id) { OBSERVED } else { why };
+        report.kept(id, why);
     }
     for (key, why) in &fold.kept {
         if gone.contains(key) {
@@ -2048,7 +2063,7 @@ mod tests {
             "{report}"
         );
         assert!(
-            has(&report, &format!("kept envelope {e}: within grace")),
+            has(&report, &format!("kept envelope {e}: observed")),
             "{report}"
         );
         assert_eq!(
@@ -2727,6 +2742,41 @@ mod tests {
         );
     }
 
+    /// An envelope no request tracks is reported `observed`. A dry run
+    /// writes no request, so its grace doesn't start: every dry run
+    /// observes it again, now. The first `--delete` run records it, and
+    /// its grace runs from that run.
+    #[tokio::test]
+    async fn only_a_delete_run_starts_an_observed_envelopes_grace() {
+        let m = bucket();
+        let e = envelope(&m, U, b"doc-0");
+        let observed = format!("kept envelope {e}: observed");
+        for at in [NOW, NOW + GRACE] {
+            let report = sweep(&m, false, at).await.unwrap();
+            assert_eq!(report.lines, std::slice::from_ref(&observed), "{report}");
+        }
+        assert!(m.get(&envelope_key(&e)).await.unwrap().is_none());
+
+        let at = NOW + GRACE;
+        let report = sweep(&m, true, at).await.unwrap();
+        assert_eq!(report.lines, std::slice::from_ref(&observed), "{report}");
+        let r: EnvelopeRequest = record(&m, &envelope_key(&e)).await;
+        assert_eq!((r.superseded_at, r.source), (at, Source::Observed));
+
+        let report = sweep(&m, false, at + GRACE - 1).await.unwrap();
+        assert_eq!(
+            report.lines,
+            [format!("kept envelope {e}: within grace")],
+            "{report}"
+        );
+        let report = sweep(&m, false, at + GRACE).await.unwrap();
+        assert_eq!(
+            report.lines,
+            [format!("would delete envelope {e}")],
+            "{report}"
+        );
+    }
+
     /// The routine leftover of a publish whose writes stopped after its
     /// index record and transition: no document, outboard or pointer. The
     /// fold keeps its transition, which no pointer reaches. Its envelope is
@@ -2777,7 +2827,7 @@ mod tests {
             "{report}"
         );
         assert!(
-            has(&report, &format!("kept envelope {e}: within grace")),
+            has(&report, &format!("kept envelope {e}: observed")),
             "{report}"
         );
         let observed: EnvelopeRequest = record(&m, &envelope_key(&e)).await;
