@@ -185,7 +185,8 @@ read both; ingest writes both). It needs the same S3 write permissions on
 is logged and never masks a successful blob ingest; re-pushing the content
 repairs it). Creator catalogs need `s3:PutObject` and
 `s3:GetObject` on `catalog-documents/`, and for catalog v2 also on
-`catalog-outboards/` and `catalog-pointers/` (pointer writes are
+`catalog-outboards/`, `catalog-indexes/`, `catalog-pointers/` and
+`catalog-transitions/` (index, pointer and transition writes are
 conditional: `If-Match` / `If-None-Match`). It needs `s3:PutObject`,
 `s3:GetObject` on `moderation/` when the publishing gate is on. It also
 needs `s3:ListBucket` on the bucket itself, without a prefix condition:

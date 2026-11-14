@@ -676,18 +676,23 @@ async fn put_catalog<S: TagStore>(
 /// Store this publish's `transition` under its key
 /// (`catalog-transitions/<sub>/<seq>-<pointer digest>`), only if none is
 /// there. The key names one signed pointer, so one already there is from
-/// the same pointer bytes:
-/// - with the same `base`, it is this publish's own, from a retry or a
-///   duplicate sent while the original was in flight. It stays as it is,
+/// the same pointer bytes, sent over a base whose `seq` (0 for none) says
+/// which of the two to keep:
+/// - the same `seq`: the same base, so this publish's own, from a retry or
+///   a duplicate sent while the original was in flight. It stays as it is,
 ///   its `at` and `dropped` too: a duplicate can't rewrite a transition the
 ///   original commits.
-/// - with another `base`, the same pointer was first sent over a base that
-///   has moved since (its pointer write lost, or its `If-Match` changed).
-///   It is replaced, only if it is still what was read (`If-Match`), so the
-///   pointer this publish commits names its real base.
+/// - a lower `seq` than this publish's base: the same pointer was first
+///   sent over a base that has moved since (its pointer write lost, or its
+///   `If-Match` changed). It is replaced, only if it is still what was read
+///   (`If-Match`), so the pointer this publish commits names its real base.
+/// - a higher `seq`: this publish stalled since it read its base, and the
+///   same pointer was sent again over a newer one meanwhile. That
+///   transition stays, and this publish is answered as a lost transition
+///   write.
 ///
-/// One that can't be read or parsed, or a replace that loses, is 502
-/// `storage unavailable`.
+/// One that can't be read or parsed, a replace that loses, or a stalled
+/// publish is 502 `storage unavailable`.
 async fn write_transition<S: TagStore>(
     api: &ApiState<S>,
     sub: &str,
@@ -717,8 +722,18 @@ async fn write_transition<S: TagStore>(
         })?;
     let existing: Transition = serde_json::from_slice(&stored.body)
         .map_err(|e| storage_unavailable("Catalog transition parse", e.into()))?;
-    if existing.base == transition.base {
-        return Ok(());
+    let base_seq = |t: &Transition| t.base.as_ref().map_or(0, |base| base.seq);
+    match base_seq(transition).cmp(&base_seq(&existing)) {
+        std::cmp::Ordering::Equal => return Ok(()),
+        std::cmp::Ordering::Less => {
+            return Err(write(anyhow::anyhow!(
+                "transition {sub}/{name} is over base seq {}, newer than this publish's {}: \
+                 a stalled publish",
+                base_seq(&existing),
+                base_seq(transition)
+            )));
+        }
+        std::cmp::Ordering::Greater => {}
     }
     let replaced = api
         .store
@@ -2856,6 +2871,41 @@ mod tests {
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
         let t = transition(&h, 3, &ours, &index()).await;
         assert_eq!(t.base, base(2, &theirs, &index()));
+        assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"3\"");
+    }
+
+    /// A publish stalled since it read seq 1 resumes after the same signed
+    /// pointer was sent again over seq 2 and committed. The transition
+    /// over the newer base stays as it is; the stalled publish is answered
+    /// as a lost transition write (502), and the pointer stays.
+    #[tokio::test]
+    async fn a_stalled_publish_over_an_older_base_keeps_the_newer_transition() {
+        let h = ingested().await;
+        let first = envelope(1);
+        assert_eq!(publish(&h, 1, &first).await.status, StatusCode::OK);
+        // What the stalled publish read at its step 7.
+        let read = h.store.catalog_pointers.lock().await[SUB].clone();
+
+        let (theirs, ours) = (envelope(2), envelope(3));
+        let r = publish_if(&h, 2, &theirs, header::IF_MATCH, "\"1\"").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let r = publish_if(&h, 3, &ours, header::IF_MATCH, "\"2\"").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let committed = h.store.transitions.lock().await.clone();
+        assert_eq!(
+            transition(&h, 3, &ours, &index()).await.base,
+            base(2, &theirs, &index())
+        );
+        let stored = h.store.catalog_pointers.lock().await[SUB].clone();
+
+        *h.store.stale_next_pointer_read.lock().unwrap() = Some(read);
+        let r = publish_if(&h, 3, &ours, header::IF_MATCH, "\"1\"").await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::BAD_GATEWAY, "storage unavailable")
+        );
+        assert_eq!(*h.store.transitions.lock().await, committed);
+        assert_eq!(h.store.catalog_pointers.lock().await[SUB], stored);
         assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"3\"");
     }
 

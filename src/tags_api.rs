@@ -353,6 +353,10 @@ pub(crate) mod test_support {
         /// The next conditional pointer write loses, as if another publish
         /// had moved the pointer since it was read.
         pub lose_next_pointer_race: std::sync::atomic::AtomicBool,
+        /// The next pointer read answers this (bundle, version) instead of
+        /// what is stored: a publish that read the pointer before other
+        /// publishes moved it, and resumes only now.
+        pub stale_next_pointer_read: std::sync::Mutex<Option<(Bytes, u64)>>,
         /// The next index record create reports one already there, without
         /// writing, though none is stored: as if the record were deleted
         /// between the create and its read.
@@ -575,6 +579,13 @@ pub(crate) mod test_support {
         }
         async fn get_catalog_pointer(&self, sub: &str) -> anyhow::Result<Option<StoredPointer>> {
             self.up()?;
+            let stale = self.stale_next_pointer_read.lock().unwrap().take();
+            if let Some((body, v)) = stale {
+                return Ok(Some(StoredPointer {
+                    body,
+                    etag: format!("\"{v}\""),
+                }));
+            }
             Ok(self
                 .catalog_pointers
                 .lock()
