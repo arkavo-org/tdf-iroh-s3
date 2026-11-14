@@ -1,6 +1,7 @@
 //! `ObjectStore for S3Client` against a real versioned bucket: conditional
 //! creates, delete markers, version listing across pages and version
-//! deletion (plan call 12). Every test is ignored, and passes without touching S3 when
+//! deletion (plan call 12), and a publish's transition writes: the
+//! conditional create and the replace over an ETag. Every test is ignored, and passes without touching S3 when
 //! `TDF_IROH_S3_VERSIONED_BUCKET` or `AWS_REGION` is unset:
 //!
 //! ```text
@@ -216,6 +217,65 @@ async fn a_concurrent_conditional_create_reports_false() {
         let winner = if a { body("a") } else { body("b") };
         assert_eq!(s3.get(&key).await.unwrap(), Some(winner));
         assert_eq!(s3.list_versions(&key).await.unwrap().len(), 1);
+    })
+    .catch_unwind()
+    .await;
+    clean_up(&s3, outcome).await;
+}
+
+/// A publish's transition (`put_catalog_transition`), as `write_transition`
+/// uses it: created only if none is there, replaced only over the ETag it
+/// was read at. A replace over a stale ETag writes nothing and reports
+/// `false` (412). A replace where no object is: S3 answers 404, not 412,
+/// so it is an error, where the route's test store reports `false`; both
+/// end as 502, and neither writes.
+#[tokio::test]
+#[ignore = "needs a real versioned bucket: TDF_IROH_S3_VERSIONED_BUCKET"]
+async fn a_transition_is_created_once_and_replaced_over_its_etag() {
+    let Some(s3) = scratch("transition").await else {
+        return;
+    };
+    let outcome = AssertUnwindSafe(async {
+        let (sub, name) = ("u1", "00000000000000000002-ab");
+        assert_eq!(s3.get_catalog_transition(sub, name).await.unwrap(), None);
+        let missing = s3
+            .put_catalog_transition(sub, name, body("ghost"), Some("\"0123\""))
+            .await;
+        eprintln!("If-Match where no object is: {missing:?}");
+        assert!(!matches!(missing, Ok(true)), "{missing:?}");
+        assert_eq!(s3.get_catalog_transition(sub, name).await.unwrap(), None);
+
+        assert!(
+            s3.put_catalog_transition(sub, name, body("first"), None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !s3.put_catalog_transition(sub, name, body("second"), None)
+                .await
+                .unwrap()
+        );
+        let (stored, read) = s3.get_catalog_transition(sub, name).await.unwrap().unwrap();
+        assert_eq!(stored, body("first"));
+
+        assert!(
+            s3.put_catalog_transition(sub, name, body("second"), Some(&read))
+                .await
+                .unwrap()
+        );
+        let (stored, now) = s3.get_catalog_transition(sub, name).await.unwrap().unwrap();
+        assert_eq!(stored, body("second"));
+        assert_ne!(now, read);
+        assert!(
+            !s3.put_catalog_transition(sub, name, body("third"), Some(&read))
+                .await
+                .unwrap()
+        );
+        let (stored, _) = s3.get_catalog_transition(sub, name).await.unwrap().unwrap();
+        assert_eq!(stored, body("second"));
+        // One version per successful write.
+        let key = format!("catalog-transitions/{sub}/{name}");
+        assert_eq!(s3.list_versions(&key).await.unwrap().len(), 2);
     })
     .catch_unwind()
     .await;
