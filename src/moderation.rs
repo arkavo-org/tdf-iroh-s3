@@ -194,10 +194,16 @@ const SESSIONS: &str = "sessions";
 /// owner record, before it is refused.
 const SESSION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Session and owner lookups at once. A push that finds them all busy is
-/// refused: a peer must not be able to make the node send S3 a request per
-/// push.
+/// Session lookups at once, for pushes whose session this gate doesn't hold.
+/// A push that finds them all busy is refused: a peer with no session must
+/// not be able to make the node send S3 a request per push.
 const SESSION_LOOKUPS: usize = 16;
+
+/// Owner lookups at once. Every push the other checks accept sends S3 one
+/// owner read; a push that finds them all busy is refused. Kept apart from
+/// [`SESSION_LOOKUPS`], so pushes with no session can't hold the permits a
+/// publisher's push needs.
+const OWNER_LOOKUPS: usize = 16;
 
 /// How long an endpoint whose lookup found no live session is refused
 /// without asking the store again.
@@ -489,6 +495,7 @@ pub struct PublishGate {
     connections: Mutex<HashMap<u64, EndpointId>>,
     store: Option<Arc<dyn SessionStore>>,
     lookups: tokio::sync::Semaphore,
+    owner_lookups: tokio::sync::Semaphore,
     /// Endpoints whose last lookup found no live session, and when.
     misses: Mutex<HashMap<EndpointId, Instant>>,
     decider: Arc<PublishDecider>,
@@ -522,6 +529,7 @@ impl PublishGate {
             connections: Mutex::new(HashMap::new()),
             store: None,
             lookups: tokio::sync::Semaphore::new(SESSION_LOOKUPS),
+            owner_lookups: tokio::sync::Semaphore::new(OWNER_LOOKUPS),
             misses: Mutex::new(HashMap::new()),
             decider: Arc::new(PublishDecider::default()),
             session_ttl: Duration::from_secs(
@@ -771,13 +779,13 @@ impl PublishGate {
     /// Whether `subject` may push `hash_hex`: not when another account owns
     /// it. An unowned recording may be pushed (ingest then claims it). An
     /// owner record that can't be read in time, or parsed, refuses the push,
-    /// and so does finding every lookup busy. Checked last, so a push refused
-    /// otherwise costs no read; skipped without an owner store.
+    /// and so does finding every owner lookup busy. Checked last, so a push
+    /// refused otherwise costs no read; skipped without an owner store.
     async fn owner_allows(&self, subject: &str, hash_hex: &str) -> Result<(), PushRefusal> {
         let Some(owners) = self.owners.as_ref() else {
             return Ok(());
         };
-        let Ok(_permit) = self.lookups.try_acquire() else {
+        let Ok(_permit) = self.owner_lookups.try_acquire() else {
             warn!(%subject, hash = %hash_hex, "Owner lookups busy; push refused");
             return Err(PushRefusal::OwnerUnknown);
         };
@@ -2163,8 +2171,8 @@ mod tests {
         let owners = Arc::new(MemOwners::default());
         let gate = owner_gate(Some(&owners));
         let _all = gate
-            .lookups
-            .try_acquire_many(SESSION_LOOKUPS as u32)
+            .owner_lookups
+            .try_acquire_many(OWNER_LOOKUPS as u32)
             .unwrap();
         // Refused without a lookup, though the recording has no owner.
         assert_eq!(
@@ -2173,13 +2181,29 @@ mod tests {
         );
     }
 
+    /// Pushes with no session keep session lookups busy; they must not
+    /// refuse a publisher's push, whose session is held.
     #[tokio::test]
-    async fn without_an_owner_store_the_check_is_skipped() {
-        let gate = owner_gate(None);
-        // Not even a lookup permit is needed.
+    async fn busy_session_lookups_do_not_block_owner_lookups() {
+        let owners = Arc::new(MemOwners::default());
+        let hash = owned_hash();
+        seed_owner(&owners, &hash, owner_record(&hash, OWNER_UUID));
+        let gate = owner_gate(Some(&owners));
         let _all = gate
             .lookups
             .try_acquire_many(SESSION_LOOKUPS as u32)
+            .unwrap();
+        let (sub, _) = gate.authorize_push(1, &hash).await.unwrap();
+        assert_eq!(sub, OWNER_UUID);
+    }
+
+    #[tokio::test]
+    async fn without_an_owner_store_the_check_is_skipped() {
+        let gate = owner_gate(None);
+        // Not even an owner lookup permit is needed.
+        let _all = gate
+            .owner_lookups
+            .try_acquire_many(OWNER_LOOKUPS as u32)
             .unwrap();
         let (sub, _) = gate.authorize_push(1, &owned_hash()).await.unwrap();
         assert_eq!(sub, OWNER_UUID);
