@@ -17,7 +17,7 @@ use super::{
     RecordingRequest, SUBJECTS, State, SubjectRequest, TRANSITIONS, Transition, transition_name,
 };
 use crate::catalog_scan::{self, Catalogs};
-use crate::creator_catalog::is_lower_hex_hash;
+use crate::creator_catalog::{is_lower_hex_hash, object_from_slice};
 use crate::moderation::{
     BLOCKS, Block, CATALOG_BLOCKS, CatalogBlock, SUSPENSIONS, Suspension, canonical_subject,
     valid_subject,
@@ -142,7 +142,7 @@ async fn transitions<O: ObjectStore>(store: &O) -> anyhow::Result<BTreeMap<Strin
 fn transition(key: &str, body: &[u8]) -> anyhow::Result<Transition> {
     let [sub, name] = names(key, TRANSITIONS)?;
     anyhow::ensure!(valid_subject(sub), "{sub} is not a subject");
-    let t: Transition = serde_json::from_slice(body)?;
+    let t: Transition = object_from_slice(body)?;
     same("subject", &t.subject, sub)?;
     same("name", &transition_name(t.seq, &t.pointer), name)?;
     let base = t.base.iter().flat_map(|b| [&b.catalog_hash, &b.pointer]);
@@ -189,7 +189,7 @@ async fn requests<O: ObjectStore>(store: &O) -> anyhow::Result<(Requests, BTreeM
 fn recording(key: &str, body: &[u8]) -> anyhow::Result<((String, String), RecordingRequest)> {
     let [sub, hash] = names(key, RECORDINGS)?;
     let (sub, hash) = (canonical(sub)?, lower_hex(hash)?);
-    let r: RecordingRequest = serde_json::from_slice(body)?;
+    let r: RecordingRequest = object_from_slice(body)?;
     same("subject", &r.subject, sub)?;
     same("hash", &r.hash, hash)?;
     tombstone_dated(r.state, r.deleted_at)?;
@@ -199,7 +199,7 @@ fn recording(key: &str, body: &[u8]) -> anyhow::Result<((String, String), Record
 fn envelope(key: &str, body: &[u8]) -> anyhow::Result<(String, EnvelopeRequest)> {
     let [hash] = names(key, ENVELOPES)?;
     let hash = lower_hex(hash)?;
-    let r: EnvelopeRequest = serde_json::from_slice(body)?;
+    let r: EnvelopeRequest = object_from_slice(body)?;
     same("hash", &r.hash, hash)?;
     tombstone_dated(r.state, r.deleted_at)?;
     Ok((hash.to_string(), r))
@@ -208,7 +208,7 @@ fn envelope(key: &str, body: &[u8]) -> anyhow::Result<(String, EnvelopeRequest)>
 fn operator(key: &str, body: &[u8]) -> anyhow::Result<((String, String), OperatorRequest)> {
     let [sub, hash] = names(key, OPERATOR)?;
     let (sub, hash) = (canonical(sub)?, lower_hex(hash)?);
-    let r: OperatorRequest = serde_json::from_slice(body)?;
+    let r: OperatorRequest = object_from_slice(body)?;
     same("subject", &r.subject, sub)?;
     same("hash", &r.hash, hash)?;
     tombstone_dated(r.state, r.deleted_at)?;
@@ -218,7 +218,7 @@ fn operator(key: &str, body: &[u8]) -> anyhow::Result<((String, String), Operato
 fn subject(key: &str, body: &[u8]) -> anyhow::Result<(String, SubjectRequest)> {
     let [sub] = names(key, SUBJECTS)?;
     let sub = canonical(sub)?;
-    let r: SubjectRequest = serde_json::from_slice(body)?;
+    let r: SubjectRequest = object_from_slice(body)?;
     same("subject", &r.subject, sub)?;
     tombstone_dated(r.state, r.deleted_at)?;
     Ok((sub.to_string(), r))
@@ -278,7 +278,7 @@ fn moderation_record<T: DeserializeOwned>(
     let parse = || {
         let [name] = names(key, &moderation_prefix(kind))?;
         let name = valid(name)?;
-        let record: T = serde_json::from_slice(body)?;
+        let record: T = object_from_slice(body)?;
         same(what, name_of(&record), name)?;
         anyhow::Ok(record)
     };
@@ -587,6 +587,152 @@ mod tests {
                 assert!(err.contains(&key), "{key} ({body}): {err}");
             }
         }
+    }
+
+    /// Every record the snapshot reads is a JSON object: the same values as
+    /// an array, which a derived struct also reads, are unreadable.
+    #[tokio::test]
+    async fn read_refuses_records_as_arrays() {
+        use crate::creator_catalog::test_support::array_form;
+        use crate::deletion::{
+            EnvelopeRequest, OperatorRequest, RecordingRequest, Scope, Source, State,
+            SubjectRequest, TransitionBase,
+        };
+        use crate::moderation::{BlobOwner, Block, CatalogBlock, Suspension};
+        let arkavo = format!("arkavo:{U}");
+        let transition_at = transition_key(&arkavo, &transition_name(2, &h("d2")));
+        let mut based = transition(&arkavo, 2, &h("d2"));
+        based.base = Some(TransitionBase {
+            seq: 1,
+            catalog_hash: h("c0"),
+            pointer: h("d1"),
+        });
+        let cases: Vec<(String, Vec<u8>)> = vec![
+            (
+                transition_at.clone(),
+                serde_json::to_vec(&transition(&arkavo, 2, &h("d2"))).unwrap(),
+            ),
+            (transition_at.clone(), serde_json::to_vec(&based).unwrap()),
+            (
+                recording_key(U, &h("aa")),
+                serde_json::to_vec(&RecordingRequest {
+                    hash: h("aa"),
+                    subject: U.into(),
+                    requested_at: 10,
+                    seq: 2,
+                    state: State::Pending,
+                    deleted_at: None,
+                })
+                .unwrap(),
+            ),
+            (
+                envelope_key(&h("e1")),
+                serde_json::to_vec(&EnvelopeRequest {
+                    hash: h("e1"),
+                    owner: Some(arkavo.clone()),
+                    superseded_at: 10,
+                    source: Source::Observed,
+                    state: State::Pending,
+                    deleted_at: None,
+                })
+                .unwrap(),
+            ),
+            (
+                operator_key("u2", &h("b1")),
+                serde_json::to_vec(&OperatorRequest {
+                    hash: h("b1"),
+                    subject: "u2".into(),
+                    requested_at: 10,
+                    reason: "r".into(),
+                    scope: Scope::Hash,
+                    state: State::Deleted,
+                    deleted_at: Some(20),
+                })
+                .unwrap(),
+            ),
+            (
+                subject_key("c1"),
+                serde_json::to_vec(&SubjectRequest {
+                    subject: "c1".into(),
+                    requested_at: 10,
+                    reason: "r".into(),
+                    state: State::Pending,
+                    deleted_at: None,
+                })
+                .unwrap(),
+            ),
+            (
+                "moderation/suspensions/s1".into(),
+                serde_json::to_vec(&Suspension {
+                    subject: "s1".into(),
+                    reason: "r".into(),
+                    report_id: None,
+                    hide_catalog: true,
+                    by: "op".into(),
+                    at: 1,
+                    lifted_by: None,
+                    lifted_at: None,
+                })
+                .unwrap(),
+            ),
+            (
+                format!("moderation/blocks/{}", h("b1")),
+                serde_json::to_vec(&Block {
+                    hash: h("b1"),
+                    reason: "r".into(),
+                    report_id: None,
+                    by: "op".into(),
+                    at: 1,
+                    lifted_by: None,
+                    lifted_at: None,
+                })
+                .unwrap(),
+            ),
+            (
+                "moderation/catalog-blocks/c1".into(),
+                serde_json::to_vec(&CatalogBlock {
+                    subject: "c1".into(),
+                    reason: "r".into(),
+                    report_id: None,
+                    by: "op".into(),
+                    at: 1,
+                    lifted_by: None,
+                    lifted_at: None,
+                })
+                .unwrap(),
+            ),
+            (
+                format!("moderation/publishers/{}", h("aa")),
+                serde_json::to_vec(&BlobOwner {
+                    hash: h("aa"),
+                    subject: arkavo.clone(),
+                    endpoint_id: "e".into(),
+                    at: 1,
+                })
+                .unwrap(),
+            ),
+        ];
+        for (key, good) in cases {
+            let m = populated();
+            m.insert(&key, good.clone());
+            read(&m)
+                .await
+                .unwrap_or_else(|e| panic!("{key} as an object: {e:#}"));
+            m.insert(&key, array_form(&good));
+            let e = read(&m).await.expect_err(&key);
+            assert!(
+                format!("{e:#}").contains("expected a JSON object"),
+                "{key}: {e:#}"
+            );
+        }
+
+        // A transition's base, inside an object.
+        let mut nested = serde_json::to_value(&based).unwrap();
+        nested["base"] = json!([1, h("c0"), h("d1")]);
+        let m = populated();
+        m.insert(&transition_at, serde_json::to_vec(&nested).unwrap());
+        let e = read(&m).await.expect_err("base as an array");
+        assert!(format!("{e:#}").contains("expected a JSON object"), "{e:#}");
     }
 
     /// Keys that aren't the layout, and records that can't be what they

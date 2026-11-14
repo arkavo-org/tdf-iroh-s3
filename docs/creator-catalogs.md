@@ -108,7 +108,7 @@ A creator whose metadata TDF had a weaker policy than its recording would show t
 
 ## The index
 
-The node can't decrypt the envelope, so the publisher sends the document's entries in the clear alongside it, as `index` in `PUT /v2/catalogs/{sub}`: a JSON array of at most 1000 entries, each exactly `{"contentID", "version", "payloadHash", "payloadSize"}`, the document's entry without its `metadata`, held to the same rules. **The creator's passkey signs the index** through the pointer's [`indexHash`](#indexhash), the SHA-256 of its canonical form, and the node refuses an index that doesn't match it. The node checks the recordings against what it has ingested, stores the index at `catalog-indexes/<hash>`, once per envelope, and **never serves it**. Moderation reads it to find a recording's hash from its `contentID`.
+The node can't decrypt the envelope, so the publisher sends the document's entries in the clear alongside it, as `index` in `PUT /v2/catalogs/{sub}`: a JSON array of at most 1000 entries, each exactly `{"contentID", "version", "payloadHash", "payloadSize"}` (a JSON object: the same values as an array are rejected), the document's entry without its `metadata`, held to the same rules. **The creator's passkey signs the index** through the pointer's [`indexHash`](#indexhash), the SHA-256 of its canonical form, and the node refuses an index that doesn't match it. The node checks the recordings against what it has ingested, stores the index at `catalog-indexes/<hash>`, once per envelope, and **never serves it**. Moderation reads it to find a recording's hash from its `contentID`.
 
 The signature binds the index to the pointer, and so to the envelope's hash, but not to the entries inside the encrypted document: those two agree only by the creator's honesty. An entry left out of the index can only hide the creator's own entry from moderation, so reports carry the `payloadHash`, not just a `contentID`.
 
@@ -257,7 +257,7 @@ A reader checks the whole chain itself. So neither the node nor its storage can 
 
 ### The pointer
 
-The exact UTF-8 bytes of one JSON object. It is carried base64url-encoded and is never re-serialized, so the signed bytes are the bytes everyone reads.
+The exact UTF-8 bytes of one JSON object (the same values as a JSON array are rejected). It is carried base64url-encoded and is never re-serialized, so the signed bytes are the bytes everyone reads.
 
 ```json
 {"schema":"arkavo.catalog-pointer/2","owner":"<sub>","seq":7,"catalogHash":"<64 lowercase hex>","catalogSize":1234,"indexHash":"<64 lowercase hex>","issuedAt":"2026-10-19T01:02:03Z"}

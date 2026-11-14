@@ -17,6 +17,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::catalog_scan::INDEXES;
+use crate::creator_catalog::Object;
 
 pub mod due;
 pub mod fold;
@@ -196,7 +197,8 @@ pub struct Transition {
     /// Lowercase hex SHA-256 of this publish's signed pointer bytes.
     pub pointer: String,
     /// The stored pointer this publish replaces, whatever its visibility;
-    /// `null` when none was stored.
+    /// `null` when none was stored. A missing key reads as `null`.
+    #[serde(default, deserialize_with = "optional_object")]
     pub base: Option<TransitionBase>,
     /// When the publish was made (Unix seconds): a drop's clock.
     pub at: i64,
@@ -217,6 +219,13 @@ pub struct TransitionBase {
     pub catalog_hash: String,
     /// Lowercase hex SHA-256 of the stored pointer's signed bytes.
     pub pointer: String,
+}
+
+/// `null`, or a `T` read through `creator_catalog::object`.
+fn optional_object<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> Result<Option<T>, D::Error> {
+    Ok(Option::<Object<T>>::deserialize(d)?.map(|o| o.0))
 }
 
 #[cfg(test)]

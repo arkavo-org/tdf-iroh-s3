@@ -32,7 +32,7 @@ use std::collections::HashSet;
 use crate::auth::{AuthError, CwtVerifier, PASSKEY_CREDENTIAL_TYP, p256_from_cose_key};
 use crate::creator_catalog::{
     MAX_CATALOG_BYTES, MAX_OWNER_BYTES, NoDuplicateKeys, is_lower_hex_hash, is_utc_timestamp,
-    valid_identifier,
+    object, object_from_slice, valid_identifier,
 };
 
 /// The pointer schema a publish carries: seven keys, `indexHash` among
@@ -111,7 +111,7 @@ pub fn parse_pointer(bytes: &[u8]) -> Result<Pointer, String> {
     }
     std::str::from_utf8(bytes).map_err(|_| "pointer is not UTF-8".to_string())?;
     serde_json::from_slice::<NoDuplicateKeys>(bytes).map_err(|e| format!("pointer: {e}"))?;
-    let p: Pointer = serde_json::from_slice(bytes).map_err(|e| format!("pointer: {e}"))?;
+    let p: Pointer = object_from_slice(bytes).map_err(|e| format!("pointer: {e}"))?;
     match p.schema.as_str() {
         POINTER_SCHEMA => match &p.index_hash {
             None => return Err(format!("pointer \"{POINTER_SCHEMA}\" requires indexHash")),
@@ -154,6 +154,7 @@ pub fn parse_pointer(bytes: &[u8]) -> Result<Pointer, String> {
 #[serde(deny_unknown_fields)]
 pub struct Bundle {
     pub pointer: String,
+    #[serde(deserialize_with = "object")]
     pub assertion: Assertion,
     pub credential: String,
 }
@@ -673,6 +674,19 @@ mod tests {
         let mut b = bundle("u1", 1, DOC, None);
         b.credential = URL_SAFE_NO_PAD.encode(sign_credential(payload, &idp_key(), IDP_KID));
         b
+    }
+
+    #[test]
+    fn a_pointer_as_an_array_is_refused() {
+        use crate::creator_catalog::test_support::array_form;
+        let hash = "03".repeat(32);
+        for index_hash in [Some(hash.as_str()), None] {
+            let good = pointer_bytes("u1", 7, DOC, index_hash);
+            assert!(parse_pointer(&good).is_ok());
+            let why = parse_pointer(&array_form(&good)).unwrap_err();
+            assert!(why.starts_with("pointer: "), "{why}");
+            assert!(why.contains("expected a JSON object"), "{why}");
+        }
     }
 
     #[test]
