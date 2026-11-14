@@ -22,8 +22,14 @@
 //!    next run, which folds the new transitions first. A failure leaves
 //!    the item pending, and the run goes on.
 //!
-//! Never delete what the owner didn't ask to delete; never act on
-//! unreadable state; a dry run writes nothing.
+//! Then, in both modes, it verifies each tombstone at least
+//! [`VERIFY_AFTER`] old ([`verify_tombstones`], spec 3.4 step 7): it
+//! forgets one whose objects stay gone, or came back fresh or listed, and
+//! deletes again what an in-flight write brought back.
+//!
+//! Never delete what the owner didn't ask to delete; never leave a deleted
+//! object to come back; never act on unreadable state; a dry run writes
+//! nothing.
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -35,11 +41,12 @@ use super::due::{self, Decision, Item, View};
 use super::fold::{self, Fold};
 use super::snapshot::{self, Requests, Snapshot};
 use super::{
-    EnvelopeRequest, State, TRANSITIONS, envelope_key, operator_key, recording_key, subject_key,
+    EnvelopeRequest, State, TRANSITIONS, VERIFY_AFTER, envelope_key, operator_key, recording_key,
+    subject_key,
 };
-use crate::catalog_scan::{Catalogs, INDEXES};
+use crate::catalog_scan::{Catalogs, INDEXES, POINTERS};
 use crate::moderation::{canonical_subject, valid_subject};
-use crate::object_store::ObjectStore;
+use crate::object_store::{ObjectStore, VersionInfo};
 
 /// Where a catalog document lives, with its `owner` metadata.
 const DOCUMENTS: &str = "catalog-documents/";
@@ -64,6 +71,20 @@ const NO_LONGER_DUE: &str = "no longer due";
 /// Why a due envelope is kept at its re-check: a stored pointer names it.
 const POINTER_NAMES_IT: &str = "a pointer still names it";
 
+/// Why an item is deferred: its requester's catalog moved.
+const CATALOG_CHANGED: &str = "catalog changed";
+
+/// Why a tombstone is forgotten with its objects kept (spec 3.4 step 7):
+/// one was written more than [`VERIFY_AFTER`] after the delete; the
+/// recording is listed; the envelope is current.
+const FRESH: &str = "fresh";
+const LISTED_AGAIN: &str = "listed again";
+const CURRENT_AGAIN: &str = "current again";
+
+/// Why a subject's tombstone is kept: an envelope request of that owner is
+/// pending, and the tombstone releases it (`due::everything_requested`).
+const ENVELOPES_PENDING: &str = "envelopes pending";
+
 /// What a run did, or in a dry run would do. [`fmt::Display`] prints
 /// [`lines`](Self::lines), then `N deleted, N kept, N deferred, N failed`
 /// (`N would delete` in a dry run).
@@ -71,13 +92,19 @@ const POINTER_NAMES_IT: &str = "a pointer still names it";
 pub struct Report {
     /// In order: one line per due item, in the order the run takes them
     /// (`deleted <id>`, `would delete <id>`, `kept <id>: <why>`,
-    /// `deferred <id>: catalog changed`, `failed <id>: <error>`); then
-    /// `kept <id>: <why>` for each pending request not due, and for each
-    /// transition the fold keeps; then each deleted recording a catalog
-    /// lists and each deleted envelope a pointer names (spec 3.4 step 8).
-    /// `<id>` is [`Item::id`]: `<kind> <name>`.
+    /// `deferred <id>: catalog changed`, `failed <id>: <error>`); then one
+    /// line per tombstoned item verified, in the same order (`verified
+    /// <id>`, `fresh <id>`, `listed again <id>`, `current again <id>`,
+    /// `recreated <id>`, `kept <id>: <why>`, `failed <id>: <error>`; in a
+    /// dry run `would verify <id>`, `would forget <id>: <why>`, `would
+    /// delete again <id>`); then `kept <id>: <why>` for each pending
+    /// request not due, and for each transition the fold keeps; then each
+    /// deleted recording a catalog lists and each deleted envelope a
+    /// pointer names (spec 3.4 step 8). `<id>` is [`Item::id`]: `<kind>
+    /// <name>`.
     pub lines: Vec<String>,
-    /// Items deleted (in a dry run: that would be).
+    /// Items deleted, and tombstoned items deleted again (in a dry run:
+    /// that would be).
     pub deleted: usize,
     pub kept: usize,
     pub deferred: usize,
@@ -103,13 +130,41 @@ impl Report {
     }
 
     fn deferred(&mut self, id: &str) {
-        self.lines.push(format!("deferred {id}: catalog changed"));
+        self.lines.push(format!("deferred {id}: {CATALOG_CHANGED}"));
         self.deferred += 1;
     }
 
     fn failed(&mut self, id: &str, error: &anyhow::Error) {
         self.lines.push(format!("failed {id}: {error:#}"));
         self.failures += 1;
+    }
+
+    /// A tombstone whose objects stayed gone, removed.
+    fn verified(&mut self, id: &str) {
+        self.lines.push(if self.dry_run {
+            format!("would verify {id}")
+        } else {
+            format!("verified {id}")
+        });
+    }
+
+    /// A tombstone removed with its objects kept, for `why`.
+    fn forgot(&mut self, id: &str, why: &str) {
+        self.lines.push(if self.dry_run {
+            format!("would forget {id}: {why}")
+        } else {
+            format!("{why} {id}")
+        });
+    }
+
+    /// A tombstoned item's objects, written back in flight, deleted again.
+    fn recreated(&mut self, id: &str) {
+        self.lines.push(if self.dry_run {
+            format!("would delete again {id}")
+        } else {
+            format!("recreated {id}")
+        });
+        self.deleted += 1;
     }
 }
 
@@ -153,12 +208,12 @@ pub async fn sweep<O: ObjectStore>(store: &O, delete: bool, now: i64) -> anyhow:
         ..Report::default()
     };
     let items = in_deletion_order(&decision.due);
+    let mut baseline = Pointers::of(&snapshot.catalogs);
     if delete {
         write_fold(store, &snapshot.requests, &fold).await?;
         for r in &observed {
             put_json(store, &envelope_key(&r.hash), r).await?;
         }
-        let mut baseline = Pointers::of(&snapshot.catalogs);
         for item in items {
             take(store, item, &mut baseline, now, &mut report).await?;
         }
@@ -167,7 +222,7 @@ pub async fn sweep<O: ObjectStore>(store: &O, delete: bool, now: i64) -> anyhow:
             report.deleted(&item.id());
         }
     }
-    verify_tombstones(store, delete, now, &mut report).await?;
+    verify_tombstones(store, delete, &requests, &mut baseline, now, &mut report).await?;
 
     for (id, why) in &decision.kept {
         report.kept(id, why);
@@ -265,14 +320,19 @@ async fn write_fold<O: ObjectStore>(
 /// Subjects, then recordings, then envelopes, each by [`Item::id`]: a
 /// subject's pointers go before its envelopes.
 fn in_deletion_order(due: &[Item]) -> Vec<&Item> {
-    let rank = |item: &Item| match item {
+    let mut items: Vec<&Item> = due.iter().collect();
+    items.sort_by_cached_key(|item| deletion_order(item));
+    items
+}
+
+/// The sort key of [`in_deletion_order`].
+fn deletion_order(item: &Item) -> (u8, String) {
+    let rank = match item {
         Item::Subject(_) => 0,
         Item::Recording { .. } => 1,
         Item::Envelope(_) => 2,
     };
-    let mut items: Vec<&Item> = due.iter().collect();
-    items.sort_by_cached_key(|item| (rank(item), item.id()));
-    items
+    (rank, item.id())
 }
 
 /// Each pointer as the first read saw it, less those this run deleted
@@ -377,33 +437,47 @@ async fn recheck<O: ObjectStore>(
     let Some(item) = decision.due.iter().find(|i| i.id() == id).cloned() else {
         return Ok(Recheck::Kept(kept_reason(&decision, item)));
     };
+    Ok(match held(&item, &fresh, baseline) {
+        Some(Hold::PointerNamesIt) => Recheck::Kept(POINTER_NAMES_IT.to_string()),
+        Some(Hold::Moved) => Recheck::Deferred,
+        None => Recheck::Due {
+            item,
+            fresh: Box::new(fresh),
+            view,
+        },
+    })
+}
+
+/// Why an item the fresh decision has due waits all the same.
+enum Hold {
+    /// An envelope a stored pointer names: kept.
+    PointerNamesIt,
+    /// Its requester's catalog moved since the first read: deferred.
+    Moved,
+}
+
+/// Whether `item`, due on `fresh`, waits all the same (see [`Hold`]).
+fn held(item: &Item, fresh: &Snapshot, baseline: &Pointers) -> Option<Hold> {
     // An envelope any stored pointer names stays, even one in `S` (a
     // subject being deleted, whose pointers are outside `C`): its pointer
     // delete may have failed this run. Deleting the index record a `/2`
     // pointer names would make every later strict read fail ("no index
     // record"), this run's final read and every sweep and `claim-owners`
     // after it. The next run retries the subject first.
-    if let Item::Envelope(hash) = &item
+    if let Item::Envelope(hash) = item
         && fresh
             .catalogs
             .pointers
             .iter()
             .any(|p| &p.catalog_hash == hash)
     {
-        return Ok(Recheck::Kept(POINTER_NAMES_IT.to_string()));
+        return Some(Hold::PointerNamesIt);
     }
     let current = Pointers::of(&fresh.catalogs);
-    if requesters(&item, &fresh)
+    requesters(item, fresh)
         .iter()
         .any(|subject| baseline.moved(subject, &current))
-    {
-        return Ok(Recheck::Deferred);
-    }
-    Ok(Recheck::Due {
-        item,
-        fresh: Box::new(fresh),
-        view,
-    })
+        .then_some(Hold::Moved)
 }
 
 /// Why the fresh decision keeps `item`: for a recording, the first kept
@@ -526,16 +600,355 @@ async fn delete_item<O: ObjectStore>(
     Ok(())
 }
 
-/// Spec 3.4 step 7, Task 17: verify each tombstone at least
-/// [`super::VERIFY_AFTER`] old, and forget it once every object it covers
-/// is still gone. Not yet: it does nothing, so tombstones stay.
+/// Spec 3.4 step 7: verify each tombstoned item whose newest tombstone is
+/// at least [`VERIFY_AFTER`] old (any in-flight push, backfill or publish
+/// has finished by then), in [`in_deletion_order`]. Its objects are the
+/// versions of its keys that aren't delete markers: a recording's
+/// [`RECORDING_OBJECTS`], an envelope's [`ENVELOPE_OBJECTS`], a subject's
+/// pointer keys (both forms of it). In the spec's order:
+/// 1. an object written more than [`VERIFY_AFTER`] after the delete is
+///    fresh (a new push, publish or pointer): forget the tombstones, keep
+///    everything;
+/// 2. a recording in `L`, or an envelope in `C`: forget them, keep the
+///    objects;
+/// 3. any other object came back in flight: re-check the item as step 6
+///    does ([`deletable_again`]) and delete its objects again, keeping the
+///    tombstones; or keep everything, and say why;
+/// 4. no object: forget them.
+///
+/// A subject's tombstone is not forgotten while an envelope request of
+/// that owner is pending: it releases those envelopes from a hidden
+/// catalog (`due::everything_requested`).
+///
+/// It reads the bucket again first: with `delete`, the requests too; in a
+/// dry run, which wrote nothing, it takes `unwritten` (the folded and
+/// observed requests) instead, and changes nothing. A recording's
+/// tombstones (`recordings/` and `operator/`, of any subject) are verified
+/// together, by hash. `Err` when a read fails; a failed delete is reported
+/// and the run goes on.
 async fn verify_tombstones<O: ObjectStore>(
-    _store: &O,
-    _delete: bool,
-    _now: i64,
-    _report: &mut Report,
+    store: &O,
+    delete: bool,
+    unwritten: &Requests,
+    baseline: &mut Pointers,
+    now: i64,
+    report: &mut Report,
 ) -> anyhow::Result<()> {
+    let read = snapshot::read(store)
+        .await
+        .context("the verify read failed")?;
+    let requests = if delete { &read.requests } else { unwritten };
+    let view = due::view(&read.catalogs, requests, &read.moderation);
+    let mut groups: Vec<Tombstones> = tombstones(requests)
+        .into_iter()
+        .filter(|t| t.deleted_at.saturating_add(VERIFY_AFTER) <= now)
+        .collect();
+    groups.sort_by_cached_key(|t| deletion_order(&t.item));
+
+    for group in &groups {
+        let id = group.item.id();
+        let objects = objects(store, &group.item)
+            .await
+            .with_context(|| format!("verifying {id}"))?;
+        let written_by = group.deleted_at.saturating_add(VERIFY_AFTER);
+        let forget = if objects.iter().any(|v| v.modified > written_by) {
+            Some(FRESH)
+        } else {
+            match &group.item {
+                Item::Recording { hash, .. } if view.l.contains(hash) => Some(LISTED_AGAIN),
+                Item::Envelope(hash) if view.c.contains(hash) => Some(CURRENT_AGAIN),
+                _ if objects.is_empty() => None,
+                _ => {
+                    again(
+                        store, delete, group, &objects, &read, requests, baseline, now, report,
+                    )
+                    .await?;
+                    continue;
+                }
+            }
+        };
+        // A subject has no rule 2: this holds rules 1 and 4.
+        if let Item::Subject(sub) = &group.item
+            && envelopes_pending(requests, &read.catalogs, sub)
+        {
+            report.kept(&id, ENVELOPES_PENDING);
+            continue;
+        }
+        if delete && let Err(e) = remove(store, group).await {
+            report.failed(&id, &e);
+            continue;
+        }
+        match forget {
+            Some(why) => report.forgot(&id, why),
+            None => report.verified(&id),
+        }
+    }
     Ok(())
+}
+
+/// One item's tombstones, verified together.
+struct Tombstones {
+    /// What they cover. A recording's `requests` are their keys.
+    item: Item,
+    tombstones: Vec<Tombstone>,
+    /// The newest `deletedAt` among them.
+    deleted_at: i64,
+}
+
+/// One tombstone, by the names in its request key.
+enum Tombstone {
+    Recording(String, String),
+    Operator(String, String),
+    Envelope(String),
+    Subject(String),
+}
+
+impl Tombstone {
+    fn key(&self) -> String {
+        match self {
+            Tombstone::Recording(sub, hash) => recording_key(sub, hash),
+            Tombstone::Operator(sub, hash) => operator_key(sub, hash),
+            Tombstone::Envelope(hash) => envelope_key(hash),
+            Tombstone::Subject(sub) => subject_key(sub),
+        }
+    }
+
+    /// How [`Decision::kept`] names its request.
+    fn id(&self) -> String {
+        match self {
+            Tombstone::Recording(sub, hash) => format!("recording {sub}/{hash}"),
+            Tombstone::Operator(sub, hash) => format!("operator {sub}/{hash}"),
+            Tombstone::Envelope(hash) => format!("envelope {hash}"),
+            Tombstone::Subject(sub) => format!("subject {sub}"),
+        }
+    }
+
+    /// Make its request in `requests` pending again.
+    fn revive(&self, requests: &mut Requests) {
+        let names = |sub: &String, hash: &String| (sub.clone(), hash.clone());
+        let request = match self {
+            Tombstone::Recording(sub, hash) => requests
+                .recordings
+                .get_mut(&names(sub, hash))
+                .map(|r| (&mut r.state, &mut r.deleted_at)),
+            Tombstone::Operator(sub, hash) => requests
+                .operator
+                .get_mut(&names(sub, hash))
+                .map(|r| (&mut r.state, &mut r.deleted_at)),
+            Tombstone::Envelope(hash) => requests
+                .envelopes
+                .get_mut(hash)
+                .map(|r| (&mut r.state, &mut r.deleted_at)),
+            Tombstone::Subject(sub) => requests
+                .subjects
+                .get_mut(sub)
+                .map(|r| (&mut r.state, &mut r.deleted_at)),
+        };
+        if let Some((state, deleted_at)) = request {
+            (*state, *deleted_at) = (State::Pending, None);
+        }
+    }
+}
+
+/// Every tombstone in `requests`, by item: a recording's by hash, of any
+/// subject and either kind.
+fn tombstones(requests: &Requests) -> Vec<Tombstones> {
+    let dated = |state, at: Option<i64>| at.filter(|_| state == State::Deleted);
+    let mut recordings: BTreeMap<&String, Vec<(Tombstone, i64)>> = BTreeMap::new();
+    for ((sub, hash), r) in &requests.recordings {
+        if let Some(at) = dated(r.state, r.deleted_at) {
+            let t = Tombstone::Recording(sub.clone(), hash.clone());
+            recordings.entry(hash).or_default().push((t, at));
+        }
+    }
+    for ((sub, hash), r) in &requests.operator {
+        if let Some(at) = dated(r.state, r.deleted_at) {
+            let t = Tombstone::Operator(sub.clone(), hash.clone());
+            recordings.entry(hash).or_default().push((t, at));
+        }
+    }
+    let group = |item: Item, tombstones: Vec<(Tombstone, i64)>| Tombstones {
+        item,
+        deleted_at: tombstones
+            .iter()
+            .map(|(_, at)| *at)
+            .fold(i64::MIN, i64::max),
+        tombstones: tombstones.into_iter().map(|(t, _)| t).collect(),
+    };
+    let mut out = Vec::new();
+    for (hash, tombstones) in recordings {
+        let mut keys: Vec<String> = tombstones.iter().map(|(t, _)| t.key()).collect();
+        keys.sort();
+        let item = Item::Recording {
+            hash: hash.clone(),
+            requests: keys,
+        };
+        out.push(group(item, tombstones));
+    }
+    for (hash, r) in &requests.envelopes {
+        if let Some(at) = dated(r.state, r.deleted_at) {
+            let t = Tombstone::Envelope(hash.clone());
+            out.push(group(Item::Envelope(hash.clone()), vec![(t, at)]));
+        }
+    }
+    for (sub, r) in &requests.subjects {
+        if let Some(at) = dated(r.state, r.deleted_at) {
+            let t = Tombstone::Subject(sub.clone());
+            out.push(group(Item::Subject(sub.clone()), vec![(t, at)]));
+        }
+    }
+    out
+}
+
+/// Every version of `item`'s objects that is not a delete marker. A
+/// subject's are its pointer keys, `<sub>` canonically it (both
+/// `arkavo:<uuid>` and `<uuid>`).
+async fn objects<O: ObjectStore>(store: &O, item: &Item) -> anyhow::Result<Vec<VersionInfo>> {
+    let mut versions = Vec::new();
+    if let Item::Subject(sub) = item {
+        versions = list_versions(store, POINTERS).await?;
+        versions.retain(|v| pointer_subject(&v.key) == Some(sub.as_str()));
+    }
+    for key in object_keys(item) {
+        let listed = list_versions(store, &key).await?;
+        versions.extend(listed.into_iter().filter(|v| v.key == key));
+    }
+    versions.retain(|v| !v.delete_marker);
+    Ok(versions)
+}
+
+/// A recording's or an envelope's object keys, in the order they are
+/// deleted; none for a subject.
+fn object_keys(item: &Item) -> Vec<String> {
+    let (prefixes, hash): (&[&str], _) = match item {
+        Item::Recording { hash, .. } => (&RECORDING_OBJECTS, hash),
+        Item::Envelope(hash) => (&ENVELOPE_OBJECTS, hash),
+        Item::Subject(_) => return Vec::new(),
+    };
+    prefixes.iter().map(|p| format!("{p}{hash}")).collect()
+}
+
+/// A pointer key's subject, canonical; `None` for a name that isn't one.
+fn pointer_subject(key: &str) -> Option<&str> {
+    key.strip_prefix(POINTERS)
+        .filter(|sub| valid_subject(sub))
+        .map(canonical_subject)
+}
+
+/// Whether an envelope request of `subject` (canonical) is pending.
+fn envelopes_pending(requests: &Requests, catalogs: &Catalogs, subject: &str) -> bool {
+    requests
+        .envelopes
+        .values()
+        .any(|r| r.state == State::Pending && due::envelope_owner(r, catalogs) == Some(subject))
+}
+
+/// Remove every version of each of `group`'s tombstones.
+async fn remove<O: ObjectStore>(store: &O, group: &Tombstones) -> anyhow::Result<()> {
+    for t in &group.tombstones {
+        delete_versions(store, &t.key()).await?;
+    }
+    Ok(())
+}
+
+/// Rule 3: `objects` came back, all written by an hour after the delete.
+/// With `delete`, re-check the item on a fresh read, as step 6 does, then
+/// delete its objects again: a recording's and an envelope's keys in
+/// order, a subject's pointer keys. In a dry run, re-check it on `read`
+/// and `requests`. The tombstones stay as they are. `Err` when the fresh
+/// read fails.
+#[allow(clippy::too_many_arguments)]
+async fn again<O: ObjectStore>(
+    store: &O,
+    delete: bool,
+    group: &Tombstones,
+    objects: &[VersionInfo],
+    read: &Snapshot,
+    requests: &Requests,
+    baseline: &mut Pointers,
+    now: i64,
+    report: &mut Report,
+) -> anyhow::Result<()> {
+    let id = group.item.id();
+    if !delete {
+        match deletable_again(read, requests, group, baseline, now) {
+            Ok(()) => report.recreated(&id),
+            Err(why) => report.kept(&id, &why),
+        }
+        return Ok(());
+    }
+    let fresh = snapshot::read(store)
+        .await
+        .with_context(|| format!("re-checking {id}"))?;
+    if let Err(why) = deletable_again(&fresh, &fresh.requests, group, baseline, now) {
+        report.kept(&id, &why);
+        return Ok(());
+    }
+    let keys: Vec<String> = match &group.item {
+        Item::Subject(_) => objects
+            .iter()
+            .map(|v| v.key.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        item => object_keys(item),
+    };
+    for key in &keys {
+        if let Err(e) = delete_versions(store, key).await {
+            report.failed(&id, &e);
+            return Ok(());
+        }
+        // A pointer this run deleted is no catalog change.
+        baseline.forget(key);
+    }
+    report.recreated(&id);
+    Ok(())
+}
+
+/// Step 6's re-check for a tombstoned item, on `fresh` and its
+/// `requests`: whether [`due::due`] has it due with its tombstones pending
+/// again, and [`held`] doesn't hold it; else why not.
+///
+/// Its owner record's absence doesn't count against it: the sweep deleted
+/// that record with the recording. Only one naming another account (whose
+/// push it is) keeps it. "No owner record" is the last rule a recording's
+/// request is kept for ([`due::NO_OWNER_RECORD`]), so a tombstone kept for
+/// it passes every other.
+fn deletable_again(
+    fresh: &Snapshot,
+    requests: &Requests,
+    group: &Tombstones,
+    baseline: &Pointers,
+    now: i64,
+) -> Result<(), String> {
+    let mut revived = requests.clone();
+    for t in &group.tombstones {
+        t.revive(&mut revived);
+    }
+    let view = due::view(&fresh.catalogs, &revived, &fresh.moderation);
+    let decision = due::due(fresh, &revived, &view, now);
+    let id = group.item.id();
+    let item = match decision.due.iter().find(|i| i.id() == id) {
+        Some(item) => item,
+        None => {
+            let ids: Vec<String> = group.tombstones.iter().map(Tombstone::id).collect();
+            let why: Vec<&str> = decision
+                .kept
+                .iter()
+                .filter(|(kept, _)| ids.contains(kept))
+                .map(|(_, why)| why.as_str())
+                .collect();
+            if !why.contains(&due::NO_OWNER_RECORD) {
+                return Err(why.first().copied().unwrap_or(NO_LONGER_DUE).to_string());
+            }
+            &group.item
+        }
+    };
+    match held(item, fresh, baseline) {
+        Some(Hold::PointerNamesIt) => Err(POINTER_NAMES_IT.to_string()),
+        Some(Hold::Moved) => Err(CATALOG_CHANGED.to_string()),
+        None => Ok(()),
+    }
 }
 
 /// Spec 3.4 step 8: each recording a tombstone covers that a catalog
@@ -575,6 +988,16 @@ async fn put_json<O: ObjectStore>(
         .put(key, body)
         .await
         .with_context(|| format!("writing {key} failed"))
+}
+
+async fn list_versions<O: ObjectStore>(
+    store: &O,
+    prefix: &str,
+) -> anyhow::Result<Vec<VersionInfo>> {
+    store
+        .list_versions(prefix)
+        .await
+        .with_context(|| format!("listing {prefix} failed"))
 }
 
 async fn delete_versions<O: ObjectStore>(store: &O, key: &str) -> anyhow::Result<()> {
@@ -1390,6 +1813,549 @@ mod tests {
         );
         for key in recording_keys(&p) {
             assert!(m.get(&key).await.unwrap().is_some(), "{key}");
+        }
+    }
+
+    /// Spec 3.4 step 7: tombstones verified an hour after their delete.
+    mod verify {
+        use super::*;
+        use crate::deletion::VERIFY_AFTER;
+
+        /// When the tombstones were written.
+        const T: i64 = 1000;
+        /// When they are verified: an hour later.
+        const AT: i64 = T + VERIFY_AFTER;
+
+        /// `recordings/<sub>/<hash>`, deleted at `T`, requested a grace
+        /// period before (so it was due then, and would be again).
+        fn tombstone(m: &MemObjects, sub: &str, hash: &str) {
+            put(
+                m,
+                &recording_key(sub, hash),
+                RecordingRequest {
+                    hash: hash.into(),
+                    subject: sub.into(),
+                    requested_at: T - GRACE,
+                    seq: 1,
+                    state: State::Deleted,
+                    deleted_at: Some(T),
+                },
+            );
+        }
+
+        /// `operator/<sub>/<hash>`, scope `hash`, deleted at `deleted_at`.
+        fn operator_tombstone(m: &MemObjects, sub: &str, hash: &str, deleted_at: i64) {
+            put(
+                m,
+                &operator_key(sub, hash),
+                OperatorRequest {
+                    hash: hash.into(),
+                    subject: sub.into(),
+                    requested_at: T,
+                    reason: "court order".into(),
+                    scope: Scope::Hash,
+                    state: State::Deleted,
+                    deleted_at: Some(deleted_at),
+                },
+            );
+        }
+
+        /// `envelopes/<hash>` of `owner`, deleted at `deleted_at`.
+        fn envelope_tombstone(m: &MemObjects, hash: &str, owner: &str, deleted_at: i64) {
+            put(
+                m,
+                &envelope_key(hash),
+                EnvelopeRequest {
+                    hash: hash.into(),
+                    owner: Some(owner.into()),
+                    superseded_at: deleted_at - GRACE,
+                    source: Source::Transition,
+                    state: State::Deleted,
+                    deleted_at: Some(deleted_at),
+                },
+            );
+        }
+
+        /// `subjects/<sub>`, deleted at `T`.
+        fn subject_tombstone(m: &MemObjects, sub: &str) {
+            put(
+                m,
+                &subject_key(sub),
+                SubjectRequest {
+                    subject: sub.into(),
+                    requested_at: T,
+                    reason: "account closed".into(),
+                    state: State::Deleted,
+                    deleted_at: Some(T),
+                },
+            );
+        }
+
+        fn block(m: &MemObjects, hash: &str) {
+            put(
+                m,
+                &format!("moderation/blocks/{hash}"),
+                json!({"hash": hash, "reason": "r", "by": "op", "at": 1}),
+            );
+        }
+
+        #[tokio::test]
+        async fn a_clean_tombstone_is_removed() {
+            let m = MemObjects::default();
+            let p = h("a1");
+            tombstone(&m, U, &p);
+            // Written twice: every version goes.
+            tombstone(&m, U, &p);
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert_eq!(
+                report.to_string(),
+                format!("verified recording {p}\n0 deleted, 0 kept, 0 deferred, 0 failed")
+            );
+            assert!(gone(&m, &recording_key(U, &p)).await);
+            assert_eq!(m.deletes(), [recording_key(U, &p)]);
+        }
+
+        #[tokio::test]
+        async fn a_fresh_push_keeps_everything() {
+            let m = MemObjects::default();
+            let p = h("a1");
+            tombstone(&m, U, &p);
+            // A new push, by a new owner, after the hour.
+            m.set_now(AT + 1);
+            m.insert(&format!("blobs/{p}"), "blob");
+            put(
+                &m,
+                &format!("moderation/publishers/{p}"),
+                json!({"hash": p, "subject": U2, "endpointId": "e", "at": AT + 1}),
+            );
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(has(&report, &format!("fresh recording {p}")), "{report}");
+            assert_eq!(report.failures, 0);
+            assert!(gone(&m, &recording_key(U, &p)).await);
+            assert_eq!(m.deletes(), [recording_key(U, &p)], "no object");
+            assert!(m.get(&format!("blobs/{p}")).await.unwrap().is_some());
+        }
+
+        #[tokio::test]
+        async fn a_relisted_recording_keeps_its_objects() {
+            let m = MemObjects::default();
+            let p = h("a1");
+            tombstone(&m, U, &p);
+            // Within the hour: re-listed beats recreated.
+            m.set_now(T + 10);
+            recording(&m, &p, U2);
+            publish_2(&m, U2, 1, b"other", &[&p]);
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(
+                has(&report, &format!("listed again recording {p}")),
+                "{report}"
+            );
+            assert_eq!(report.failures, 0);
+            assert!(gone(&m, &recording_key(U, &p)).await);
+            assert_eq!(m.deletes(), [recording_key(U, &p)], "no object");
+            for key in recording_keys(&p) {
+                assert!(m.get(&key).await.unwrap().is_some(), "{key}");
+            }
+        }
+
+        /// An in-flight write that landed after the delete is deleted
+        /// again; its tombstone stays, as written. The owner record went
+        /// with the recording, so its absence doesn't hold it back.
+        #[tokio::test]
+        async fn a_late_write_is_deleted_again() {
+            let m = MemObjects::default();
+            let p = h("a1");
+            tombstone(&m, U, &p);
+            m.set_now(T + 10);
+            m.insert(&format!("outboards/{p}"), "outboard");
+            let before: RecordingRequest = record(&m, &recording_key(U, &p)).await;
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(
+                has(&report, &format!("recreated recording {p}")),
+                "{report}"
+            );
+            assert_eq!(report.failures, 0);
+            assert_eq!(m.deletes(), recording_keys(&p), "in order");
+            assert!(gone(&m, &format!("outboards/{p}")).await);
+            let after: RecordingRequest = record(&m, &recording_key(U, &p)).await;
+            assert_eq!(after, before, "the tombstone is kept unchanged");
+        }
+
+        /// A late write under another account's owner record is that
+        /// account's push: kept, and so is the tombstone.
+        #[tokio::test]
+        async fn a_late_write_by_another_owner_is_kept() {
+            let m = MemObjects::default();
+            let p = h("a1");
+            tombstone(&m, U, &p);
+            m.set_now(T + 10);
+            recording(&m, &p, U2);
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(
+                has(
+                    &report,
+                    &format!("kept recording {p}: owner is not the requester")
+                ),
+                "{report}"
+            );
+            assert!(m.deletes().is_empty());
+            for key in recording_keys(&p) {
+                assert!(m.get(&key).await.unwrap().is_some(), "{key}");
+            }
+            let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
+            assert_eq!(r.state, State::Deleted);
+        }
+
+        #[tokio::test]
+        async fn a_young_tombstone_waits() {
+            let m = MemObjects::default();
+            let (p, q) = (h("a1"), h("a2"));
+            tombstone(&m, U, &p);
+            tombstone(&m, U, &q);
+            m.set_now(T + 10);
+            m.insert(&format!("outboards/{q}"), "outboard");
+            let before = versions(&m).await;
+
+            let report = sweep(&m, true, AT - 1).await.unwrap();
+            assert!(report.lines.is_empty(), "{report}");
+            assert_eq!(versions(&m).await, before);
+            assert!(m.deletes().is_empty());
+        }
+
+        #[tokio::test]
+        async fn envelope_and_subject_tombstones_verify_the_same_way() {
+            let m = MemObjects::default();
+            let e = h("e1");
+            envelope_tombstone(&m, &e, U, T);
+            subject_tombstone(&m, U);
+            // A returning creator's new pointer, under the other key form.
+            m.set_now(AT + 1);
+            publish_2(&m, &arkavo(U), 1, b"doc-new", &[]);
+            let pointer = format!("catalog-pointers/{}", arkavo(U));
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(has(&report, &format!("verified envelope {e}")), "{report}");
+            assert!(has(&report, &format!("fresh subject {U}")), "{report}");
+            assert_eq!(report.failures, 0);
+            assert!(gone(&m, &envelope_key(&e)).await);
+            assert!(gone(&m, &subject_key(U)).await);
+            assert!(m.get(&pointer).await.unwrap().is_some());
+        }
+
+        /// A subject's tombstone releases its hidden envelopes (spec 3.4
+        /// step 5), so it stays while any envelope request of that owner
+        /// is pending.
+        #[tokio::test]
+        async fn a_subject_tombstone_waits_for_its_envelopes() {
+            let m = MemObjects::default();
+            subject_tombstone(&m, U);
+            catalog_block(&m, U);
+            // Its owner named by the index record only, in the other form.
+            let e = envelope(&m, &arkavo(U), b"doc-u");
+            put(
+                &m,
+                &envelope_key(&e),
+                EnvelopeRequest {
+                    hash: e.clone(),
+                    owner: None,
+                    superseded_at: AT,
+                    source: Source::Observed,
+                    state: State::Pending,
+                    deleted_at: None,
+                },
+            );
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(
+                has(&report, &format!("kept subject {U}: envelopes pending")),
+                "{report}"
+            );
+            let r: SubjectRequest = record(&m, &subject_key(U)).await;
+            assert_eq!(r.state, State::Deleted);
+
+            // Once the envelope is deleted, the subject verifies.
+            let mut r: EnvelopeRequest = record(&m, &envelope_key(&e)).await;
+            (r.state, r.deleted_at) = (State::Deleted, Some(AT));
+            put(&m, &envelope_key(&e), r);
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(has(&report, &format!("verified subject {U}")), "{report}");
+            assert!(gone(&m, &subject_key(U)).await);
+        }
+
+        /// A late pointer of a subject still catalog-blocked is deleted
+        /// again, and no other account's; with the block lifted it is
+        /// kept.
+        #[tokio::test]
+        async fn a_late_pointer_is_deleted_again_while_the_block_stands() {
+            let m = MemObjects::default();
+            subject_tombstone(&m, U);
+            catalog_block(&m, U);
+            publish_2(&m, U2, 1, b"doc-other", &[]);
+            m.set_now(T + 10);
+            publish_2(&m, U, 1, b"doc-late", &[]);
+            let pointer = format!("catalog-pointers/{U}");
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(has(&report, &format!("recreated subject {U}")), "{report}");
+            assert_eq!(report.failures, 0);
+            assert_eq!(m.deletes(), std::slice::from_ref(&pointer));
+            assert!(gone(&m, &pointer).await);
+            let other = format!("catalog-pointers/{U2}");
+            assert!(m.get(&other).await.unwrap().is_some());
+            let r: SubjectRequest = record(&m, &subject_key(U)).await;
+            assert_eq!((r.state, r.deleted_at), (State::Deleted, Some(T)));
+
+            let m = MemObjects::default();
+            subject_tombstone(&m, U);
+            m.set_now(T + 10);
+            publish_2(&m, U, 1, b"doc-late", &[]);
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(
+                has(&report, &format!("kept subject {U}: catalog block lifted")),
+                "{report}"
+            );
+            assert!(m.get(&pointer).await.unwrap().is_some());
+            assert!(m.get(&subject_key(U)).await.unwrap().is_some());
+        }
+
+        /// A late envelope a stored pointer names stays (the pointer is
+        /// its subject's, being deleted, whose delete failed): deleting the
+        /// index record of a live `/2` pointer would break every strict
+        /// read.
+        #[tokio::test]
+        async fn a_late_envelope_a_pointer_names_is_kept() {
+            let m = MemObjects::default();
+            let e = catalog(b"doc-u");
+            envelope_tombstone(&m, &e, U, T);
+            catalog_block(&m, U);
+            subject_request(&m, U);
+            m.set_now(T + 10);
+            publish_2(&m, U, 1, b"doc-u", &[]);
+            let pointer = format!("catalog-pointers/{U}");
+            m.fail_on(&pointer, Op::Delete);
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(
+                has(
+                    &report,
+                    &format!("kept envelope {e}: a pointer still names it")
+                ),
+                "{report}"
+            );
+            assert!(
+                m.get(&format!("catalog-indexes/{e}"))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            snapshot::read(&m).await.unwrap();
+        }
+
+        /// Rule 2 for an envelope: a pointer names it again.
+        #[tokio::test]
+        async fn a_current_envelope_keeps_its_objects() {
+            let m = MemObjects::default();
+            let e = catalog(b"doc-e");
+            envelope_tombstone(&m, &e, U, T);
+            m.set_now(T + 10);
+            publish_2(&m, U, 1, b"doc-e", &[]);
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(
+                has(&report, &format!("current again envelope {e}")),
+                "{report}"
+            );
+            assert_eq!(report.failures, 0);
+            assert_eq!(m.deletes(), [envelope_key(&e)], "no object");
+            let index = format!("catalog-indexes/{e}");
+            assert!(m.get(&index).await.unwrap().is_some());
+        }
+
+        /// A late envelope object no pointer names is deleted again, its
+        /// keys in order.
+        #[tokio::test]
+        async fn a_late_envelope_is_deleted_again() {
+            let m = MemObjects::default();
+            let e = h("e1");
+            envelope_tombstone(&m, &e, U, T);
+            m.set_now(T + 10);
+            m.insert(&format!("catalog-outboards/{e}"), "outboard");
+            let before: EnvelopeRequest = record(&m, &envelope_key(&e)).await;
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(has(&report, &format!("recreated envelope {e}")), "{report}");
+            assert_eq!(m.deletes(), envelope_keys(&e));
+            assert!(gone(&m, &format!("catalog-outboards/{e}")).await);
+            let after: EnvelopeRequest = record(&m, &envelope_key(&e)).await;
+            assert_eq!(after, before, "the tombstone is kept unchanged");
+        }
+
+        /// A delete marker is no object, even one written after the hour.
+        #[tokio::test]
+        async fn a_delete_marker_is_no_object() {
+            let m = MemObjects::default();
+            let p = h("a1");
+            tombstone(&m, U, &p);
+            m.set_now(AT + 1);
+            m.delete_current(&format!("blobs/{p}"));
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(has(&report, &format!("verified recording {p}")), "{report}");
+            assert!(gone(&m, &recording_key(U, &p)).await);
+        }
+
+        /// A dry run verifies against the requests the run would have
+        /// written: here, an envelope request observed this run keeps the
+        /// subject's tombstone.
+        #[tokio::test]
+        async fn a_dry_run_verifies_against_what_it_would_write() {
+            let m = MemObjects::default();
+            subject_tombstone(&m, U);
+            catalog_block(&m, U);
+            // Untracked: observed this run, owned by `U`.
+            envelope(&m, U, b"doc-u");
+
+            let report = sweep(&m, false, AT).await.unwrap();
+            assert!(
+                has(&report, &format!("kept subject {U}: envelopes pending")),
+                "{report}"
+            );
+            assert!(m.deletes().is_empty());
+        }
+
+        /// A late write whose requester published since the run's first
+        /// read waits for the next run, like a due item.
+        #[tokio::test]
+        async fn a_late_write_waits_for_a_moved_catalog() {
+            let m = MemObjects::default();
+            let (p, q) = (h("a1"), h("a2"));
+            let [_, second] = dropped(&m, &p);
+            put(
+                &m,
+                &recording_key(U, &q),
+                RecordingRequest {
+                    hash: q.clone(),
+                    subject: U.into(),
+                    requested_at: NOW - 2 * GRACE,
+                    seq: 1,
+                    state: State::Deleted,
+                    deleted_at: Some(NOW - VERIFY_AFTER),
+                },
+            );
+            m.set_now(NOW - VERIFY_AFTER + 10);
+            m.insert(&format!("blobs/{q}"), "blob");
+            m.on_before_delete(&second.key, |m| {
+                publish_2(m, U, 3, b"doc-3", &[]);
+            });
+
+            let report = sweep(&m, true, NOW).await.unwrap();
+            assert!(
+                has(&report, &format!("kept recording {q}: catalog changed")),
+                "{report}"
+            );
+            assert!(m.get(&format!("blobs/{q}")).await.unwrap().is_some());
+            assert!(m.get(&recording_key(U, &q)).await.unwrap().is_some());
+        }
+
+        /// Deletion is per hash, and so is verification: one line, and
+        /// every tombstone for the hash removed together. A young one
+        /// among them makes the whole hash wait.
+        #[tokio::test]
+        async fn a_hashs_tombstones_verify_together() {
+            let m = MemObjects::default();
+            let p = h("a1");
+            tombstone(&m, U, &p);
+            operator_tombstone(&m, U2, &p, T);
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert_eq!(
+                report.lines,
+                [format!("verified recording {p}")],
+                "{report}"
+            );
+            assert!(gone(&m, &recording_key(U, &p)).await);
+            assert!(gone(&m, &operator_key(U2, &p)).await);
+
+            let m = MemObjects::default();
+            tombstone(&m, U, &p);
+            operator_tombstone(&m, U2, &p, T + 1);
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(report.lines.is_empty(), "{report}");
+            assert!(m.deletes().is_empty());
+        }
+
+        /// A blocked hash's late write is deleted again under its
+        /// operator's scope-`hash` tombstone, whatever the owner's
+        /// tombstone says.
+        #[tokio::test]
+        async fn any_tombstone_of_a_hash_can_delete_it_again() {
+            let m = MemObjects::default();
+            let p = h("a1");
+            tombstone(&m, U, &p);
+            operator_tombstone(&m, U2, &p, T);
+            block(&m, &p);
+            m.set_now(T + 10);
+            m.insert(&format!("blobs/{p}"), "blob");
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(
+                has(&report, &format!("recreated recording {p}")),
+                "{report}"
+            );
+            assert!(gone(&m, &format!("blobs/{p}")).await);
+        }
+
+        #[tokio::test]
+        async fn a_failed_removal_is_reported_and_the_run_goes_on() {
+            let m = MemObjects::default();
+            let (p, q) = (h("a1"), h("a2"));
+            tombstone(&m, U, &p);
+            tombstone(&m, U, &q);
+            m.fail_on(&recording_key(U, &p), Op::Delete);
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert_eq!(report.failures, 1);
+            let failed = format!("failed recording {p}: ");
+            assert!(
+                report.lines.iter().any(|l| l.starts_with(&failed)),
+                "{report}"
+            );
+            assert!(m.get(&recording_key(U, &p)).await.unwrap().is_some());
+            assert!(has(&report, &format!("verified recording {q}")), "{report}");
+            assert!(gone(&m, &recording_key(U, &q)).await);
+        }
+
+        #[tokio::test]
+        async fn a_dry_run_verifies_nothing() {
+            let m = MemObjects::default();
+            let (p, q, r) = (h("a1"), h("a2"), h("a3"));
+            for hash in [&p, &q, &r] {
+                tombstone(&m, U, hash);
+            }
+            m.set_now(T + 10);
+            m.insert(&format!("outboards/{r}"), "outboard");
+            m.set_now(AT + 1);
+            m.insert(&format!("blobs/{q}"), "blob");
+            let before = versions(&m).await;
+
+            let report = sweep(&m, false, AT).await.unwrap();
+            assert_eq!(
+                report.lines,
+                [
+                    format!("would verify recording {p}"),
+                    format!("would forget recording {q}: fresh"),
+                    format!("would delete again recording {r}"),
+                ],
+                "{report}"
+            );
+            assert_eq!(versions(&m).await, before);
+            assert!(m.deletes().is_empty());
         }
     }
 }

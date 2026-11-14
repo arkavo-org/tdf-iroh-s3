@@ -38,7 +38,10 @@ const STILL_LISTED: &str = "still listed";
 const STILL_CURRENT: &str = "still current";
 const BLOCKED: &str = "blocked";
 const NOT_THE_REQUESTER: &str = "owner is not the requester";
-const NO_OWNER_RECORD: &str = "no owner record";
+/// The last rule of both [`recording_kept`] and [`operator_kept`]: a
+/// request kept for it passes every other rule. The sweep relies on that
+/// when it verifies a tombstone.
+pub(super) const NO_OWNER_RECORD: &str = "no owner record";
 const BLOCK_LIFTED: &str = "block lifted";
 const CATALOG_BLOCK_LIFTED: &str = "catalog block lifted";
 const OWNER_HIDDEN: &str = "owner hidden";
