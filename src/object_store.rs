@@ -175,6 +175,11 @@ pub(crate) mod mem {
             self.state().now = now;
         }
 
+        /// The time later writes are stamped with.
+        pub fn now(&self) -> i64 {
+            self.state().now
+        }
+
         /// Make the next call of `op` on `key` fail, once (see [`Op`]).
         pub fn fail_on(&self, key: &str, op: Op) {
             self.state().failures.push((key.to_string(), op));
