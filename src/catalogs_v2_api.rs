@@ -15,7 +15,10 @@
 //!   `catalog-pointers/<sub>` only when its `seq` is greater than the
 //!   stored one's, and only when the stored pointer is still the base named
 //!   by `If-Match` / `If-None-Match` (tdf-iroh-s3#29; 412 otherwise), one of
-//!   which is required (428 without).
+//!   which is required (428 without). Once the checks pass, each publish
+//!   records its transition (`deletion::Transition`, never served) before
+//!   the document, index and pointer: what it dropped from the served base
+//!   catalog and what it added.
 //! - `GET /v2/catalogs/{sub}` — a token, then the catalog decision: whether
 //!   the reader may open the envelope's attribute (403 otherwise). The
 //!   stored bundle, with `ETag: "<seq>"`, which readers verify themselves
@@ -35,19 +38,22 @@ use bytes::Bytes;
 use iroh_blobs::Hash;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::authz::{DecisionProvider, DecisionRequest, ResourceType, SharedDecisionProvider};
 use crate::catalog_metadata::{self, CAMPAIGN_FQN_PREFIX, EnvelopeRefusal};
 use crate::catalog_v2::{self, Bundle, BundleError, POINTER_SCHEMA, Passkeys};
-use crate::catalogs_api::{check_payloads, is_json, owner_hidden};
+use crate::catalogs_api::{check_payloads, is_json, owner_hidden, owner_subjects};
 use crate::creator_catalog::{
-    self, MAX_CATALOG_BYTES, MAX_OWNER_BYTES, NoDuplicateKeys, valid_identifier,
+    self, CreatorCatalogEntry, MAX_CATALOG_BYTES, MAX_OWNER_BYTES, NoDuplicateKeys,
+    valid_identifier,
 };
+use crate::deletion::{Transition, TransitionBase, transition_name};
 use crate::moderation::{bearer, canonical_subject, now_secs};
 use crate::tags_api::{
     ApiState, TagStore, authorize_catalog_reader, authorize_publisher, is_blocked,
@@ -246,8 +252,14 @@ pub(crate) fn stored_pointer(body: &[u8]) -> anyhow::Result<StoredPointerInfo> {
         seq: pointer.seq,
         catalog_hash: pointer.catalog_hash,
         index_hash: pointer.index_hash,
-        digest: hex::encode(Sha256::digest(&bytes)),
+        digest: pointer_digest(&bytes),
     })
+}
+
+/// Lowercase hex SHA-256 of signed pointer bytes: what names a pointer's
+/// transition (`deletion::transition_name`).
+fn pointer_digest(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// A stored pointer's entity tag: its `seq`, quoted. A stored seq only
@@ -383,6 +395,17 @@ async fn put_catalog<S: TagStore>(
             format!("invalid bundle: pointer schema must be \"{POINTER_SCHEMA}\""),
         ));
     }
+    // Names this publish's transition. `verify_bundle` decoded the same
+    // field, so this can't fail.
+    let digest = URL_SAFE_NO_PAD
+        .decode(&req.bundle.pointer)
+        .map(|bytes| pointer_digest(&bytes))
+        .map_err(|_| {
+            reject(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid bundle: pointer is not unpadded base64url".into(),
+            )
+        })?;
 
     // 4. The pointer names exactly this document: an envelope of `sub`'s
     //    catalog under one attribute.
@@ -471,16 +494,13 @@ async fn put_catalog<S: TagStore>(
     // A pointer at a catalog with no index record names a document from
     // before envelopes, which `GET` never serves: it reads as none, so the
     // first envelope may start at any seq. The conditional write below
-    // still replaces exactly that pointer.
-    let live = match &current {
-        Some((_, info)) => api
-            .store
-            .get_catalog_index(&info.catalog_hash)
-            .await
-            .map_err(|e| storage_unavailable("Catalog index read", e))?
-            .is_some(),
-        None => false,
+    // still replaces exactly that pointer. The base's recordings decide
+    // what this publish drops and adds (its transition, step 8).
+    let base_hashes = match &current {
+        Some((_, info)) => base_hashes(api, info).await?,
+        None => None,
     };
+    let live = base_hashes.is_some();
     let current_seq = current.as_ref().filter(|_| live).map(|(_, info)| info.seq);
     // Preconditions see what `GET` serves: a pointer whose catalog is
     // blocked reads as none, so a client that got the 404 can publish with
@@ -505,17 +525,57 @@ async fn put_catalog<S: TagStore>(
     }
     let expected = current.as_ref().map(|(stored, _)| stored.etag.as_str());
 
-    // 8. The document, its outboard and its index first, so a stored
-    //    pointer never names a document that cannot be served or decided;
-    //    then the pointer, only if nobody else moved it meanwhile. The index
-    //    record is created once: one envelope has one index, so a publish
-    //    that lost can't rewrite the committed pointer's index.
+    // 8. The transition first (after the 412 and 409, so a retry of a
+    //    publish that committed can't rewrite its transition), then the
+    //    document, its outboard and its index, so a stored pointer never
+    //    names a document that cannot be served or decided; then the
+    //    pointer, only if nobody else moved it meanwhile. The index record
+    //    is created once: one envelope has one index, so a publish that
+    //    lost can't rewrite the committed pointer's index. A transition
+    //    whose pointer write lost is never reachable from a pointer, so the
+    //    sweep never folds it.
     let outboard = crate::ingest::compute_outboard(
         &document[..],
         document.len() as u64,
         Hash::from_bytes(*blake3::hash(&document).as_bytes()),
     )
     .map_err(|e| storage_unavailable("Catalog outboard", e))?;
+    // Dropped only from a base `GET` served: its catalog not blocked and
+    // its owner not hidden.
+    let served = served_seq.is_some() && !owner_hidden(api, Some(&sub));
+    let new_hashes: BTreeSet<String> = entries.iter().map(|e| e.payload_hash.clone()).collect();
+    let transition = Transition {
+        subject: sub.clone(),
+        seq: pointer.seq,
+        catalog_hash: hash.clone(),
+        pointer: digest,
+        base: current.as_ref().map(|(_, info)| TransitionBase {
+            seq: info.seq,
+            catalog_hash: info.catalog_hash.clone(),
+            pointer: info.digest.clone(),
+        }),
+        at: now_secs(),
+        dropped: dropped(
+            api,
+            &sub,
+            base_hashes.as_ref().filter(|_| served),
+            &new_hashes,
+        )
+        .await?,
+        added: new_hashes
+            .iter()
+            .filter(|h| !base_hashes.as_ref().is_some_and(|base| base.contains(*h)))
+            .cloned()
+            .collect(),
+    };
+    api.store
+        .put_catalog_transition(
+            &sub,
+            &transition_name(transition.seq, &transition.pointer),
+            Bytes::from(serde_json::to_vec(&transition).expect("transition serializes")),
+        )
+        .await
+        .map_err(|e| storage_unavailable("Catalog transition write", e))?;
     let size = document.len();
     let record = IndexRecord {
         owner: sub.clone(),
@@ -589,11 +649,83 @@ async fn put_catalog<S: TagStore>(
 /// `index_hash`. `Err` when the record doesn't parse: the node wrote it, so
 /// that is a storage fault.
 fn is_retry(record: &[u8], sub: &str, index_hash: &str) -> anyhow::Result<bool> {
+    let (owner, entries) = read_index_record(record)?;
+    Ok(canonical_subject(&owner) == canonical_subject(sub)
+        && creator_catalog::index_hash(&entries) == index_hash)
+}
+
+/// A stored index record's owner and parsed entries.
+fn read_index_record(record: &[u8]) -> anyhow::Result<(String, Vec<CreatorCatalogEntry>)> {
     let record: IndexRecord = serde_json::from_slice(record)?;
     let entries = creator_catalog::parse_index(record.entries)
         .map_err(|why| anyhow::anyhow!("invalid index: {why}"))?;
-    Ok(canonical_subject(&record.owner) == canonical_subject(sub)
-        && creator_catalog::index_hash(&entries) == index_hash)
+    Ok((record.owner, entries))
+}
+
+/// The recordings of the stored pointer `base`, from its index record;
+/// `None` when it has none (a pointer from before envelopes). The node
+/// wrote the record, so one that doesn't parse, or whose canonical hash
+/// isn't a `/2` base's `indexHash`, is a storage fault: 502, and the
+/// publish writes nothing.
+async fn base_hashes<S: TagStore>(
+    api: &ApiState<S>,
+    base: &StoredPointerInfo,
+) -> Result<Option<BTreeSet<String>>, ApiError> {
+    let Some(record) = api
+        .store
+        .get_catalog_index(&base.catalog_hash)
+        .await
+        .map_err(|e| storage_unavailable("Catalog index read", e))?
+    else {
+        return Ok(None);
+    };
+    let (_, entries) =
+        read_index_record(&record).map_err(|e| storage_unavailable("Catalog index parse", e))?;
+    if let Some(signed) = &base.index_hash
+        && creator_catalog::index_hash(&entries) != *signed
+    {
+        error!(
+            catalog = %base.catalog_hash,
+            seq = base.seq,
+            "Stored catalog index does not match its pointer's indexHash"
+        );
+        return Err(fail(StatusCode::BAD_GATEWAY, "storage unavailable"));
+    }
+    Ok(Some(entries.into_iter().map(|e| e.payload_hash).collect()))
+}
+
+/// What a publish drops (spec 3.1): the recordings of the `served` base
+/// (`None` when the base isn't served) that `new` doesn't list, less those
+/// blocked now and those whose owner record doesn't name `sub` (subjects
+/// compared canonically; no record is not `sub`'s). Sorted. An owner record
+/// that can't be read is 502 `storage unavailable`.
+async fn dropped<S: TagStore>(
+    api: &ApiState<S>,
+    sub: &str,
+    served: Option<&BTreeSet<String>>,
+    new: &BTreeSet<String>,
+) -> Result<Vec<String>, ApiError> {
+    let Some(base) = served else {
+        return Ok(Vec::new());
+    };
+    let gone: Vec<String> = base
+        .difference(new)
+        .filter(|h| !is_blocked(api, h))
+        .cloned()
+        .collect();
+    let owners = owner_subjects(api, gone.clone())
+        .await
+        .map_err(|(status, msg)| fail(status, msg))?;
+    let publisher = canonical_subject(sub);
+    Ok(gone
+        .into_iter()
+        .filter(|h| {
+            owners
+                .get(h)
+                .and_then(Option::as_deref)
+                .is_some_and(|owner| canonical_subject(owner) == publisher)
+        })
+        .collect())
 }
 
 /// The envelope's one attribute, or the 422 reason `document` is not an
@@ -808,6 +940,7 @@ mod tests {
     };
     use crate::catalog_v2::test_support as v2;
     use crate::creator_catalog::test_support::{PAYLOAD_SIZE, entry};
+    use crate::deletion::{Transition, TransitionBase, transition_name};
     use crate::moderation::{DEFAULT_PUBLISH_ENTITLEMENT, Moderation, PublishPolicy};
     use crate::tags_api::TagPublishing;
     use crate::tags_api::test_support::MemStore;
@@ -822,7 +955,10 @@ mod tests {
     const SUB: &str = "5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10";
     const READER: &str = "0b5e7c1d-8a2f-4c3e-9d10-7f6a5b4c3d2e";
 
-    struct StubStatus(Mutex<Result<(), StatusRefusal>>);
+    /// The IdP's answer, and something to run once when it is asked (step
+    /// 6): a moderation change that lands after the token checks.
+    type OnCheck = Box<dyn FnOnce() + Send>;
+    struct StubStatus(Mutex<Result<(), StatusRefusal>>, Mutex<Option<OnCheck>>);
 
     impl CredentialStatus for StubStatus {
         fn check<'a>(
@@ -832,6 +968,9 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<(), StatusRefusal>> + Send + 'a>> {
             assert_eq!(credential_id, v2::CREDENTIAL_ID);
             assert_eq!(sub, SUB);
+            if let Some(on_check) = self.1.lock().unwrap().take() {
+                on_check();
+            }
             let answer = self.0.lock().unwrap().clone();
             Box::pin(async move { answer })
         }
@@ -901,7 +1040,7 @@ mod tests {
                 moderation: Arc::clone(&moderation),
             }),
         });
-        let status = Arc::new(StubStatus(Mutex::new(Ok(()))));
+        let status = Arc::new(StubStatus(Mutex::new(Ok(())), Mutex::new(None)));
         let decider = Arc::new(StubDecider {
             answer: Mutex::new(Some(true)),
             asked: Mutex::new(Vec::new()),
@@ -1780,9 +1919,10 @@ mod tests {
         assert!(h.decider.asked.lock().unwrap().is_empty());
     }
 
-    /// Nothing of a refused publish is stored: no document, outboard, index
-    /// record or pointer.
+    /// Nothing of a refused publish is stored: no transition, document,
+    /// outboard, index record or pointer.
     async fn assert_nothing_stored(h: &Harness) {
+        assert!(h.store.transitions.lock().await.is_empty());
         assert!(h.store.catalog_documents.lock().await.is_empty());
         assert!(h.store.catalog_outboards.lock().await.is_empty());
         assert!(h.store.catalog_indexes.lock().await.is_empty());
@@ -2035,6 +2175,387 @@ mod tests {
         assert_eq!(r.headers[header::ETAG], "\"4\"");
         let served: Bundle = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(served, signed(4, &new, &index()));
+    }
+
+    /// Hex SHA-256 of a bundle's signed pointer bytes.
+    fn digest_of(bundle: &Bundle) -> String {
+        hex::encode(Sha256::digest(
+            URL_SAFE_NO_PAD.decode(&bundle.pointer).unwrap(),
+        ))
+    }
+
+    /// The transition recorded by `SUB`'s publish of `document` at `seq`
+    /// over `index`.
+    async fn transition(
+        h: &Harness,
+        seq: u64,
+        document: &[u8],
+        index: &serde_json::Value,
+    ) -> Transition {
+        let digest = digest_of(&signed(seq, document, index));
+        let key = format!("{SUB}/{}", transition_name(seq, &digest));
+        let body = h.store.transitions.lock().await.get(&key).cloned();
+        serde_json::from_slice(&body.expect("transition recorded")).unwrap()
+    }
+
+    /// Publishes `seq` over `index` with exactly the `precondition` header.
+    async fn publish_index_if(
+        h: &Harness,
+        seq: u64,
+        document: &[u8],
+        index: &serde_json::Value,
+        precondition: (header::HeaderName, &str),
+    ) -> Reply {
+        let body = body_with(document, &signed(seq, document, index), index.clone());
+        put_with(h, SUB, &token(SUB), body, &[precondition]).await
+    }
+
+    fn base(seq: u64, document: &[u8], index: &serde_json::Value) -> Option<TransitionBase> {
+        Some(TransitionBase {
+            seq,
+            catalog_hash: hash_of(document),
+            pointer: digest_of(&signed(seq, document, index)),
+        })
+    }
+
+    /// rec-n naming payload(n).
+    fn rec(n: u8) -> serde_json::Value {
+        entry(&format!("rec-{n}"), &payload(n))
+    }
+
+    #[tokio::test]
+    async fn the_first_publish_records_every_hash_as_added() {
+        let h = ingested().await;
+        let document = envelope(1);
+        let bundle = signed(1, &document, &index());
+        let before = now_secs();
+        let r = put(&h, SUB, &token(SUB), body(&document, &bundle)).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+
+        let transitions = h.store.transitions.lock().await;
+        let key = format!("{SUB}/00000000000000000001-{}", digest_of(&bundle));
+        assert_eq!(transitions.keys().collect::<Vec<_>>(), [&key]);
+        let recorded: serde_json::Value = serde_json::from_slice(&transitions[&key]).unwrap();
+        let at = recorded["at"].as_i64().unwrap();
+        assert!((before..=now_secs()).contains(&at));
+        assert_eq!(
+            recorded,
+            json!({
+                "subject": SUB,
+                "seq": 1,
+                "catalogHash": hash_of(&document),
+                "pointer": digest_of(&bundle),
+                "base": null,
+                "at": at,
+                "dropped": [],
+                "added": [payload(1)],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hide_records_the_dropped_recording() {
+        let h = ingested().await;
+        ingest(&h, 2).await;
+        let (first, both) = (envelope(1), json!([rec(1), rec(2)]));
+        let r = publish_index(&h, 1, &first, both.clone()).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let (second, kept) = (envelope(2), json!([rec(1)]));
+        let r = publish_index(&h, 2, &second, kept.clone()).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+
+        let t = transition(&h, 2, &second, &kept).await;
+        assert_eq!(t.subject, SUB);
+        assert_eq!(t.catalog_hash, hash_of(&second));
+        assert_eq!(t.base, base(1, &first, &both));
+        assert_eq!(t.dropped, [payload(2)]);
+        assert!(t.added.is_empty());
+        assert_eq!(h.store.transitions.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_blocked_recording_is_not_dropped() {
+        let h = ingested().await;
+        ingest(&h, 2).await;
+        let r = publish_index(&h, 1, &envelope(1), json!([rec(1), rec(2)])).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        h.moderation.block_for_test(&payload(2));
+        let (second, kept) = (envelope(2), json!([rec(1)]));
+        let r = publish_index(&h, 2, &second, kept.clone()).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        assert!(transition(&h, 2, &second, &kept).await.dropped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_recording_the_publisher_does_not_own_is_not_dropped() {
+        let h = ingested().await;
+        for n in 2..=4 {
+            ingest(&h, n).await;
+        }
+        let all = json!([rec(1), rec(2), rec(3), rec(4)]);
+        let r = publish_index(&h, 1, &envelope(1), all).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        // payload(2) is another account's now, payload(3) is the publisher's
+        // under its other form of the subject, payload(4) has no owner.
+        h.store.own(&payload(2), READER).await;
+        h.store.own(&payload(3), &format!("arkavo:{SUB}")).await;
+        h.store.owners.lock().await.remove(&payload(4));
+        let (second, kept) = (envelope(2), json!([rec(1)]));
+        let r = publish_index(&h, 2, &second, kept.clone()).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let t = transition(&h, 2, &second, &kept).await;
+        assert_eq!(t.dropped, [payload(3)]);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_owner_record_of_a_dropped_recording_is_unavailable() {
+        let h = ingested().await;
+        ingest(&h, 2).await;
+        let first = envelope(1);
+        let r = publish_index(&h, 1, &first, json!([rec(1), rec(2)])).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let stored = h.store.catalog_pointers.lock().await[SUB].clone();
+        h.store
+            .owners
+            .lock()
+            .await
+            .insert(payload(2), Bytes::from_static(b"not a record"));
+
+        let second = envelope(2);
+        let r = publish_index(&h, 2, &second, json!([rec(1)])).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::BAD_GATEWAY, "storage unavailable")
+        );
+        assert_eq!(h.store.transitions.lock().await.len(), 1);
+        assert!(
+            !h.store
+                .catalog_documents
+                .lock()
+                .await
+                .contains_key(&hash_of(&second))
+        );
+        assert_eq!(h.store.catalog_pointers.lock().await[SUB], stored);
+    }
+
+    #[tokio::test]
+    async fn nothing_is_dropped_from_a_base_that_is_not_served() {
+        #[derive(Debug)]
+        enum Hidden {
+            EnvelopeBlocked,
+            CatalogBlocked,
+            /// A suspended subject can't publish: this one is suspended
+            /// after its token checks, mid-publish.
+            HideCatalogSuspension,
+        }
+        for hidden in [
+            Hidden::EnvelopeBlocked,
+            Hidden::CatalogBlocked,
+            Hidden::HideCatalogSuspension,
+        ] {
+            let h = ingested().await;
+            ingest(&h, 2).await;
+            ingest(&h, 3).await;
+            let (first, both) = (envelope(1), json!([rec(1), rec(2)]));
+            let r = publish_index(&h, 1, &first, both.clone()).await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+            let precondition = match hidden {
+                // `GET` serves none, so the client publishes as after a 404.
+                Hidden::EnvelopeBlocked => {
+                    h.moderation.block_for_test(&hash_of(&first));
+                    (header::IF_NONE_MATCH, "*")
+                }
+                Hidden::CatalogBlocked => {
+                    h.moderation.block_catalog_for_test(SUB);
+                    (header::IF_MATCH, "\"1\"")
+                }
+                Hidden::HideCatalogSuspension => {
+                    let moderation = Arc::clone(&h.moderation);
+                    *h.status.1.lock().unwrap() =
+                        Some(Box::new(move || moderation.suspend_for_test(SUB, true)));
+                    (header::IF_MATCH, "\"1\"")
+                }
+            };
+
+            let (second, next) = (envelope(2), json!([rec(1), rec(3)]));
+            let r = publish_index_if(&h, 2, &second, &next, precondition).await;
+            assert_eq!(r.status, StatusCode::OK, "{hidden:?}: {}", r.error());
+            let t = transition(&h, 2, &second, &next).await;
+            assert!(t.dropped.is_empty(), "{hidden:?}");
+            assert_eq!(
+                t.added,
+                [payload(3)],
+                "{hidden:?}: against the base's index"
+            );
+            assert_eq!(t.base, base(1, &first, &both), "{hidden:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_transition_write_stores_nothing() {
+        let unavailable = (StatusCode::BAD_GATEWAY, "storage unavailable");
+        let h = ingested().await;
+        h.store.fail_next_transition.store(true, Ordering::Relaxed);
+        let r = publish(&h, 1, &envelope(1)).await;
+        assert_eq!((r.status, r.error().as_str()), unavailable);
+        assert_nothing_stored(&h).await;
+
+        // Over a stored pointer: nothing of the new publish either.
+        assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
+        let stored = h.store.catalog_pointers.lock().await[SUB].clone();
+        h.store.fail_next_transition.store(true, Ordering::Relaxed);
+        let second = envelope(2);
+        let r = publish(&h, 2, &second).await;
+        assert_eq!((r.status, r.error().as_str()), unavailable);
+        let hash = hash_of(&second);
+        assert!(!h.store.catalog_documents.lock().await.contains_key(&hash));
+        assert!(!h.store.catalog_outboards.lock().await.contains_key(&hash));
+        assert!(!h.store.catalog_indexes.lock().await.contains_key(&hash));
+        assert_eq!(h.store.catalog_pointers.lock().await[SUB], stored);
+        assert_eq!(h.store.transitions.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_a_commit_keeps_the_committed_transition() {
+        let h = ingested().await;
+        assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
+        let second = envelope(2);
+        let r = publish_if(&h, 2, &second, header::IF_MATCH, "\"1\"").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let committed = h.store.transitions.lock().await.clone();
+        assert_eq!(committed.len(), 2);
+
+        // The reply was lost and the client resends: refused before the
+        // transition is written, so the committed one keeps its base.
+        let r = publish_if(&h, 2, &second, header::IF_MATCH, "\"1\"").await;
+        assert_eq!(r.status, StatusCode::PRECONDITION_FAILED, "{}", r.error());
+        assert_eq!(*h.store.transitions.lock().await, committed);
+        let r = publish_if(&h, 2, &second, header::IF_MATCH, "*").await;
+        assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.error());
+        assert_eq!(*h.store.transitions.lock().await, committed);
+    }
+
+    #[tokio::test]
+    async fn a_2_base_with_a_tampered_index_is_502() {
+        let h = ingested().await;
+        ingest(&h, 2).await;
+        let first = envelope(1);
+        assert_eq!(publish(&h, 1, &first).await.status, StatusCode::OK);
+        let stored = h.store.catalog_pointers.lock().await[SUB].clone();
+        for tampered in [
+            // Parses, but isn't the index the `/2` pointer's indexHash binds.
+            index_record(SUB, json!([rec(2)])),
+            index_record(SUB, json!([rec(1), rec(2)])),
+            // Doesn't parse.
+            index_record(SUB, json!([{"contentID": "rec-1"}])),
+            Bytes::from_static(b"not a record"),
+        ] {
+            h.store
+                .catalog_indexes
+                .lock()
+                .await
+                .insert(hash_of(&first), tampered);
+            let second = envelope(2);
+            let r = publish(&h, 2, &second).await;
+            assert_eq!(
+                (r.status, r.error().as_str()),
+                (StatusCode::BAD_GATEWAY, "storage unavailable")
+            );
+            assert_eq!(h.store.transitions.lock().await.len(), 1);
+            assert!(
+                !h.store
+                    .catalog_documents
+                    .lock()
+                    .await
+                    .contains_key(&hash_of(&second))
+            );
+            assert_eq!(h.store.catalog_pointers.lock().await[SUB], stored);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_publish_over_a_1_base_records_its_digest() {
+        let h = ingested().await;
+        ingest(&h, 2).await;
+        let old = envelope(1);
+        let stored = serde_json::to_vec(&v2::bundle(SUB, 3, &old, None)).unwrap();
+        h.store
+            .catalog_pointers
+            .lock()
+            .await
+            .insert(SUB.into(), (Bytes::from(stored), 99));
+        h.store
+            .catalog_indexes
+            .lock()
+            .await
+            .insert(hash_of(&old), index_record(SUB, json!([rec(1), rec(2)])));
+
+        let (new, kept) = (envelope(2), json!([rec(1)]));
+        let r = publish_index_if(&h, 4, &new, &kept, (header::IF_MATCH, "\"3\"")).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let t = transition(&h, 4, &new, &kept).await;
+        let pointer = hex::encode(Sha256::digest(v2::pointer_bytes(SUB, 3, &old, None)));
+        assert_eq!(
+            t.base,
+            Some(TransitionBase {
+                seq: 3,
+                catalog_hash: hash_of(&old),
+                pointer,
+            })
+        );
+        assert_eq!(t.dropped, [payload(2)]);
+        assert!(t.added.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_publish_over_a_pointer_from_before_envelopes_adds_everything() {
+        let h = ingested().await;
+        let old = b"{\"schema\":\"arkavo.creator-catalog/1\"}".to_vec();
+        let stored = serde_json::to_vec(&v2::bundle(SUB, 12, &old, None)).unwrap();
+        h.store
+            .catalog_pointers
+            .lock()
+            .await
+            .insert(SUB.into(), (Bytes::from(stored), 99));
+
+        let document = envelope(1);
+        let r = publish_index_if(&h, 1, &document, &index(), (header::IF_NONE_MATCH, "*")).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let t = transition(&h, 1, &document, &index()).await;
+        let pointer = hex::encode(Sha256::digest(v2::pointer_bytes(SUB, 12, &old, None)));
+        assert_eq!(
+            t.base,
+            Some(TransitionBase {
+                seq: 12,
+                catalog_hash: hash_of(&old),
+                pointer,
+            })
+        );
+        assert!(t.dropped.is_empty());
+        assert_eq!(t.added, [payload(1)]);
+    }
+
+    #[tokio::test]
+    async fn an_ungated_node_drops_nothing() {
+        // No owner records are written there.
+        let h = harness_ungated();
+        for n in [1, 2] {
+            h.store
+                .ingest_with_manifest(
+                    &payload(n),
+                    PAYLOAD_SIZE,
+                    manifest(recording_policy(), &[KAS]),
+                )
+                .await;
+        }
+        let r = publish_index(&h, 1, &envelope(1), json!([rec(1), rec(2)])).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let (second, kept) = (envelope(2), json!([rec(1)]));
+        let r = publish_index(&h, 2, &second, kept.clone()).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let t = transition(&h, 2, &second, &kept).await;
+        assert!(t.dropped.is_empty());
+        assert!(t.added.is_empty());
     }
 
     #[tokio::test]

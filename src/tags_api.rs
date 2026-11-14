@@ -73,6 +73,15 @@ pub trait TagStore: Send + Sync + 'static {
         &self,
         hash_hex: &str,
     ) -> impl Future<Output = anyhow::Result<Option<Bytes>>> + Send;
+    /// Write a publish's transition record
+    /// (`catalog-transitions/<sub>/<name>`, never served), before its
+    /// document, index and pointer.
+    fn put_catalog_transition(
+        &self,
+        sub: &str,
+        name: &str,
+        body: Bytes,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
     /// A creator's stored catalog v2 pointer bundle.
     fn get_catalog_pointer(
         &self,
@@ -160,6 +169,15 @@ impl TagStore for crate::store::s3::S3Client {
 
     async fn get_catalog_index(&self, hash_hex: &str) -> anyhow::Result<Option<Bytes>> {
         Self::get_catalog_index(self, hash_hex).await
+    }
+
+    async fn put_catalog_transition(
+        &self,
+        sub: &str,
+        name: &str,
+        body: Bytes,
+    ) -> anyhow::Result<()> {
+        Self::put_catalog_transition(self, sub, name, body).await
     }
 
     async fn get_catalog_pointer(&self, sub: &str) -> anyhow::Result<Option<StoredPointer>> {
@@ -274,7 +292,7 @@ pub(crate) mod test_support {
     use tokio::sync::Mutex;
 
     /// In-memory ingested blobs (hash → size), owner records, catalog
-    /// documents, indexes and pointers.
+    /// documents, indexes, transitions and pointers.
     #[derive(Default)]
     pub struct MemStore {
         pub blobs: Mutex<HashMap<String, u64>>,
@@ -293,6 +311,10 @@ pub(crate) mod test_support {
         pub down: std::sync::atomic::AtomicBool,
         pub catalog_outboards: Mutex<HashMap<String, Bytes>>,
         pub catalog_indexes: Mutex<HashMap<String, Bytes>>,
+        /// `"<sub>/<name>"` → transition record body.
+        pub transitions: Mutex<std::collections::BTreeMap<String, Bytes>>,
+        /// The next transition write fails, as an unreachable store would.
+        pub fail_next_transition: std::sync::atomic::AtomicBool,
         /// sub → (bundle, version). The version stands in for S3's ETag.
         pub catalog_pointers: Mutex<HashMap<String, (Bytes, u64)>>,
         pub pointer_versions: std::sync::atomic::AtomicU64,
@@ -439,6 +461,25 @@ pub(crate) mod test_support {
         async fn get_catalog_index(&self, hash_hex: &str) -> anyhow::Result<Option<Bytes>> {
             self.up()?;
             Ok(self.catalog_indexes.lock().await.get(hash_hex).cloned())
+        }
+        async fn put_catalog_transition(
+            &self,
+            sub: &str,
+            name: &str,
+            body: Bytes,
+        ) -> anyhow::Result<()> {
+            self.up()?;
+            anyhow::ensure!(
+                !self
+                    .fail_next_transition
+                    .swap(false, std::sync::atomic::Ordering::Relaxed),
+                "transition write failed"
+            );
+            self.transitions
+                .lock()
+                .await
+                .insert(format!("{sub}/{name}"), body);
+            Ok(())
         }
         async fn get_catalog_pointer(&self, sub: &str) -> anyhow::Result<Option<StoredPointer>> {
             self.up()?;

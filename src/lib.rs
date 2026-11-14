@@ -7,6 +7,7 @@ pub mod catalogs_api;
 pub mod catalogs_v2_api;
 pub mod config;
 pub mod creator_catalog;
+pub mod deletion;
 pub mod entity_chain;
 pub mod ingest;
 pub mod moderation;

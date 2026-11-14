@@ -193,24 +193,7 @@ async fn check_owners<S: TagStore>(
     entries: &[CreatorCatalogEntry],
     publisher: &str,
 ) -> Result<(), PayloadRefusal> {
-    let owners = look_up(state, hashes(entries), |store, hash| async move {
-        let unavailable = || (StatusCode::BAD_GATEWAY, "storage unavailable".to_string());
-        match store.get_blob_owner(&hash).await {
-            Ok(Some(bytes)) => match parse_owner(&hash, &bytes) {
-                Ok(owner) => Ok(Some(owner.subject)),
-                Err(e) => {
-                    warn!(%hash, error = format!("{e:#}"), "Owner record unreadable");
-                    Err(unavailable())
-                }
-            },
-            Ok(None) => Ok(None),
-            Err(e) => {
-                warn!(%hash, error = %e, "Owner record read failed");
-                Err(unavailable())
-            }
-        }
-    })
-    .await?;
+    let owners = owner_subjects(state, hashes(entries)).await?;
 
     let publisher = canonical_subject(publisher);
     let mut another = Vec::new();
@@ -244,6 +227,33 @@ async fn check_owners<S: TagStore>(
         error: error.to_string(),
         content_ids: Some(content_ids),
     })
+}
+
+/// Each hash's owner subject, as its owner record names it (`None`: no
+/// record). A record that can't be read or parsed is 502 `storage
+/// unavailable`.
+pub(crate) async fn owner_subjects<S: TagStore>(
+    state: &ApiState<S>,
+    hashes: Vec<String>,
+) -> Result<HashMap<String, Option<String>>, (StatusCode, String)> {
+    look_up(state, hashes, |store, hash| async move {
+        let unavailable = || (StatusCode::BAD_GATEWAY, "storage unavailable".to_string());
+        match store.get_blob_owner(&hash).await {
+            Ok(Some(bytes)) => match parse_owner(&hash, &bytes) {
+                Ok(owner) => Ok(Some(owner.subject)),
+                Err(e) => {
+                    warn!(%hash, error = format!("{e:#}"), "Owner record unreadable");
+                    Err(unavailable())
+                }
+            },
+            Ok(None) => Ok(None),
+            Err(e) => {
+                warn!(%hash, error = %e, "Owner record read failed");
+                Err(unavailable())
+            }
+        }
+    })
+    .await
 }
 
 /// The distinct recording hashes `entries` name, in entry order.

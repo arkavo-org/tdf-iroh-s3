@@ -256,6 +256,13 @@ impl S3Client {
         format!("{}catalog-pointers/{}", self.prefix, sub)
     }
 
+    /// One publish's transition record (`deletion::Transition`), named by
+    /// `deletion::transition_name`; `sub` as in the pointer key. Never
+    /// served: the deletion sweep reads it.
+    pub fn catalog_transition_key(&self, sub: &str, name: &str) -> String {
+        format!("{}catalog-transitions/{}/{}", self.prefix, sub, name)
+    }
+
     pub async fn put_blob(&self, hash_hex: &str, data: Bytes) -> Result<()> {
         self.client
             .put_object()
@@ -701,6 +708,21 @@ impl S3Client {
         }
     }
 
+    /// Write a publish's transition record, before its document, index and
+    /// pointer.
+    pub async fn put_catalog_transition(&self, sub: &str, name: &str, body: Bytes) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.catalog_transition_key(sub, name))
+            .content_type("application/json")
+            .body(body.into())
+            .send()
+            .await
+            .context("Failed to PUT catalog transition to S3")?;
+        Ok(())
+    }
+
     /// Store a creator's pointer bundle only if the stored one is still
     /// `expected` (its ETag), or, with `None`, only if there is none.
     /// `false` when another write got there first.
@@ -1008,6 +1030,15 @@ mod tests {
         let s3 = S3Client::new_mock("bucket", "us-east-1", "");
         assert_eq!(s3.list_page_size, 1000);
         assert_eq!(s3.with_list_page_size(2).list_page_size, 2);
+    }
+
+    #[test]
+    fn transitions_are_keyed_by_subject_and_name() {
+        let s3 = S3Client::new_mock("bucket", "us-east-1", "run-1/");
+        assert_eq!(
+            s3.catalog_transition_key("arkavo:u1", "00000000000000000007-ab"),
+            "run-1/catalog-transitions/arkavo:u1/00000000000000000007-ab"
+        );
     }
 
     #[test]
