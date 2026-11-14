@@ -85,8 +85,9 @@ enum Command {
     /// an account published (--all)
     ///
     /// --hash: each hash must be a recording's (not a catalog envelope's)
-    /// with an active block; a scope-hash request for each. --all: the subject must have an active catalog block; a
-    /// scope-subject request for every hash in the live index of each of
+    /// with an active block; a scope-hash request for each. --all: the
+    /// subject must have an active catalog block and an active suspension;
+    /// a scope-subject request for every hash in the live index of each of
     /// its pointers and every hash its owner records name, then a request
     /// for the subject (its pointers). Nothing is written unless every
     /// precondition holds. One line per key; sweep-deletions --delete then
@@ -99,7 +100,8 @@ enum Command {
         /// Blocked recordings' BLAKE3 hashes, 64 lowercase hex characters.
         #[arg(long, num_args = 1.., conflicts_with = "all", required_unless_present = "all")]
         hash: Vec<String>,
-        /// Everything the subject published; needs its catalog block.
+        /// Everything the subject published; needs its catalog block and
+        /// its suspension.
         #[arg(long)]
         all: bool,
         /// Why; stored in each request.

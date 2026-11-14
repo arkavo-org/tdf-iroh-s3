@@ -13,7 +13,8 @@
 //! its owner record bears out, or on an operator's over an active block;
 //! and `L` counts every catalog whatever its visibility: hidden, blocked
 //! and catalog-blocked owners' too. Only the pointers of a subject an
-//! operator asked to delete, while its catalog block stands, leave it.
+//! operator asked to delete, while its catalog block and its suspension
+//! stand ([`all_lifted`]), leave it.
 //!
 //! Every rule reads the requests passed in (the folded ones, with those
 //! [`observe`] made), never the snapshot's. Subjects compare canonically.
@@ -44,6 +45,7 @@ const NOT_THE_REQUESTER: &str = "owner is not the requester";
 pub(super) const NO_OWNER_RECORD: &str = "no owner record";
 const BLOCK_LIFTED: &str = "block lifted";
 const CATALOG_BLOCK_LIFTED: &str = "catalog block lifted";
+const SUSPENSION_LIFTED: &str = "suspension lifted";
 const OWNER_HIDDEN: &str = "owner hidden";
 const UNKNOWN_OWNER: &str = "unknown owner";
 
@@ -51,9 +53,9 @@ const UNKNOWN_OWNER: &str = "unknown owner";
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct View {
     /// `S`: the keys (`catalog-pointers/<sub>`) of every pointer whose
-    /// canonical subject has a pending `subjects/` request and an active
-    /// catalog block. Both pointer keys of one subject (`arkavo:<uuid>` and
-    /// `<uuid>`) are here together.
+    /// canonical subject has a pending `subjects/` request, an active
+    /// catalog block and an active suspension ([`all_lifted`]). Both pointer
+    /// keys of one subject (`arkavo:<uuid>` and `<uuid>`) are here together.
     pub s: BTreeSet<String>,
     /// `L`: every payload hash in the live index of a pointer not in `S`,
     /// whatever its visibility.
@@ -83,7 +85,7 @@ pub fn view_except(
         .filter(|p| !except.contains(&p.key))
     {
         let subject = canonical_subject(&p.subject);
-        if pending_subject(requests, subject) && moderation.catalog_blocked.contains(subject) {
+        if pending_subject(requests, subject) && all_lifted(moderation, subject).is_none() {
             view.s.insert(p.key.clone());
             continue;
         }
@@ -238,15 +240,10 @@ pub fn due(snapshot: &Snapshot, requests: &Requests, view: &View, now: i64) -> D
         if r.state != State::Pending {
             continue;
         }
-        // While its catalog block stands.
-        if snapshot
-            .moderation
-            .catalog_blocked
-            .contains(canonical_subject(sub))
-        {
-            items.push(Item::Subject(sub.clone()));
-        } else {
-            kept.push((format!("subject {sub}"), CATALOG_BLOCK_LIFTED));
+        // While its catalog block and its suspension stand.
+        match all_lifted(&snapshot.moderation, canonical_subject(sub)) {
+            None => items.push(Item::Subject(sub.clone())),
+            Some(why) => kept.push((format!("subject {sub}"), why)),
         }
     }
     for (hash, r) in &requests.envelopes {
@@ -296,10 +293,11 @@ fn recording_kept(
 }
 
 /// `operator/<sub>/<hash>`. Scope `hash`: while `hash`'s block stands, at
-/// once, listed or not. Scope `subject`: while `sub`'s catalog block
-/// stands, `hash` is in no listing and not blocked, and its owner record
-/// names `sub`. Moderation keeps a blocked hash while its block stands
-/// (decision 3), so only a scope-`hash` request deletes one.
+/// once, listed or not. Scope `subject`: while `sub`'s catalog block and
+/// suspension stand ([`all_lifted`]), `hash` is in no listing and not
+/// blocked, and its owner record names `sub`. Moderation keeps a blocked
+/// hash while its block stands (decision 3), so only a scope-`hash`
+/// request deletes one.
 fn operator_kept(
     snapshot: &Snapshot,
     view: &View,
@@ -311,8 +309,8 @@ fn operator_kept(
     match r.scope {
         Scope::Hash => (!moderation.blocked.contains(hash)).then_some(BLOCK_LIFTED),
         Scope::Subject => {
-            if !moderation.catalog_blocked.contains(canonical_subject(sub)) {
-                Some(CATALOG_BLOCK_LIFTED)
+            if let Some(why) = all_lifted(moderation, canonical_subject(sub)) {
+                Some(why)
             } else if view.l.contains(hash) {
                 Some(STILL_LISTED)
             } else if moderation.blocked.contains(hash) {
@@ -327,8 +325,8 @@ fn operator_kept(
 /// `envelopes/<hash>`: due once `GRACE` has passed since it was
 /// superseded, while it is not current and not blocked, unless its owner's
 /// catalog is hidden (an operator asking for everything the owner
-/// published lifts that, while the owner's catalog block stands) or its
-/// owner is unknown.
+/// published lifts that, while the owner's catalog block and suspension
+/// stand) or its owner is unknown.
 fn envelope_kept(
     snapshot: &Snapshot,
     requests: &Requests,
@@ -372,15 +370,35 @@ pub(super) fn envelope_owner<'a>(
 
 /// Whether an operator asked for everything `subject` published, which
 /// releases its envelopes from its hidden catalog: a `subjects/` record in
-/// any state, while `subject`'s catalog block (the request's precondition)
-/// stands. A tombstone counts: the envelopes current when the subject's
-/// pointers were deleted are observed on that run and fall due after
-/// their grace (spec 3.4 step 6), and tombstone verification keeps a
-/// `subjects/` tombstone while a pending envelope request names its
-/// subject and its catalog block stands. With the block lifted, the
-/// request holds nothing: a hidden owner's envelopes stay hidden.
+/// any state, while `subject`'s catalog block and suspension (the
+/// request's preconditions, [`all_lifted`]) stand. A tombstone counts: the
+/// envelopes current when the subject's pointers were deleted are observed
+/// on that run and fall due after their grace (spec 3.4 step 6), and
+/// tombstone verification keeps a `subjects/` tombstone while a pending
+/// envelope request names its subject and both still stand. With either
+/// lifted, the request holds nothing: a hidden owner's envelopes stay
+/// hidden.
 fn everything_requested(requests: &Requests, moderation: &ModerationView, subject: &str) -> bool {
-    requests.subjects.contains_key(subject) && moderation.catalog_blocked.contains(subject)
+    requests.subjects.contains_key(subject) && all_lifted(moderation, subject).is_none()
+}
+
+/// The first of `request-deletion --all`'s preconditions for `subject`
+/// (canonical) that no longer stands, as the reason its requests are kept:
+/// its catalog block, then its suspension. `None` while both stand. A
+/// catalog block hides the catalog but doesn't stop publishing; a
+/// suspension does, so no fresh pointer can appear while the sweep deletes
+/// the account. Every rule that acts on `--all`'s requests re-checks both
+/// through this: `S`, a `subjects/` request, a scope-`subject` request,
+/// the release of a hidden owner's envelopes, and (in the sweep) a deleted
+/// subject's late pointers and the hold on its tombstone.
+pub(super) fn all_lifted(moderation: &ModerationView, subject: &str) -> Option<&'static str> {
+    if !moderation.catalog_blocked.contains(subject) {
+        Some(CATALOG_BLOCK_LIFTED)
+    } else if !moderation.suspended.contains(subject) {
+        Some(SUSPENSION_LIFTED)
+    } else {
+        None
+    }
 }
 
 fn pending_subject(requests: &Requests, subject: &str) -> bool {
@@ -519,6 +537,21 @@ mod tests {
         s.moderation.hidden.remove(sub);
     }
 
+    fn suspend(s: &mut Snapshot, sub: &str) {
+        s.moderation.suspended.insert(sub.to_string());
+    }
+
+    fn lift_suspension(s: &mut Snapshot, sub: &str) {
+        s.moderation.suspended.remove(sub);
+    }
+
+    /// `request-deletion --all`'s preconditions: a catalog block and a
+    /// suspension.
+    fn block_and_suspend(s: &mut Snapshot, sub: &str) {
+        catalog_block(s, sub);
+        suspend(s, sub);
+    }
+
     fn owns(s: &mut Snapshot, hash: &str, sub: &str) {
         s.owners.insert(hash.to_string(), sub.to_string());
     }
@@ -558,7 +591,7 @@ mod tests {
         point(&mut s, "u2", &h("c3"), &[&h("a3")]);
         let mut r = Requests::default();
         subject(&mut r, U);
-        catalog_block(&mut s, U);
+        block_and_suspend(&mut s, U);
 
         let v = view(&s.catalogs, &r, &s.moderation);
         assert_eq!(
@@ -576,8 +609,17 @@ mod tests {
         assert_eq!(v.l, set([h("a1"), h("a2"), h("a3")]));
         assert_eq!(v.c, set([h("c1"), h("c2"), h("c3")]));
 
-        // Nor with the block alone, or over a tombstone.
+        // Nor with the suspension lifted: the subject's request waits
+        // (`suspension lifted`), so its pointers still list and name.
         catalog_block(&mut s, U);
+        lift_suspension(&mut s, U);
+        let v = view(&s.catalogs, &r, &s.moderation);
+        assert!(v.s.is_empty(), "{:?}", v.s);
+        assert_eq!(v.l, set([h("a1"), h("a2"), h("a3")]));
+        assert_eq!(v.c, set([h("c1"), h("c2"), h("c3")]));
+
+        // Nor with the block and suspension alone, or over a tombstone.
+        suspend(&mut s, U);
         assert!(
             view(&s.catalogs, &Requests::default(), &s.moderation)
                 .s
@@ -619,7 +661,7 @@ mod tests {
         point(&mut s, "u1", &h("c1"), &[]);
         // Being deleted: its current envelope is no longer in `C`.
         point(&mut s, U, &h("c2"), &[]);
-        catalog_block(&mut s, U);
+        block_and_suspend(&mut s, U);
         let mut r = Requests::default();
         subject(&mut r, U);
         // Tracked: pending, and a tombstone.
@@ -688,7 +730,7 @@ mod tests {
     fn one_item_per_recording() {
         let mut s = Snapshot::default();
         owns(&mut s, &h("a1"), U);
-        catalog_block(&mut s, U);
+        block_and_suspend(&mut s, U);
         let mut r = Requests::default();
         recording(&mut r, U, &h("a1"), NOW - GRACE);
         operator(&mut r, U, &h("a1"), Scope::Subject);
@@ -770,7 +812,7 @@ mod tests {
     #[test]
     fn operator_subject_scope_keeps_a_blocked_hash() {
         let mut s = Snapshot::default();
-        catalog_block(&mut s, U);
+        block_and_suspend(&mut s, U);
         owns(&mut s, &h("a1"), U);
         s.moderation.blocked.insert(h("a1"));
         let mut r = Requests::default();
@@ -808,13 +850,13 @@ mod tests {
     }
 
     #[test]
-    fn operator_subject_scope_needs_the_catalog_block() {
+    fn operator_subject_scope_needs_the_catalog_block_and_suspension() {
         let mut s = Snapshot::default();
         // `U`'s own catalog lists a1, but `U` is being deleted: its
         // pointer is in `S`, so a1 is not in `L`.
         point(&mut s, &arkavo(U), &h("c1"), &[&h("a1")]);
         point(&mut s, "u2", &h("c2"), &[&h("a2")]);
-        catalog_block(&mut s, U);
+        block_and_suspend(&mut s, U);
         for hash in ["a1", "a2"] {
             owns(&mut s, &h(hash), U);
         }
@@ -856,19 +898,47 @@ mod tests {
                 kept(format!("subject {U}"), "catalog block lifted"),
             ]
         );
+
+        // The block stands and the suspension is lifted: every request
+        // waits, a1 included, which `U`'s pointer lists again.
+        catalog_block(&mut s, U);
+        lift_suspension(&mut s, U);
+        let out = decide(&s, &r);
+        assert!(out.due.is_empty(), "{:?}", out.due);
+        assert_eq!(
+            out.kept,
+            [
+                kept(id("a1"), "suspension lifted"),
+                kept(id("a2"), "suspension lifted"),
+                kept(id("a3"), "suspension lifted"),
+                kept(id("a4"), "suspension lifted"),
+                kept(format!("subject {U}"), "suspension lifted"),
+            ]
+        );
+
+        // Both lifted: the block is named.
+        lift_catalog_block(&mut s, U);
+        let out = decide(&s, &r);
+        assert!(
+            out.kept
+                .iter()
+                .all(|(_, why)| why == "catalog block lifted"),
+            "{:?}",
+            out.kept
+        );
     }
 
     #[test]
-    fn a_subject_is_due_while_its_catalog_block_stands() {
+    fn a_subject_is_due_while_its_catalog_block_and_suspension_stand() {
         let mut s = Snapshot::default();
         point(&mut s, &arkavo(U), &h("c1"), &[]);
         point(&mut s, U, &h("c2"), &[]);
-        catalog_block(&mut s, U);
+        block_and_suspend(&mut s, U);
         let mut r = Requests::default();
         subject(&mut r, U);
         // A subject with no pointer left is due too.
         subject(&mut r, U2);
-        catalog_block(&mut s, U2);
+        block_and_suspend(&mut s, U2);
 
         let out = decide(&s, &r);
         assert_eq!(
@@ -884,6 +954,16 @@ mod tests {
             out.kept,
             [kept(format!("subject {U}"), "catalog block lifted")]
         );
+
+        // A suspension, `hideCatalog` or not, is the other half.
+        catalog_block(&mut s, U);
+        lift_suspension(&mut s, U);
+        let out = decide(&s, &r);
+        assert_eq!(out.due, [Item::Subject(U2.to_string())]);
+        assert_eq!(
+            out.kept,
+            [kept(format!("subject {U}"), "suspension lifted")]
+        );
     }
 
     #[test]
@@ -893,7 +973,7 @@ mod tests {
         s.moderation.blocked.insert(h("e4"));
         catalog_block(&mut s, "u4");
         s.moderation.hidden.insert("u5".into());
-        catalog_block(&mut s, "u6");
+        block_and_suspend(&mut s, "u6");
         let mut r = Requests::default();
         subject(&mut r, "u6");
         let past = NOW - GRACE;
@@ -1016,7 +1096,7 @@ mod tests {
     #[test]
     fn a_subject_tombstone_releases_a_hidden_owners_envelope() {
         let mut s = Snapshot::default();
-        catalog_block(&mut s, U);
+        block_and_suspend(&mut s, U);
         catalog_block(&mut s, U2);
         let mut r = Requests::default();
         subject(&mut r, U);
@@ -1040,11 +1120,12 @@ mod tests {
         );
     }
 
-    /// Only while the owner's catalog block stands: lifted, the operator's
-    /// request no longer holds, and a hideCatalog suspension hides the
-    /// owner's envelopes as any hidden owner's.
+    /// Only while the owner's catalog block and suspension stand: with
+    /// either lifted, the operator's request no longer holds, and a
+    /// hideCatalog suspension or the catalog block hides the owner's
+    /// envelopes as any hidden owner's.
     #[test]
-    fn a_subject_record_releases_envelopes_only_while_its_catalog_block_stands() {
+    fn a_subject_record_releases_envelopes_only_while_its_block_and_suspension_stand() {
         let mut s = Snapshot::default();
         s.moderation.hidden.insert(U.to_string());
         s.moderation.hidden.insert(U2.to_string());
@@ -1068,6 +1149,34 @@ mod tests {
                 kept(format!("subject {U2}"), "catalog block lifted"),
             ]
         );
+
+        // The catalog blocks stand, the suspensions are lifted.
+        catalog_block(&mut s, U);
+        catalog_block(&mut s, U2);
+        let out = decide(&s, &r);
+        assert!(out.due.is_empty(), "{:?}", out.due);
+        assert_eq!(
+            out.kept,
+            [
+                kept(format!("envelope {}", h("e1")), "owner hidden"),
+                kept(format!("envelope {}", h("e2")), "owner hidden"),
+                kept(format!("subject {U2}"), "suspension lifted"),
+            ]
+        );
+
+        // Both stand: released.
+        suspend(&mut s, U);
+        suspend(&mut s, U2);
+        let out = decide(&s, &r);
+        assert_eq!(
+            out.due,
+            [
+                Item::Envelope(h("e1")),
+                Item::Envelope(h("e2")),
+                Item::Subject(U2.to_string()),
+            ]
+        );
+        assert!(out.kept.is_empty(), "{:?}", out.kept);
     }
 
     #[test]
@@ -1102,7 +1211,7 @@ mod tests {
         let mut s = Snapshot::default();
         owns(&mut s, &h("a1"), "u1");
         owns(&mut s, &h("a2"), "u1");
-        catalog_block(&mut s, "u1");
+        block_and_suspend(&mut s, "u1");
         let mut r = Requests::default();
         subject(&mut r, "u1");
         recording(&mut r, "u1", &h("a2"), NOW - GRACE);

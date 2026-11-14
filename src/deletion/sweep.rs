@@ -108,7 +108,7 @@ const LOST: &str = "lost its publish";
 
 /// Why a subject's tombstone is kept: an envelope request of that owner is
 /// pending, and the tombstone releases it while the owner's catalog block
-/// stands (`due::everything_requested`).
+/// and suspension stand (`due::everything_requested`).
 const ENVELOPES_PENDING: &str = "envelopes pending";
 
 /// What a run did, or in a dry run would do. [`fmt::Display`] prints
@@ -653,8 +653,9 @@ fn newest_push<'a>(versions: impl IntoIterator<Item = &'a VersionInfo>) -> Optio
 /// the push. `None` for any other item, with no push, when none is older,
 /// or when another request still has the hash due without them: an
 /// operator's, whose own rules hold whatever a push does (scope `subject`
-/// while the catalog block stands; scope `hash` while the block does, and
-/// the node refuses a blocked hash's push).
+/// while the catalog block and the suspension stand, and the node refuses
+/// a suspended account's push; scope `hash` while the block does, and the
+/// node refuses a blocked hash's push).
 ///
 /// Step 6 only, not the tombstones' verification: every write that
 /// recreates a deleted recording is after its drop, and one within the
@@ -924,9 +925,10 @@ async fn delete_item<O: ObjectStore>(
 /// 4. no object: forget them.
 ///
 /// A subject's tombstone is not forgotten while an envelope request of
-/// that owner is pending and the owner's catalog block stands: it releases
-/// those envelopes from a hidden catalog then (`due::everything_requested`).
-/// With the block lifted it releases nothing, and goes.
+/// that owner is pending and the owner's catalog block and suspension
+/// stand ([`due::all_lifted`]): it releases those envelopes from a hidden
+/// catalog then (`due::everything_requested`). With either lifted it
+/// releases nothing, and goes.
 ///
 /// It reads the bucket again first: with `delete`, the requests and their
 /// write times too; in a dry run, which wrote nothing, it takes
@@ -1001,7 +1003,7 @@ async fn verify_tombstones<O: ObjectStore>(
         };
         // A subject has no rule 2: this holds rules 1 and 4.
         if let Item::Subject(sub) = &group.item
-            && read.moderation.catalog_blocked.contains(sub)
+            && due::all_lifted(&read.moderation, sub).is_none()
             && envelopes_pending(requests, &read.catalogs, sub)
         {
             report.kept(&id, ENVELOPES_PENDING);
@@ -1177,9 +1179,10 @@ fn object_keys(item: &Item) -> Vec<String> {
 
 /// The keys of the pointers rule 3 deletes again, now or once their
 /// subject's tombstone is [`VERIFY_AFTER`] old: those of a subject with a
-/// `subjects/` tombstone of any age whose catalog block stands, whose
-/// current version was written by [`VERIFY_AFTER`] after the tombstone was
-/// (`written`, by key: an in-flight publish). One written later is a
+/// `subjects/` tombstone of any age whose catalog block and suspension
+/// stand ([`due::all_lifted`]), whose current version was written by
+/// [`VERIFY_AFTER`] after the tombstone was (`written`, by key: an
+/// in-flight publish). One written later is a
 /// returning creator's, and counts. A tombstone whose write time is
 /// unknown makes every pointer of its subject late: rule 2 then forgets
 /// nothing on their account.
@@ -1192,9 +1195,7 @@ async fn late_pointers<O: ObjectStore>(
     let written_by: BTreeMap<&str, i64> = requests
         .subjects
         .iter()
-        .filter(|(sub, r)| {
-            r.state == State::Deleted && moderation.catalog_blocked.contains(sub.as_str())
-        })
+        .filter(|(sub, r)| r.state == State::Deleted && due::all_lifted(moderation, sub).is_none())
         .map(|(sub, _)| {
             let by = written
                 .get(&subject_key(sub))
@@ -1558,6 +1559,30 @@ mod tests {
         );
     }
 
+    fn suspend(m: &MemObjects, sub: &str) {
+        put(
+            m,
+            &format!("moderation/suspensions/{sub}"),
+            json!({"subject": sub, "reason": "r", "hideCatalog": false, "by": "op", "at": 1}),
+        );
+    }
+
+    fn lift_suspension(m: &MemObjects, sub: &str) {
+        put(
+            m,
+            &format!("moderation/suspensions/{sub}"),
+            json!({"subject": sub, "reason": "r", "hideCatalog": false, "by": "op", "at": 1,
+                   "liftedAt": 2}),
+        );
+    }
+
+    /// `request-deletion --all`'s preconditions: a catalog block and a
+    /// suspension.
+    fn block_and_suspend(m: &MemObjects, sub: &str) {
+        catalog_block(m, sub);
+        suspend(m, sub);
+    }
+
     fn subject_request(m: &MemObjects, sub: &str) {
         put(
             m,
@@ -1753,7 +1778,7 @@ mod tests {
         publish_2(&m, &arkavo(U), 1, b"doc-a", &[]);
         publish_2(&m, U, 1, b"doc-b", &[]);
         publish_2(&m, U2, 1, b"doc-c", &[]);
-        catalog_block(&m, U);
+        block_and_suspend(&m, U);
         subject_request(&m, U);
 
         let report = sweep(&m, true, NOW).await.unwrap();
@@ -1769,6 +1794,60 @@ mod tests {
         let r: SubjectRequest = record(&m, &subject_key(U)).await;
         assert_eq!(r.state, State::Deleted);
         assert_eq!(r.deleted_at, Some(NOW));
+    }
+
+    /// `--all`'s preconditions are re-checked at each item's fresh read,
+    /// the suspension as the catalog block: lifted after the first read,
+    /// the subject and its scope-`subject` recording are kept, and the
+    /// recording its pointer lists stays listed.
+    #[tokio::test]
+    async fn a_suspension_lifted_after_the_first_read_keeps_the_subject() {
+        let m = bucket();
+        let p = h("a1");
+        recording(&m, &p, U);
+        let t = publish(&m, U, 1, b"doc-u", &[&p], None, NOW - 10, &[], &[&p]);
+        block_and_suspend(&m, U);
+        subject_request(&m, U);
+        put(
+            &m,
+            &operator_key(U, &p),
+            OperatorRequest {
+                hash: p.clone(),
+                subject: U.into(),
+                requested_at: NOW,
+                reason: "account closed".into(),
+                scope: Scope::Subject,
+                state: State::Pending,
+                deleted_at: None,
+            },
+        );
+        // Once the run has decided (it folds `t` first), the operator lifts
+        // the suspension.
+        m.on_before_delete(&t.key, |m| lift_suspension(m, U));
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert!(
+            has(&report, &format!("kept subject {U}: suspension lifted")),
+            "{report}"
+        );
+        assert!(
+            has(&report, &format!("kept recording {p}: suspension lifted")),
+            "{report}"
+        );
+        assert_eq!((report.deleted, report.failures), (0, 0), "{report}");
+        assert!(
+            m.get(&format!("catalog-pointers/{U}"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        for key in recording_keys(&p) {
+            assert!(m.get(&key).await.unwrap().is_some(), "{key}");
+        }
+        let r: SubjectRequest = record(&m, &subject_key(U)).await;
+        assert_eq!(r.state, State::Pending);
+        let r: OperatorRequest = record(&m, &operator_key(U, &p)).await;
+        assert_eq!(r.state, State::Pending);
     }
 
     #[tokio::test]
@@ -2149,7 +2228,7 @@ mod tests {
         let p = h("a1");
         recording(&m, &p, U);
         publish_2(&m, U, 1, b"doc-u", &[&p]);
-        catalog_block(&m, U);
+        block_and_suspend(&m, U);
         subject_request(&m, U);
         put(
             &m,
@@ -2204,7 +2283,7 @@ mod tests {
         let e = catalog(b"doc-u");
         m.insert_with_owner(&format!("catalog-documents/{e}"), "doc-u", U);
         m.insert(&format!("catalog-outboards/{e}"), "outboard");
-        catalog_block(&m, U);
+        block_and_suspend(&m, U);
         subject_request(&m, U);
         // Observed on an earlier run, a grace period ago.
         put(
@@ -2732,7 +2811,7 @@ mod tests {
     async fn a_pointer_written_during_the_fresh_read_survives() {
         let m = bucket();
         let t = publish(&m, U, 1, b"doc-u", &[], None, NOW - 10, &[], &[]);
-        catalog_block(&m, U);
+        block_and_suspend(&m, U);
         subject_request(&m, U);
         let pointer = format!("catalog-pointers/{U}");
         let body = m.get(&pointer).await.unwrap().unwrap();
@@ -2979,7 +3058,7 @@ mod tests {
         recording(&m, &p, U);
         request(&m, U, &p, NOW - GRACE);
         operator(&m, &p);
-        catalog_block(&m, U);
+        block_and_suspend(&m, U);
 
         let report = sweep(&m, true, NOW).await.unwrap();
         assert_eq!(
@@ -3350,7 +3429,7 @@ mod tests {
             tombstone(&m, U, &p);
             rewrite_at(&m, &subject_key(U), late).await;
             rewrite_at(&m, &recording_key(U, &p), late).await;
-            catalog_block(&m, U);
+            block_and_suspend(&m, U);
             m.set_now(late + 10);
             recording(&m, &p, U);
             publish_2(&m, U, 1, b"doc-late", &[&p]);
@@ -3451,7 +3530,7 @@ mod tests {
         async fn a_subject_tombstone_waits_for_its_envelopes() {
             let m = MemObjects::default();
             subject_tombstone(&m, U);
-            catalog_block(&m, U);
+            block_and_suspend(&m, U);
             // Its owner named by the index record only, in the other form.
             let e = envelope(&m, &arkavo(U), b"doc-u");
             put(
@@ -3523,7 +3602,7 @@ mod tests {
         async fn a_late_pointer_is_deleted_again_while_the_block_stands() {
             let m = MemObjects::default();
             subject_tombstone(&m, U);
-            catalog_block(&m, U);
+            block_and_suspend(&m, U);
             publish_2(&m, U2, 1, b"doc-other", &[]);
             m.set_now(T + 10);
             publish_2(&m, U, 1, b"doc-late", &[]);
@@ -3551,6 +3630,80 @@ mod tests {
             );
             assert!(m.get(&pointer).await.unwrap().is_some());
             assert!(m.get(&subject_key(U)).await.unwrap().is_some());
+
+            // The same with the block standing and the suspension lifted.
+            let m = MemObjects::default();
+            subject_tombstone(&m, U);
+            catalog_block(&m, U);
+            lift_suspension(&m, U);
+            m.set_now(T + 10);
+            publish_2(&m, U, 1, b"doc-late", &[]);
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(
+                has(&report, &format!("kept subject {U}: suspension lifted")),
+                "{report}"
+            );
+            assert!(m.get(&pointer).await.unwrap().is_some());
+            assert!(m.get(&subject_key(U)).await.unwrap().is_some());
+        }
+
+        /// A deleted subject's late pointer lists and names nothing only
+        /// while rule 3 can delete it again: with the suspension lifted it
+        /// stays, so the recording it lists is listed again, and kept.
+        #[tokio::test]
+        async fn a_late_pointer_lists_once_the_suspension_is_lifted() {
+            let m = MemObjects::default();
+            let p = h("a1");
+            subject_tombstone(&m, U);
+            catalog_block(&m, U);
+            lift_suspension(&m, U);
+            tombstone(&m, U, &p);
+            m.set_now(T + 10);
+            recording(&m, &p, U);
+            publish_2(&m, U, 1, b"doc-late", &[&p]);
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert!(
+                has(&report, &format!("kept subject {U}: suspension lifted")),
+                "{report}"
+            );
+            assert!(
+                has(&report, &format!("listed again recording {p}")),
+                "{report}"
+            );
+            assert_eq!(report.failures, 0);
+            for key in recording_keys(&p) {
+                assert!(m.get(&key).await.unwrap().is_some(), "{key}");
+            }
+            assert!(gone(&m, &recording_key(U, &p)).await);
+        }
+
+        /// With the suspension lifted, a subject's tombstone releases
+        /// nothing either: the catalog block still hides its owner's
+        /// envelope, and the tombstone verifies all the same.
+        #[tokio::test]
+        async fn a_lifted_suspensions_subject_tombstone_releases_nothing() {
+            let m = MemObjects::default();
+            subject_tombstone(&m, U);
+            catalog_block(&m, U);
+            lift_suspension(&m, U);
+            let e = envelope(&m, U, b"doc-u");
+            envelope_request(&m, &e, U, AT - GRACE);
+
+            let report = sweep(&m, true, AT).await.unwrap();
+            assert_eq!(
+                report.lines,
+                [
+                    format!("verified subject {U}"),
+                    format!("kept envelope {e}: owner hidden"),
+                ],
+                "{report}"
+            );
+            assert!(gone(&m, &subject_key(U)).await);
+            for key in envelope_keys(&e) {
+                assert!(m.get(&key).await.unwrap().is_some(), "{key}");
+            }
         }
 
         /// A late envelope a stored pointer names stays (the pointer is
@@ -3562,7 +3715,7 @@ mod tests {
             let m = MemObjects::default();
             let e = catalog(b"doc-u");
             envelope_tombstone(&m, &e, U, T);
-            catalog_block(&m, U);
+            block_and_suspend(&m, U);
             subject_request(&m, U);
             m.set_now(T + 10);
             publish_2(&m, U, 1, b"doc-u", &[]);
@@ -3646,7 +3799,7 @@ mod tests {
         async fn a_dry_run_verifies_against_what_it_would_write() {
             let m = MemObjects::default();
             subject_tombstone(&m, U);
-            catalog_block(&m, U);
+            block_and_suspend(&m, U);
             // Untracked: observed this run, owned by `U`.
             envelope(&m, U, b"doc-u");
 
@@ -3667,7 +3820,7 @@ mod tests {
             let m = MemObjects::default();
             let p = h("a1");
             subject_tombstone(&m, U);
-            catalog_block(&m, U);
+            block_and_suspend(&m, U);
             tombstone(&m, U, &p);
             m.set_now(T + 10);
             recording(&m, &p, U);
@@ -3694,7 +3847,7 @@ mod tests {
             let m = MemObjects::default();
             let p = h("a1");
             subject_tombstone_at(&m, U, T + 1);
-            catalog_block(&m, U);
+            block_and_suspend(&m, U);
             tombstone(&m, U, &p);
             m.set_now(T + 10);
             recording(&m, &p, U);
@@ -3716,7 +3869,7 @@ mod tests {
             let m = MemObjects::default();
             let p = h("a1");
             subject_tombstone(&m, U);
-            catalog_block(&m, U);
+            block_and_suspend(&m, U);
             tombstone(&m, U, &p);
             m.set_now(T + 10);
             recording(&m, &p, U);
@@ -3742,7 +3895,7 @@ mod tests {
             let m = MemObjects::default();
             let e = catalog(b"doc-e");
             subject_tombstone(&m, U);
-            catalog_block(&m, U);
+            block_and_suspend(&m, U);
             envelope_tombstone(&m, &e, U, T);
             m.set_now(T + 10);
             publish_2(&m, U, 1, b"doc-e", &[]);

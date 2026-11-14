@@ -101,7 +101,8 @@ pub enum Source {
 pub enum Scope {
     /// One blocked hash (`request-deletion --hash`).
     Hash,
-    /// One hash of a catalog-blocked subject (`request-deletion --all`).
+    /// One hash of a catalog-blocked, suspended subject
+    /// (`request-deletion --all`).
     Subject,
 }
 

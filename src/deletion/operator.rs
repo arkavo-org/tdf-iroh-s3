@@ -7,9 +7,14 @@
 //!   hash is refused: the sweep deletes only a recording's objects for it.
 //! - [`request_all`] (`--all`): everything an account published, for a
 //!   creator who can't publish an empty catalog (decision 6). Its
-//!   precondition is the account's active catalog block. Writes a
-//!   scope-`subject` `operator/<sub>/<hash>` for every hash in a live index
-//!   of the account's pointers and every hash its owner records name, then
+//!   preconditions are the account's active catalog block and its active
+//!   suspension: a catalog block hides the catalog but doesn't stop
+//!   publishing, and a pointer the account published after the sweep
+//!   deleted its pointers would make the tombstone's verification forget
+//!   the request as fresh. A suspended account can't publish. The sweep
+//!   re-checks both (`due::all_lifted`). Writes a scope-`subject`
+//!   `operator/<sub>/<hash>` for every hash in a live index of the
+//!   account's pointers and every hash its owner records name, then
 //!   `subjects/<sub>`, which deletes its pointers. That is its whole
 //!   coverage: anything else needs `--hash`.
 //!
@@ -102,7 +107,7 @@ pub async fn request_hashes<O: ObjectStore>(
 /// deduplicated, in hash order; then `subjects/<sub>`, last. `Err`, with
 /// nothing written, if the subject or the reason is invalid, if anything
 /// in the bucket is unreadable, or if the subject has no active catalog
-/// block.
+/// block or, that checked first, no active suspension.
 pub async fn request_all<O: ObjectStore>(
     store: &O,
     subject: &str,
@@ -115,6 +120,10 @@ pub async fn request_all<O: ObjectStore>(
     anyhow::ensure!(
         snapshot.moderation.catalog_blocked.contains(sub),
         "{sub} has no active catalog block: --all needs one"
+    );
+    anyhow::ensure!(
+        snapshot.moderation.suspended.contains(sub),
+        "{sub} has no active suspension: --all needs one"
     );
     let catalogs = &snapshot.catalogs;
     let mut hashes = BTreeSet::new();
@@ -291,6 +300,22 @@ mod tests {
         );
     }
 
+    fn suspension(m: &MemObjects, subject: &str, lifted_at: Option<i64>) {
+        put(
+            m,
+            &format!("moderation/suspensions/{subject}"),
+            json!({"subject": subject, "reason": "r", "hideCatalog": false, "by": "op", "at": 1,
+                   "liftedAt": lifted_at}),
+        );
+    }
+
+    /// `--all`'s preconditions: an active catalog block and an active
+    /// suspension.
+    fn block_and_suspend(m: &MemObjects, subject: &str) {
+        catalog_block(m, subject, None);
+        suspension(m, subject, None);
+    }
+
     fn owner(m: &MemObjects, hash: &str, subject: &str) {
         put(
             m,
@@ -390,7 +415,7 @@ mod tests {
     async fn arguments_the_sweep_could_not_read_back_are_refused() {
         let m = MemObjects::default();
         block(&m, &h("a1"), None);
-        catalog_block(&m, U, None);
+        block_and_suspend(&m, U);
         let ok = [h("a1")];
         let refused = |result: anyhow::Result<Vec<Requested>>, why: &str| {
             let err = result.unwrap_err().to_string();
@@ -423,21 +448,25 @@ mod tests {
     async fn all_needs_an_active_catalog_block() {
         let m = MemObjects::default();
         publish_2(&m, U, 1, b"doc", &[&h("a1")]);
-        assert!(request_all(&m, U, WHY, NOW).await.is_err(), "no block");
+        let no_block = format!("{U} has no active catalog block: --all needs one");
+        let refused = |result: anyhow::Result<Vec<Requested>>| result.unwrap_err().to_string();
+        assert_eq!(refused(request_all(&m, U, WHY, NOW).await), no_block);
 
-        // A lifted catalog block, or a hideCatalog suspension, is not one.
+        // A lifted catalog block, or a hideCatalog suspension, is not one;
+        // the block is checked first.
         catalog_block(&m, U, Some(5));
         put(
             &m,
             &format!("moderation/suspensions/{U}"),
             json!({"subject": U, "reason": "r", "hideCatalog": true, "by": "op", "at": 1}),
         );
-        assert!(request_all(&m, U, WHY, NOW).await.is_err(), "lifted");
+        assert_eq!(refused(request_all(&m, U, WHY, NOW).await), no_block);
         // Another account's block isn't this one's.
         catalog_block(&m, U2, None);
-        assert!(request_all(&m, U, WHY, NOW).await.is_err(), "another's");
+        assert_eq!(refused(request_all(&m, U, WHY, NOW).await), no_block);
         assert_eq!(request_writes(&m).await, 0, "nothing written");
 
+        // The hideCatalog suspension stands: with the block, it proceeds.
         catalog_block(&m, U, None);
         let out = request_all(&m, U, WHY, NOW).await.unwrap();
         assert_eq!(
@@ -447,6 +476,55 @@ mod tests {
                 requested(subject_key(U))
             ]
         );
+    }
+
+    /// A catalog block hides the catalog but doesn't stop publishing: once
+    /// the sweep deleted its pointers, the account could publish afresh,
+    /// and the tombstone would be forgotten as fresh. A suspension stops
+    /// that, so `--all` needs one too, `hideCatalog` or not.
+    #[tokio::test]
+    async fn all_needs_an_active_suspension() {
+        let m = MemObjects::default();
+        publish_2(&m, U, 1, b"doc", &[&h("a1")]);
+        owner(&m, &h("a2"), U);
+        catalog_block(&m, U, None);
+        let no_suspension = format!("{U} has no active suspension: --all needs one");
+        let refused = |result: anyhow::Result<Vec<Requested>>| result.unwrap_err().to_string();
+        assert_eq!(refused(request_all(&m, U, WHY, NOW).await), no_suspension);
+
+        // A lifted suspension is none, and another account's isn't this
+        // one's.
+        suspension(&m, U, Some(5));
+        suspension(&m, U2, None);
+        assert_eq!(refused(request_all(&m, U, WHY, NOW).await), no_suspension);
+        assert_eq!(request_writes(&m).await, 0, "nothing written");
+
+        // Without the block too, the block is named.
+        let m2 = MemObjects::default();
+        suspension(&m2, U, None);
+        assert_eq!(
+            refused(request_all(&m2, U, WHY, NOW).await),
+            format!("{U} has no active catalog block: --all needs one")
+        );
+        assert_eq!(request_writes(&m2).await, 0, "nothing written");
+
+        // Suspended (keyed canonically, asked for as `arkavo:<uuid>`): it
+        // proceeds as before.
+        suspension(&m, U, None);
+        let out = request_all(&m, &format!("arkavo:{U}"), WHY, NOW)
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            [
+                requested(operator_key(U, &h("a1"))),
+                requested(operator_key(U, &h("a2"))),
+                requested(subject_key(U))
+            ]
+        );
+        let back = read_back(&m).await;
+        assert_eq!(back.operator.len(), 2);
+        assert_eq!(back.subjects[U], subject(U));
     }
 
     #[tokio::test]
@@ -464,7 +542,7 @@ mod tests {
         // Another account's recording, listed and owned.
         publish_2(&m, U2, 1, b"doc-u2", &[&h("d1")]);
         owner(&m, &h("d1"), U2);
-        catalog_block(&m, U, None);
+        block_and_suspend(&m, U);
 
         let out = request_all(&m, U, WHY, NOW).await.unwrap();
         let mut expected: Vec<String> = ["a1", "a2", "b1", "c3", "c4"]
@@ -500,7 +578,7 @@ mod tests {
         let m = MemObjects::default();
         let arkavo = format!("arkavo:{U}");
         block(&m, &h("a1"), None);
-        catalog_block(&m, U, None);
+        block_and_suspend(&m, U);
         owner(&m, &h("a2"), U);
 
         let out = request_hashes(&m, &arkavo, &[h("a1")], WHY, NOW)
@@ -589,7 +667,7 @@ mod tests {
         );
 
         // The same for `subjects/<sub>`.
-        catalog_block(&m, U, None);
+        block_and_suspend(&m, U);
         let first = SubjectRequest {
             requested_at: 7,
             ..subject(U)
@@ -624,7 +702,7 @@ mod tests {
     #[tokio::test]
     async fn a_pending_request_of_the_scope_that_cannot_delete_is_rewritten() {
         let m = MemObjects::default();
-        catalog_block(&m, U, None);
+        block_and_suspend(&m, U);
         owner(&m, &h("a1"), U);
         owner(&m, &h("a2"), U);
         owner(&m, &h("a3"), U);
@@ -687,7 +765,7 @@ mod tests {
     async fn an_unreadable_record_writes_nothing() {
         let m = MemObjects::default();
         block(&m, &h("a1"), None);
-        catalog_block(&m, U, None);
+        block_and_suspend(&m, U);
         owner(&m, &h("a1"), U);
         let bad = operator_key(U2, &h("b1"));
         m.insert(&bad, "not a request");

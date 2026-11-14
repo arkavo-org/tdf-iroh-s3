@@ -85,6 +85,8 @@ pub struct ModerationView {
     /// Canonical subjects whose catalog is hidden: an active catalog block,
     /// or an active suspension with `hideCatalog`.
     pub hidden: HashSet<String>,
+    /// Canonical subjects with an active suspension, `hideCatalog` or not.
+    pub suspended: HashSet<String>,
 }
 
 /// Read everything the sweep decides on, strictly (see the module doc).
@@ -245,8 +247,13 @@ async fn moderation<O: ObjectStore>(store: &O) -> anyhow::Result<ModerationView>
     let mut view = ModerationView::default();
     for (ObjectInfo { key, .. }, body) in bodies(store, &moderation_prefix(SUSPENSIONS)).await? {
         let s = moderation_record::<Suspension>(&key, &body, SUSPENSIONS, SUBJECT, |s| &s.subject)?;
-        if s.lifted_at.is_none() && s.hide_catalog {
-            view.hidden.insert(s.subject);
+        // Active as the publish gate has it (`Moderation::reload`): no
+        // `liftedAt`. A suspension has no expiry.
+        if s.lifted_at.is_none() {
+            if s.hide_catalog {
+                view.hidden.insert(s.subject.clone());
+            }
+            view.suspended.insert(s.subject);
         }
     }
     for (ObjectInfo { key, .. }, body) in bodies(store, &moderation_prefix(BLOCKS)).await? {
@@ -543,6 +550,11 @@ mod tests {
             view.hidden,
             HashSet::from(["c1".to_string(), "s1".to_string(), U2.to_string()]),
             "active catalog blocks and hideCatalog suspensions"
+        );
+        assert_eq!(
+            view.suspended,
+            HashSet::from(["s1".to_string(), "s2".to_string(), U2.to_string()]),
+            "active suspensions, hideCatalog or not"
         );
 
         assert_eq!(
