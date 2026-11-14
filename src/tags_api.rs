@@ -59,13 +59,15 @@ pub trait TagStore: Send + Sync + 'static {
         hash_hex: &str,
         outboard: Bytes,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
-    /// Store a catalog's index record (`catalog-indexes/<hash>`), never
-    /// served.
-    fn put_catalog_index(
+    /// Create a catalog's index record (`catalog-indexes/<hash>`, never
+    /// served) only if none exists: one envelope has one index. `false`
+    /// when one already does, or when a concurrent create of it is still in
+    /// flight.
+    fn create_catalog_index(
         &self,
         hash_hex: &str,
         body: Bytes,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    ) -> impl Future<Output = anyhow::Result<bool>> + Send;
     /// A catalog's index record; `None` for a catalog stored without one.
     fn get_catalog_index(
         &self,
@@ -152,8 +154,8 @@ impl TagStore for crate::store::s3::S3Client {
         Self::put_catalog_outboard(self, hash_hex, outboard).await
     }
 
-    async fn put_catalog_index(&self, hash_hex: &str, body: Bytes) -> anyhow::Result<()> {
-        Self::put_catalog_index(self, hash_hex, body).await
+    async fn create_catalog_index(&self, hash_hex: &str, body: Bytes) -> anyhow::Result<bool> {
+        Self::create_catalog_index(self, hash_hex, body).await
     }
 
     async fn get_catalog_index(&self, hash_hex: &str) -> anyhow::Result<Option<Bytes>> {
@@ -297,6 +299,9 @@ pub(crate) mod test_support {
         /// The next conditional pointer write loses, as if another publish
         /// had moved the pointer since it was read.
         pub lose_next_pointer_race: std::sync::atomic::AtomicBool,
+        /// The next index record create loses without writing, as if a
+        /// concurrent create of the same record were still in flight.
+        pub lose_next_index_create: std::sync::atomic::AtomicBool,
     }
 
     impl MemStore {
@@ -409,13 +414,27 @@ pub(crate) mod test_support {
                 .insert(hash_hex.to_string(), outboard);
             Ok(())
         }
-        async fn put_catalog_index(&self, hash_hex: &str, body: Bytes) -> anyhow::Result<()> {
+        /// As S3's `If-None-Match: *`: the first body stays.
+        async fn create_catalog_index(&self, hash_hex: &str, body: Bytes) -> anyhow::Result<bool> {
             self.up()?;
-            self.catalog_indexes
+            if self
+                .lose_next_index_create
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                return Ok(false);
+            }
+            match self
+                .catalog_indexes
                 .lock()
                 .await
-                .insert(hash_hex.to_string(), body);
-            Ok(())
+                .entry(hash_hex.to_string())
+            {
+                std::collections::hash_map::Entry::Occupied(_) => Ok(false),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(body);
+                    Ok(true)
+                }
+            }
         }
         async fn get_catalog_index(&self, hash_hex: &str) -> anyhow::Result<Option<Bytes>> {
             self.up()?;

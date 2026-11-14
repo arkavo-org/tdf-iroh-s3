@@ -2,16 +2,20 @@
 //!
 //! - `PUT /v2/catalogs/{sub}` — publish: the catalog document, the
 //!   creator's passkey-signed pointer bundle and the catalog's clear index.
-//!   The document is a ZTDF envelope whose payload is the
+//!   The pointer is `arkavo.catalog-pointer/2`, whose `indexHash` is the
+//!   SHA-256 of the canonical index sent with it, so the passkey signs the
+//!   index too. The document is a ZTDF envelope whose payload is the
 //!   `arkavo.creator-catalog/2` document, under one attribute
 //!   (`catalog_metadata::check_envelope`); the node never decrypts it and
-//!   checks the recordings it lists through the index, which it stores at
-//!   `catalog-indexes/<hash>` and never serves. The document is stored
-//!   under `catalog-documents/<blake3>` with its BAO outboard, so it is
-//!   served over iroh; the bundle replaces `catalog-pointers/<sub>` only
-//!   when its `seq` is greater than the stored one's, and only when the
-//!   stored pointer is still the base named by `If-Match` /
-//!   `If-None-Match`, if given (tdf-iroh-s3#29; 412 otherwise).
+//!   checks the recordings it lists through the index, which it stores
+//!   once per envelope at `catalog-indexes/<hash>` (`If-None-Match: *`;
+//!   another index for the same envelope is a 409) and never serves. The
+//!   document is stored under `catalog-documents/<blake3>` with its BAO
+//!   outboard, so it is served over iroh; the bundle replaces
+//!   `catalog-pointers/<sub>` only when its `seq` is greater than the
+//!   stored one's, and only when the stored pointer is still the base named
+//!   by `If-Match` / `If-None-Match` (tdf-iroh-s3#29; 412 otherwise), one of
+//!   which is required (428 without).
 //! - `GET /v2/catalogs/{sub}` — a token, then the catalog decision: whether
 //!   the reader may open the envelope's attribute (403 otherwise). The
 //!   stored bundle, with `ETag: "<seq>"`, which readers verify themselves
@@ -39,12 +43,12 @@ use tracing::{info, warn};
 
 use crate::authz::{DecisionProvider, DecisionRequest, ResourceType, SharedDecisionProvider};
 use crate::catalog_metadata::{self, CAMPAIGN_FQN_PREFIX, EnvelopeRefusal};
-use crate::catalog_v2::{self, Bundle, BundleError, Passkeys};
+use crate::catalog_v2::{self, Bundle, BundleError, POINTER_SCHEMA, Passkeys};
 use crate::catalogs_api::{check_payloads, is_json, owner_hidden};
 use crate::creator_catalog::{
     self, MAX_CATALOG_BYTES, MAX_OWNER_BYTES, NoDuplicateKeys, valid_identifier,
 };
-use crate::moderation::{bearer, now_secs};
+use crate::moderation::{bearer, canonical_subject, now_secs};
 use crate::tags_api::{
     ApiState, TagStore, authorize_catalog_reader, authorize_publisher, is_blocked,
 };
@@ -371,6 +375,14 @@ async fn put_catalog<S: TagStore>(
         }
     })?;
     let pointer = &verified.pointer;
+    // A publish carries `/2`, whose `indexHash` binds the index to the
+    // passkey. Stored `/1` pointers are still read and served.
+    if pointer.schema != POINTER_SCHEMA {
+        return Err(reject(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("invalid bundle: pointer schema must be \"{POINTER_SCHEMA}\""),
+        ));
+    }
 
     // 4. The pointer names exactly this document: an envelope of `sub`'s
     //    catalog under one attribute.
@@ -397,8 +409,10 @@ async fn put_catalog<S: TagStore>(
     }
 
     // 5. The index: the recordings the envelope lists, which the node can't
-    //    read. Nothing blocked, every payload ingested at its size, owned by
-    //    the publisher (gated only), with a stored manifest, each recording
+    //    read. It must be the index the passkey signed (`indexHash`, over
+    //    its canonical form), checked before anything is looked up. Nothing
+    //    blocked, every payload ingested at its size, owned by the
+    //    publisher (gated only), with a stored manifest, each recording
     //    carrying the envelope's attribute. The metadata TDFs inside the
     //    envelope are Creator's to check.
     let index = req.index.clone();
@@ -408,6 +422,13 @@ async fn put_catalog<S: TagStore>(
             format!("invalid index: {why}"),
         )
     })?;
+    let index_hash = creator_catalog::index_hash(&entries);
+    if pointer.index_hash.as_deref() != Some(index_hash.as_str()) {
+        return Err(reject(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid bundle: indexHash does not match the index".into(),
+        ));
+    }
     if is_blocked(api, &hash) {
         return Err(reject(StatusCode::FORBIDDEN, "content is blocked".into()));
     }
@@ -430,8 +451,14 @@ async fn put_catalog<S: TagStore>(
             }
         })?;
 
-    // 7. Merged from the stored pointer, if the request names its base,
-    //    and newer than it.
+    // 7. Merged from the stored pointer the request names as its base
+    //    (one of the two headers is required), and newer than it.
+    if !headers.contains_key(header::IF_MATCH) && !headers.contains_key(header::IF_NONE_MATCH) {
+        return Err(reject(
+            StatusCode::PRECONDITION_REQUIRED,
+            "precondition required".into(),
+        ));
+    }
     let current = api
         .store
         .get_catalog_pointer(&sub)
@@ -480,7 +507,9 @@ async fn put_catalog<S: TagStore>(
 
     // 8. The document, its outboard and its index first, so a stored
     //    pointer never names a document that cannot be served or decided;
-    //    then the pointer, only if nobody else moved it meanwhile.
+    //    then the pointer, only if nobody else moved it meanwhile. The index
+    //    record is created once: one envelope has one index, so a publish
+    //    that lost can't rewrite the committed pointer's index.
     let outboard = crate::ingest::compute_outboard(
         &document[..],
         document.len() as u64,
@@ -502,13 +531,38 @@ async fn put_catalog<S: TagStore>(
         .put_catalog_outboard(&hash, Bytes::from(outboard))
         .await
         .map_err(|e| storage_unavailable("Catalog outboard write", e))?;
-    api.store
-        .put_catalog_index(
+    let created = api
+        .store
+        .create_catalog_index(
             &hash,
             Bytes::from(serde_json::to_vec(&record).expect("record serializes")),
         )
         .await
         .map_err(|e| storage_unavailable("Catalog index write", e))?;
+    if !created {
+        // The envelope already has a record: a retry of this publish goes
+        // on, another index is a 409, and none readable yet (a concurrent
+        // create still in flight) is a 502.
+        let existing = api
+            .store
+            .get_catalog_index(&hash)
+            .await
+            .map_err(|e| storage_unavailable("Catalog index read", e))?
+            .ok_or_else(|| {
+                storage_unavailable(
+                    "Catalog index read",
+                    anyhow::anyhow!("index record {hash} exists but can't be read yet"),
+                )
+            })?;
+        let retry = is_retry(&existing, &sub, &index_hash)
+            .map_err(|e| storage_unavailable("Catalog index parse", e))?;
+        if !retry {
+            return Err(reject(
+                StatusCode::CONFLICT,
+                "catalog document already published with another index".into(),
+            ));
+        }
+    }
     let bundle = serde_json::to_vec(&req.bundle).expect("bundle serializes");
     let written = api
         .store
@@ -528,6 +582,18 @@ async fn put_catalog<S: TagStore>(
         "hash": hash,
         "size": size,
     })))
+}
+
+/// Whether a stored index record is a retry of this publish: `sub`'s
+/// (subjects compared canonically), and its entries' canonical hash is
+/// `index_hash`. `Err` when the record doesn't parse: the node wrote it, so
+/// that is a storage fault.
+fn is_retry(record: &[u8], sub: &str, index_hash: &str) -> anyhow::Result<bool> {
+    let record: IndexRecord = serde_json::from_slice(record)?;
+    let entries = creator_catalog::parse_index(record.entries)
+        .map_err(|why| anyhow::anyhow!("invalid index: {why}"))?;
+    Ok(canonical_subject(&record.owner) == canonical_subject(sub)
+        && creator_catalog::index_hash(&entries) == index_hash)
 }
 
 /// The envelope's one attribute, or the 422 reason `document` is not an
@@ -805,6 +871,16 @@ mod tests {
     }
 
     fn harness_with(decisions: bool) -> Harness {
+        build(decisions, true)
+    }
+
+    /// As [`harness`], on an ungated node (`publishing: None`, development
+    /// only): tokens are verified, nothing else.
+    fn harness_ungated() -> Harness {
+        build(true, false)
+    }
+
+    fn build(decisions: bool, gated: bool) -> Harness {
         let (_, token_vk) = keypair();
         let store = Arc::new(MemStore::new());
         let moderation = Arc::new(Moderation::default());
@@ -814,7 +890,7 @@ mod tests {
                 (b"kid-1".to_vec(), token_vk),
                 (v2::IDP_KID.to_vec(), *v2::idp_key().verifying_key()),
             ])),
-            publishing: Some(TagPublishing {
+            publishing: gated.then(|| TagPublishing {
                 policy: Arc::new(PublishPolicy {
                     entitlement: Some(DEFAULT_PUBLISH_ENTITLEMENT.into()),
                     audience: Some("arkavo".into()),
@@ -921,6 +997,19 @@ mod tests {
         body_with(document, bundle, index())
     }
 
+    /// The `indexHash` of `index`. An index that doesn't parse is refused
+    /// before its hash is compared, so it gets any well-formed hash.
+    fn hash_of_index(index: &serde_json::Value) -> String {
+        creator_catalog::parse_index(index.clone())
+            .map(|entries| creator_catalog::index_hash(&entries))
+            .unwrap_or_else(|_| "0".repeat(64))
+    }
+
+    /// `SUB`'s `/2` bundle for `document` at `seq`, signed over `index`.
+    fn signed(seq: u64, document: &[u8], index: &serde_json::Value) -> Bundle {
+        v2::bundle(SUB, seq, document, Some(&hash_of_index(index)))
+    }
+
     struct Reply {
         status: StatusCode,
         headers: HeaderMap,
@@ -951,8 +1040,20 @@ mod tests {
         }
     }
 
+    /// The precondition a client sends after reading `sub`'s catalog:
+    /// `If-Match: *` once a pointer is stored, `If-None-Match: *` before.
+    async fn read_precondition(h: &Harness, sub: &str) -> (header::HeaderName, &'static str) {
+        if h.store.catalog_pointers.lock().await.contains_key(sub) {
+            (header::IF_MATCH, "*")
+        } else {
+            (header::IF_NONE_MATCH, "*")
+        }
+    }
+
+    /// A publish with the precondition of [`read_precondition`].
     async fn put(h: &Harness, sub: &str, bearer: &str, body: Vec<u8>) -> Reply {
-        put_with(h, sub, bearer, body, &[]).await
+        let precondition = read_precondition(h, sub).await;
+        put_with(h, sub, bearer, body, &[precondition]).await
     }
 
     async fn put_with(
@@ -973,7 +1074,7 @@ mod tests {
         send(&h.app, req.body(Body::from(body)).unwrap()).await
     }
 
-    /// Publishes `seq` with one precondition header.
+    /// Publishes `seq` with exactly one precondition header.
     async fn publish_if(
         h: &Harness,
         seq: u64,
@@ -981,7 +1082,7 @@ mod tests {
         name: header::HeaderName,
         value: &str,
     ) -> Reply {
-        let body = body(document, &v2::bundle(SUB, seq, document, None));
+        let body = body(document, &signed(seq, document, &index()));
         put_with(h, SUB, &token(SUB), body, &[(name, value)]).await
     }
 
@@ -995,7 +1096,7 @@ mod tests {
         document: &[u8],
         index: serde_json::Value,
     ) -> Reply {
-        let body = body_with(document, &v2::bundle(SUB, seq, document, None), index);
+        let body = body_with(document, &signed(seq, document, &index), index);
         put(h, SUB, &token(SUB), body).await
     }
 
@@ -1060,7 +1161,7 @@ mod tests {
         let h = ingested().await;
         let document = envelope(1);
         let hash = hash_of(&document);
-        let bundle = v2::bundle(SUB, 1, &document, None);
+        let bundle = signed(1, &document, &index());
 
         let r = put(&h, SUB, &token(SUB), body(&document, &bundle)).await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
@@ -1270,7 +1371,7 @@ mod tests {
     async fn a_campaign_catalog_comes_from_the_campaign_creator() {
         let h = ingested().await;
         let document = envelope(1);
-        let bundle = || body(&document, &v2::bundle(SUB, 1, &document, None));
+        let bundle = || body(&document, &signed(1, &document, &index()));
         for patreon in [
             None,
             Some(patreon("consumer", None)),
@@ -1341,7 +1442,7 @@ mod tests {
             &h,
             SUB,
             &creator_of_99,
-            body(&document, &v2::bundle(SUB, 1, &document, None)),
+            body(&document, &signed(1, &document, &index())),
         )
         .await;
         assert_eq!(
@@ -1487,7 +1588,7 @@ mod tests {
             assert_precondition_failed(&h, r, &ours, 1).await;
         }
         let served: Bundle = serde_json::from_slice(&get(&h, SUB).await.body).unwrap();
-        assert_eq!(served, v2::bundle(SUB, 7, &theirs, None));
+        assert_eq!(served, signed(7, &theirs, &index()));
 
         let r = publish_if(&h, 11, &ours, header::IF_MATCH, "\"6\", \"7\"").await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.error());
@@ -1548,7 +1649,7 @@ mod tests {
         assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
         let other = envelope(2);
         let put = |none_match: &'static str| {
-            let body = body(&other, &v2::bundle(SUB, 2, &other, None));
+            let body = body(&other, &signed(2, &other, &index()));
             let both = [
                 (header::IF_MATCH, "\"1\""),
                 (header::IF_NONE_MATCH, none_match),
@@ -1573,7 +1674,7 @@ mod tests {
                 .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {}", token(SUB)))
                 .header(name, header::HeaderValue::from_bytes(b"\"1\xff\"").unwrap())
-                .body(Body::from(body(&other, &v2::bundle(SUB, 2, &other, None))))
+                .body(Body::from(body(&other, &signed(2, &other, &index()))))
                 .unwrap();
             let r = send(&h.app, req).await;
             assert_precondition_failed(&h, r, &other, 1).await;
@@ -1600,7 +1701,7 @@ mod tests {
             &h,
             SUB,
             &token("someone-else"),
-            body(&document, &v2::bundle(SUB, 1, &document, None)),
+            body(&document, &signed(1, &document, &index())),
         )
         .await;
         assert_eq!(r.status, StatusCode::FORBIDDEN);
@@ -1614,7 +1715,7 @@ mod tests {
             &h,
             SUB,
             &token(SUB),
-            body(&envelope(1), &v2::bundle(SUB, 1, &envelope(2), None)),
+            body(&envelope(1), &signed(1, &envelope(2), &index())),
         )
         .await;
         assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1625,9 +1726,9 @@ mod tests {
     async fn a_tampered_bundle_is_refused() {
         let h = ingested().await;
         let document = envelope(1);
-        let mut bundle = v2::bundle(SUB, 1, &document, None);
+        let mut bundle = signed(1, &document, &index());
         // Re-point a validly signed bundle at seq 9: the passkey signed seq 1.
-        let pointer = v2::pointer_bytes(SUB, 9, &document, None);
+        let pointer = v2::pointer_bytes(SUB, 9, &document, Some(&hash_of_index(&index())));
         bundle.pointer = URL_SAFE_NO_PAD.encode(pointer);
         let r = put(&h, SUB, &token(SUB), body(&document, &bundle)).await;
         assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1679,6 +1780,263 @@ mod tests {
         assert!(h.decider.asked.lock().unwrap().is_empty());
     }
 
+    /// Nothing of a refused publish is stored: no document, outboard, index
+    /// record or pointer.
+    async fn assert_nothing_stored(h: &Harness) {
+        assert!(h.store.catalog_documents.lock().await.is_empty());
+        assert!(h.store.catalog_outboards.lock().await.is_empty());
+        assert!(h.store.catalog_indexes.lock().await.is_empty());
+        assert!(h.store.catalog_pointers.lock().await.is_empty());
+    }
+
+    /// An index record for `index` as `owner` published it.
+    fn index_record(owner: &str, index: serde_json::Value) -> Bytes {
+        let record = IndexRecord {
+            owner: owner.into(),
+            attribute: CAMPAIGN.into(),
+            entries: index,
+        };
+        Bytes::from(serde_json::to_vec(&record).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_1_publish_is_refused() {
+        let h = ingested().await;
+        let document = envelope(1);
+        let r = put(
+            &h,
+            SUB,
+            &token(SUB),
+            body(&document, &v2::bundle(SUB, 1, &document, None)),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                r#"invalid bundle: pointer schema must be "arkavo.catalog-pointer/2""#
+            )
+        );
+        assert_nothing_stored(&h).await;
+    }
+
+    #[tokio::test]
+    async fn the_index_must_match_its_hash() {
+        let h = ingested().await;
+        let document = envelope(1);
+        let bundle = signed(1, &document, &index());
+        // An empty index publishes on its own, and so does rec-1 at another
+        // version; neither is the index the passkey signed.
+        let mut bumped = entry("rec-1", &payload(1));
+        bumped["version"] = json!(2);
+        for sent in [json!([]), json!([bumped])] {
+            let r = put(&h, SUB, &token(SUB), body_with(&document, &bundle, sent)).await;
+            assert_eq!(
+                (r.status, r.error().as_str()),
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid bundle: indexHash does not match the index"
+                )
+            );
+        }
+        assert_nothing_stored(&h).await;
+    }
+
+    #[tokio::test]
+    async fn the_index_hash_is_checked_before_the_payloads() {
+        let h = ingested().await;
+        let document = envelope(1);
+        let unknown = json!([entry("rec-2", &payload(2))]);
+        let mismatched = body_with(&document, &signed(1, &document, &index()), unknown.clone());
+        let refused = (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid bundle: indexHash does not match the index",
+        );
+        let r = put(&h, SUB, &token(SUB), mismatched.clone()).await;
+        assert_eq!((r.status, r.error().as_str()), refused);
+        assert_eq!(h.store.blob_lookups.load(Ordering::Relaxed), 0);
+        // Before the block check too.
+        h.moderation.block_for_test(&hash_of(&document));
+        let r = put(&h, SUB, &token(SUB), mismatched).await;
+        assert_eq!((r.status, r.error().as_str()), refused);
+
+        // Signed over the index it carries, the payloads are checked.
+        let other = envelope(2);
+        let r = put(
+            &h,
+            SUB,
+            &token(SUB),
+            body_with(&other, &signed(1, &other, &unknown), unknown.clone()),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.error()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("payload {} is not ingested", payload(2))
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_publish_needs_a_precondition() {
+        let gated = ingested().await;
+        // Ungated: no owner records, and the precondition still applies.
+        let ungated = harness_ungated();
+        ungated
+            .store
+            .ingest_with_manifest(
+                &payload(1),
+                PAYLOAD_SIZE,
+                manifest(recording_policy(), &[KAS]),
+            )
+            .await;
+        for h in [gated, ungated] {
+            let document = envelope(1);
+            let bare = |seq: u64| {
+                let body = body(&document, &signed(seq, &document, &index()));
+                let h = &h;
+                async move { put_with(h, SUB, &token(SUB), body, &[]).await }
+            };
+            let required = (StatusCode::PRECONDITION_REQUIRED, "precondition required");
+            let r = bare(1).await;
+            assert_eq!((r.status, r.error().as_str()), required);
+            assert_nothing_stored(&h).await;
+
+            let r = publish(&h, 1, &document).await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+            // Over a stored pointer too, before the seq is compared.
+            for seq in [1, 2] {
+                let r = bare(seq).await;
+                assert_eq!((r.status, r.error().as_str()), required);
+            }
+            assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"1\"");
+        }
+    }
+
+    #[tokio::test]
+    async fn one_envelope_has_one_index() {
+        let h = ingested().await;
+        ingest(&h, 2).await;
+        let document = envelope(1);
+        let hash = hash_of(&document);
+        assert_eq!(publish(&h, 1, &document).await.status, StatusCode::OK);
+        let first = h.store.catalog_indexes.lock().await[&hash].clone();
+
+        // The same envelope at seq 2 with another index, signed over it.
+        let conflict = (
+            StatusCode::CONFLICT,
+            "catalog document already published with another index",
+        );
+        let r = publish_index(&h, 2, &document, json!([entry("rec-2", &payload(2))])).await;
+        assert_eq!((r.status, r.error().as_str()), conflict);
+        assert_eq!(h.store.catalog_indexes.lock().await[&hash], first);
+        assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"1\"");
+
+        // Another account's record of the envelope is no retry, even with
+        // the same index.
+        let h = ingested().await;
+        let theirs = index_record(READER, index());
+        h.store
+            .catalog_indexes
+            .lock()
+            .await
+            .insert(hash.clone(), theirs.clone());
+        let r = publish(&h, 1, &document).await;
+        assert_eq!((r.status, r.error().as_str()), conflict);
+        assert_eq!(h.store.catalog_indexes.lock().await[&hash], theirs);
+        assert!(h.store.catalog_pointers.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_retry_with_the_same_index_publishes() {
+        let h = ingested().await;
+        ingest(&h, 2).await;
+        let document = envelope(1);
+        let hash = hash_of(&document);
+        let (a, b) = (entry("rec-1", &payload(1)), entry("rec-2", &payload(2)));
+        let r = publish_index(&h, 1, &document, json!([a.clone(), b.clone()])).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let first = h.store.catalog_indexes.lock().await[&hash].clone();
+
+        // The same entries in another order are the same canonical index.
+        let r = publish_index(&h, 2, &document, json!([b, a])).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        assert_eq!(
+            h.store.catalog_indexes.lock().await[&hash],
+            first,
+            "the first record stays"
+        );
+        assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"2\"");
+
+        // A record under the account's other form of its subject is its own.
+        let h = ingested().await;
+        h.store
+            .catalog_indexes
+            .lock()
+            .await
+            .insert(hash, index_record(&format!("arkavo:{SUB}"), index()));
+        let r = publish(&h, 1, &document).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+    }
+
+    #[tokio::test]
+    async fn an_index_record_that_cannot_be_read_back_is_unavailable() {
+        let unavailable = (StatusCode::BAD_GATEWAY, "storage unavailable");
+        // The create loses to one still in flight, so nothing is there yet.
+        let h = ingested().await;
+        h.store
+            .lose_next_index_create
+            .store(true, Ordering::Relaxed);
+        let r = publish(&h, 1, &envelope(1)).await;
+        assert_eq!((r.status, r.error().as_str()), unavailable);
+        assert!(h.store.catalog_indexes.lock().await.is_empty());
+        assert!(h.store.catalog_pointers.lock().await.is_empty());
+
+        // The record there doesn't parse.
+        let h = ingested().await;
+        let hash = hash_of(&envelope(1));
+        let garbage = Bytes::from_static(b"not a record");
+        h.store
+            .catalog_indexes
+            .lock()
+            .await
+            .insert(hash.clone(), garbage.clone());
+        let r = publish(&h, 1, &envelope(1)).await;
+        assert_eq!((r.status, r.error().as_str()), unavailable);
+        assert_eq!(h.store.catalog_indexes.lock().await[&hash], garbage);
+        assert!(h.store.catalog_pointers.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_2_publish_replaces_a_stored_1_pointer() {
+        let h = ingested().await;
+        let old = envelope(1);
+        let stored = Bytes::from(serde_json::to_vec(&v2::bundle(SUB, 3, &old, None)).unwrap());
+        h.store
+            .catalog_pointers
+            .lock()
+            .await
+            .insert(SUB.into(), (stored.clone(), 99));
+        h.store
+            .catalog_indexes
+            .lock()
+            .await
+            .insert(hash_of(&old), index_record(SUB, index()));
+        let r = get(&h, SUB).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        assert_eq!(r.headers[header::ETAG], "\"3\"");
+        assert_eq!(r.body, stored, "GET serves the stored /1 bytes");
+
+        let new = envelope(2);
+        let r = publish_if(&h, 4, &new, header::IF_MATCH, "\"3\"").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let r = get(&h, SUB).await;
+        assert_eq!(r.headers[header::ETAG], "\"4\"");
+        let served: Bundle = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(served, signed(4, &new, &index()));
+    }
+
     #[tokio::test]
     async fn reads_of_unknown_and_invalid_subjects() {
         let h = harness();
@@ -1694,7 +2052,7 @@ mod tests {
     async fn malformed_requests_are_refused() {
         let h = ingested().await;
         let document = envelope(1);
-        let bundle = v2::bundle(SUB, 1, &document, None);
+        let bundle = signed(1, &document, &index());
         let mut b: serde_json::Value = serde_json::from_slice(&body(&document, &bundle)).unwrap();
         b["document"] = serde_json::Value::String(
             base64::engine::general_purpose::URL_SAFE.encode(&document[..10]) + "=",

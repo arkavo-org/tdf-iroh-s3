@@ -659,18 +659,26 @@ impl S3Client {
         }
     }
 
-    /// Store a catalog's index record under `catalog-indexes/<hash>`.
-    pub async fn put_catalog_index(&self, hash_hex: &str, body: Bytes) -> Result<()> {
-        self.client
+    /// Create a catalog's index record under `catalog-indexes/<hash>` only
+    /// if none exists (`If-None-Match: *`): one envelope has one index.
+    /// `false` when one already does, or when a concurrent conditional
+    /// write to it is in progress.
+    pub async fn create_catalog_index(&self, hash_hex: &str, body: Bytes) -> Result<bool> {
+        match self
+            .client
             .put_object()
             .bucket(&self.bucket)
             .key(self.catalog_index_key(hash_hex))
             .content_type("application/json")
+            .if_none_match("*")
             .body(body.into())
             .send()
             .await
-            .context("Failed to PUT catalog index to S3")?;
-        Ok(())
+        {
+            Ok(_) => Ok(true),
+            Err(e) if lost_condition(&e) => Ok(false),
+            Err(e) => Err(anyhow::Error::new(e).context("Failed to create catalog index in S3")),
+        }
     }
 
     /// A catalog's index record, or `None` (a catalog published before

@@ -108,9 +108,9 @@ A creator whose metadata TDF had a weaker policy than its recording would show t
 
 ## The index
 
-The node can't decrypt the envelope, so the publisher sends the document's entries in the clear alongside it, as `index` in `PUT /v2/catalogs/{sub}`: a JSON array of at most 1000 entries, each exactly `{"contentID", "version", "payloadHash", "payloadSize"}`, the document's entry without its `metadata`, held to the same rules. The node checks the recordings against what it has ingested, stores the index at `catalog-indexes/<hash>` and **never serves it**. Moderation reads it to find a recording's hash from its `contentID`.
+The node can't decrypt the envelope, so the publisher sends the document's entries in the clear alongside it, as `index` in `PUT /v2/catalogs/{sub}`: a JSON array of at most 1000 entries, each exactly `{"contentID", "version", "payloadHash", "payloadSize"}`, the document's entry without its `metadata`, held to the same rules. **The creator's passkey signs the index** through the pointer's [`indexHash`](#indexhash), the SHA-256 of its canonical form, and the node refuses an index that doesn't match it. The node checks the recordings against what it has ingested, stores the index at `catalog-indexes/<hash>`, once per envelope, and **never serves it**. Moderation reads it to find a recording's hash from its `contentID`.
 
-The index and the encrypted document are bound only by the creator's honesty. An entry left out of the index can only hide the creator's own entry from moderation, so reports carry the `payloadHash`, not just a `contentID`.
+The signature binds the index to the pointer, and so to the envelope's hash, but not to the entries inside the encrypted document: those two agree only by the creator's honesty. An entry left out of the index can only hide the creator's own entry from moderation, so reports carry the `payloadHash`, not just a `contentID`.
 
 ## HTTP routes
 
@@ -235,7 +235,7 @@ The first account to push a recording owns it. When the node ingests a push, it 
 Catalog v2 ([tdf-iroh-s3#27](https://github.com/arkavo-org/tdf-iroh-s3/issues/27)) is how a creator's current catalog is named and proved.
 
 - **The envelope travels over iroh.** A reader fetches it by BLAKE3 hash from the pinned node, the same way it fetches recordings.
-- **The creator signs a pointer with their passkey.** The pointer names the envelope's hash and size and carries a sequence number.
+- **The creator signs a pointer with their passkey.** The pointer names the envelope's hash and size and the hash of its clear [index](#the-index), and carries a sequence number.
 - **The IdP attests the passkey.** identity.arkavo.net signs which passkey credential belongs to which subject ([authnz-rs#104](https://github.com/arkavo-org/authnz-rs/issues/104), `docs/passkey-credential-attestation.md` there).
 
 A reader checks the whole chain itself. So neither the node nor its storage can forge a creator's catalog, or roll back a reader that has already seen a newer `seq`. They can still withhold a catalog, or show an older signed one to a reader that has never seen a newer `seq`.
@@ -247,19 +247,51 @@ A reader checks the whole chain itself. So neither the node nor its storage can 
 The exact UTF-8 bytes of one JSON object. It is carried base64url-encoded and is never re-serialized, so the signed bytes are the bytes everyone reads.
 
 ```json
-{"schema":"arkavo.catalog-pointer/1","owner":"<sub>","seq":7,"catalogHash":"<64 lowercase hex>","catalogSize":1234,"issuedAt":"2026-10-19T01:02:03Z"}
+{"schema":"arkavo.catalog-pointer/2","owner":"<sub>","seq":7,"catalogHash":"<64 lowercase hex>","catalogSize":1234,"indexHash":"<64 lowercase hex>","issuedAt":"2026-10-19T01:02:03Z"}
 ```
 
 | Field | Rule |
 |---|---|
-| `schema` | `arkavo.catalog-pointer/1` |
+| `schema` | `arkavo.catalog-pointer/2` |
 | `owner` | the publisher's `sub`, byte for byte (the same rules as a catalog's `owner`) |
 | `seq` | integer, 1 to 9 007 199 254 740 991 |
 | `catalogHash` | BLAKE3 of the envelope's bytes, 64 lowercase hex characters |
 | `catalogSize` | the envelope's length in bytes, 1 to 4 194 304 |
+| `indexHash` | SHA-256 of the canonical [index](#the-index) ([below](#indexhash)), 64 lowercase hex characters |
 | `issuedAt` | `YYYY-MM-DDTHH:MM:SSZ` |
 
-The object holds exactly these keys, with no key repeated and nothing after it, and is at most 1024 bytes.
+The object holds exactly these seven keys, with no key repeated and nothing after it, and is at most 1024 bytes. `indexHash` is **SHA-256**, while `catalogHash` and `payloadHash` are BLAKE3.
+
+**`arkavo.catalog-pointer/1`** is the same object without `indexHash`: exactly the other six keys. A `/1` with `indexHash`, or a `/2` without it, is invalid. The node accepts only `/2` in a publish, but `GET /v2/catalogs/{sub}` still serves a stored `/1` pointer until the creator's next publish replaces it, so readers decode both.
+
+The node refuses a pointer that breaks these rules with `invalid bundle: <reason>`. The reasons about `indexHash` are:
+
+- `pointer "arkavo.catalog-pointer/2" requires indexHash`
+- `pointer indexHash must be 64 lowercase hex characters`
+- `pointer "arkavo.catalog-pointer/1" must not carry indexHash`
+
+Any other `schema` gets `pointer schema must be "arkavo.catalog-pointer/2"`.
+
+#### `indexHash`
+
+`indexHash` is the lowercase hex SHA-256 of the canonical index, built from the parsed index entries, never from the bytes received:
+
+- entries sorted by `contentID`, comparing the UTF-8 bytes;
+- each written as `{"contentID":"<id>","version":<n>,"payloadHash":"<hex>","payloadSize":<n>}`, keys in exactly that order;
+- joined with `,` inside `[` `]`, no whitespace. The empty index is `[]`.
+- No escaping arises: `contentID` is `[A-Za-z0-9:._@-]`.
+
+The `index` sent in `PUT` is unchanged: its key and entry order are free, and the node canonicalizes it.
+
+**Vectors**
+
+| Name | Input order of `contentID` | `indexHash` |
+|---|---|---|
+| empty | — | `4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945` |
+| two | `rec-b` (v1, `bb…`, 2048), `rec-a` (v3, `aa…`, 1024) | `03f745d8d08d9e9e11cabf33d85e8beb452eb3a2b2e541f92e1703c1f4152df4` |
+| byte-order | `a_1`, `a@1`, `A`, `a:1`, `a.1`, `a-1` (entry *n*, counting from 0 in this order, has hash byte `n` ×32, size *n*+1, v1; so `a_1` is `00`×32, size 1) | `79129b9fa70e8ab5d0894d07098294de6dec2677c9df538b3eb05df98bd8ef18` |
+
+Canonical bytes of "two": `[{"contentID":"rec-a","version":3,"payloadHash":"aa…aa","payloadSize":1024},{"contentID":"rec-b","version":1,"payloadHash":"bb…bb","payloadSize":2048}]` (64 hex characters each). "byte-order" sorts to `A`, `a-1`, `a.1`, `a:1`, `a@1`, `a_1`. ArkavoKit's shared vectors (`Tests/ArkavoCatalogTests/Vectors/catalog-vectors.json`) are to carry these, each with its full `index` text.
 
 ### The signed bundle
 
@@ -302,12 +334,12 @@ The node checks this on publish and readers check it on read. The rules are the 
 
 This is the only route that publishes a catalog. The request needs `Authorization: Bearer <Arkavo CWT>` and `Content-Type: application/json`. Its body is `{"document": "<base64url envelope bytes>", "bundle": {…}, "index": [ … ]}`, at most 10 MiB (10 485 760 bytes): a 4 MiB envelope is about 5.6 MiB in base64url, and an index of 1000 entries up to about 400 KiB.
 
-The request should name the base the client merged its document from, with a standard conditional header (RFC 9110). Without one, a publish signed while another device saved can replace that device's catalog.
+The request must name the base the client merged its document from, with a standard conditional header (RFC 9110). Without one, a device whose own highest `seq` exceeds the stored one could publish over a base it never read, and replace what another device saved.
 
 - **`If-Match: "<seq>"`:** the client merged from the stored pointer with this `seq`, as `GET /v2/catalogs/{sub}` tagged it (`ETag`). The tag is compared strongly: a weak tag (`W/"7"`) or a bare `7` never matches. `If-Match: *` matches any pointer that `GET` serves.
 - **`If-None-Match: *`:** the client merged from "no catalog yet" (a 404). No pointer may be stored, apart from one `GET` doesn't serve: preconditions see what `GET` serves. That is a pointer whose catalog is blocked, whose `seq` must still be exceeded, or one at a catalog from before envelopes, which reads as no pointer at all, so the first envelope may start at any `seq`.
 
-If the stored pointer is no longer that base, the node answers 412 `catalog changed since it was read` and stores nothing. Read the pointer again, merge, sign and retry. When both headers are sent, both must hold. A header value that is not visible ASCII fails. Without either header the node skips this check, for now; once clients send one, a missing precondition may become a 428.
+If the stored pointer is no longer that base, the node answers 412 `catalog changed since it was read` and stores nothing. Read the pointer again, merge, sign and retry. When both headers are sent, both must hold. A header value that is not visible ASCII fails. A request with neither header gets 428 `precondition required`, also on a node with `[publishing] required = false`.
 
 The node checks the following in order:
 
@@ -320,6 +352,7 @@ The node checks the following in order:
 | The body is JSON with exactly `document`, `bundle` and `index`, and no key repeated anywhere in it | 400 `invalid request: <reason>` |
 | `document` is 1–4 194 304 bytes of unpadded base64url | 422 `invalid request: …` |
 | Verification steps 1–3 | 422 `invalid bundle: <reason>`; 502 `key set unavailable` |
+| The pointer is `arkavo.catalog-pointer/2` | 422 `invalid bundle: pointer schema must be "arkavo.catalog-pointer/2"` |
 | The pointer names this document | 422 `invalid bundle: catalogHash or catalogSize does not match the document` |
 | `document` is a ZTDF archive (manifest and payload member, as [ingest accepts](#archive-layout-accepted-at-ingest)) | 422 `document is not a TDF` |
 | Its `payload.mimeType` is `application/vnd.arkavo.creator-catalog+json` | 422 `document is not a catalog` |
@@ -327,6 +360,7 @@ The node checks the following in order:
 | Its policy's `uuid` is a non-empty string | 422 `catalog policy has no uuid` |
 | For a campaign attribute: the token's `arkavo_patreon` has role `creator` and a `campaign_id` (a string) equal to the envelope's campaign id. Identity sets it only for the campaign the account owns. | 403 `catalog campaign is not the publisher's` |
 | `index` is an array of at most 1000 valid [index entries](#the-index) with unique `contentID`s | 422 `invalid index: <reason>`, e.g. `invalid index: entries[3].contentID duplicates entries[1].contentID` |
+| The pointer's `indexHash` is this index's ([`indexHash`](#indexhash)) | 422 `invalid bundle: indexHash does not match the index` |
 | Nothing blocked: the envelope's hash, no entry's `payloadHash` | 403 `content is blocked` |
 | Every `payloadHash` is an ingested blob | 422 `payload <hash> is not ingested`, the first missing one in entry order |
 | Every entry's `payloadSize` equals the ingested blob's size, each entry checked, also entries that share a payload | 422 `payload <hash> size does not match` |
@@ -335,12 +369,14 @@ The node checks the following in order:
 | Every recording's manifest is stored (at ingest) and readable. A recording ingested before the node stored manifests has none: push it again. | 422 `payload <hash> manifest is not stored` or `… manifest is unreadable` |
 | Every entry's recording policy names the envelope's attribute | 422 `entry <contentID> policy does not include the catalog attribute` |
 | The passkey credential is still the subject's, according to the IdP's status route | 403 `passkey credential unknown`, `… revoked` or `… belongs to another subject`; 502 `credential status unavailable` |
-| The stored pointer is the base named by `If-Match` or `If-None-Match`, if either is sent | 412 `catalog changed since it was read` |
+| `If-Match` or `If-None-Match` is sent | 428 `precondition required` |
+| The stored pointer is the base named by `If-Match` or `If-None-Match` | 412 `catalog changed since it was read` |
 | `seq` is greater than the stored one | 409 `seq must be greater than <n>` |
+| The envelope has no index record yet, or its record is a retry of this publish: `{sub}`'s (subjects compared canonically), with the same canonical index. Checked as the record is written, after the envelope and its outboard. | 409 `catalog document already published with another index`; 502 `storage unavailable` when the existing record can't be read |
 
 The two owner refusals also carry `contentIDs`: the `contentID` of every entry refused, sorted, including every entry that names the same payload. For example: `{"error":"recording belongs to another account","contentIDs":["rec-a","rec-b"]}`. Every other refusal in the table is `{"error":"…"}` alone.
 
-The node then stores the envelope at `catalog-documents/<blake3>` with its BAO outboard at `catalog-outboards/<blake3>`, the index at `catalog-indexes/<blake3>` (never served), then the bundle at `catalog-pointers/<sub>`. The pointer is written only if no other publish replaced it in the meantime; otherwise 409 `seq must be greater than the stored seq: another publish won`. Read the pointer again and retry.
+The node then stores the envelope at `catalog-documents/<blake3>` with its BAO outboard at `catalog-outboards/<blake3>`, the index at `catalog-indexes/<blake3>` (never served), then the bundle at `catalog-pointers/<sub>`. The index is written only if the envelope has none (`If-None-Match: *`): one envelope has one index, so a publish that lost can't rewrite the index of the pointer that won. An envelope already stored with another index gets the table's last 409; a fresh envelope (a new policy `uuid`) has a new hash. The pointer is written only if no other publish replaced it in the meantime; otherwise 409 `seq must be greater than the stored seq: another publish won`. Read the pointer again and retry.
 
 200: `{"owner":"<sub>","seq":<n>,"hash":"<blake3 hex>","size":<bytes>}`.
 
@@ -366,10 +402,10 @@ Fetch `catalogHash` from the pinned node, with a size limit of `catalogSize`. Th
 
 1. Read the stored pointer (`GET /v2/catalogs/<sub>`), keeping its `ETag`, decrypt its envelope and merge into its document (a 404: start an empty catalog). Set `seq` to one more than the higher of its `seq` and the highest this device has used.
 2. Encrypt the merged document as a new [envelope](#the-envelope), with a fresh policy `uuid`.
-3. Write the pointer bytes over the envelope's hash and size, and keep them exactly.
+3. Write the `/2` pointer bytes over the envelope's hash and size and the index's [`indexHash`](#indexhash), and keep them exactly.
 4. Get a passkey assertion for RP `identity.arkavo.net`, with challenge SHA-256(pointer bytes) and user verification required. Allow only the signed-in account's credentials.
 5. Get the attestation for the assertion's credential: `POST https://identity.arkavo.net/passkeys/credential-attestation`.
-6. `PUT /v2/catalogs/<sub>` with the envelope, the bundle and the index (the merged document's `entries`), and `If-Match: <the ETag>`, or `If-None-Match: *` after a 404. On a 412 or a 409, go back to step 1 and retry once.
+6. `PUT /v2/catalogs/<sub>` with the envelope, the bundle and the index (the merged document's `entries`, which `indexHash` covers), and `If-Match: <the ETag>`, or `If-None-Match: *` after a 404. One of the two is required. On a 412 or a 409, go back to step 1 and retry once.
 
 ## Removed with `/1` (2026-10-27)
 

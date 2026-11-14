@@ -210,3 +210,33 @@ async fn test_create_moderation_record_is_conditional() {
         Some(first)
     );
 }
+
+/// A catalog's index record is created once (`If-None-Match: *`): a second
+/// create reports `false` and leaves the first body in place.
+#[tokio::test(flavor = "current_thread")]
+async fn test_create_catalog_index_is_conditional() {
+    use bytes::Bytes;
+    use tdf_iroh_s3::config::S3Config;
+
+    // SAFETY: current_thread runtime ensures no other threads read env vars concurrently.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+    }
+    let s3 = S3Client::from_config(&S3Config {
+        bucket: "test-bucket".into(),
+        region: "us-east-1".into(),
+        prefix: String::new(),
+        endpoint_url: metadata_s3().await,
+        force_path_style: true,
+    })
+    .await
+    .unwrap();
+
+    let hash = "ef".repeat(32);
+    let first = Bytes::from_static(b"{\"owner\":\"u1\"}");
+    let second = Bytes::from_static(b"{\"owner\":\"u2\"}");
+    assert!(s3.create_catalog_index(&hash, first.clone()).await.unwrap());
+    assert!(!s3.create_catalog_index(&hash, second).await.unwrap());
+    assert_eq!(s3.get_catalog_index(&hash).await.unwrap(), Some(first));
+}
