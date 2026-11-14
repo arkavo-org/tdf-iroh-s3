@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 pub mod due;
 pub mod fold;
 pub mod snapshot;
+pub mod sweep;
 
 /// Where transitions live: `catalog-transitions/<sub>/<name>`.
 pub const TRANSITIONS: &str = "catalog-transitions/";

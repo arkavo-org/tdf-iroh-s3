@@ -333,7 +333,10 @@ fn envelope_kept(
 /// An envelope's owner, canonical: its request's (the transition's
 /// subject, or the document's owner metadata the sweep read), else its
 /// index record's.
-fn envelope_owner<'a>(r: &'a EnvelopeRequest, catalogs: &'a Catalogs) -> Option<&'a str> {
+pub(super) fn envelope_owner<'a>(
+    r: &'a EnvelopeRequest,
+    catalogs: &'a Catalogs,
+) -> Option<&'a str> {
     r.owner
         .as_deref()
         .or_else(|| catalogs.indexes.get(&r.hash).map(|i| i.owner.as_str()))

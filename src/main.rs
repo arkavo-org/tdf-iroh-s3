@@ -13,6 +13,7 @@ use tdf_iroh_s3::authz::{
 use tdf_iroh_s3::catalogs_api;
 use tdf_iroh_s3::catalogs_v2_api;
 use tdf_iroh_s3::config::{AuthzConfig, Config, PublishDecisions};
+use tdf_iroh_s3::deletion::sweep::sweep;
 use tdf_iroh_s3::moderation::{self, Moderation, ModerationApi, PublishGate, PublishPolicy};
 use tdf_iroh_s3::node::TdfIrohNode;
 use tdf_iroh_s3::node_api;
@@ -65,6 +66,19 @@ enum Command {
         /// Why; printed, not stored.
         #[arg(long)]
         reason: String,
+    },
+    /// Delete what owners and operators asked to delete, every version,
+    /// once it is due (a dry run unless --delete)
+    ///
+    /// Folds committed catalog transitions into deletion requests, then
+    /// deletes each recording, catalog envelope and subject's pointers that
+    /// is due, re-checking each just before. One line per item, then
+    /// counts. Anything unreadable aborts the run before it writes
+    /// anything. Exits 1 if the run aborts or any item fails.
+    SweepDeletions {
+        /// Write and delete; without it, only report.
+        #[arg(long)]
+        delete: bool,
     },
 }
 
@@ -121,6 +135,24 @@ async fn release_owner(config: &Config, hash: &str, subject: &str, reason: &str)
     }
 }
 
+/// `sweep-deletions`: the report, then counts. Exits 1 when the run
+/// aborts (the error chain on stderr) or any item failed.
+async fn sweep_deletions(config: &Config, delete: bool) -> Result<()> {
+    let s3 = S3Client::from_config(&config.s3).await?;
+    let report = match sweep(&s3, delete, moderation::now_secs()).await {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("sweep-deletions aborted: {e:#}");
+            std::process::exit(1);
+        }
+    };
+    println!("{report}");
+    if report.failures > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -148,6 +180,7 @@ async fn main() -> Result<()> {
             subject,
             reason,
         }) => return release_owner(&config, &hash, &subject, &reason).await,
+        Some(Command::SweepDeletions { delete }) => return sweep_deletions(&config, delete).await,
         None => {}
     }
     info!(
