@@ -139,17 +139,30 @@ This route is public. It is how a publisher confirms ingest before naming a hash
 
 Creator asks this before the passkey prompt, so the creator doesn't sign a catalog that lists another account's recording. It asks again after a failed push, to explain it: the node refuses a push of another account's recording with only an iroh error code (see [Ownership](#ownership)).
 
-The request needs `Authorization: Bearer <Arkavo CWT>`, checked before the hash, as for [`PUT /v2/catalogs/{sub}`](#put-v2catalogssub-publish): the publishing checks in [publishing-and-moderation.md](publishing-and-moderation.md), with the `X-Entity-Token` devices when `[publishing] decisions` is `shadow` or `pdp`. On a node with `[publishing] required = false` the token still has to verify.
+The request needs `Authorization: Bearer <Arkavo CWT>`, checked before the hash, as for [`PUT /v2/catalogs/{sub}`](#put-v2catalogssub-publish): the publishing checks in [publishing-and-moderation.md](publishing-and-moderation.md), with the `X-Entity-Token` devices when `[publishing] decisions` is `shadow` or `pdp`.
+
+The lists below are complete. `invalid hash` and `storage unavailable` are this route's own; every other string comes from the publishing checks, as on `PUT`. Those marked *`pdp` only* arise only when `[publishing] decisions` is `pdp`: under `shadow` the node asks the decision service with the devices but enforces only its local answer, so it logs a failed device token or a denial rather than refusing.
 
 - **200:** `{"hash":"<hash>","owner":"<owner>"}`, where `owner` is one of:
   - `"you"`: the token's subject owns the recording. Subjects are compared canonically, so `arkavo:<uuid>` and `<uuid>` are one account.
   - `"another account"`: another account owns it. The node never says which account.
   - `"none"`: no account owns it, and its next push claims it. This doesn't say the recording is ingested; `GET /blobs/<hash>` does. A node with `[publishing] required = false` records no owners, so it always answers `"none"`.
-- **400:** `invalid hash`. The hash must be 64 lowercase hex characters.
-- **401:** `missing bearer token` or `invalid token`.
-- **403:** `publishing entitlement required`, `publishing suspended` or `publishing not permitted`.
-- **502:** `storage unavailable` when the owner record can't be read. The node also answers 502 when it can't fetch the key set to check the token.
-- **503:** `decision service unavailable`.
+- **400:**
+  - `invalid hash`: the hash isn't 64 lowercase hex characters. This is the only 400 the route adds, and it is checked after the token.
+  - *`pdp` only:* `too many entities`, a chain of more than 8 (the person, the `X-Entity-Token` devices and the node's environment).
+- **401:**
+  - `missing bearer token`;
+  - `invalid token`: the token doesn't verify (signature, expiry, issuer, or `aud` other than `[publishing] audience`);
+  - *`pdp` only:* `invalid entity token`, an `X-Entity-Token` that isn't a valid DeviceCheck CWT; `entity token subject does not match bearer subject`.
+- **403:**
+  - `service tokens cannot publish`: the token names a service client (`client:*`), not a person;
+  - `publishing suspended`;
+  - `publishing entitlement required`, under `local` and `shadow` only (under `pdp` the decision replaces the entitlement check);
+  - *`pdp` only:* `publishing not permitted`, the decision service's denial.
+- **502:** `storage unavailable` when the owner record can't be read; `invalid token` when the node can't fetch the key set to check the token.
+- **503:** *`pdp` only:* `decision service unavailable`.
+
+On a node with `[publishing] required = false` only the token is checked, without the audience: its refusals are 401 `missing bearer token` or `invalid token`, 502 `invalid token`, and the route's own 400 `invalid hash` and 502 `storage unavailable`.
 
 ### `GET /node`: the node's iroh identity
 
