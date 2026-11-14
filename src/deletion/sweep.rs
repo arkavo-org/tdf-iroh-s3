@@ -134,9 +134,10 @@ pub struct Report {
     /// `recreated <id>`, `kept <id>: <why>`, `failed <id>: <error>`; in a
     /// dry run `would verify <id>`, `would forget <id>: <why>`, `would
     /// delete again <id>`); then `kept <id>: <why>` for each pending
-    /// request not due, and for each transition the fold keeps but for
-    /// those of a subject whose delete the run ran (would run): they went
-    /// with it, or go when its next run retries a delete that failed; then
+    /// request not due, and for each transition the fold keeps that
+    /// survives the run: not one the run deleted with its subject (in a
+    /// dry run: would delete), whichever step of the subject's delete
+    /// failed; then
     /// each deleted recording a catalog lists and each deleted envelope a
     /// pointer names (spec 3.4 step 8), or `failed final read: <error>`.
     /// `<id>` is [`Item::id`]: `<kind> <name>`.
@@ -307,10 +308,9 @@ async fn run<O: ObjectStore>(
 
     let items = in_deletion_order(&decision.due);
     let mut baseline = Pointers::of(&snapshot.catalogs);
-    // The subjects whose delete this run ran (in a dry run: would run).
-    // Their transitions, those the fold kept included, went with them, or
-    // go when the subject's next run retries a delete that failed.
-    let mut gone_subjects = BTreeSet::new();
+    // The keys this run deleted (in a dry run: the transitions it would
+    // delete with their subjects): no transition among them is kept.
+    let mut gone = BTreeSet::new();
     // The requests this run closed (in a dry run: would close): not kept.
     let mut closed = BTreeSet::new();
     if delete {
@@ -323,11 +323,7 @@ async fn run<O: ObjectStore>(
             put_json(store, &envelope_key(&r.hash), r).await?;
         }
         for item in items {
-            if take(store, item, &mut baseline, now, report).await?
-                && let Item::Subject(sub) = item
-            {
-                gone_subjects.insert(sub.as_str());
-            }
+            take(store, item, &mut baseline, now, report, &mut gone).await?;
         }
         for item in &decision.unowned {
             closed.extend(close(store, item, &baseline, now, report).await?);
@@ -352,8 +348,15 @@ async fn run<O: ObjectStore>(
                 report.pushed_again(&id);
             } else {
                 report.deleted(&id);
+                // Every transition of the subject would go with it.
                 if let Item::Subject(sub) = item {
-                    gone_subjects.insert(sub.as_str());
+                    let of_subject = fold.kept.iter().map(|(key, _)| key).filter(|key| {
+                        snapshot
+                            .transitions
+                            .get(*key)
+                            .is_some_and(|t| canonical_subject(&t.subject) == sub)
+                    });
+                    gone.extend(of_subject.cloned());
                 }
             }
         }
@@ -387,11 +390,7 @@ async fn run<O: ObjectStore>(
         }
     }
     for (key, why) in &fold.kept {
-        let subject = snapshot
-            .transitions
-            .get(key)
-            .map(|t| canonical_subject(&t.subject));
-        if subject.is_some_and(|sub| gone_subjects.contains(sub)) {
+        if gone.contains(key) {
             continue;
         }
         let name = key.strip_prefix(TRANSITIONS).unwrap_or(key);
@@ -548,9 +547,9 @@ impl Pointers {
 /// Take one due item (spec 3.4 step 6): list its versions, re-check it on
 /// a fresh read, check a recording wasn't pushed again since its drops
 /// ([`pushed_again`]: restart their grace), then delete exactly the listed
-/// versions, or report why not. Whether it ran the item's delete, which
-/// either deleted it or failed part way (reported); `Err` only when the
-/// fresh read or a listing fails.
+/// versions, or report why not. Each key it deleted goes into `gone`, up
+/// to a failure part way (reported); `Err` only when the fresh read or a
+/// listing fails.
 ///
 /// The versions are listed before the fresh read, so everything the delete
 /// removes existed when that read judged the item; a version written after
@@ -566,7 +565,8 @@ async fn take<O: ObjectStore>(
     baseline: &mut Pointers,
     now: i64,
     report: &mut Report,
-) -> anyhow::Result<bool> {
+    gone: &mut BTreeSet<String>,
+) -> anyhow::Result<()> {
     let id = item.id();
     let listed = list_candidates(store, item)
         .await
@@ -577,11 +577,11 @@ async fn take<O: ObjectStore>(
     {
         Recheck::Kept(why) => {
             report.kept(&id, &why);
-            return Ok(false);
+            return Ok(());
         }
         Recheck::Deferred => {
             report.deferred(&id);
-            return Ok(false);
+            return Ok(());
         }
         Recheck::Due { item, fresh, view } => (item, fresh, view),
     };
@@ -599,14 +599,14 @@ async fn take<O: ObjectStore>(
                 Ok(()) => report.pushed_again(&id),
                 Err(e) => report.failed(&id, &e),
             }
-            return Ok(false);
+            return Ok(());
         }
     }
-    match delete_item(store, &item, &fresh, &listed, baseline, now).await {
+    match delete_item(store, &item, &fresh, &listed, baseline, now, gone).await {
         Ok(()) => report.deleted(&id),
         Err(e) => report.failed(&id, &e),
     }
-    Ok(true)
+    Ok(())
 }
 
 /// What a delete may remove: an item's keys, in the order they are
@@ -619,11 +619,13 @@ struct Listed {
 impl Listed {
     /// Delete exactly the listed versions, key by key in order; one
     /// written since the listing stays. A key with none listed deletes
-    /// nothing. The first failure stops it.
+    /// nothing. The first failure stops it. Each key deleted goes into
+    /// `gone`.
     async fn delete<O: ObjectStore>(
         &self,
         store: &O,
         baseline: &mut Pointers,
+        gone: &mut BTreeSet<String>,
     ) -> anyhow::Result<()> {
         for key in &self.keys {
             let ids: Vec<String> = self
@@ -638,6 +640,7 @@ impl Listed {
                 .with_context(|| format!("deleting {key} failed"))?;
             // A pointer this run deleted is no catalog change.
             baseline.forget(key);
+            gone.insert(key.clone());
         }
         Ok(())
     }
@@ -952,8 +955,9 @@ fn requesters(item: &Item, fresh: &Snapshot) -> BTreeSet<String> {
 
 /// Delete exactly the `listed` versions of the item's objects, key by key
 /// in order ([`due_keys`]: a subject's pointers, then its transitions),
-/// then mark its requests `deleted` at `now`: the fresh records, so nothing
-/// cancelled meanwhile comes back. The first failure stops the item.
+/// each key deleted into `gone`, then mark its requests `deleted` at
+/// `now`: the fresh records, so nothing cancelled meanwhile comes back.
+/// The first failure stops the item.
 async fn delete_item<O: ObjectStore>(
     store: &O,
     item: &Item,
@@ -961,8 +965,9 @@ async fn delete_item<O: ObjectStore>(
     listed: &Listed,
     baseline: &mut Pointers,
     now: i64,
+    gone: &mut BTreeSet<String>,
 ) -> anyhow::Result<()> {
-    listed.delete(store, baseline).await?;
+    listed.delete(store, baseline, gone).await?;
     let requests = &fresh.requests;
     match item {
         Item::Recording { .. } => {
@@ -1602,7 +1607,8 @@ async fn again<O: ObjectStore>(
         report.kept(&id, &why);
         return Ok(());
     }
-    match listed.delete(store, baseline).await {
+    // Tombstoned items' keys: no transition is among them.
+    match listed.delete(store, baseline, &mut BTreeSet::new()).await {
         Ok(()) => report.recreated(&id),
         Err(e) => report.failed(&id, &e),
     }
@@ -2220,11 +2226,22 @@ mod tests {
         assert_eq!(versions(&m).await, before);
     }
 
+    /// The report's `kept transition` lines of `sub`.
+    fn kept_transitions(report: &Report, sub: &str) -> Vec<String> {
+        let prefix = format!("kept transition {sub}/");
+        report
+            .lines
+            .iter()
+            .filter(|l| l.starts_with(&prefix))
+            .cloned()
+            .collect()
+    }
+
     /// A transition delete that fails fails the subject, after its
     /// pointers: the next run takes the subject again, with no pointer
-    /// left, and deletes the rest. Meanwhile none of its transitions is
-    /// reported kept, those deleted before the failure or left for the
-    /// retry.
+    /// left, and deletes the rest. Meanwhile the report lists exactly the
+    /// transitions that survived as kept: not the one deleted before the
+    /// failure.
     #[tokio::test]
     async fn a_failed_transition_delete_is_retried() {
         let m = bucket();
@@ -2243,11 +2260,10 @@ mod tests {
                 .any(|l| l.starts_with(&format!("failed subject {U}: "))),
             "{report}"
         );
-        assert!(
-            report
-                .lines
-                .iter()
-                .all(|l| !l.starts_with(&format!("kept transition {U}/"))),
+        let name = t.strip_prefix(TRANSITIONS).unwrap();
+        assert_eq!(
+            kept_transitions(&report, U),
+            [format!("kept transition {name}: younger than grace")],
             "{report}"
         );
         assert!(gone(&m, &format!("catalog-pointers/{U}")).await);
@@ -2262,6 +2278,45 @@ mod tests {
         assert!(gone(&m, &t).await);
         let r: SubjectRequest = record(&m, &subject_key(U)).await;
         assert_eq!(r.state, State::Deleted);
+    }
+
+    /// A subject whose delete fails at its first pointer deletes none of
+    /// its transitions, and the report lists each as kept.
+    #[tokio::test]
+    async fn a_subject_failed_at_its_pointer_reports_its_transitions_kept() {
+        let m = bucket();
+        publish_2(&m, U, 1, b"doc-b", &[]);
+        block_and_suspend(&m, U);
+        subject_request(&m, U);
+        let transitions = [
+            orphan(&m, U, 2, NOW - 10),
+            orphan(&m, &arkavo(U), 3, NOW - 10),
+        ];
+        m.fail_on(&format!("catalog-pointers/{U}"), Op::Delete);
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.starts_with(&format!("failed subject {U}: "))),
+            "{report}"
+        );
+        let mut kept = kept_transitions(&report, U);
+        kept.extend(kept_transitions(&report, &arkavo(U)));
+        kept.sort();
+        let mut want: Vec<String> = transitions
+            .iter()
+            .map(|key| {
+                let name = key.strip_prefix(TRANSITIONS).unwrap();
+                format!("kept transition {name}: younger than grace")
+            })
+            .collect();
+        want.sort();
+        assert_eq!(kept, want, "{report}");
+        for key in &transitions {
+            assert!(m.get(key).await.unwrap().is_some(), "{key}");
+        }
     }
 
     /// A transition written after its subject was deleted (a publish in
