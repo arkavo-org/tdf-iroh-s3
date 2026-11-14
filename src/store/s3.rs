@@ -49,6 +49,13 @@ fn unix_secs(modified: Option<&DateTime>, listed: &str) -> Result<i64> {
         .with_context(|| format!("S3 listed {listed} with no last-modified time"))
 }
 
+/// Whether a listing page of `prefix` says more pages follow. Missing
+/// `IsTruncated` is an error: read as the end of the listing, it could
+/// leave keys unlisted.
+fn more_pages(is_truncated: Option<bool>, prefix: &str) -> Result<bool> {
+    is_truncated.with_context(|| format!("S3 listed {prefix} with no IsTruncated"))
+}
+
 impl S3Client {
     /// Create a new S3 client using the default AWS credential chain (IAM role on EC2).
     pub async fn new(bucket: &str, region: &str, prefix: &str) -> Result<Self> {
@@ -202,7 +209,7 @@ impl S3Client {
                     latest.unwrap_or(false),
                 ));
             }
-            if resp.is_truncated() != Some(true) {
+            if !more_pages(resp.is_truncated(), &full)? {
                 break;
             }
             // Without both markers the next page could skip versions.
@@ -900,7 +907,7 @@ impl ObjectStore for S3Client {
                     modified: unix_secs(obj.last_modified(), listed)?,
                 });
             }
-            if resp.is_truncated() != Some(true) {
+            if !more_pages(resp.is_truncated(), &full)? {
                 break;
             }
             continuation = Some(
@@ -1088,6 +1095,21 @@ mod tests {
             .map(|v| v.version_id)
             .collect();
         assert_eq!(ids, ["v1", "m2"]);
+    }
+
+    /// A page without `IsTruncated` is an error: read as the end of the
+    /// listing, it would leave keys unlisted, and the sweep would decide
+    /// on part of the bucket.
+    #[test]
+    fn a_listing_without_is_truncated_is_an_error() {
+        assert!(more_pages(Some(true), "blobs/").unwrap());
+        assert!(!more_pages(Some(false), "blobs/").unwrap());
+        let err = more_pages(None, "run-1/blobs/").unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("IsTruncated") && err.contains("run-1/blobs/"),
+            "{err}"
+        );
     }
 
     #[test]
