@@ -559,11 +559,12 @@ async fn put_catalog<S: TagStore>(
     //    its 409 or 502 writes nothing else, no transition either. The
     //    document and its outboard come before the pointer, so a stored
     //    pointer never names a document that cannot be served or decided;
-    //    the pointer is written only if nobody else moved it meanwhile. An
-    //    index record or transition whose later writes fail is named by no
-    //    pointer: a transition whose pointer write lost is never reachable
-    //    from a pointer, so the sweep never folds it, and a retry of this
-    //    publish completes the rest.
+    //    the pointer is written only if nobody else moved it meanwhile.
+    //    What a publish wrote before a later write failed, or before its
+    //    pointer write lost, is not named by its pointer: the sweep never
+    //    folds such a transition, and the same publish sent again after a
+    //    failed write completes it (after a lost pointer write, it gets the
+    //    412).
     let outboard = crate::ingest::compute_outboard(
         &document[..],
         document.len() as u64,
@@ -2298,6 +2299,36 @@ mod tests {
         assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"1\"");
     }
 
+    /// An outboard write that fails after the document's leaves the
+    /// stored pointer as it was; the same publish sent again completes.
+    #[tokio::test]
+    async fn a_publish_whose_outboard_write_failed_completes_on_retry() {
+        let h = ingested().await;
+        assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
+        let stored = h.store.catalog_pointers.lock().await[SUB].clone();
+        let second = envelope(2);
+        let hash = hash_of(&second);
+        h.store
+            .fail_next_outboard_write
+            .store(true, Ordering::Relaxed);
+        let r = publish(&h, 2, &second).await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::BAD_GATEWAY, "storage unavailable")
+        );
+        assert!(h.store.catalog_indexes.lock().await.contains_key(&hash));
+        assert!(h.store.catalog_documents.lock().await.contains_key(&hash));
+        assert!(!h.store.catalog_outboards.lock().await.contains_key(&hash));
+        assert_eq!(h.store.catalog_pointers.lock().await[SUB], stored);
+        assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"1\"");
+
+        let r = publish(&h, 2, &second).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        assert!(h.store.catalog_outboards.lock().await.contains_key(&hash));
+        assert_eq!(h.store.transitions.lock().await.len(), 2);
+        assert_eq!(get(&h, SUB).await.headers[header::ETAG], "\"2\"");
+    }
+
     #[tokio::test]
     async fn a_retry_with_the_same_index_publishes() {
         let h = ingested().await;
@@ -2688,17 +2719,40 @@ mod tests {
         assert_eq!(*h.store.transitions.lock().await, committed);
         // Sent with the committed pointer's own tag: past the 412, the 409.
         let r = publish_if(&h, 2, &second, header::IF_MATCH, "\"2\"").await;
-        assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.error());
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::CONFLICT, "seq must be greater than 2")
+        );
         assert_eq!(*h.store.transitions.lock().await, committed);
+    }
+
+    /// A committed publish sent again after a catalog block hid its pointer:
+    /// `If-None-Match: *` holds then (`GET` serves none), so only the seq
+    /// floor, the stored pointer's whatever its visibility, stops it, before
+    /// its transition is written again.
+    #[tokio::test]
+    async fn a_retry_over_a_hidden_commit_meets_the_seq_floor() {
+        let h = ingested().await;
+        assert_eq!(publish(&h, 1, &envelope(1)).await.status, StatusCode::OK);
+        let second = envelope(2);
+        let r = publish_if(&h, 2, &second, header::IF_MATCH, "\"1\"").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let committed = h.store.transitions.lock().await.clone();
+        let stored = h.store.catalog_pointers.lock().await[SUB].clone();
+
+        h.moderation.block_catalog_for_test(SUB);
+        assert_eq!(get(&h, SUB).await.status, StatusCode::NOT_FOUND);
+        let r = publish_if(&h, 2, &second, header::IF_NONE_MATCH, "*").await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (StatusCode::CONFLICT, "seq must be greater than 2")
+        );
+        assert_eq!(*h.store.transitions.lock().await, committed);
+        assert_eq!(h.store.catalog_pointers.lock().await[SUB], stored);
     }
 
     #[tokio::test]
     async fn a_2_base_with_a_tampered_index_is_502() {
-        let h = ingested().await;
-        ingest(&h, 2).await;
-        let first = envelope(1);
-        assert_eq!(publish(&h, 1, &first).await.status, StatusCode::OK);
-        let stored = h.store.catalog_pointers.lock().await[SUB].clone();
         for tampered in [
             // Parses, but isn't the index the `/2` pointer's indexHash binds.
             index_record(SUB, json!([rec(2)])),
@@ -2707,25 +2761,28 @@ mod tests {
             index_record(SUB, json!([{"contentID": "rec-1"}])),
             Bytes::from_static(b"not a record"),
         ] {
+            // Each case on its own node, with the tag a client read before
+            // the record was tampered with: no `GET` (or its attribute
+            // cache) between the cases.
+            let h = ingested().await;
+            ingest(&h, 2).await;
+            let first = envelope(1);
+            assert_eq!(publish(&h, 1, &first).await.status, StatusCode::OK);
+            let stored = h.store.catalog_pointers.lock().await[SUB].clone();
             h.store
                 .catalog_indexes
                 .lock()
                 .await
-                .insert(hash_of(&first), tampered);
+                .insert(hash_of(&first), tampered.clone());
             let second = envelope(2);
-            let r = publish(&h, 2, &second).await;
+            let r = publish_if(&h, 2, &second, header::IF_MATCH, "\"1\"").await;
             assert_eq!(
                 (r.status, r.error().as_str()),
-                (StatusCode::BAD_GATEWAY, "storage unavailable")
+                (StatusCode::BAD_GATEWAY, "storage unavailable"),
+                "{tampered:?}"
             );
             assert_eq!(h.store.transitions.lock().await.len(), 1);
-            assert!(
-                !h.store
-                    .catalog_documents
-                    .lock()
-                    .await
-                    .contains_key(&hash_of(&second))
-            );
+            assert_unstored(&h, &second, 1).await;
             assert_eq!(h.store.catalog_pointers.lock().await[SUB], stored);
         }
     }

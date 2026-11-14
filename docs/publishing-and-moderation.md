@@ -308,7 +308,7 @@ The privacy policy excepts content removed by moderation: a blocked recording or
 
 ### Creators who can't publish
 
-A creator whose entitlement lapsed, who is suspended, whom the decision service denies, or whose catalog is blocked can't publish the empty catalog that deletes their recordings. On their request, an operator:
+A creator whose entitlement lapsed, who is suspended, or whom the decision service denies can't publish the empty catalog that deletes their recordings. A creator whose catalog is blocked can publish, with `If-None-Match: *` after `GET`'s 404, but the publish drops nothing: `GET` hides the base, and a base it doesn't serve drops nothing ([What a publish records](#what-a-publish-records)). On their request, an operator:
 
 1. **Blocks their catalog,** unless it is already: `PUT /moderation/blocks/catalogs/<sub>` ([Moderation](#moderation-operators)). This hides the catalog at once and is `--all`'s precondition. Keep it until the sweep is done, envelopes included (step 4): while it is lifted, every request waits (`catalog block lifted`), and an envelope of the subject's that a `hideCatalog` suspension still hides is kept (`owner hidden`).
 2. **Runs `request-deletion --subject <sub> --all --reason <why>`.**
@@ -324,7 +324,6 @@ A creator whose entitlement lapsed, who is suspended, whom the decision service 
 - A creator who hides from a Mac without the recording's archive can undo the Hide only within the 7 days: afterwards re-listing needs a push.
 - A publish that lists a hash again between an item's re-check and its delete leaves a listed recording that answers as gone. The sweep reports it: `deleted recording <hash> is listed again`.
 - A blocked envelope is kept while its block stands: `request-deletion --hash` refuses an envelope's hash, and the sweep holds a blocked envelope (`kept envelope <hash>: blocked`).
-- A catalog-blocked creator who isn't suspended gets 412 on `If-None-Match: *`, because preconditions ignore the owner's hide. This predates deletion and needs its own fix.
 - Not deleted at all: recordings pushed but never listed, outside `request-deletion`; leftovers of removed features other than envelopes (`/1` tags, `catalog-index/`, `campaign-creators/`); copies outside the node (what viewers or peers already fetched, the KAS, identity, CloudWatch logs).
 
 ### IAM for deletion

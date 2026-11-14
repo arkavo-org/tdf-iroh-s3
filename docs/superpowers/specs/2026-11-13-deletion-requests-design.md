@@ -148,7 +148,7 @@ Readers (the sweep, the diff at publish) check a `/2` pointer's stored index aga
 
 #### 3.1 Transitions, written at publish
 
-Each publish writes `catalog-transitions/<sub>/<seq, 20 digits>-<pointer digest>` (`<sub>` as the pointer key; the digest is the lowercase hex SHA-256 of the signed pointer bytes, so the key is unique to one signed pointer) **before** the document, index and pointer (step 8), and fails with 502 `storage unavailable` if it can't:
+Each publish writes `catalog-transitions/<sub>/<seq, 20 digits>-<pointer digest>` (`<sub>` as the pointer key; the digest is the lowercase hex SHA-256 of the signed pointer bytes, so the key is unique to one signed pointer) in step 8, after the index record and **before** the document, outboard and pointer (index → transition → document → outboard → pointer), and fails with 502 `storage unavailable` if it can't:
 
 ```json
 {"subject":"<sub>","seq":8,"catalogHash":"<new>","pointer":"<digest>","base":{"seq":7,"catalogHash":"<old>","pointer":"<digest>"},"at":<unix secs>,

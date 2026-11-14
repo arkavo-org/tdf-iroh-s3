@@ -1811,6 +1811,57 @@ mod tests {
         );
     }
 
+    /// The routine leftover of a publish whose writes stopped after its
+    /// index record: no document, outboard or pointer. Observed as an
+    /// untracked envelope with no owner of its own (no document to name
+    /// one), its owner is its index record's, and it is deleted once its
+    /// grace has passed. Nothing aborts.
+    #[tokio::test]
+    async fn an_index_record_left_alone_is_deleted_after_grace() {
+        let m = bucket();
+        publish_2(&m, U, 1, b"doc-u", &[]);
+        let e = catalog(b"doc-left");
+        put(
+            &m,
+            &format!("catalog-indexes/{e}"),
+            index_record(&arkavo(U), &[]),
+        );
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert_eq!(report.failures, 0, "{report}");
+        assert!(
+            has(&report, &format!("kept envelope {e}: within grace")),
+            "{report}"
+        );
+        let observed: EnvelopeRequest = record(&m, &envelope_key(&e)).await;
+        assert_eq!(
+            observed,
+            EnvelopeRequest {
+                hash: e.clone(),
+                owner: None,
+                superseded_at: NOW,
+                source: Source::Observed,
+                state: State::Pending,
+                deleted_at: None,
+            }
+        );
+
+        // A grace later: due, its owner the index record's (canonical). An
+        // unknown owner would keep it ("unknown owner").
+        let later = NOW + GRACE;
+        m.set_now(later);
+        let report = sweep(&m, true, later).await.unwrap();
+        assert_eq!(report.failures, 0, "{report}");
+        assert!(has(&report, &format!("deleted envelope {e}")), "{report}");
+        assert_eq!(m.deletes(), envelope_keys(&e));
+        assert!(gone(&m, &format!("catalog-indexes/{e}")).await);
+        let r: EnvelopeRequest = record(&m, &envelope_key(&e)).await;
+        assert_eq!((r.state, r.deleted_at), (State::Deleted, Some(later)));
+        // The current envelope's index record stays.
+        assert!(!gone(&m, &format!("catalog-indexes/{}", catalog(b"doc-u"))).await);
+        snapshot::read(&m).await.unwrap();
+    }
+
     /// A subject's pointers go first, then recordings, then envelopes.
     /// Deleting the subject's own pointers is no catalog change: its
     /// recordings and envelopes are deleted in the same run.

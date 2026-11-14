@@ -329,6 +329,8 @@ pub(crate) mod test_support {
         pub fail_next_index_create: std::sync::atomic::AtomicBool,
         /// The next catalog document write fails without writing.
         pub fail_next_document_write: std::sync::atomic::AtomicBool,
+        /// The next catalog outboard write fails without writing.
+        pub fail_next_outboard_write: std::sync::atomic::AtomicBool,
     }
 
     impl MemStore {
@@ -441,6 +443,12 @@ pub(crate) mod test_support {
             outboard: Bytes,
         ) -> anyhow::Result<()> {
             self.up()?;
+            anyhow::ensure!(
+                !self
+                    .fail_next_outboard_write
+                    .swap(false, std::sync::atomic::Ordering::Relaxed),
+                "outboard write failed"
+            );
             self.catalog_outboards
                 .lock()
                 .await
