@@ -319,6 +319,10 @@ pub(crate) mod test_support {
     use std::collections::HashMap;
     use tokio::sync::Mutex;
 
+    /// Another request's writes, run by a `MemStore` hook in the middle of
+    /// a call (`MemStore::commit_pointer`, `MemStore::store_transition`).
+    pub type StoreHook = Box<dyn FnOnce(&MemStore) + Send>;
+
     /// In-memory ingested blobs (hash → size), owner records, catalog
     /// documents, indexes, transitions and pointers.
     #[derive(Default)]
@@ -357,6 +361,12 @@ pub(crate) mod test_support {
         /// what is stored: a publish that read the pointer before other
         /// publishes moved it, and resumes only now.
         pub stale_next_pointer_read: std::sync::Mutex<Option<(Bytes, u64)>>,
+        /// Runs once, right after the next transition read: between
+        /// `write_transition`'s transition read and its pointer re-read, as
+        /// another request's writes landing there would.
+        pub after_next_transition_read: std::sync::Mutex<Option<StoreHook>>,
+        /// Runs once, right after the next pointer read.
+        pub after_next_pointer_read: std::sync::Mutex<Option<StoreHook>>,
         /// The next index record create reports one already there, without
         /// writing, though none is stored: as if the record were deleted
         /// between the create and its read.
@@ -372,6 +382,36 @@ pub(crate) mod test_support {
     impl MemStore {
         pub fn new() -> Self {
             Self::default()
+        }
+
+        /// Store `body` as `sub`'s pointer at a new version, as a publish
+        /// that committed would. For hooks, which run with no store lock
+        /// held.
+        pub fn commit_pointer(&self, sub: &str, body: Bytes) {
+            let v = self
+                .pointer_versions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.catalog_pointers
+                .try_lock()
+                .expect("no pointer lock held")
+                .insert(sub.to_string(), (body, v));
+        }
+
+        /// Store `body` as the transition under `key` (`"<sub>/<name>"`).
+        /// For hooks, which run with no store lock held.
+        pub fn store_transition(&self, key: &str, body: Bytes) {
+            self.transitions
+                .try_lock()
+                .expect("no transition lock held")
+                .insert(key.to_string(), body);
+        }
+
+        /// Run the hook in `slot`, if one is set, once.
+        fn run_hook(&self, slot: &std::sync::Mutex<Option<StoreHook>>) {
+            let hook = slot.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(self);
+            }
         }
 
         /// A stored transition's ETag: its body's hash, quoted, as S3's
@@ -567,7 +607,7 @@ pub(crate) mod test_support {
             name: &str,
         ) -> anyhow::Result<Option<StoredTransition>> {
             self.up()?;
-            Ok(self
+            let found = self
                 .transitions
                 .lock()
                 .await
@@ -575,26 +615,23 @@ pub(crate) mod test_support {
                 .map(|body| StoredTransition {
                     body: body.clone(),
                     etag: Self::transition_etag(body),
-                }))
+                });
+            self.run_hook(&self.after_next_transition_read);
+            Ok(found)
         }
         async fn get_catalog_pointer(&self, sub: &str) -> anyhow::Result<Option<StoredPointer>> {
             self.up()?;
             let stale = self.stale_next_pointer_read.lock().unwrap().take();
-            if let Some((body, v)) = stale {
-                return Ok(Some(StoredPointer {
-                    body,
-                    etag: format!("\"{v}\""),
-                }));
+            let found = match stale {
+                Some(read) => Some(read),
+                None => self.catalog_pointers.lock().await.get(sub).cloned(),
             }
-            Ok(self
-                .catalog_pointers
-                .lock()
-                .await
-                .get(sub)
-                .map(|(body, v)| StoredPointer {
-                    body: body.clone(),
-                    etag: format!("\"{v}\""),
-                }))
+            .map(|(body, v)| StoredPointer {
+                body,
+                etag: format!("\"{v}\""),
+            });
+            self.run_hook(&self.after_next_pointer_read);
+            Ok(found)
         }
         /// As S3's conditional put: `If-Match` the version, or
         /// `If-None-Match: *`.

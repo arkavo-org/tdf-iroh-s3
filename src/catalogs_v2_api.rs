@@ -559,13 +559,17 @@ async fn put_catalog<S: TagStore>(
     //    its 409 or 502 writes nothing else, no transition either. The
     //    transition is created only if none is under its key; one there is
     //    replaced only while the stored pointer is still the one this
-    //    publish read (`write_transition`), so a stalled copy can't rewrite
-    //    a transition another copy committed. `write_transition`'s own 502s
-    //    come after the index create, which is harmless: they need a
-    //    transition already under this key, so these pointer bytes were
-    //    sent before, and the pointer signs the envelope's hash and its
-    //    `indexHash`, so that attempt created this same record and this
-    //    create was a retry that wrote nothing. The document and its
+    //    publish read (`write_transition`), so a stalled copy over another
+    //    base can't rewrite a transition another copy committed. (Two
+    //    copies over the same base can leave the last writer's `at` and
+    //    `dropped`; the base is the same.) `write_transition`'s refusals (a
+    //    moved pointer, a lost replace, an unreadable transition) come after
+    //    the index create, which is harmless: each needs a transition
+    //    already under this key, so these pointer bytes were sent before,
+    //    and the pointer signs the envelope's hash and its `indexHash`, so
+    //    that attempt created or found this same record and this create was
+    //    a retry that wrote nothing. A failed transition write is a storage
+    //    error like any later write's. The document and its
     //    outboard come before the pointer, so a stored
     //    pointer never names a document that cannot be served or decided;
     //    the pointer is written only if nobody else moved it meanwhile.
@@ -2824,12 +2828,13 @@ mod tests {
         })
     }
 
-    /// Two copies of one publish over the same base, the original in
-    /// flight. The duplicate finds the original's transition with the
-    /// pointer still the base both read: it replaces it (a fresh `at`, the
-    /// same base) and commits. The original then finds the pointer moved
-    /// to that same pointer: it keeps the transition and answers 502, and a
-    /// read of the pointer shows its own `pointer` served.
+    /// Copies of one publish over the same base. A first copy wrote its
+    /// transition and is still in flight. A second finds it with the
+    /// pointer still the base all read: it replaces it (a fresh `at`, the
+    /// same base) and commits. A third copy, stalled since its step-7 read,
+    /// before its transition write, then finds the pointer moved to that
+    /// same pointer: it keeps the transition and answers 502, and a read of
+    /// the pointer shows its own `pointer` served.
     #[tokio::test]
     async fn concurrent_duplicates_over_the_same_base_both_end_correct() {
         let h = ingested().await;
@@ -2864,7 +2869,7 @@ mod tests {
         assert!(t.at >= before, "the duplicate's own `at`");
         let committed = h.store.transitions.lock().await.clone();
 
-        // The original resumes from its step 7 read.
+        // The third copy resumes from its step-7 read.
         *h.store.stale_next_pointer_read.lock().unwrap() = Some(read);
         let r = publish_if(&h, 2, &second, header::IF_MATCH, "\"1\"").await;
         assert_eq!(
@@ -3029,6 +3034,163 @@ mod tests {
         let t = transition(&h, 2, &second, &index()).await;
         assert!(t.at >= before, "{} < {before}", t.at);
         assert_eq!(t.base, first_attempt.base);
+    }
+
+    /// The setup of the interleaving tests: seq 1 stored, and a first
+    /// attempt of ours (seq 3) over it that lost its pointer race, leaving
+    /// its transition. Returns ours, the key and that transition's body.
+    async fn ours_lost_a_race(h: &Harness) -> (Vec<u8>, String, Bytes) {
+        assert_eq!(publish(h, 1, &envelope(1)).await.status, StatusCode::OK);
+        let ours = envelope(3);
+        h.store
+            .lose_next_pointer_race
+            .store(true, Ordering::Relaxed);
+        let r = publish_if(h, 3, &ours, header::IF_MATCH, "\"1\"").await;
+        assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.error());
+        let key = transition_key(3, &ours, &index());
+        let first = h.store.transitions.lock().await[&key].clone();
+        (ours, key, first)
+    }
+
+    /// `SUB`'s transition of `document` at `seq` over `base`, as stored.
+    fn transition_body(seq: u64, document: &[u8], base: Option<TransitionBase>, at: i64) -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&Transition {
+                subject: SUB.into(),
+                seq,
+                catalog_hash: hash_of(document),
+                pointer: digest_of(&signed(seq, document, &index())),
+                base,
+                at,
+                dropped: vec![],
+                added: vec![],
+            })
+            .unwrap(),
+        )
+    }
+
+    /// The bundle `SUB` signs for `document` at `seq`, as stored.
+    fn bundle_body(seq: u64, document: &[u8]) -> Bytes {
+        Bytes::from(serde_json::to_vec(&signed(seq, document, &index())).unwrap())
+    }
+
+    /// Another copy's write landing between `write_transition`'s
+    /// transition read and its pointer re-read (the `MemStore` hook) ends
+    /// in 502, from the moved pointer or a lost replace, and the transition
+    /// is left as that copy wrote it: never this copy's base over it.
+    /// - another copy commits ours over seq 1;
+    /// - theirs commits seq 2, then another copy of ours replaces the
+    ///   transition with base 2 and commits;
+    /// - another copy replaces the transition, the pointer unchanged.
+    #[tokio::test]
+    async fn writes_between_the_transition_read_and_the_pointer_check_end_in_502() {
+        #[derive(Debug, Clone, Copy)]
+        enum Between {
+            Commit,
+            NewerBaseCommit,
+            Replace,
+        }
+        for between in [Between::Commit, Between::NewerBaseCommit, Between::Replace] {
+            let h = ingested().await;
+            let (ours, key, first) = ours_lost_a_race(&h).await;
+            let theirs = envelope(2);
+            let (hook_key, ours_bundle, theirs_bundle) =
+                (key.clone(), bundle_body(3, &ours), bundle_body(2, &theirs));
+            let left = match between {
+                Between::Commit => first.clone(),
+                Between::NewerBaseCommit => {
+                    transition_body(3, &ours, base(2, &theirs, &index()), 2_000)
+                }
+                Between::Replace => {
+                    transition_body(3, &ours, base(1, &envelope(1), &index()), 2_000)
+                }
+            };
+            let written = left.clone();
+            *h.store.after_next_transition_read.lock().unwrap() =
+                Some(Box::new(move |store: &MemStore| match between {
+                    Between::Commit => store.commit_pointer(SUB, ours_bundle),
+                    Between::NewerBaseCommit => {
+                        store.commit_pointer(SUB, theirs_bundle);
+                        store.store_transition(&hook_key, written);
+                        store.commit_pointer(SUB, ours_bundle);
+                    }
+                    Between::Replace => store.store_transition(&hook_key, written),
+                }));
+
+            let r = publish_if(&h, 3, &ours, header::IF_MATCH, "\"1\"").await;
+            assert_eq!(
+                (r.status, r.error().as_str()),
+                (StatusCode::BAD_GATEWAY, "storage unavailable"),
+                "{between:?}"
+            );
+            assert_eq!(h.store.transitions.lock().await[&key], left, "{between:?}");
+        }
+    }
+
+    /// The interleaving that leaves the losing copy's `at`: copy B wrote
+    /// the transition; copy A reads it and its pointer check passes; B
+    /// commits; A's replace succeeds, and A's pointer write loses (409).
+    /// The transition names B's predecessor, the base both read, with A's
+    /// `at`.
+    #[tokio::test]
+    async fn a_copy_that_replaces_as_the_other_commits_ends_at_409() {
+        let h = ingested().await;
+        let first = envelope(1);
+        assert_eq!(publish(&h, 1, &first).await.status, StatusCode::OK);
+        let second = envelope(2);
+        let key = transition_key(2, &second, &index());
+        h.store.transitions.lock().await.insert(
+            key.clone(),
+            transition_body(2, &second, base(1, &first, &index()), 1_000),
+        );
+        let b_commits = bundle_body(2, &second);
+        // B commits right after A's pointer check: the hook after A's
+        // transition read sets one after the pointer read that follows.
+        *h.store.after_next_transition_read.lock().unwrap() =
+            Some(Box::new(move |store: &MemStore| {
+                *store.after_next_pointer_read.lock().unwrap() =
+                    Some(Box::new(move |store: &MemStore| {
+                        store.commit_pointer(SUB, b_commits)
+                    }));
+            }));
+
+        let before = now_secs();
+        let r = publish_if(&h, 2, &second, header::IF_MATCH, "\"1\"").await;
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (
+                StatusCode::CONFLICT,
+                "seq must be greater than the stored seq: another publish won"
+            )
+        );
+        let t = transition(&h, 2, &second, &index()).await;
+        assert_eq!(t.base, base(1, &first, &index()));
+        assert!(t.at >= before, "A's `at`, the losing copy's");
+        let served: Bundle = serde_json::from_slice(&get(&h, SUB).await.body).unwrap();
+        assert_eq!(served, signed(2, &second, &index()));
+    }
+
+    /// A resend whose stored pointer `GET` hides (a catalog block): sent
+    /// with `If-None-Match: *` after the 404, its `expected` is still the
+    /// hidden pointer's ETag, so the transition is replaced with that
+    /// pointer as its base, and the publish commits.
+    #[tokio::test]
+    async fn a_resend_over_a_hidden_pointer_replaces_the_transition() {
+        let h = ingested().await;
+        let (ours, _, _) = ours_lost_a_race(&h).await;
+        let theirs = envelope(2);
+        let r = publish_if(&h, 2, &theirs, header::IF_MATCH, "\"1\"").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        h.moderation.block_catalog_for_test(SUB);
+        assert_eq!(get(&h, SUB).await.status, StatusCode::NOT_FOUND);
+
+        let r = publish_if(&h, 3, &ours, header::IF_NONE_MATCH, "*").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+        let t = transition(&h, 3, &ours, &index()).await;
+        assert_eq!(t.base, base(2, &theirs, &index()));
+        assert!(t.dropped.is_empty(), "a hidden base drops nothing");
+        let stored = h.store.catalog_pointers.lock().await[SUB].0.clone();
+        assert_eq!(stored, bundle_body(3, &ours));
     }
 
     /// A transition under this publish's key, the pointer still what it
