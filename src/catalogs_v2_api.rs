@@ -3144,12 +3144,18 @@ mod tests {
             transition_body(2, &second, base(1, &first, &index()), 1_000),
         );
         let b_commits = bundle_body(2, &second);
+        // The version B's commit takes: the copies sign the same pointer,
+        // so the stored bytes can't say whose write stored it.
+        let b_version = Arc::new(std::sync::Mutex::new(None));
+        let b_took = Arc::clone(&b_version);
         // B commits right after A's pointer check: the hook after A's
         // transition read sets one after the pointer read that follows.
         *h.store.after_next_transition_read.lock().unwrap() =
             Some(Box::new(move |store: &MemStore| {
                 *store.after_next_pointer_read.lock().unwrap() =
                     Some(Box::new(move |store: &MemStore| {
+                        *b_took.lock().unwrap() =
+                            Some(store.pointer_versions.load(Ordering::Relaxed));
                         store.commit_pointer(SUB, b_commits)
                     }));
             }));
@@ -3166,31 +3172,52 @@ mod tests {
         let t = transition(&h, 2, &second, &index()).await;
         assert_eq!(t.base, base(1, &first, &index()));
         assert!(t.at >= before, "A's `at`, the losing copy's");
-        let served: Bundle = serde_json::from_slice(&get(&h, SUB).await.body).unwrap();
-        assert_eq!(served, signed(2, &second, &index()));
+        // What is stored is B's write, and nothing was written after it.
+        let b_version = b_version.lock().unwrap().expect("B committed");
+        assert_eq!(h.store.catalog_pointers.lock().await[SUB].1, b_version);
+        assert_eq!(
+            h.store.pointer_versions.load(Ordering::Relaxed),
+            b_version + 1
+        );
     }
 
     /// A resend whose stored pointer `GET` hides (a catalog block): sent
     /// with `If-None-Match: *` after the 404, its `expected` is still the
     /// hidden pointer's ETag, so the transition is replaced with that
-    /// pointer as its base, and the publish commits.
+    /// pointer as its base, and the publish commits. The hidden base lists
+    /// a recording ours doesn't, and drops nothing: unhidden, the same
+    /// publish drops it.
     #[tokio::test]
     async fn a_resend_over_a_hidden_pointer_replaces_the_transition() {
-        let h = ingested().await;
-        let (ours, _, _) = ours_lost_a_race(&h).await;
-        let theirs = envelope(2);
-        let r = publish_if(&h, 2, &theirs, header::IF_MATCH, "\"1\"").await;
-        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
-        h.moderation.block_catalog_for_test(SUB);
-        assert_eq!(get(&h, SUB).await.status, StatusCode::NOT_FOUND);
+        let theirs_index = json!([rec(1), rec(2)]);
+        for hidden in [true, false] {
+            let h = ingested().await;
+            ingest(&h, 2).await;
+            let (ours, _, _) = ours_lost_a_race(&h).await;
+            let theirs = envelope(2);
+            let r =
+                publish_index_if(&h, 2, &theirs, &theirs_index, (header::IF_MATCH, "\"1\"")).await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+            let precondition = if hidden {
+                h.moderation.block_catalog_for_test(SUB);
+                assert_eq!(get(&h, SUB).await.status, StatusCode::NOT_FOUND);
+                (header::IF_NONE_MATCH, "*")
+            } else {
+                (header::IF_MATCH, "\"2\"")
+            };
 
-        let r = publish_if(&h, 3, &ours, header::IF_NONE_MATCH, "*").await;
-        assert_eq!(r.status, StatusCode::OK, "{}", r.error());
-        let t = transition(&h, 3, &ours, &index()).await;
-        assert_eq!(t.base, base(2, &theirs, &index()));
-        assert!(t.dropped.is_empty(), "a hidden base drops nothing");
-        let stored = h.store.catalog_pointers.lock().await[SUB].0.clone();
-        assert_eq!(stored, bundle_body(3, &ours));
+            let r = publish_if(&h, 3, &ours, precondition.0, precondition.1).await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.error());
+            let t = transition(&h, 3, &ours, &index()).await;
+            assert_eq!(t.base, base(2, &theirs, &theirs_index));
+            if hidden {
+                assert!(t.dropped.is_empty(), "a hidden base drops nothing");
+            } else {
+                assert_eq!(t.dropped, [payload(2)]);
+            }
+            let stored = h.store.catalog_pointers.lock().await[SUB].0.clone();
+            assert_eq!(stored, bundle_body(3, &ours));
+        }
     }
 
     /// A transition under this publish's key, the pointer still what it
