@@ -334,12 +334,14 @@ The node checks this on publish and readers check it on read. The rules are the 
 
 This is the only route that publishes a catalog. The request needs `Authorization: Bearer <Arkavo CWT>` and `Content-Type: application/json`. Its body is `{"document": "<base64url envelope bytes>", "bundle": {…}, "index": [ … ]}`, at most 10 MiB (10 485 760 bytes): a 4 MiB envelope is about 5.6 MiB in base64url, and an index of 1000 entries up to about 400 KiB.
 
-The request must name the base the client merged its document from, with a standard conditional header (RFC 9110). Without one, a device whose own highest `seq` exceeds the stored one could publish over a base it never read, and replace what another device saved.
+The request must name the base the client merged its document from, with exactly one of two standard conditional headers (RFC 9110), in the form below. Without one, a device whose own highest `seq` exceeds the stored one could publish over a base it never read, and replace what another device saved.
 
-- **`If-Match: "<seq>"`:** the client merged from the stored pointer with this `seq`, as `GET /v2/catalogs/{sub}` tagged it (`ETag`). The tag is compared strongly: a weak tag (`W/"7"`) or a bare `7` never matches. `If-Match: *` matches any pointer that `GET` serves.
-- **`If-None-Match: *`:** the client merged from "no catalog yet" (a 404). No pointer may be stored, apart from one `GET` doesn't serve: preconditions see what `GET` serves. That is a pointer whose catalog is blocked, whose `seq` must still be exceeded, or one at a catalog from before envelopes, which reads as no pointer at all, so the first envelope may start at any `seq`.
+- **`If-Match: "<seq>"`:** the client merged from the stored pointer with this `seq`, as `GET /v2/catalogs/{sub}` tagged it (`ETag`). It is one strong entity tag whose content is ASCII decimal digits, sent as one header line with no list. It holds only when `GET` serves a pointer whose `ETag` is exactly that tag.
+- **`If-None-Match: *`:** exactly `*`, as one header line. The client merged from "no catalog yet" (a 404). No pointer may be stored, apart from one `GET` doesn't serve: preconditions see what `GET` serves. That is a pointer whose catalog is blocked, whose `seq` must still be exceeded, or one at a catalog from before envelopes, which reads as no pointer at all, so the first envelope may start at any `seq`.
 
-If the stored pointer is no longer that base, the node answers 412 `catalog changed since it was read` and stores nothing. Read the pointer again, merge, sign and retry. When both headers are sent, both must hold. A header value that is not visible ASCII fails. A request with neither header gets 428 `precondition required`, also on a node with `[publishing] required = false`.
+Anything else gets 428 `precondition required`, before the node reads the stored pointer, also on a node with `[publishing] required = false`. That includes neither header or both, `If-Match: *`, a list of tags, a weak (`W/"7"`), unquoted (`7`), empty or non-digit tag, any `If-None-Match` other than `*`, a repeated header line, and a value that is not visible ASCII.
+
+If the stored pointer is no longer that base, the node answers 412 `catalog changed since it was read` and stores nothing. Read the pointer again, merge, sign and retry.
 
 The node checks the following in order:
 
@@ -369,7 +371,7 @@ The node checks the following in order:
 | Every recording's manifest is stored (at ingest) and readable. A recording ingested before the node stored manifests has none: push it again. | 422 `payload <hash> manifest is not stored` or `… manifest is unreadable` |
 | Every entry's recording policy names the envelope's attribute | 422 `entry <contentID> policy does not include the catalog attribute` |
 | The passkey credential is still the subject's, according to the IdP's status route | 403 `passkey credential unknown`, `… revoked` or `… belongs to another subject`; 502 `credential status unavailable` |
-| `If-Match` or `If-None-Match` is sent | 428 `precondition required` |
+| exactly one of `If-Match: "<seq>"` or `If-None-Match: *` is sent | 428 `precondition required` |
 | The stored pointer is the base named by `If-Match` or `If-None-Match` | 412 `catalog changed since it was read` |
 | `seq` is greater than the stored one | 409 `seq must be greater than <n>` |
 | The envelope has no index record yet, or its record is a retry of this publish: `{sub}`'s (subjects compared canonically), with the same canonical index. Checked as the record is written, before the envelope and its outboard. | 409 `catalog document already published with another index`; 502 `storage unavailable` when the existing record can't be read |
@@ -405,7 +407,7 @@ Fetch `catalogHash` from the pinned node, with a size limit of `catalogSize`. Th
 3. Write the `/2` pointer bytes over the envelope's hash and size and the index's [`indexHash`](#indexhash), and keep them exactly.
 4. Get a passkey assertion for RP `identity.arkavo.net`, with challenge SHA-256(pointer bytes) and user verification required. Allow only the signed-in account's credentials.
 5. Get the attestation for the assertion's credential: `POST https://identity.arkavo.net/passkeys/credential-attestation`.
-6. `PUT /v2/catalogs/<sub>` with the envelope, the bundle and the index (the merged document's `entries`, which `indexHash` covers), and `If-Match: <the ETag>`, or `If-None-Match: *` after a 404. One of the two is required. On a 412 or a 409, go back to step 1 and retry once.
+6. `PUT /v2/catalogs/<sub>` with the envelope, the bundle and the index (the merged document's `entries`, which `indexHash` covers), and `If-Match: <the ETag>`, or `If-None-Match: *` after a 404. Send exactly one of the two, in that form. On a 412 or a 409, go back to step 1 and retry once.
 
 ## Removed with `/1` (2026-10-27)
 
