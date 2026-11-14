@@ -33,8 +33,10 @@ async fn test_s3_key_with_prefix() {
     );
 }
 
-/// A loopback S3 that keeps each object's body and `x-amz-meta-owner`. A
-/// `PUT` with `If-None-Match: *` on an existing key fails with 412.
+/// A loopback S3 that keeps each object's body, `x-amz-meta-owner` and an
+/// ETag that changes with every write. A `PUT` with `If-None-Match: *` on
+/// an existing key, or with an `If-Match` that isn't the key's ETag, fails
+/// with 412.
 async fn metadata_s3() -> String {
     metadata_s3_with_conflicts(0).await
 }
@@ -49,15 +51,17 @@ async fn metadata_s3_with_conflicts(conflicts: usize) -> String {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    type Objects = Arc<Mutex<(HashMap<String, (Bytes, Option<String>)>, usize)>>;
-    let objects: Objects = Arc::new(Mutex::new((HashMap::new(), conflicts)));
+    /// key → (body, owner, ETag), the conflicts left to answer, and the
+    /// writes so far (each write's ETag).
+    type Objects = Arc<Mutex<(HashMap<String, (Bytes, Option<String>, String)>, usize, u64)>>;
+    let objects: Objects = Arc::new(Mutex::new((HashMap::new(), conflicts, 0)));
     let app = axum::Router::new().fallback(
         move |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| {
             let objects = Arc::clone(&objects);
             async move {
                 let key = uri.path().to_string();
                 let mut guard = objects.lock().unwrap();
-                let (objects, conflicts) = &mut *guard;
+                let (objects, conflicts, writes) = &mut *guard;
                 match method {
                     Method::PUT => {
                         let create_only = headers
@@ -71,7 +75,11 @@ async fn metadata_s3_with_conflicts(conflicts: usize) -> String {
                             )
                                 .into_response();
                         }
-                        if create_only && objects.contains_key(&key) {
+                        let if_match = headers.get("if-match").and_then(|v| v.to_str().ok());
+                        let current = objects.get(&key).map(|(_, _, etag)| etag.as_str());
+                        if (create_only && current.is_some())
+                            || if_match.is_some_and(|tag| current != Some(tag))
+                        {
                             return (
                                 StatusCode::PRECONDITION_FAILED,
                                 "<Error><Code>PreconditionFailed</Code><Message>x</Message></Error>",
@@ -82,17 +90,20 @@ async fn metadata_s3_with_conflicts(conflicts: usize) -> String {
                             .get("x-amz-meta-owner")
                             .and_then(|v| v.to_str().ok())
                             .map(str::to_string);
-                        objects.insert(key, (body, owner));
-                        (StatusCode::OK, [("etag", "\"fake\"")]).into_response()
+                        *writes += 1;
+                        let etag = format!("\"v{writes}\"");
+                        objects.insert(key, (body, owner, etag.clone()));
+                        (StatusCode::OK, [("etag", etag)]).into_response()
                     }
                     Method::GET | Method::HEAD => match objects.get(&key) {
-                        Some((body, owner)) => {
+                        Some((body, owner, etag)) => {
                             let mut res = if method == Method::GET {
                                 body.clone().into_response()
                             } else {
                                 (StatusCode::OK, [("content-length", body.len().to_string())])
                                     .into_response()
                             };
+                            res.headers_mut().insert("etag", etag.parse().unwrap());
                             if let Some(owner) = owner {
                                 res.headers_mut()
                                     .insert("x-amz-meta-owner", owner.parse().unwrap());
@@ -301,4 +312,47 @@ async fn test_create_catalog_index_sends_a_409_again() {
     );
     assert!(shown.contains("409"), "{shown}");
     assert_eq!(s3.get_catalog_index(&hash).await.unwrap(), None);
+}
+
+/// A publish's transition is created only if none is stored, and replaced
+/// only over the ETag it was read at: a stale ETag loses, and the stored
+/// record stays.
+#[tokio::test(flavor = "current_thread")]
+async fn test_catalog_transition_is_created_once_then_replaced_conditionally() {
+    use bytes::Bytes;
+
+    let s3 = loopback_client(metadata_s3().await).await;
+    let (sub, name) = ("u1", "00000000000000000002-ab");
+    let first = Bytes::from_static(b"{\"base\":1}");
+    let second = Bytes::from_static(b"{\"base\":2}");
+    let third = Bytes::from_static(b"{\"base\":3}");
+    assert_eq!(s3.get_catalog_transition(sub, name).await.unwrap(), None);
+    assert!(
+        s3.put_catalog_transition(sub, name, first.clone(), None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !s3.put_catalog_transition(sub, name, second.clone(), None)
+            .await
+            .unwrap()
+    );
+    let (body, read) = s3.get_catalog_transition(sub, name).await.unwrap().unwrap();
+    assert_eq!(body, first);
+
+    assert!(
+        s3.put_catalog_transition(sub, name, second.clone(), Some(&read))
+            .await
+            .unwrap()
+    );
+    let (body, now) = s3.get_catalog_transition(sub, name).await.unwrap().unwrap();
+    assert_eq!(body, second);
+    assert_ne!(now, read);
+    assert!(
+        !s3.put_catalog_transition(sub, name, third, Some(&read))
+            .await
+            .unwrap()
+    );
+    let (body, _) = s3.get_catalog_transition(sub, name).await.unwrap().unwrap();
+    assert_eq!(body, second);
 }

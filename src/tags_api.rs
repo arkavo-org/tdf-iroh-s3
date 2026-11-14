@@ -74,14 +74,24 @@ pub trait TagStore: Send + Sync + 'static {
         hash_hex: &str,
     ) -> impl Future<Output = anyhow::Result<Option<Bytes>>> + Send;
     /// Write a publish's transition record
-    /// (`catalog-transitions/<sub>/<name>`, never served), after its index
-    /// record and before its document, outboard and pointer.
+    /// (`catalog-transitions/<sub>/<name>`, never served) only if none is
+    /// stored (`expected` `None`: `If-None-Match: *`), or only if the stored
+    /// one still has the ETag `expected` (`If-Match`). `false` when the
+    /// condition failed; `Err` when it can't be written, a conflicting
+    /// write still in progress after the retries included.
     fn put_catalog_transition(
         &self,
         sub: &str,
         name: &str,
         body: Bytes,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+        expected: Option<&str>,
+    ) -> impl Future<Output = anyhow::Result<bool>> + Send;
+    /// A stored transition record and its ETag.
+    fn get_catalog_transition(
+        &self,
+        sub: &str,
+        name: &str,
+    ) -> impl Future<Output = anyhow::Result<Option<StoredTransition>>> + Send;
     /// A creator's stored catalog v2 pointer bundle.
     fn get_catalog_pointer(
         &self,
@@ -101,6 +111,13 @@ pub trait TagStore: Send + Sync + 'static {
 /// A stored catalog v2 pointer bundle and the version it was read at.
 #[derive(Debug, Clone)]
 pub struct StoredPointer {
+    pub body: Bytes,
+    pub etag: String,
+}
+
+/// A stored transition record and the ETag it was read at.
+#[derive(Debug, Clone)]
+pub struct StoredTransition {
     pub body: Bytes,
     pub etag: String,
 }
@@ -176,8 +193,19 @@ impl TagStore for crate::store::s3::S3Client {
         sub: &str,
         name: &str,
         body: Bytes,
-    ) -> anyhow::Result<()> {
-        Self::put_catalog_transition(self, sub, name, body).await
+        expected: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        Self::put_catalog_transition(self, sub, name, body, expected).await
+    }
+
+    async fn get_catalog_transition(
+        &self,
+        sub: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<StoredTransition>> {
+        Ok(Self::get_catalog_transition(self, sub, name)
+            .await?
+            .map(|(body, etag)| StoredTransition { body, etag }))
     }
 
     async fn get_catalog_pointer(&self, sub: &str) -> anyhow::Result<Option<StoredPointer>> {
@@ -315,6 +343,10 @@ pub(crate) mod test_support {
         pub transitions: Mutex<std::collections::BTreeMap<String, Bytes>>,
         /// The next transition write fails, as an unreachable store would.
         pub fail_next_transition: std::sync::atomic::AtomicBool,
+        /// The next conditional replace of a transition (`If-Match`) loses
+        /// without writing, as if another write had replaced it since it was
+        /// read.
+        pub lose_next_transition_replace: std::sync::atomic::AtomicBool,
         /// sub → (bundle, version). The version stands in for S3's ETag.
         pub catalog_pointers: Mutex<HashMap<String, (Bytes, u64)>>,
         pub pointer_versions: std::sync::atomic::AtomicU64,
@@ -336,6 +368,12 @@ pub(crate) mod test_support {
     impl MemStore {
         pub fn new() -> Self {
             Self::default()
+        }
+
+        /// A stored transition's ETag: its body's hash, quoted, as S3's
+        /// for a single-part upload depends only on the body.
+        pub fn transition_etag(body: &Bytes) -> String {
+            format!("\"{}\"", blake3::hash(body).to_hex())
         }
 
         /// Record `hash` as ingested with `size` bytes.
@@ -487,12 +525,15 @@ pub(crate) mod test_support {
             self.up()?;
             Ok(self.catalog_indexes.lock().await.get(hash_hex).cloned())
         }
+        /// As S3's conditional put: `If-None-Match: *`, or `If-Match` the
+        /// ETag [`MemStore::transition_etag`] gives.
         async fn put_catalog_transition(
             &self,
             sub: &str,
             name: &str,
             body: Bytes,
-        ) -> anyhow::Result<()> {
+            expected: Option<&str>,
+        ) -> anyhow::Result<bool> {
             self.up()?;
             anyhow::ensure!(
                 !self
@@ -500,11 +541,37 @@ pub(crate) mod test_support {
                     .swap(false, std::sync::atomic::Ordering::Relaxed),
                 "transition write failed"
             );
-            self.transitions
+            if expected.is_some()
+                && self
+                    .lose_next_transition_replace
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                return Ok(false);
+            }
+            let key = format!("{sub}/{name}");
+            let mut transitions = self.transitions.lock().await;
+            let current = transitions.get(&key).map(Self::transition_etag);
+            if current.as_deref() != expected {
+                return Ok(false);
+            }
+            transitions.insert(key, body);
+            Ok(true)
+        }
+        async fn get_catalog_transition(
+            &self,
+            sub: &str,
+            name: &str,
+        ) -> anyhow::Result<Option<StoredTransition>> {
+            self.up()?;
+            Ok(self
+                .transitions
                 .lock()
                 .await
-                .insert(format!("{sub}/{name}"), body);
-            Ok(())
+                .get(&format!("{sub}/{name}"))
+                .map(|body| StoredTransition {
+                    body: body.clone(),
+                    etag: Self::transition_etag(body),
+                }))
         }
         async fn get_catalog_pointer(&self, sub: &str) -> anyhow::Result<Option<StoredPointer>> {
             self.up()?;

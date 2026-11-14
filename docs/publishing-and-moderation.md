@@ -202,7 +202,7 @@ Hide from Catalog publishes the catalog without the entry, and an account deleti
 - `dropped`: the recordings in the served base's index that the new index doesn't list, less those blocked at the time and those whose owner record doesn't name the publisher. A base `GET` doesn't serve (its envelope blocked, its owner catalog-blocked or suspended with `hideCatalog`, a pointer from before envelopes) drops nothing.
 - `added`: the recordings the new index lists and the base's index doesn't.
 
-The publish writes no request. The sweep acts only on a committed transition, one reachable from a current pointer through `base` links. The pointer write is conditional on the base, so a publish that lost the race leaves a transition nothing reaches.
+The publish writes no request. The sweep acts only on a committed transition, one reachable from a current pointer through `base` links. The pointer write is conditional on the base, so a publish that lost the race leaves a transition nothing reaches. The transition is created only if none is under its key (`If-None-Match: *`), and its key names one signed pointer. A resend of the same publish over the same base, a retry or a duplicate sent while the first was in flight, keeps the transition already there, its `at` and `dropped` included, so it can't rewrite one the first commits. The same pointer sent over a base that moved since (its first attempt lost the race) replaces the transition, only if it is unchanged since read (`If-Match`; otherwise 502), so the transition a committed pointer reaches names its real base.
 
 ### The grace and the weekly sweep
 
@@ -328,7 +328,7 @@ A creator whose entitlement lapsed, who is suspended, or whom the decision servi
 
 ### IAM for deletion
 
-- **The instance role** needs `s3:PutObject` on `<prefix>catalog-transitions/*`: without it every publish answers 502 `storage unavailable`. Its conditional creates on `moderation/publishers/*` are under [IAM](#iam).
+- **The instance role** needs `s3:PutObject` and `s3:GetObject` on `<prefix>catalog-transitions/*`: without `s3:PutObject` every publish answers 502 `storage unavailable`, and without `s3:GetObject` so does every resend of a publish whose transition is already stored. Its conditional creates on `moderation/publishers/*` are under [IAM](#iam).
 - **Operators** running any of the four commands need `s3:ListBucket`, `s3:ListBucketVersions`, `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and `s3:DeleteObjectVersion` on the bucket, under the prefix.
 
 ### The lifecycle rule
@@ -373,7 +373,7 @@ Ownership, pointer `/2` and deletion ship as three PRs that merge and deploy tog
    1. Against a scratch versioned bucket, never production: `TDF_IROH_S3_VERSIONED_BUCKET=<scratch bucket> AWS_REGION=<region> cargo test --test s3_versioned_test -- --ignored --nocapture` passes. With either variable unset, every test passes without touching S3 and prints `<test> skipped: set TDF_IROH_S3_VERSIONED_BUCKET and AWS_REGION` (shown only with `--nocapture`). A run that prints it proves nothing.
    2. `claim-owners` reports no conflicts; then `claim-owners --write`.
    3. `sweep-deletions` (a dry run) on production completes: no unreadable record. Time it: a `--delete` run costs about one full read per due item, and a dry run about two full reads.
-   4. The instance role can write `catalog-transitions/*` ([IAM for deletion](#iam-for-deletion)). The lifecycle rule can go on any time.
+   4. The instance role can write and read `catalog-transitions/*` ([IAM for deletion](#iam-for-deletion)). The lifecycle rule can go on any time.
 4. **Deploy the node with no overlap:** no instance running the old code serves after a new one does. An old instance would overwrite owner records and accept `/1` publishes that write no transition, which breaks the chain the sweep follows. Then run `claim-owners` (a dry run) again. From here `/1` publishes get 422 `invalid bundle: pointer schema must be "arkavo.catalog-pointer/2"`, so Creator rc.2 and earlier TestFlight builds can't publish, update or hide.
 5. **The Creator release that publishes `/2` ships.** Before the switch, test it against a node running this version outside production.
 6. **The operator schedules `sweep-deletions --delete` weekly** from then on, for example in the deploy runbook: nothing in the node runs it. The first `--delete` run after the switch records every envelope superseded before it, each carrying its entries' metadata TDFs, titles included (no transition named them, so the run observes them). The first run 7 or more days later deletes them all in one wave.
@@ -391,4 +391,4 @@ moderation_refresh_secs = 30
 decisions = "local"                # local | shadow | pdp (needs [catalog.authz] endpoint)
 ```
 
-The node's IAM role needs `s3:PutObject`, `s3:GetObject` and `s3:ListBucket` on `<prefix>moderation/*`, which includes `moderation/audit/` and the conditional creates of `moderation/publishers/` (see [IAM](#iam)), and `s3:PutObject` on `<prefix>catalog-transitions/*` (see [IAM for deletion](#iam-for-deletion)).
+The node's IAM role needs `s3:PutObject`, `s3:GetObject` and `s3:ListBucket` on `<prefix>moderation/*`, which includes `moderation/audit/` and the conditional creates of `moderation/publishers/` (see [IAM](#iam)), and `s3:PutObject` and `s3:GetObject` on `<prefix>catalog-transitions/*` (see [IAM for deletion](#iam-for-deletion)).

@@ -692,18 +692,24 @@ impl S3Client {
 
     /// A creator's stored pointer bundle and its ETag.
     pub async fn get_catalog_pointer(&self, sub: &str) -> Result<Option<(Bytes, String)>> {
+        self.get_with_etag(&self.catalog_pointer_key(sub), "catalog pointer")
+            .await
+    }
+
+    /// The object at `key` (the full key) and its ETag, or `None`.
+    async fn get_with_etag(&self, key: &str, what: &str) -> Result<Option<(Bytes, String)>> {
         match self
             .client
             .get_object()
             .bucket(&self.bucket)
-            .key(self.catalog_pointer_key(sub))
+            .key(key)
             .send()
             .await
         {
             Ok(resp) => {
                 let etag = resp
                     .e_tag()
-                    .context("S3 GET of a catalog pointer returned no ETag")?
+                    .with_context(|| format!("S3 GET of a {what} returned no ETag"))?
                     .to_string();
                 let data = resp.body.collect().await?;
                 Ok(Some((data.into_bytes(), etag)))
@@ -712,13 +718,37 @@ impl S3Client {
                 if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
                     Ok(None)
                 } else {
-                    Err(anyhow::anyhow!(
-                        "Failed to GET catalog pointer from S3: {}",
-                        e
-                    ))
+                    Err(anyhow::anyhow!("Failed to GET {what} from S3: {}", e))
                 }
             }
         }
+    }
+
+    /// Put `body` at `key` (the full key) only if the object there still
+    /// has the ETag `expected` (`If-Match`), or, with `None`, only if there
+    /// is none (`If-None-Match: *`), through `send_conditional`.
+    async fn put_if(
+        &self,
+        key: &str,
+        body: Bytes,
+        expected: Option<&str>,
+        what: &str,
+    ) -> Result<bool> {
+        send_conditional(&format!("Failed to PUT {what} to S3"), || {
+            let put = self
+                .client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .content_type("application/json")
+                .body(body.clone().into());
+            match expected {
+                Some(etag) => put.if_match(etag),
+                None => put.if_none_match("*"),
+            }
+            .send()
+        })
+        .await
     }
 
     /// Create a catalog's index record under `catalog-indexes/<hash>` only
@@ -762,18 +792,37 @@ impl S3Client {
     }
 
     /// Write a publish's transition record, after its index record and
-    /// before its document, outboard and pointer.
-    pub async fn put_catalog_transition(&self, sub: &str, name: &str, body: Bytes) -> Result<()> {
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(self.catalog_transition_key(sub, name))
-            .content_type("application/json")
-            .body(body.into())
-            .send()
-            .await
-            .context("Failed to PUT catalog transition to S3")?;
-        Ok(())
+    /// before its document, outboard and pointer: only if none is stored
+    /// (`expected` `None`), or only if the stored one still has the ETag
+    /// `expected`. `false` when the condition failed; `Err` when a
+    /// conflicting write is still in progress after the retries.
+    pub async fn put_catalog_transition(
+        &self,
+        sub: &str,
+        name: &str,
+        body: Bytes,
+        expected: Option<&str>,
+    ) -> Result<bool> {
+        self.put_if(
+            &self.catalog_transition_key(sub, name),
+            body,
+            expected,
+            "catalog transition",
+        )
+        .await
+    }
+
+    /// A stored transition record and its ETag, or `None`.
+    pub async fn get_catalog_transition(
+        &self,
+        sub: &str,
+        name: &str,
+    ) -> Result<Option<(Bytes, String)>> {
+        self.get_with_etag(
+            &self.catalog_transition_key(sub, name),
+            "catalog transition",
+        )
+        .await
     }
 
     /// Store a creator's pointer bundle only if the stored one is still
@@ -786,21 +835,12 @@ impl S3Client {
         body: Bytes,
         expected: Option<&str>,
     ) -> Result<bool> {
-        let key = self.catalog_pointer_key(sub);
-        send_conditional("Failed to PUT catalog pointer to S3", || {
-            let put = self
-                .client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(&key)
-                .content_type("application/json")
-                .body(body.clone().into());
-            match expected {
-                Some(etag) => put.if_match(etag),
-                None => put.if_none_match("*"),
-            }
-            .send()
-        })
+        self.put_if(
+            &self.catalog_pointer_key(sub),
+            body,
+            expected,
+            "catalog pointer",
+        )
         .await
     }
 

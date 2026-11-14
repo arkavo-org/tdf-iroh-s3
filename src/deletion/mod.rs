@@ -170,7 +170,8 @@ pub struct SubjectRequest {
 }
 
 /// What one publish changed (spec 3.1), written after its index record and
-/// before its document, outboard and pointer, and never served.
+/// before its document, outboard and pointer, once per signed pointer
+/// (`catalogs_v2_api::write_transition`), and never served.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Transition {
