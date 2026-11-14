@@ -4,8 +4,13 @@
 //! links (spec 3.1); one from a publish that lost the pointer race never
 //! is. [`fold`] walks back from each pointer to the first missing
 //! transition (the start of history, or one an earlier run folded and
-//! deleted), applies that chain oldest first, and sorts every transition
+//! deleted), applies the chains oldest first, and sorts every transition
 //! no pointer reaches into lost (deleted unfolded) or kept.
+//!
+//! Requests are per canonical subject, and one subject can have two
+//! pointer keys (`arkavo:<uuid>` and `<uuid>`). So a subject's chains
+//! apply as one sequence in time order, each chain still oldest first:
+//! the newest drop wins, and an add undoes an older drop, across both.
 //!
 //! A run that stops after writing its requests and before deleting the
 //! transitions it folded folds them again next time. So applying a
@@ -43,14 +48,18 @@ pub struct Fold {
     /// Every request after folding: the snapshot's, with each committed
     /// transition applied.
     pub requests: Requests,
-    /// `(sub, hash)` of each recording request the snapshot held pending
-    /// that folding removed, because an add re-listed its hash: the sweep
-    /// deletes these. A request an add cancelled and a later drop set
-    /// again is in `requests`, not here.
+    /// The requests the sweep deletes: exactly the keys `(sub, hash)` of
+    /// the recording requests the snapshot held `pending` that are not in
+    /// `requests` after folding (an add re-listed the hash, and no later
+    /// drop set it again), in key order. Not here: a request an add
+    /// cancelled and a later drop set again, which is in `requests` (the
+    /// sweep writes it); one created and cancelled within this fold, which
+    /// was never stored; and a tombstone, which no add removes.
     pub cancelled: Vec<(String, String)>,
-    /// The transitions applied, by key, oldest first in each chain. Deleted
-    /// in this order, a run that stops part way leaves each chain's newest
-    /// transitions, still reachable from the pointer.
+    /// The transitions applied, by key, in the order applied: oldest first
+    /// in each chain, one subject's chains interleaved by time. Deleted in
+    /// this order, a run that stops part way leaves each chain's newest
+    /// transitions, still reachable from its pointer.
     pub folded: Vec<String>,
     /// Transitions no pointer reaches, at least [`GRACE`] old, whose
     /// subject's current pointer has a `seq` at least theirs: publishes
@@ -77,14 +86,17 @@ pub fn fold(snapshot: &Snapshot, now: i64) -> Fold {
     let mut kept = Vec::new();
     // Every transition a pointer reaches, folded or kept.
     let mut reached = HashSet::new();
+    // Each canonical subject's chains, each oldest first, in pointer-key
+    // order.
+    let mut by_subject: BTreeMap<&str, Vec<Chain>> = BTreeMap::new();
     for p in &catalogs.pointers {
         match walk(transitions, p, cap) {
-            Walk::Chain(chain) => {
-                for (key, t) in chain.into_iter().rev() {
-                    apply(&mut requests, t);
-                    reached.insert(key);
-                    folded.push(key.clone());
-                }
+            Walk::Chain(mut chain) => {
+                chain.reverse();
+                by_subject
+                    .entry(canonical_subject(pointer_sub(p)))
+                    .or_default()
+                    .push(chain);
             }
             Walk::Cycle(keys) => {
                 for key in keys {
@@ -93,6 +105,13 @@ pub fn fold(snapshot: &Snapshot, now: i64) -> Fold {
                     }
                 }
             }
+        }
+    }
+    for chains in by_subject.into_values() {
+        for (key, t) in in_time_order(chains) {
+            apply(&mut requests, t);
+            reached.insert(key);
+            folded.push(key.clone());
         }
     }
 
@@ -138,11 +157,35 @@ pub fn fold(snapshot: &Snapshot, now: i64) -> Fold {
     }
 }
 
+/// Transitions of one pointer's chain, with their keys.
+type Chain<'a> = Vec<(&'a String, &'a Transition)>;
+
+/// One canonical subject's chains, each oldest first, as one sequence.
+/// The next transition is always the earliest by `(at, seq, key)` among
+/// each chain's next one. So time orders the chains among each other, ties
+/// go deterministically, and each chain keeps its own order even where its
+/// `at`s don't rise (publishes on instances whose clocks differ).
+fn in_time_order(chains: Vec<Chain<'_>>) -> Chain<'_> {
+    let mut next = vec![0; chains.len()];
+    let mut merged = Vec::with_capacity(chains.iter().map(Vec::len).sum());
+    while let Some((_, i)) = chains
+        .iter()
+        .zip(&next)
+        .enumerate()
+        .filter_map(|(i, (chain, &n))| chain.get(n).map(|&(key, t)| ((t.at, t.seq, key), i)))
+        .min()
+    {
+        merged.push(chains[i][next[i]]);
+        next[i] += 1;
+    }
+    merged
+}
+
 /// A pointer's walk back through `base` links.
 enum Walk<'a> {
     /// Newest first, from the transition of the pointer's own publish to
     /// the last before a missing one or a `null` base.
-    Chain(Vec<(&'a String, &'a Transition)>),
+    Chain(Chain<'a>),
     /// The keys walked, newest first and with repeats, when the walk took
     /// `cap` steps and could go on: only `base` links that cycle do that.
     Cycle(Vec<&'a String>),
@@ -669,5 +712,66 @@ mod tests {
             out.requests.recordings.keys().collect::<Vec<_>>(),
             [&rk("u2", &p)]
         );
+    }
+
+    /// One snapshot holding both, its pointers in key order, as `scan`
+    /// lists them.
+    fn both(a: Snapshot, b: Snapshot) -> Snapshot {
+        let mut s = a;
+        s.transitions.extend(b.transitions);
+        s.catalogs.pointers.extend(b.catalogs.pointers);
+        s.catalogs.pointers.sort_by(|x, y| x.key.cmp(&y.key));
+        s
+    }
+
+    /// Two pointer keys of one canonical subject share its requests, so
+    /// their chains apply as one sequence in time order, and the newest
+    /// drop and the 7-day undo hold across both.
+    #[test]
+    fn one_subjects_chains_fold_in_time_order() {
+        let p = h("a1");
+        let arkavo = format!("arkavo:{U}");
+        // `U`'s chain (A) is first in pointer-key order, `arkavo:U`'s (B)
+        // second.
+        assert!(format!("{POINTERS}{U}") < format!("{POINTERS}{arkavo}"));
+
+        // A drops at 300, B at 100: the newest drop wins.
+        let s = both(
+            chain(U, &[(300, &[&p], &[])]),
+            chain(&arkavo, &[(100, &[&p], &[])]),
+        );
+        let out = fold(&s, NOW);
+        assert_eq!(out.requests.recordings[&rk(U, &p)], pending(U, &p, 300, 1));
+        assert_eq!(out.folded, [key(&arkavo, 1), key(U, 1)], "in time order");
+
+        // A re-lists at 400, after B's drop at 100: undone.
+        let s = both(
+            chain(U, &[(400, &[], &[&p])]),
+            chain(&arkavo, &[(100, &[&p], &[])]),
+        );
+        let out = fold(&s, NOW);
+        assert_eq!(out.requests.recordings.get(&rk(U, &p)), None);
+        assert_eq!(out.folded, [key(&arkavo, 1), key(U, 1)]);
+
+        // Ties go by seq, then by key: B's add (seq 1) before A's drop
+        // (seq 2), both at 100.
+        let s = both(
+            chain(U, &[(50, &[], &[]), (100, &[&p], &[])]),
+            chain(&arkavo, &[(100, &[], &[&p])]),
+        );
+        let out = fold(&s, NOW);
+        assert_eq!(out.requests.recordings[&rk(U, &p)], pending(U, &p, 100, 2));
+        assert_eq!(out.folded, [key(U, 1), key(&arkavo, 1), key(U, 2)]);
+
+        // A chain's own order comes before time: A's re-list (publish 2)
+        // carries an earlier `at` than its drop (another instance's clock),
+        // and still comes after it.
+        let s = both(
+            chain(U, &[(300, &[&p], &[]), (200, &[], &[&p])]),
+            chain(&arkavo, &[(250, &[&p], &[])]),
+        );
+        let out = fold(&s, NOW);
+        assert_eq!(out.requests.recordings.get(&rk(U, &p)), None);
+        assert_eq!(out.folded, [key(&arkavo, 1), key(U, 1), key(U, 2)]);
     }
 }
