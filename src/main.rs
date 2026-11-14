@@ -13,6 +13,7 @@ use tdf_iroh_s3::authz::{
 use tdf_iroh_s3::catalogs_api;
 use tdf_iroh_s3::catalogs_v2_api;
 use tdf_iroh_s3::config::{AuthzConfig, Config, PublishDecisions};
+use tdf_iroh_s3::deletion::operator::{self, Outcome, Requested};
 use tdf_iroh_s3::deletion::sweep::sweep;
 use tdf_iroh_s3::moderation::{self, Moderation, ModerationApi, PublishGate, PublishPolicy};
 use tdf_iroh_s3::node::TdfIrohNode;
@@ -79,6 +80,31 @@ enum Command {
         /// Write and delete; without it, only report.
         #[arg(long)]
         delete: bool,
+    },
+    /// Ask the sweep to delete blocked recordings (--hash) or everything
+    /// an account published (--all)
+    ///
+    /// --hash: each hash must have an active block; a scope-hash request
+    /// for each. --all: the subject must have an active catalog block; a
+    /// scope-subject request for every hash in the live index of each of
+    /// its pointers and every hash its owner records name, then a request
+    /// for the subject (its pointers). Nothing is written unless every
+    /// precondition holds. One line per key; sweep-deletions --delete then
+    /// deletes them. Exits 1 if refused.
+    RequestDeletion {
+        /// The account, compared canonically: keys carry `<uuid>` for
+        /// `arkavo:<uuid>`.
+        #[arg(long)]
+        subject: String,
+        /// Blocked recordings' BLAKE3 hashes, 64 lowercase hex characters.
+        #[arg(long, num_args = 1.., conflicts_with = "all", required_unless_present = "all")]
+        hash: Vec<String>,
+        /// Everything the subject published; needs its catalog block.
+        #[arg(long)]
+        all: bool,
+        /// Why; stored in each request.
+        #[arg(long)]
+        reason: String,
     },
 }
 
@@ -153,6 +179,40 @@ async fn sweep_deletions(config: &Config, delete: bool) -> Result<()> {
     Ok(())
 }
 
+/// `request-deletion`: one line per key, then, for `--all`, its coverage.
+/// Exits 1 when refused (the error on stderr), with nothing written.
+async fn request_deletion(
+    config: &Config,
+    subject: &str,
+    hashes: &[String],
+    all: bool,
+    reason: &str,
+) -> Result<()> {
+    let s3 = S3Client::from_config(&config.s3).await?;
+    let now = moderation::now_secs();
+    let requested = if all {
+        operator::request_all(&s3, subject, reason, now).await?
+    } else {
+        operator::request_hashes(&s3, subject, hashes, reason, now).await?
+    };
+    let reason = reason.trim();
+    let other_scope = if all { "hash" } else { "subject" };
+    for Requested { key, outcome } in &requested {
+        match outcome {
+            Outcome::Requested => println!("requested {key}: {reason}"),
+            Outcome::Renewed => println!("requested {key} (replaces a deleted request): {reason}"),
+            Outcome::Rescoped => println!(
+                "requested {key} (replaces a pending scope-{other_scope} request): {reason}"
+            ),
+            Outcome::Exists => println!("exists {key}"),
+        }
+    }
+    if all {
+        println!("coverage: live indexes and owner records; add --hash for anything else");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -181,6 +241,12 @@ async fn main() -> Result<()> {
             reason,
         }) => return release_owner(&config, &hash, &subject, &reason).await,
         Some(Command::SweepDeletions { delete }) => return sweep_deletions(&config, delete).await,
+        Some(Command::RequestDeletion {
+            subject,
+            hash,
+            all,
+            reason,
+        }) => return request_deletion(&config, &subject, &hash, all, &reason).await,
         None => {}
     }
     info!(

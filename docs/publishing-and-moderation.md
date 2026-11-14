@@ -177,9 +177,193 @@ Each suspension, block or catalog block is stored as a JSON object under `modera
 
 ### Not included
 
-- **Deleting stored bytes.** A block stops distribution, but it does not remove the blob or its outboard from S3.
+- **Deleting stored bytes on a block.** A block stops distribution and keeps the blob, its outboard and its manifest in S3 while it stands. To delete a blocked recording, an operator runs `request-deletion --hash`, then the sweep ([Deletion requests](#deletion-requests-operators)). A blocked catalog envelope is kept until its block is lifted.
 - **Resolving a report's `contentId` to hashes.** That waits for the frozen catalog schema, so a takedown names payload hashes.
 - **Consuming arkavo-rs's NATS `moderation.actions.*` events.** That NATS is not reachable from EC2. arkavo-rs or a moderator calls this API.
+
+## Deletion requests (operators)
+
+A recording its owner drops from their catalog is deleted from S3, every version, within 30 days of the publish that dropped it. So is a superseded catalog envelope, which carries every entry's metadata TDF, titles included. The creator's passkey-signed publish is the request; an operator-run sweep does the deleting. What Creator sees is in [creator-catalogs.md](creator-catalogs.md#removing-a-recording). The design is `docs/superpowers/specs/2026-11-13-deletion-requests-design.md`.
+
+### What a publish records
+
+Hide from Catalog publishes the catalog without the entry, and an account deletion through Creator publishes an empty one; there is no other deletion route. Each `PUT /v2/catalogs/<sub>` first writes a transition at `catalog-transitions/<sub>/<seq, 20 digits>-<pointer digest>` (`<sub>` as in the pointer key; never served):
+
+```json
+{"subject":"<sub>","seq":8,"catalogHash":"<new>","pointer":"<digest>","base":{"seq":7,"catalogHash":"<old>","pointer":"<digest>"},"at":<unix secs>,"dropped":["<hash>"],"added":["<hash>"]}
+```
+
+- `base` is the stored pointer the publish replaces, `null` when there was none. `pointer` digests are the SHA-256 of the signed pointer bytes.
+- `dropped`: the recordings in the served base's index that the new index doesn't list, less those blocked at the time and those whose owner record doesn't name the publisher. A base `GET` doesn't serve (its envelope blocked, its owner catalog-blocked or suspended with `hideCatalog`, a pointer from before envelopes) drops nothing.
+- `added`: the recordings the new index lists and the base's index doesn't.
+
+The publish writes no request. The sweep acts only on a committed transition, one reachable from a current pointer through `base` links. The pointer write is conditional on the base, so a publish that lost the race leaves a transition nothing reaches.
+
+### The grace and the weekly sweep
+
+A dropped recording falls due 7 days after the publish that dropped it, and a superseded envelope 7 days after it was replaced. A publish that lists the recording again before then cancels the request. The first sweep after a publish folds its transition, and the first sweep once a request is due deletes it. With a weekly sweep that is about 14 days at worst.
+
+**The 30-day promise depends on running `sweep-deletions --delete` at least weekly.** Nothing runs it automatically.
+
+### Commands
+
+Each command needs the node's config (`--config`, for the bucket and prefix) and operator credentials ([IAM for deletion](#iam-for-deletion)). Subjects compare in canonical form: `arkavo:<uuid>` and `<uuid>` are one account, and request keys carry `<uuid>`.
+
+| Command | Use |
+|---|---|
+| `sweep-deletions [--delete]` | Weekly: fold transitions into requests and delete what is due. A dry run without `--delete`. |
+| `request-deletion --subject <sub> (--hash <hash>... \| --all) --reason <text>` | What the publish path can't request: blocked recordings, and everything a creator who can't publish published. |
+| `claim-owners [--write]` | The ownership backfill, before the switch: [`claim-owners`](#claim-owners-the-backfill). |
+| `release-owner --hash <hash> --subject <sub> --reason <text>` | Free a recording owned by an account deleted without emptying its catalog: [`release-owner`](#release-owner). It deletes only the owner record; `request-deletion` deletes the recording too. |
+
+#### `sweep-deletions`
+
+```bash
+tdf-iroh-s3 --config /etc/tdf-iroh-s3/config.toml sweep-deletions           # dry run: reads and reports
+tdf-iroh-s3 --config /etc/tdf-iroh-s3/config.toml sweep-deletions --delete  # writes and deletes
+```
+
+A run:
+
+1. **Reads strictly** every pointer, index record, transition and deletion request, and the suspensions, blocks, catalog blocks and owner records it decides on (not sessions or audit records). Anything it can't read or parse, or a `/2` pointer whose index record doesn't match its `indexHash`, aborts the run before it writes anything: exit 1, with `sweep-deletions aborted: <error>`, naming the key, on stderr.
+2. **Folds** each pointer's committed transitions into requests, oldest first: a dropped hash makes `recordings/<sub>/<hash>` pending from that publish's time (the newest drop wins), an added hash cancels it, and a replaced envelope makes `envelopes/<hash>` pending. The folded transitions are deleted. A transition no pointer reaches, older than 7 days, whose subject's pointer has a `seq` at least its own, lost its publish and is deleted unfolded; any other unreachable one is kept and reported.
+3. **Observes** envelopes: a hash under `catalog-documents/`, `catalog-outboards/` or `catalog-indexes/` that no pointer names and no request tracks gets an `envelopes/` request, superseded now.
+4. **Deletes** what is due (below), with `--delete`, item by item: subjects (their pointers), then recordings, then envelopes. Just before each item it reads everything again. An item no longer due is kept. One whose requester's catalog moved since the first read is deferred to the next run, which folds the new transitions first. A failed item stays pending for the next run, and the run goes on.
+5. **Verifies tombstones.** A deleted item's request stays, marked `deleted` with `deletedAt`, until a run at least an hour later checks its objects:
+   - an object written more than an hour after the delete is fresh (a new push, publish or pointer): the tombstone goes, and the objects stay;
+   - a recording listed again, or an envelope current again: the tombstone goes, the objects stay;
+   - an object written within that hour (a write in flight during the delete): deleted again (`recreated`), and the tombstone stays;
+   - nothing left: the tombstone goes.
+
+The requests live under `deletion-requests/`, written only by the sweep and `request-deletion`, subjects canonical. Below, *listed* means in the live index of any pointer, whatever its catalog's visibility, except the pointers of an account being deleted (a pending `subjects/` request whose catalog block stands).
+
+| Request | Body | Due |
+|---|---|---|
+| `recordings/<sub>/<hash>`: the owner dropped it | `{"hash","subject","requestedAt","seq","state","deletedAt"?}` | 7 days after the drop, while the hash isn't listed or blocked and its owner record names `<sub>` |
+| `operator/<sub>/<hash>`, scope `hash` | `{"hash","subject","requestedAt","reason","scope","state","deletedAt"?}` | while the hash's block stands: at once, listed or not, whoever owns it |
+| `operator/<sub>/<hash>`, scope `subject` | as above | while `<sub>`'s catalog block stands, the hash isn't listed or blocked, and its owner record names `<sub>` |
+| `subjects/<sub>` | `{"subject","requestedAt","reason","state","deletedAt"?}` | while `<sub>`'s catalog block stands |
+| `envelopes/<hash>`: superseded | `{"hash","owner"?,"supersededAt","source","state","deletedAt"?}` | 7 days after it was superseded, while no pointer names it (other than an account's being deleted), it isn't blocked, and its owner's catalog isn't hidden (catalog block or `hideCatalog`), unless an operator asked for everything that owner published (`subjects/<owner>`) |
+
+`state` is `pending` or `deleted`; `source` is `transition` or `observed`. A recording whose owner record names another account, or that has none, is kept for manual handling, and so is an envelope whose owner is unknown.
+
+Deleting removes every version and delete marker of:
+
+- a recording: `blobs/<hash>` first, so nothing is served once anything is gone, then `outboards/<hash>`, `manifests/<hash>` and `moderation/publishers/<hash>`. Ownership ends: the next push claims the recording.
+- a subject: each of its pointers, under either key (`catalog-pointers/arkavo:<uuid>`, `catalog-pointers/<uuid>`). Its envelopes are no longer current, so the same run records them, and they are due 7 days later.
+- an envelope: `catalog-documents/<hash>`, then `catalog-outboards/<hash>` and `catalog-indexes/<hash>`.
+
+Then the request is marked `deleted`. Suspension, block, catalog-block and audit records are never deleted.
+
+**Output,** on stdout:
+
+- one line per due item, in the order taken: `deleted <item>` (`would delete` in a dry run), `kept <item>: <why>`, `deferred <item>: catalog changed`, `failed <item>: <error>`;
+- one per tombstoned item checked: `verified <item>`, `fresh <item>`, `listed again <item>`, `current again <item>`, `recreated <item>`, or `kept <item>: <why>` (in a dry run `would verify <item>`, `would forget <item>: <why>`, `would delete again <item>`);
+- `kept <request>: <why>` for each pending request not due, and `kept transition <sub>/<name>: <why>` for each transition kept;
+- `deleted recording <hash> is listed again` or `deleted envelope <hash> is current again` for a deleted item a catalog names again;
+- last, the counts: `<n> deleted, <n> kept, <n> deferred, <n> failed` (`would delete` in a dry run).
+
+An `<item>` is `recording <hash>`, `subject <sub>` or `envelope <hash>`; a `<request>` is `recording <sub>/<hash>`, `operator <sub>/<hash>`, `subject <sub>` or `envelope <hash>`. A `<why>` is one of `within grace`, `still listed`, `still current`, `blocked`, `owner is not the requester`, `no owner record`, `block lifted`, `catalog block lifted`, `owner hidden`, `unknown owner`, `no longer due`, `a pointer still names it`, `envelopes pending`, `catalog changed`; a transition's is `younger than grace`, `seq above the current pointer`, `no pointer` or `a cycle in its chain`. It exits 1 if the run aborts or any item failed.
+
+#### `request-deletion`
+
+```bash
+tdf-iroh-s3 --config /etc/tdf-iroh-s3/config.toml request-deletion \
+  --subject <sub> --hash <hash> <hash> --reason "takedown, report 6f9619ff"
+tdf-iroh-s3 --config /etc/tdf-iroh-s3/config.toml request-deletion \
+  --subject <sub> --all --reason "account closed; the creator can't publish"
+```
+
+Exactly one of `--hash` and `--all` (both or neither is a usage error: exit 2). `--reason` is required and stored in each request. It reads the bucket as strictly as the sweep, and checks every precondition before it writes anything:
+
+- **`--hash`:** recordings only. Every hash, 64 lowercase hex characters, must have an active block. It writes `deletion-requests/operator/<sub>/<hash>` with scope `hash` for each, due at once while the block stands. Scope `hash` doesn't check the owner; file it under the recording's owner. To delete a recording that isn't blocked, block it first (`PUT /moderation/blocks/<hash>`).
+- **`--all`:** the subject must have an active catalog block. It writes a scope-`subject` `operator/<sub>/<hash>` for every hash in the live index of each of the subject's pointers (either key) and every hash whose owner record names the subject, then `deletion-requests/subjects/<sub>`, which deletes the subject's pointers. That is its whole coverage, and its last line says so.
+
+It prints one line per key:
+
+- `requested <key>: <reason>`: a new pending request;
+- `exists <key>`: a pending request was already there, and is left as it was;
+- `requested <key> (replaces a deleted request): <reason>`: the item was deleted and its tombstone not yet verified; asking again replaces it;
+- `requested <key> (replaces a pending scope-subject request): <reason>`, from `--hash`: scope `subject` never deletes a blocked hash, so the request becomes scope `hash`. From `--all`, `(replaces a pending scope-hash request)`: the hash's block was lifted, so scope `hash` would never delete it.
+
+`--all` then prints `coverage: live indexes and owner records; add --hash for anything else`. A refusal (an invalid argument, an unreadable record, a hash without an active block, a subject without an active catalog block) prints the error on stderr, writes nothing, and exits 1; so does a storage error partway through the writes, after which a second run reads what the first wrote as `exists`. Operator requests have no grace: the next `sweep-deletions --delete` deletes them.
+
+### Moderation keeps blocked content
+
+The privacy policy excepts content removed by moderation: a blocked recording or envelope is kept while its block stands. A takedown makes the creator drop the hash (`PUT` refuses a catalog that lists it), and that forced drop is not a request. An owner's earlier drop of a hash blocked since, and a scope-`subject` request, wait while the block stands (`kept …: blocked`). Only `request-deletion --hash` deletes a blocked recording, and only while its block stands. A blocked envelope has no such path: it stays until its block is lifted. A report alone holds nothing back.
+
+### Creators who can't publish
+
+A creator whose entitlement lapsed, who is suspended, whom the decision service denies, or whose catalog is blocked can't publish the empty catalog that deletes their recordings. On their request, an operator:
+
+1. **Blocks their catalog,** unless it is already: `PUT /moderation/blocks/catalogs/<sub>` ([Moderation](#moderation-operators)). This hides the catalog at once and is `--all`'s precondition. Keep it until the sweep is done: while it is lifted, every request waits (`catalog block lifted`).
+2. **Runs `request-deletion --subject <sub> --all --reason <why>`.**
+3. **Adds what `--all` doesn't delete** with `request-deletion --subject <sub> --hash <hash>...`, blocking each hash first if it isn't: the subject's blocked recordings, which scope `subject` keeps, and anything of theirs outside its coverage, such as a recording no live index lists that has no owner record. Scope `hash` doesn't check the owner, so make sure each hash is the subject's: a recording whose owner record names another account is not theirs to delete.
+4. **Runs `sweep-deletions`, then `sweep-deletions --delete`.** That run deletes the subject's pointers and recordings and records its envelopes, which the first sweep at least 7 days later deletes.
+
+### Known gaps
+
+- After an account is deleted through Creator, its pointer and empty envelope stay: nothing tells the node.
+- An empty-catalog publish requests nothing for a creator whose catalog reads 404 (a pointer from before envelopes, a blocked envelope, a catalog block, `hideCatalog`), and Creator skips it on a 404. On request, follow [Creators who can't publish](#creators-who-cant-publish).
+- An account deleted without emptying its catalog keeps owning its recordings, so a new account can't push the same files until an operator runs `release-owner` or `request-deletion`.
+- Drops before this shipped are not requests: recordings hidden then stay stored, also after their creator deletes their account. On request, use `request-deletion`.
+- A creator who hides from a Mac without the recording's archive can undo the Hide only within the 7 days: afterwards re-listing needs a push.
+- A publish that lists a hash again between an item's re-check and its delete leaves a listed recording that answers as gone. The sweep reports it: `deleted recording <hash> is listed again`.
+- A blocked envelope is kept while its block stands: `request-deletion --hash` deletes recordings only, and the sweep holds a blocked envelope (`kept envelope <hash>: blocked`).
+- A catalog-blocked creator who isn't suspended gets 412 on `If-None-Match: *`, because preconditions ignore the owner's hide. This predates deletion and needs its own fix.
+- Not deleted at all: recordings pushed but never listed, outside `request-deletion`; leftovers of removed features other than envelopes (`/1` tags, `catalog-index/`, `campaign-creators/`); copies outside the node (what viewers or peers already fetched, the KAS, identity, CloudWatch logs).
+
+### IAM for deletion
+
+- **The instance role** needs `s3:PutObject` on `<prefix>catalog-transitions/*`: without it every publish answers 502 `storage unavailable`. Its conditional creates on `moderation/publishers/*` are under [IAM](#iam).
+- **Operators** running any of the four commands need `s3:ListBucket`, `s3:ListBucketVersions`, `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and `s3:DeleteObjectVersion` on the bucket, under the prefix.
+
+### The lifecycle rule
+
+The sweep deletes every version of what it deletes, but an overwrite keeps the old version: old pointers, manifests, request records. So the bucket's lifecycle configuration expires noncurrent versions after 7 days and removes expired delete markers, bucket-wide, beside the existing 1-day rule on `moderation/sessions/` ([Publishing](#1-open-a-publish-session-for-the-iroh-endpoint-that-will-push)). A put replaces the whole configuration, so read the current one first and keep the sessions rule exactly as `get` returns it; the second rule below only stands in for it:
+
+```bash
+aws s3api get-bucket-lifecycle-configuration --bucket <bucket>
+aws s3api put-bucket-lifecycle-configuration --bucket <bucket> --lifecycle-configuration file://lifecycle.json
+```
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "noncurrent-versions-7d",
+      "Status": "Enabled",
+      "Filter": {"Prefix": ""},
+      "NoncurrentVersionExpiration": {"NoncurrentDays": 7},
+      "Expiration": {"ExpiredObjectDeleteMarker": true}
+    },
+    {
+      "ID": "<the existing moderation/sessions/ rule>",
+      "Status": "Enabled",
+      "Filter": {"Prefix": "moderation/sessions/"},
+      "Expiration": {"Days": 1},
+      "NoncurrentVersionExpiration": {"NoncurrentDays": 1}
+    }
+  ]
+}
+```
+
+With an `[s3] prefix`, the sessions rule's `Prefix` starts with it.
+
+### Switch day
+
+Ownership, pointer `/2` and deletion ship as three PRs that merge and deploy together: a deploy of ownership alone would refuse every publish until `claim-owners --write` had run. In order:
+
+1. **ArkavoKit release:** reads pointer `/1` and `/2`, writes `/2`. Its `CatalogPublishRequest` refuses a `/2` whose `indexHash` doesn't match its catalog.
+2. **A viewer build that accepts `/2`** reaches users, or a patch to the viewer's own pointer parser.
+3. **Before the deploy,** with operator credentials and the new binary:
+   1. Against a scratch versioned bucket, never production: `TDF_IROH_S3_VERSIONED_BUCKET=<scratch bucket> AWS_REGION=<region> cargo test --test s3_versioned_test -- --ignored --nocapture` passes. With either variable unset, every test passes without touching S3 and prints `<test> skipped: set TDF_IROH_S3_VERSIONED_BUCKET and AWS_REGION` (shown only with `--nocapture`). A run that prints it proves nothing.
+   2. `claim-owners` reports no conflicts; then `claim-owners --write`.
+   3. `sweep-deletions` (a dry run) completes: no unreadable record.
+   4. The instance role can write `catalog-transitions/*` ([IAM for deletion](#iam-for-deletion)). The lifecycle rule can go on any time.
+4. **Deploy the node with no overlap:** no instance running the old code serves after a new one does. An old instance would overwrite owner records and accept `/1` publishes that write no transition, which breaks the chain the sweep follows. Then run `claim-owners` (a dry run) again. From here `/1` publishes get 422 `invalid bundle: pointer schema must be "arkavo.catalog-pointer/2"`, so Creator rc.2 and earlier TestFlight builds can't publish, update or hide.
+5. **Creator rc.3 publishes `/2`.** Before the switch, test rc.3 against this branch run outside production.
+6. **Run `sweep-deletions --delete` weekly** from then on (the runbook schedules it).
 
 ## Configuration
 
@@ -194,4 +378,4 @@ moderation_refresh_secs = 30
 decisions = "local"                # local | shadow | pdp (needs [catalog.authz] endpoint)
 ```
 
-The node's IAM role needs `s3:PutObject`, `s3:GetObject` and `s3:ListBucket` on `<prefix>moderation/*`, which includes `moderation/audit/` and the conditional creates of `moderation/publishers/` (see [IAM](#iam)).
+The node's IAM role needs `s3:PutObject`, `s3:GetObject` and `s3:ListBucket` on `<prefix>moderation/*`, which includes `moderation/audit/` and the conditional creates of `moderation/publishers/` (see [IAM](#iam)), and `s3:PutObject` on `<prefix>catalog-transitions/*` (see [IAM for deletion](#iam-for-deletion)).

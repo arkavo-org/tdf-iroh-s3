@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod due;
 pub mod fold;
+pub mod operator;
 pub mod snapshot;
 pub mod sweep;
 

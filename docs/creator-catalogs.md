@@ -132,7 +132,7 @@ The bytes behind a hash never change, but the node may later block a document or
 This route is public. It is how a publisher confirms ingest before naming a hash in a catalog.
 
 - **200:** `{"hash":"<hex>","size":<bytes>}`, when the hash is an ingested TDF that is not blocked. The node stores the blob's outboard before the blob, so a 200 means the blob can be fetched.
-- **404:** `blob not found`. The hash was never pushed, is still being ingested, failed validation, or is blocked.
+- **404:** `blob not found`. The hash was never pushed, is still being ingested, failed validation, is blocked, or was [deleted](#removing-a-recording).
 - **400:** `invalid hash`.
 
 ### `GET /publish/recordings/{hash}`: who owns a recording
@@ -200,7 +200,19 @@ Creator reads the node to push to from this route. The iOS viewer does not. The 
    - Otherwise write the new payload hash and size and a new [metadata TDF](#the-metadata-tdf), with `version` one higher than the old entry's, inside the metadata as well.
 7. **Publish the catalog** with `PUT /v2/catalogs/<sub>` (see [Publishing (Creator)](#publishing-creator)): a new envelope, its signed pointer and the index.
 
-To remove a recording, Creator publishes the catalog without its entry. The TDF stays on the node, but no catalog lists it.
+### Removing a recording
+
+To remove a recording (Hide from Catalog), Creator publishes the catalog without its entry. That publish is the creator's request to delete the recording; there is no other deletion route. The node records what each publish drops, and an operator's weekly sweep deletes it ([publishing-and-moderation.md](publishing-and-moderation.md#deletion-requests-operators)):
+
+- **The stored TDF is deleted 7 to 30 days after the publish that dropped it,** every S3 version, with its outboard, manifest and owner record. Ownership then ends: the next push of the same bytes claims the recording.
+- **Re-listing the entry within 7 days of that publish cancels the deletion.** Publish the catalog with the entry again; the TDF is still there, so no push is needed.
+- **After the deletion, re-listing needs a fresh push.** The node no longer has the TDF: `GET /blobs/<hash>` answers 404, and a catalog that lists it gets 422 `payload <hash> is not ingested`. Push it again (step 3), then publish.
+- **A replaced payload is deleted the same way.** A new payload hash for an entry (step 6) drops the old one, which is deleted 7 to 30 days after that publish.
+- **A superseded envelope is deleted 7 to 30 days after it was replaced.** Each publish replaces the previous envelope, which carries every entry's metadata TDF, titles included.
+
+A drop counts only when the node served the catalog it was dropped from, and only for a recording the publisher [owns](#ownership): a creator whose catalog reads 404 (its envelope blocked, a catalog block or `hideCatalog`, a pointer from before envelopes) requests nothing by publishing, and a node with `[publishing] required = false`, which records no owners, deletes no recording (only superseded envelopes). The node keeps a recording while any catalog still lists it, and keeps blocked content while its block stands. A recording moderation blocked must be dropped from the catalog (`PUT` refuses it), and that drop is not a request.
+
+**Deleting an account.** Before `DELETE /account`, Creator publishes an empty catalog (no entries, `index` `[]`), which drops every recording the catalog listed. If that publish fails, Creator stops and offers Try Again or Delete Anyway. When `GET /v2/catalogs/<sub>` answers 404, Creator skips the publish. The node is never told an account was deleted: its pointer and the empty envelope stay. Anything the empty catalog can't reach is deleted by an operator on request.
 
 ### Ownership
 
@@ -370,13 +382,13 @@ The node checks the following in order:
 | Every entry's recording policy names the envelope's attribute | 422 `entry <contentID> policy does not include the catalog attribute` |
 | The passkey credential is still the subject's, according to the IdP's status route | 403 `passkey credential unknown`, `… revoked` or `… belongs to another subject`; 502 `credential status unavailable` |
 | `If-Match` or `If-None-Match` is sent | 428 `precondition required` |
-| The stored pointer is the base named by `If-Match` or `If-None-Match` | 412 `catalog changed since it was read` |
+| The stored pointer is the base named by `If-Match` or `If-None-Match` | 412 `catalog changed since it was read`; 502 `storage unavailable` when the stored pointer or its index record can't be read or parsed, or a stored `/2` pointer's index record doesn't match its `indexHash` |
 | `seq` is greater than the stored one | 409 `seq must be greater than <n>` |
 | The envelope has no index record yet, or its record is a retry of this publish: `{sub}`'s (subjects compared canonically), with the same canonical index. Checked as the record is written, after the envelope and its outboard. | 409 `catalog document already published with another index`; 502 `storage unavailable` when the existing record can't be read |
 
 The two owner refusals also carry `contentIDs`: the `contentID` of every entry refused, sorted, including every entry that names the same payload. For example: `{"error":"recording belongs to another account","contentIDs":["rec-a","rec-b"]}`. Every other refusal in the table is `{"error":"…"}` alone.
 
-The node then writes the publish's transition at `catalog-transitions/<sub>/<seq, 20 digits>-<pointer digest>` (never served): the base pointer it replaces, and which recordings it drops from the served catalog and adds, for the deletion of dropped recordings. If the transition can't be written, the node answers 502 `storage unavailable` and stores nothing else. It then stores the envelope at `catalog-documents/<blake3>` with its BAO outboard at `catalog-outboards/<blake3>`, the index at `catalog-indexes/<blake3>` (never served), then the bundle at `catalog-pointers/<sub>`. The index is written only if the envelope has none (`If-None-Match: *`): one envelope has one index, so a publish that lost can't rewrite the index of the pointer that won. An envelope already stored with another index gets the table's last 409; a fresh envelope (a new policy `uuid`) has a new hash. The pointer is written only if no other publish replaced it in the meantime; otherwise 409 `seq must be greater than the stored seq: another publish won`. Read the pointer again and retry.
+The node then writes the publish's transition at `catalog-transitions/<sub>/<seq, 20 digits>-<pointer digest>` (never served): the base pointer it replaces, and which recordings it drops from the served catalog and adds, for the [deletion of dropped recordings](#removing-a-recording). To know what the publish drops, the node reads the owner record of each recording the served base lists, the new index doesn't and no block covers (only a recording the publisher owns is dropped). If one of those owner records can't be read, or the transition can't be written, the node answers 502 `storage unavailable` and stores nothing else. It then stores the envelope at `catalog-documents/<blake3>` with its BAO outboard at `catalog-outboards/<blake3>`, the index at `catalog-indexes/<blake3>` (never served), then the bundle at `catalog-pointers/<sub>`. The index is written only if the envelope has none (`If-None-Match: *`): one envelope has one index, so a publish that lost can't rewrite the index of the pointer that won. An envelope already stored with another index gets the table's last 409; a fresh envelope (a new policy `uuid`) has a new hash. The pointer is written only if no other publish replaced it in the meantime; otherwise 409 `seq must be greater than the stored seq: another publish won`. Read the pointer again and retry.
 
 200: `{"owner":"<sub>","seq":<n>,"hash":"<blake3 hex>","size":<bytes>}`.
 
