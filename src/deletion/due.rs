@@ -41,7 +41,8 @@ const BLOCKED: &str = "blocked";
 const NOT_THE_REQUESTER: &str = "owner is not the requester";
 /// The last rule of both [`recording_kept`] and [`operator_kept`]: a
 /// request kept for it passes every other rule. The sweep relies on that
-/// when it verifies a tombstone.
+/// when it verifies a tombstone, and when it closes such a request whose
+/// recording has nothing left ([`Decision::unowned`]).
 pub(super) const NO_OWNER_RECORD: &str = "no owner record";
 const BLOCK_LIFTED: &str = "block lifted";
 const CATALOG_BLOCK_LIFTED: &str = "catalog block lifted";
@@ -170,6 +171,14 @@ pub struct Decision {
     /// spec's order. A request for a recording hash that is due is not
     /// here: its [`Item::Recording`] names it.
     pub kept: Vec<(String, String)>,
+    /// Each recording hash none of whose pending requests is due, but some
+    /// kept only for want of an owner record ([`NO_OWNER_RECORD`], the last
+    /// rule: they pass every other), as an [`Item::Recording`] whose
+    /// `requests` are those, by [`Item::id`]. They are in `kept` too. When
+    /// nothing of the recording is left, an earlier run deleted it and
+    /// failed to mark these `deleted` (the sweep deletes the owner record
+    /// last): the sweep closes them then, as tombstones.
+    pub unowned: Vec<Item>,
 }
 
 /// One recording hash's pending requests, `recordings/` and `operator/`
@@ -180,10 +189,15 @@ struct HashRequests {
     keys: Vec<String>,
     /// Those not due on their own, as `(id, why)`.
     kept: Vec<(String, &'static str)>,
+    /// The keys of those kept for [`NO_OWNER_RECORD`].
+    unowned: Vec<String>,
 }
 
 impl HashRequests {
     fn add(&mut self, key: String, id: String, kept: Option<&'static str>) {
+        if kept == Some(NO_OWNER_RECORD) {
+            self.unowned.push(key.clone());
+        }
         self.keys.push(key);
         if let Some(why) = kept {
             self.kept.push((id, why));
@@ -206,6 +220,7 @@ pub fn due(snapshot: &Snapshot, requests: &Requests, view: &View, now: i64) -> D
     let mut recordings: BTreeMap<&str, HashRequests> = BTreeMap::new();
     let mut items = Vec::new();
     let mut kept = Vec::new();
+    let mut unowned = Vec::new();
 
     for ((sub, hash), r) in &requests.recordings {
         if r.state != State::Pending {
@@ -236,6 +251,13 @@ pub fn due(snapshot: &Snapshot, requests: &Requests, view: &View, now: i64) -> D
             });
         } else {
             kept.append(&mut requested.kept);
+            if !requested.unowned.is_empty() {
+                requested.unowned.sort();
+                unowned.push(Item::Recording {
+                    hash: hash.to_string(),
+                    requests: requested.unowned,
+                });
+            }
         }
     }
     for (sub, r) in &requests.subjects {
@@ -266,6 +288,7 @@ pub fn due(snapshot: &Snapshot, requests: &Requests, view: &View, now: i64) -> D
             .into_iter()
             .map(|(id, why)| (id, why.to_string()))
             .collect(),
+        unowned,
     }
 }
 
@@ -719,6 +742,10 @@ mod tests {
                 kept(id("a6"), "no owner record"),
             ]
         );
+        assert_eq!(
+            out.unowned,
+            [rec(&h("a6"), &[recording_key("u1", &h("a6"))])]
+        );
 
         // A grace that would overflow never reads as due.
         let mut r = Requests::default();
@@ -726,6 +753,44 @@ mod tests {
         let out = decide(&s, &r);
         assert!(out.due.is_empty());
         assert_eq!(out.kept, [kept(id("a1"), "within grace")]);
+    }
+
+    /// A hash none of whose requests is due, some kept only for want of
+    /// an owner record, is `unowned`, naming those; not one with a request
+    /// due (a scope-`hash` one needs no owner record), nor one whose
+    /// requests are kept for anything else.
+    #[test]
+    fn a_hash_kept_only_for_its_owner_record_is_unowned() {
+        let mut s = Snapshot::default();
+        s.moderation.blocked.insert(h("a2"));
+        let mut r = Requests::default();
+        // a1: no owner record; its operator request's block was lifted.
+        recording(&mut r, U, &h("a1"), NOW - GRACE);
+        recording(&mut r, "u2", &h("a1"), NOW);
+        operator(&mut r, "u3", &h("a1"), Scope::Hash);
+        // a2: blocked, and an operator's scope-hash request makes it due.
+        recording(&mut r, U, &h("a2"), NOW - GRACE);
+        operator(&mut r, "u3", &h("a2"), Scope::Hash);
+        // a3: within grace only.
+        recording(&mut r, U, &h("a3"), NOW);
+
+        let out = decide(&s, &r);
+        assert_eq!(
+            out.due,
+            [rec(
+                &h("a2"),
+                &[operator_key("u3", &h("a2")), recording_key(U, &h("a2"))]
+            )]
+        );
+        assert_eq!(out.unowned, [rec(&h("a1"), &[recording_key(U, &h("a1"))])]);
+        assert!(
+            out.kept.contains(&kept(
+                format!("recording {U}/{}", h("a1")),
+                "no owner record"
+            )),
+            "{:?}",
+            out.kept
+        );
     }
 
     #[test]
@@ -886,6 +951,7 @@ mod tests {
                 kept(id("a4"), "no owner record"),
             ]
         );
+        assert_eq!(out.unowned, [rec(&h("a4"), &[operator_key(U, &h("a4"))])]);
 
         lift_catalog_block(&mut s, U);
         let out = decide(&s, &r);

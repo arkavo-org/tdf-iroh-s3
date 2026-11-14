@@ -6,7 +6,8 @@
 //! and decides what is due ([`due`]), all before it writes anything: any
 //! unreadable record aborts the run with nothing written. A dry run stops
 //! there and reports what it would delete, having listed each due
-//! recording's pushed objects for its push check (below), a read.
+//! recording's pushed objects for its push check, and each unowned
+//! recording's objects for its close (below): reads.
 //!
 //! With `delete`, it then writes, in this order:
 //! 1. the requests the fold changed, then deletes the requests it
@@ -28,7 +29,13 @@
 //!    of the hash older than the push restarts its grace from the push
 //!    ([`pushed_again`]). Only a listing cancels a drop. Otherwise it
 //!    deletes exactly the versions it listed, never one written since. A
-//!    failure leaves the item pending, and the run goes on.
+//!    failure leaves the item pending, and the run goes on;
+//! 4. each recording kept only for want of an owner record whose objects
+//!    are all gone ([`close`]): an earlier run deleted it but failed to
+//!    write its tombstone. Its requests become tombstones, deleting
+//!    nothing, after the same fresh re-check and a second listing; a push
+//!    meanwhile wins (its grace restarts next run). A dry run reports
+//!    these too, from its listing alone.
 //!
 //! Then, in both modes, it verifies each tombstone at least
 //! [`VERIFY_AFTER`] old ([`verify_tombstones`], spec 3.4 step 7): it
@@ -122,7 +129,9 @@ pub struct Report {
     /// publish, not counted; then one line per due item, in the order the
     /// run takes them (`deleted <id>`, `would delete <id>`, `kept <id>:
     /// <why>`, `pushed again <id>` (in a dry run too), `deferred <id>:
-    /// catalog changed`, `failed <id>: <error>`);
+    /// catalog changed`, `failed <id>: <error>`); then `deleted <id>`
+    /// (`would delete <id>`) or `failed <id>: <error>` for each recording
+    /// whose requests [`close`] closed, by id, which aren't reported kept;
     /// then one line per tombstoned item verified, in the same order (`verified
     /// <id>`, `fresh <id>`, `listed again <id>`, `current again <id>`,
     /// `recreated <id>`, `kept <id>: <why>`, `failed <id>: <error>`; in a
@@ -135,8 +144,8 @@ pub struct Report {
     /// <error>`.
     /// `<id>` is [`Item::id`]: `<kind> <name>`.
     pub lines: Vec<String>,
-    /// Items deleted, and tombstoned items deleted again (in a dry run:
-    /// that would be).
+    /// Items deleted, recordings closed with nothing left, and tombstoned
+    /// items deleted again (in a dry run: that would be).
     pub deleted: usize,
     /// Items, tombstoned items, requests and transitions kept, a recording
     /// pushed again among them.
@@ -294,6 +303,8 @@ async fn run<O: ObjectStore>(
     // The subjects this run deleted (in a dry run: would delete). Their
     // transitions went with them, those the fold kept included.
     let mut gone_subjects = BTreeSet::new();
+    // The requests this run closed (in a dry run: would close): not kept.
+    let mut closed = BTreeSet::new();
     if delete {
         write_fold(store, &snapshot.requests, &fold).await?;
         for key in &fold.lost {
@@ -309,6 +320,9 @@ async fn run<O: ObjectStore>(
             {
                 gone_subjects.insert(sub.as_str());
             }
+        }
+        for item in &decision.unowned {
+            closed.extend(close(store, item, &baseline, now, report).await?);
         }
     } else {
         for key in &fold.lost {
@@ -335,6 +349,17 @@ async fn run<O: ObjectStore>(
                 }
             }
         }
+        // `close` without its re-read: the recording's listing.
+        for item in &decision.unowned {
+            let id = item.id();
+            let listed = list_keys(store, object_keys(item))
+                .await
+                .with_context(|| format!("checking {id}"))?;
+            if !any_object(&listed.versions) {
+                report.deleted(&id);
+                closed.extend(request_ids(&requests, item));
+            }
+        }
     }
     verify_tombstones(
         store,
@@ -347,7 +372,9 @@ async fn run<O: ObjectStore>(
     .await?;
 
     for (id, why) in &decision.kept {
-        report.kept(id, why);
+        if !closed.contains(id) {
+            report.kept(id, why);
+        }
     }
     for (key, why) in &fold.kept {
         let subject = snapshot
@@ -932,26 +959,8 @@ async fn delete_item<O: ObjectStore>(
     listed.delete(store, baseline).await?;
     let requests = &fresh.requests;
     match item {
-        Item::Recording {
-            hash,
-            requests: keys,
-        } => {
-            for ((sub, h), r) in &requests.recordings {
-                let key = recording_key(sub, h);
-                if h == hash && keys.contains(&key) {
-                    let mut r = r.clone();
-                    (r.state, r.deleted_at) = (State::Deleted, Some(now));
-                    put_json(store, &key, &r).await?;
-                }
-            }
-            for ((sub, h), r) in &requests.operator {
-                let key = operator_key(sub, h);
-                if h == hash && keys.contains(&key) {
-                    let mut r = r.clone();
-                    (r.state, r.deleted_at) = (State::Deleted, Some(now));
-                    put_json(store, &key, &r).await?;
-                }
-            }
+        Item::Recording { .. } => {
+            mark_deleted(store, requests, item, now).await?;
         }
         Item::Subject(sub) => {
             let mut r = requests
@@ -973,6 +982,136 @@ async fn delete_item<O: ObjectStore>(
         }
     }
     Ok(())
+}
+
+/// Mark the requests a recording `item` names `deleted` at `now`: their
+/// records in `requests` (a fresh read's), so nothing cancelled meanwhile
+/// comes back. Their ids, as [`due::Decision::kept`] names them. The
+/// first failed write stops it.
+async fn mark_deleted<O: ObjectStore>(
+    store: &O,
+    requests: &Requests,
+    item: &Item,
+    now: i64,
+) -> anyhow::Result<Vec<String>> {
+    let Item::Recording {
+        hash,
+        requests: keys,
+    } = item
+    else {
+        return Ok(Vec::new());
+    };
+    let mut ids = Vec::new();
+    for ((sub, h), r) in &requests.recordings {
+        let key = recording_key(sub, h);
+        if h == hash && keys.contains(&key) {
+            let mut r = r.clone();
+            (r.state, r.deleted_at) = (State::Deleted, Some(now));
+            put_json(store, &key, &r).await?;
+            ids.push(format!("recording {sub}/{h}"));
+        }
+    }
+    for ((sub, h), r) in &requests.operator {
+        let key = operator_key(sub, h);
+        if h == hash && keys.contains(&key) {
+            let mut r = r.clone();
+            (r.state, r.deleted_at) = (State::Deleted, Some(now));
+            put_json(store, &key, &r).await?;
+            ids.push(format!("operator {sub}/{h}"));
+        }
+    }
+    Ok(ids)
+}
+
+/// The ids of the requests a recording `item` names, as
+/// [`due::Decision::kept`] names them.
+fn request_ids(requests: &Requests, item: &Item) -> Vec<String> {
+    let Item::Recording {
+        hash,
+        requests: keys,
+    } = item
+    else {
+        return Vec::new();
+    };
+    let recordings = requests
+        .recordings
+        .keys()
+        .filter(|(sub, h)| h == hash && keys.contains(&recording_key(sub, h)))
+        .map(|(sub, h)| format!("recording {sub}/{h}"));
+    let operator = requests
+        .operator
+        .keys()
+        .filter(|(sub, h)| h == hash && keys.contains(&operator_key(sub, h)))
+        .map(|(sub, h)| format!("operator {sub}/{h}"));
+    recordings.chain(operator).collect()
+}
+
+/// Whether any listed version is an object, not a delete marker.
+fn any_object(versions: &[VersionInfo]) -> bool {
+    versions.iter().any(|v| !v.delete_marker)
+}
+
+/// Close an unowned recording ([`due::Decision::unowned`]) that has
+/// nothing left: its requests, kept only for want of an owner record,
+/// passed every other rule, and an earlier run deleted the recording (its
+/// owner record last) but failed to mark them `deleted`. Like an
+/// envelope with no object left, they become tombstones, deleting nothing,
+/// reported as `deleted <id>`; verification then forgets them.
+///
+/// It lists the recording's objects (a delete marker is none) and stops at
+/// the first one, with no fresh read: an unowned recording that is still
+/// stored is kept, as the first decision reported it. Otherwise it reads
+/// everything again: the recording must still be unowned there, with its
+/// requester's catalog unmoved, and its pushed objects, listed once more
+/// after that read, must still show nothing. A push that lands meanwhile
+/// writes an object, and an owner record makes the request due, so the
+/// next run restarts its grace instead ([`pushed_again`]). The ids of the
+/// requests it closed. `Err` when the fresh read or a listing fails; a
+/// failed write is reported.
+async fn close<O: ObjectStore>(
+    store: &O,
+    item: &Item,
+    baseline: &Pointers,
+    now: i64,
+    report: &mut Report,
+) -> anyhow::Result<Vec<String>> {
+    let id = item.id();
+    let Item::Recording { hash, .. } = item else {
+        return Ok(Vec::new());
+    };
+    let listed = list_keys(store, object_keys(item))
+        .await
+        .with_context(|| format!("re-checking {id}"))?;
+    if any_object(&listed.versions) {
+        return Ok(Vec::new());
+    }
+    let fresh = snapshot::read(store)
+        .await
+        .with_context(|| format!("re-checking {id}"))?;
+    let view = due::view(&fresh.catalogs, &fresh.requests, &fresh.moderation);
+    let decision = due::due(&fresh, &fresh.requests, &view, now);
+    let Some(item) = decision.unowned.into_iter().find(|i| i.id() == id) else {
+        return Ok(Vec::new());
+    };
+    if held(&item, &fresh, baseline).is_some() {
+        return Ok(Vec::new());
+    }
+    let since = list_keys(store, pushed_keys(hash))
+        .await
+        .with_context(|| format!("re-checking {id}"))?;
+    if any_object(&since.versions) {
+        return Ok(Vec::new());
+    }
+    match mark_deleted(store, &fresh.requests, &item, now).await {
+        Ok(ids) => {
+            report.deleted(&id);
+            Ok(ids)
+        }
+        Err(e) => {
+            report.failed(&id, &e);
+            Ok(Vec::new())
+        }
+    }
 }
 
 /// Spec 3.4 step 7: verify each tombstoned item whose newest tombstone is
@@ -3355,6 +3494,196 @@ mod tests {
         let r: OperatorRequest = record(&m, &operator_key(U, &p)).await;
         assert_eq!((r.state, r.requested_at), (State::Pending, NOW - GRACE));
         assert!(m.deletes().is_empty());
+    }
+
+    /// A request left pending after its recording was deleted (the
+    /// tombstone write failed), with nothing pushed since, is closed: with
+    /// no object of the recording left, it becomes a tombstone, deleting
+    /// nothing, and verification then forgets it. A dry run reports it and
+    /// writes nothing.
+    #[tokio::test]
+    async fn a_stale_request_with_nothing_left_becomes_a_tombstone() {
+        let m = bucket();
+        let p = h("a1");
+        pushed(&m, &p, U);
+        request(&m, U, &p, NOW - GRACE);
+        m.fail_on(&recording_key(U, &p), Op::Put);
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert_eq!(report.failures, 1, "{report}");
+        let deletes = m.deletes();
+
+        let before = versions(&m).await;
+        let report = sweep(&m, false, NOW).await.unwrap();
+        assert_eq!(
+            report.to_string(),
+            format!("would delete recording {p}\n1 would delete, 0 kept, 0 deferred, 0 failed")
+        );
+        assert_eq!(versions(&m).await, before);
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert_eq!(
+            report.to_string(),
+            format!("deleted recording {p}\n1 deleted, 0 kept, 0 deferred, 0 failed")
+        );
+        assert_eq!(m.deletes(), deletes, "nothing deleted");
+        let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
+        assert_eq!(
+            (r.state, r.deleted_at, r.requested_at),
+            (State::Deleted, Some(NOW), NOW - GRACE)
+        );
+
+        let at = NOW + VERIFY_AFTER;
+        m.set_now(at);
+        let report = sweep(&m, true, at).await.unwrap();
+        assert_eq!(
+            report.lines,
+            [format!("verified recording {p}")],
+            "{report}"
+        );
+        assert!(gone(&m, &recording_key(U, &p)).await);
+    }
+
+    /// A request kept for want of an owner record whose recording still
+    /// has an object (here an unowned blob) is left as it was.
+    #[tokio::test]
+    async fn a_request_whose_recording_has_an_object_is_unchanged() {
+        let m = bucket();
+        let p = h("a1");
+        m.set_now(PUSHED_AT);
+        m.insert(&format!("blobs/{p}"), "blob");
+        m.set_now(NOW);
+        request(&m, U, &p, NOW - GRACE);
+        let before = versions(&m).await;
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert_eq!(
+            report.to_string(),
+            format!(
+                "kept recording {U}/{p}: no owner record\n0 deleted, 1 kept, 0 deferred, 0 failed"
+            )
+        );
+        assert_eq!(versions(&m).await, before);
+        assert!(m.deletes().is_empty());
+    }
+
+    /// With nothing left at the first read but a push landing during the
+    /// close's fresh read, the restart rule wins: the request isn't closed,
+    /// and the next run restarts its grace from the push.
+    #[tokio::test]
+    async fn a_push_during_a_close_wins_over_the_tombstone() {
+        let m = bucket();
+        let p = h("a1");
+        request(&m, U, &p, NOW - GRACE);
+        let t = publish(&m, U, 1, b"doc-u", &[], None, PUSHED_AT, &[], &[]);
+        let (key, hash) = (recording_key(U, &p), p.clone());
+        m.on_before_delete(&t.key, move |m| {
+            m.on_before_get(&key, move |m| recording(m, &hash, U));
+        });
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert!(!has(&report, &format!("deleted recording {p}")), "{report}");
+        assert_eq!(report.failures, 0, "{report}");
+        let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
+        assert_eq!((r.state, r.requested_at), (State::Pending, NOW - GRACE));
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert!(
+            has(&report, &format!("pushed again recording {p}")),
+            "{report}"
+        );
+        let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
+        assert_eq!((r.state, r.requested_at), (State::Pending, NOW));
+        for key in recording_keys(&p) {
+            assert!(m.get(&key).await.unwrap().is_some(), "{key}");
+        }
+    }
+
+    /// The run that finds a push deletes nothing, even when a grace has
+    /// already passed since the push: the next run does.
+    #[tokio::test]
+    async fn the_run_that_finds_a_push_deletes_nothing() {
+        let m = bucket();
+        let p = h("a1");
+        pushed(&m, &p, U);
+        request(&m, U, &p, PUSHED_AT + 10);
+        let push = PUSHED_AT + 20;
+        m.set_now(push);
+        m.insert(&format!("manifests/{p}"), "{}");
+        m.set_now(NOW);
+        assert!(push + GRACE <= NOW);
+        let before = stored(&m).await;
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert_eq!(
+            report.to_string(),
+            format!("pushed again recording {p}\n0 deleted, 1 kept, 0 deferred, 0 failed")
+        );
+        assert_eq!(stored(&m).await, before);
+        assert!(m.deletes().is_empty());
+        let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
+        assert_eq!((r.state, r.requested_at), (State::Pending, push));
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert!(has(&report, &format!("deleted recording {p}")), "{report}");
+        for key in recording_keys(&p) {
+            assert!(gone(&m, &key).await, "{key}");
+        }
+    }
+
+    /// A restart whose request write fails is a failed item: nothing is
+    /// deleted, and the request is left as it was.
+    #[tokio::test]
+    async fn a_failed_restart_write_fails_the_item() {
+        let m = bucket();
+        let p = h("a1");
+        recording(&m, &p, U);
+        request(&m, U, &p, NOW - GRACE);
+        m.fail_on(&recording_key(U, &p), Op::Put);
+        let before = stored(&m).await;
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert_eq!(report.failures, 1, "{report}");
+        let failed = format!("failed recording {p}: ");
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.starts_with(&failed) && l.contains(&recording_key(U, &p))),
+            "{report}"
+        );
+        assert!(
+            !has(&report, &format!("pushed again recording {p}")),
+            "{report}"
+        );
+        assert_eq!(stored(&m).await, before);
+        assert!(m.deletes().is_empty());
+        let r: RecordingRequest = record(&m, &recording_key(U, &p)).await;
+        assert_eq!((r.state, r.requested_at), (State::Pending, NOW - GRACE));
+    }
+
+    /// A push restarts only the drops before it. Another account's drop
+    /// after the push (here once `release-owner` let it claim the
+    /// recording) still deletes it, and every request is marked deleted.
+    #[tokio::test]
+    async fn a_drop_after_the_push_still_deletes() {
+        let m = bucket();
+        let p = h("a1");
+        pushed(&m, &p, U2);
+        request(&m, U, &p, PUSHED_AT - 10);
+        request(&m, U2, &p, NOW - GRACE);
+
+        let report = sweep(&m, true, NOW).await.unwrap();
+        assert_eq!(
+            report.to_string(),
+            format!("deleted recording {p}\n1 deleted, 0 kept, 0 deferred, 0 failed")
+        );
+        for key in recording_keys(&p) {
+            assert!(gone(&m, &key).await, "{key}");
+        }
+        for sub in [U, U2] {
+            let r: RecordingRequest = record(&m, &recording_key(sub, &p)).await;
+            assert_eq!(r.state, State::Deleted, "{sub}");
+        }
     }
 
     /// Spec 3.4 step 7: tombstones verified an hour after their delete.
