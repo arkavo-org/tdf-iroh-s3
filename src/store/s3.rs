@@ -89,6 +89,18 @@ fn versions_of(key: &str, listed: Vec<(VersionInfo, bool)>) -> Vec<VersionInfo> 
     versions.into_iter().map(|(v, _)| v).collect()
 }
 
+/// [`versions_of`], only those `version_ids` names: the versions a caller
+/// listed and judged that are still there, the current one last.
+fn named_versions_of(
+    key: &str,
+    listed: Vec<(VersionInfo, bool)>,
+    version_ids: &[String],
+) -> Vec<VersionInfo> {
+    let mut versions = versions_of(key, listed);
+    versions.retain(|v| version_ids.contains(&v.version_id));
+    versions
+}
+
 /// A listed entry's write time in Unix seconds. Missing is an error: a
 /// made-up time could make a fresh write look old.
 fn unix_secs(modified: Option<&DateTime>, listed: &str) -> Result<i64> {
@@ -1095,8 +1107,8 @@ impl ObjectStore for S3Client {
         if version_ids.is_empty() {
             return Ok(0);
         }
-        let mut versions = versions_of(key, self.list_versions_marked(key).await?);
-        versions.retain(|v| version_ids.contains(&v.version_id));
+        let listed = self.list_versions_marked(key).await?;
+        let versions = named_versions_of(key, listed, version_ids);
         self.delete_each_version(key, &versions).await
     }
 }
@@ -1196,6 +1208,41 @@ mod tests {
             .map(|v| v.version_id)
             .collect();
         assert_eq!(ids, ["v1", "m2"]);
+    }
+
+    /// Only the named versions, still the current one last; one written
+    /// since the caller listed isn't named, and isn't deleted.
+    #[test]
+    fn only_the_named_versions_are_deleted_the_current_one_last() {
+        let named = |ids: &[&str]| -> Vec<String> { ids.iter().map(|s| s.to_string()).collect() };
+        let ids = |versions: Vec<VersionInfo>| -> Vec<String> {
+            versions.into_iter().map(|v| v.version_id).collect()
+        };
+        let listed = || {
+            vec![
+                (version("blobs/aa", "v3", false), true),
+                (version("blobs/aa", "v2", false), false),
+                (version("blobs/aab", "v9", false), true),
+                (version("blobs/aa", "m1", true), false),
+            ]
+        };
+        assert_eq!(
+            ids(named_versions_of(
+                "blobs/aa",
+                listed(),
+                &named(&["v3", "m1", "v9"])
+            )),
+            ["m1", "v3"]
+        );
+        // `v3` was written after the caller listed: not named, kept.
+        assert_eq!(
+            ids(named_versions_of(
+                "blobs/aa",
+                listed(),
+                &named(&["v2", "m1", "v0"])
+            )),
+            ["v2", "m1"]
+        );
     }
 
     /// A page without `IsTruncated` is an error: read as the end of the
