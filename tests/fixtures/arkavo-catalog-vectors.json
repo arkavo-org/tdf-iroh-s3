@@ -1,5 +1,5 @@
 {
- "description": "ArkavoCatalog's shared vectors. `document` is an arkavo.creator-catalog/2 document, the decrypted payload of the catalog envelope; each entry carries its metadata TDF as base64url `metadata`. `index` is the clear entry list a /2 publish sends to the node (PUT /v2/catalogs `index`), without metadata. `metadata` is the decrypted payload of an entry's metadata TDF. `pointer` is an arkavo.catalog-pointer/1, whose catalogSize is the envelope's. Each vector is UTF-8 `text`, or `base64` for bytes that are not valid UTF-8 or carry a byte-order mark. `valid` says whether a reader accepts it.",
+ "description": "ArkavoCatalog's shared vectors. `document` is an arkavo.creator-catalog/2 document, the decrypted payload of the catalog envelope; each entry carries its metadata TDF as base64url `metadata`. `index` is the clear entry list a /2 publish sends to the node (PUT /v2/catalogs `index`), without metadata. An `index` vector may also carry `indexHash`: the lowercase hex SHA-256 of its canonical form, which a /2 pointer signs (entries sorted by the UTF-8 bytes of contentID, each written as {\"contentID\",\"version\",\"payloadHash\",\"payloadSize\"} in that key order, joined with commas inside [ ], no whitespace; built from the parsed entries, so the vector's own key and entry order don't matter). `metadata` is the decrypted payload of an entry's metadata TDF. `pointer` is an arkavo.catalog-pointer/2, a JSON object of exactly seven keys, indexHash among them (64 lowercase hex, the SHA-256 of the canonical index), or an arkavo.catalog-pointer/1, exactly the other six keys; a /2 without indexHash or a /1 with one is invalid. A writer puts indexHash between catalogSize and issuedAt, but key order is free: a reader accepts the keys in any order. catalogSize is the envelope's. A pointer or an index entry is a JSON object: the same values as a JSON array are invalid. Each vector is UTF-8 `text`, or `base64` for bytes that are not valid UTF-8 or carry a byte-order mark. `valid` says whether a reader accepts it.",
  "vectors": [
   {
    "kind": "document",
@@ -620,6 +620,33 @@
    "base64": "77u/W3siY29udGVudElEIjoicmVjLTAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwidmVyc2lvbiI6MSwicGF5bG9hZEhhc2giOiIxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIiwicGF5bG9hZFNpemUiOjczNDIwNjd9XQ=="
   },
   {
+   "kind": "index",
+   "name": "indexHash: empty",
+   "valid": true,
+   "text": "[]",
+   "indexHash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  {
+   "kind": "index",
+   "name": "indexHash: two, given out of order",
+   "valid": true,
+   "text": "[{\"contentID\":\"rec-b\",\"payloadHash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"payloadSize\":2048,\"version\":1},{\"contentID\":\"rec-a\",\"payloadHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"payloadSize\":1024,\"version\":3}]",
+   "indexHash": "03f745d8d08d9e9e11cabf33d85e8beb452eb3a2b2e541f92e1703c1f4152df4"
+  },
+  {
+   "kind": "index",
+   "name": "indexHash: byte order",
+   "valid": true,
+   "text": "[{\"contentID\":\"a_1\",\"version\":1,\"payloadHash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"payloadSize\":1},{\"contentID\":\"a@1\",\"version\":1,\"payloadHash\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"payloadSize\":2},{\"contentID\":\"A\",\"version\":1,\"payloadHash\":\"0202020202020202020202020202020202020202020202020202020202020202\",\"payloadSize\":3},{\"contentID\":\"a:1\",\"version\":1,\"payloadHash\":\"0303030303030303030303030303030303030303030303030303030303030303\",\"payloadSize\":4},{\"contentID\":\"a.1\",\"version\":1,\"payloadHash\":\"0404040404040404040404040404040404040404040404040404040404040404\",\"payloadSize\":5},{\"contentID\":\"a-1\",\"version\":1,\"payloadHash\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"payloadSize\":6}]",
+   "indexHash": "79129b9fa70e8ab5d0894d07098294de6dec2677c9df538b3eb05df98bd8ef18"
+  },
+  {
+   "kind": "index",
+   "name": "index entry as an array",
+   "valid": false,
+   "text": "[[\"rec-0123456789abcdef0123456789abcdef\",1,\"1111111111111111111111111111111111111111111111111111111111111111\",7342067]]"
+  },
+  {
    "kind": "metadata",
    "name": "payload",
    "valid": true,
@@ -939,6 +966,18 @@
   },
   {
    "kind": "pointer",
+   "name": "/2",
+   "valid": true,
+   "text": "{\"schema\":\"arkavo.catalog-pointer/2\",\"owner\":\"5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10\",\"seq\":7,\"catalogHash\":\"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7\",\"catalogSize\":97,\"indexHash\":\"03f745d8d08d9e9e11cabf33d85e8beb452eb3a2b2e541f92e1703c1f4152df4\",\"issuedAt\":\"2026-10-19T01:02:03Z\"}"
+  },
+  {
+   "kind": "pointer",
+   "name": "/2, keys in another order",
+   "valid": true,
+   "text": "{\"issuedAt\":\"2026-10-19T01:02:03Z\",\"indexHash\":\"03f745d8d08d9e9e11cabf33d85e8beb452eb3a2b2e541f92e1703c1f4152df4\",\"catalogSize\":97,\"catalogHash\":\"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7\",\"seq\":7,\"owner\":\"5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10\",\"schema\":\"arkavo.catalog-pointer/2\"}"
+  },
+  {
+   "kind": "pointer",
    "name": "unknown key",
    "valid": false,
    "text": "{\"schema\":\"arkavo.catalog-pointer/1\",\"owner\":\"5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10\",\"seq\":7,\"catalogHash\":\"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7\",\"catalogSize\":97,\"issuedAt\":\"2026-10-19T01:02:03Z\",\"note\":\"x\"}"
@@ -951,9 +990,63 @@
   },
   {
    "kind": "pointer",
-   "name": "schema /2",
+   "name": "/2 without indexHash",
    "valid": false,
    "text": "{\"schema\":\"arkavo.catalog-pointer/2\",\"owner\":\"5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10\",\"seq\":7,\"catalogHash\":\"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7\",\"catalogSize\":97,\"issuedAt\":\"2026-10-19T01:02:03Z\"}"
+  },
+  {
+   "kind": "pointer",
+   "name": "/2 with an extra key",
+   "valid": false,
+   "text": "{\"schema\":\"arkavo.catalog-pointer/2\",\"owner\":\"5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10\",\"seq\":7,\"catalogHash\":\"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7\",\"catalogSize\":97,\"indexHash\":\"03f745d8d08d9e9e11cabf33d85e8beb452eb3a2b2e541f92e1703c1f4152df4\",\"issuedAt\":\"2026-10-19T01:02:03Z\",\"note\":\"x\"}"
+  },
+  {
+   "kind": "pointer",
+   "name": "/2 with indexHash repeated",
+   "valid": false,
+   "text": "{\"schema\":\"arkavo.catalog-pointer/2\",\"owner\":\"5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10\",\"seq\":7,\"catalogHash\":\"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7\",\"catalogSize\":97,\"indexHash\":\"03f745d8d08d9e9e11cabf33d85e8beb452eb3a2b2e541f92e1703c1f4152df4\",\"indexHash\":\"03f745d8d08d9e9e11cabf33d85e8beb452eb3a2b2e541f92e1703c1f4152df4\",\"issuedAt\":\"2026-10-19T01:02:03Z\"}"
+  },
+  {
+   "kind": "pointer",
+   "name": "/2 indexHash of 63 characters",
+   "valid": false,
+   "text": "{\"schema\":\"arkavo.catalog-pointer/2\",\"owner\":\"5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10\",\"seq\":7,\"catalogHash\":\"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7\",\"catalogSize\":97,\"indexHash\":\"03f745d8d08d9e9e11cabf33d85e8beb452eb3a2b2e541f92e1703c1f4152df\",\"issuedAt\":\"2026-10-19T01:02:03Z\"}"
+  },
+  {
+   "kind": "pointer",
+   "name": "/2 indexHash of 65 characters",
+   "valid": false,
+   "text": "{\"schema\":\"arkavo.catalog-pointer/2\",\"owner\":\"5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10\",\"seq\":7,\"catalogHash\":\"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7\",\"catalogSize\":97,\"indexHash\":\"03f745d8d08d9e9e11cabf33d85e8beb452eb3a2b2e541f92e1703c1f4152df40\",\"issuedAt\":\"2026-10-19T01:02:03Z\"}"
+  },
+  {
+   "kind": "pointer",
+   "name": "/2 indexHash in uppercase",
+   "valid": false,
+   "text": "{\"schema\":\"arkavo.catalog-pointer/2\",\"owner\":\"5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10\",\"seq\":7,\"catalogHash\":\"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7\",\"catalogSize\":97,\"indexHash\":\"03F745D8D08D9E9E11CABF33D85E8BEB452EB3A2B2E541F92E1703C1F4152DF4\",\"issuedAt\":\"2026-10-19T01:02:03Z\"}"
+  },
+  {
+   "kind": "pointer",
+   "name": "/2 indexHash null",
+   "valid": false,
+   "text": "{\"schema\":\"arkavo.catalog-pointer/2\",\"owner\":\"5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10\",\"seq\":7,\"catalogHash\":\"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7\",\"catalogSize\":97,\"indexHash\":null,\"issuedAt\":\"2026-10-19T01:02:03Z\"}"
+  },
+  {
+   "kind": "pointer",
+   "name": "/1 with indexHash",
+   "valid": false,
+   "text": "{\"schema\":\"arkavo.catalog-pointer/1\",\"owner\":\"5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10\",\"seq\":7,\"catalogHash\":\"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7\",\"catalogSize\":97,\"indexHash\":\"03f745d8d08d9e9e11cabf33d85e8beb452eb3a2b2e541f92e1703c1f4152df4\",\"issuedAt\":\"2026-10-19T01:02:03Z\"}"
+  },
+  {
+   "kind": "pointer",
+   "name": "/1 with indexHash null",
+   "valid": false,
+   "text": "{\"schema\":\"arkavo.catalog-pointer/1\",\"owner\":\"5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10\",\"seq\":7,\"catalogHash\":\"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7\",\"catalogSize\":97,\"indexHash\":null,\"issuedAt\":\"2026-10-19T01:02:03Z\"}"
+  },
+  {
+   "kind": "pointer",
+   "name": "/3 with indexHash",
+   "valid": false,
+   "text": "{\"schema\":\"arkavo.catalog-pointer/3\",\"owner\":\"5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10\",\"seq\":7,\"catalogHash\":\"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7\",\"catalogSize\":97,\"indexHash\":\"03f745d8d08d9e9e11cabf33d85e8beb452eb3a2b2e541f92e1703c1f4152df4\",\"issuedAt\":\"2026-10-19T01:02:03Z\"}"
   },
   {
    "kind": "pointer",
@@ -1014,6 +1107,18 @@
    "name": "longer than 1,024 bytes",
    "valid": false,
    "text": "                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                {\"schema\":\"arkavo.catalog-pointer/1\",\"owner\":\"5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10\",\"seq\":7,\"catalogHash\":\"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7\",\"catalogSize\":97,\"issuedAt\":\"2026-10-19T01:02:03Z\"}"
+  },
+  {
+   "kind": "pointer",
+   "name": "/1 pointer as an array",
+   "valid": false,
+   "text": "[\"arkavo.catalog-pointer/1\",\"5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10\",7,\"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7\",97,\"2026-10-19T01:02:03Z\"]"
+  },
+  {
+   "kind": "pointer",
+   "name": "/2 pointer as an array",
+   "valid": false,
+   "text": "[\"arkavo.catalog-pointer/2\",\"5c1f0e7a-2b8d-4c0f-9a51-3f2b6d8e4a10\",7,\"729d79721d28362279f6e2a5a9e0f7b64a7e9097adfa67207f41b615618d01e7\",97,\"03f745d8d08d9e9e11cabf33d85e8beb452eb3a2b2e541f92e1703c1f4152df4\",\"2026-10-19T01:02:03Z\"]"
   }
  ]
 }

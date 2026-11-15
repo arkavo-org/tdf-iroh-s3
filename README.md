@@ -180,17 +180,25 @@ entity_mode = "claims"
 ```
 
 The IAM role needs read and write on `blobs/` and `outboards/` (fetches
-read both; ingest writes both). It needs the same S3 write permissions on
-`manifests/` as on `blobs/`: the manifest write is best-effort (a failure
-is logged and never masks a successful blob ingest; re-pushing the content
-repairs it). Creator catalogs need `s3:PutObject` and
-`s3:GetObject` on `catalog-documents/`, and for catalog v2 also on
-`catalog-outboards/` and `catalog-pointers/` (pointer writes are
-conditional: `If-Match` / `If-None-Match`). It needs `s3:PutObject`,
-`s3:GetObject` on `moderation/` when the publishing gate is on. It also
+read both; ingest writes both). It needs the same on `manifests/`: the
+catalog publish checks read a recording's manifest, and the manifest write
+is best-effort (a failure is logged and never masks a successful blob
+ingest; re-pushing the content repairs it). Creator catalogs need
+`s3:PutObject` and `s3:GetObject` on `catalog-documents/`, and for catalog
+v2 also on `catalog-outboards/`, `catalog-indexes/`, `catalog-pointers/`
+and `catalog-transitions/` (index, pointer and transition writes are
+conditional: `If-Match` / `If-None-Match`; a publish reads the stored
+index record and transition back when its create finds one). It needs
+`s3:PutObject`, `s3:GetObject` on `moderation/` when the publishing gate
+is on, which includes the owner records' conditional creates. It also
 needs `s3:ListBucket` on the bucket itself, without a prefix condition:
 without it S3 answers a missing key with 403, and the node reports unknown
-hashes as 502 `storage unavailable` instead of 404.
+hashes as 502 `storage unavailable` instead of 404. The node never
+deletes. The operator commands (`claim-owners`, `release-owner`,
+`sweep-deletions`, `request-deletion`) run with operator credentials, not
+the node's role: their permissions are in
+[docs/publishing-and-moderation.md](docs/publishing-and-moderation.md)
+under IAM and IAM for deletion.
 
 ## HTTP API
 
