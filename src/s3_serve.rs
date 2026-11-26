@@ -14,7 +14,11 @@
 //! Outboards up to [`MAX_CACHED_OUTBOARD_BYTES`] (16 MiB, covering blobs up to
 //! 4 GiB) are kept in a bounded LRU cache so streaming a recording segment by
 //! segment reads `outboards/<hash>` from S3 once instead of re-reading Merkle
-//! tree paths on every segment.
+//! tree paths on every segment. Cold loads are de-duplicated per hash and
+//! capped at [`OUTBOARD_LOADS`] in flight (bounding peak memory across all
+//! concurrent serves); a cold first ranged request on a large (> 1 MiB)
+//! outboard streams only the tree nodes it needs and promotes the outboard
+//! into the cache on the second ranged request.
 //!
 //! A blob ingested before outboards were stored has none: the first fetch
 //! of it computes the outboard by streaming the blob from S3 once, checks
@@ -42,7 +46,7 @@ use iroh_blobs::Hash;
 use iroh_blobs::store::IROH_BLOCK_SIZE;
 use iroh_io::AsyncStreamWriter;
 use tokio::io::{AsyncBufRead, AsyncReadExt};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 use tracing::{error, info, warn};
 
 use crate::store::s3::S3Client;
@@ -85,9 +89,27 @@ const OUTBOARD_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// bounded range GETs.
 const MAX_CACHED_OUTBOARD_BYTES: usize = 16 * 1024 * 1024;
 
+/// Outboards up to this size (1 MiB, covering blobs up to 256 MiB) are loaded
+/// and cached eagerly on first access. Larger cold outboards serve their first
+/// ranged request directly via bounded S3 range reads and promote into the
+/// cache on a second ranged request (or immediately on a whole-blob send).
+const SMALL_OUTBOARD_BYTES: u64 = 1024 * 1024;
+
 /// Most outboards held in the cache at once, bounding map overhead when
 /// serving many small blobs.
 const OUTBOARD_CACHE_ENTRIES: usize = 1024;
+
+/// Most cold full-outboard loads allowed in flight at once across all
+/// concurrent serves (at most 4 × 16 MiB = 64 MiB). Additional cold requests
+/// fall back to constant-memory streaming reads from S3.
+const OUTBOARD_LOADS: usize = 4;
+
+/// Most large-outboard hashes remembered for 2-hit ranged cache promotion.
+const RANGED_SEEN_CAPACITY: usize = 10_000;
+
+/// Broadcast channel carrying the result of one in-flight outboard load so
+/// concurrent cold requests for the same hash share a single S3 GET.
+type OutboardLoadRx = watch::Receiver<Option<Result<Bytes, String>>>;
 
 /// Why a hash is not served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +163,16 @@ pub struct S3Server {
     /// `catalog-outboards/<hash>`), so segment-by-segment streaming avoids
     /// re-fetching Merkle tree paths from S3 on every range request.
     outboards: Mutex<OutboardCache>,
+    /// Caps concurrent full-outboard loads in flight ([`OUTBOARD_LOADS`]) so
+    /// many simultaneous cold serves stay memory-bounded.
+    outboard_loads: Arc<Semaphore>,
+    /// In-flight full-outboard loads by hash so concurrent cold requests for
+    /// the same blob share a single S3 GET and buffer.
+    loading_outboards: Mutex<HashMap<Hash, OutboardLoadRx>>,
+    /// Hashes with large (> [`SMALL_OUTBOARD_BYTES`]) outboards that have
+    /// already seen one cold ranged request; a second ranged request promotes
+    /// their outboard into `outboards`.
+    ranged_seen: Mutex<HashSet<Hash>>,
     /// Hashes whose outboard is being computed.
     backfilling: Mutex<HashSet<Hash>>,
     backfills: Arc<Semaphore>,
@@ -164,6 +196,9 @@ impl S3Server {
                 MAX_CACHED_OUTBOARD_BYTES,
                 OUTBOARD_CACHE_ENTRIES,
             )),
+            outboard_loads: Arc::new(Semaphore::new(OUTBOARD_LOADS)),
+            loading_outboards: Mutex::default(),
+            ranged_seen: Mutex::default(),
             backfilling: Mutex::default(),
             backfills: Arc::new(Semaphore::new(BACKFILLS)),
             corrupt: Mutex::default(),
@@ -248,8 +283,9 @@ impl S3Server {
             spans,
         );
         let outboard_size = tree.outboard_size();
+        let is_whole_blob = ranges.is_all();
         let (outboard_data, newly_loaded) = self
-            .load_outboard(hash, object, &hex, outboard_size)
+            .load_outboard(hash, object, &hex, outboard_size, is_whole_blob)
             .await?;
         let outboard = PreOrderOutboard {
             root: blake3::Hash::from(hash),
@@ -278,17 +314,25 @@ impl S3Server {
         Ok(())
     }
 
-    /// Return the BAO outboard reader for `hash`: from memory if cached (or
-    /// empty), fetched whole into memory if it fits in the cache budget, or
-    /// streamed with bounded S3 range reads if larger than
-    /// [`MAX_CACHED_OUTBOARD_BYTES`]. Returns `(reader, Some(bytes))` when
-    /// fetched fresh so the caller can cache it after validation succeeds.
+    /// Return the BAO outboard reader for `hash`:
+    /// - from memory if empty or already cached;
+    /// - waiting on an in-flight load for the same hash if one is running
+    ///   (de-duplicating concurrent cold requests into one S3 GET and buffer);
+    /// - loaded whole into memory (capped at [`OUTBOARD_LOADS`] concurrent
+    ///   loads) for whole-blob sends, small outboards (≤ 1 MiB), or a second
+    ///   ranged request on a large outboard;
+    /// - streamed directly from S3 in constant memory otherwise (sequential
+    ///   for whole-blob sends, bounded per-node range reads for ranged sends).
+    ///
+    /// Returns `(reader, Some(bytes))` when freshly loaded so the caller
+    /// caches it only after BAO validation succeeds.
     async fn load_outboard(
         &self,
         hash: Hash,
         object: &Object,
         hex: &str,
         outboard_size: u64,
+        is_whole_blob: bool,
     ) -> io::Result<(OutboardData, Option<Bytes>)> {
         if outboard_size == 0 {
             return Ok((OutboardData::Memory(Bytes::new()), None));
@@ -299,12 +343,97 @@ impl S3Server {
             return Ok((OutboardData::Memory(cached), None));
         }
         let key = object.outboard_key(&self.s3, hex);
-        if outboard_size <= MAX_CACHED_OUTBOARD_BYTES as u64 {
-            let bytes = read_object_exact(&self.s3, &key, outboard_size as usize).await?;
-            return Ok((OutboardData::Memory(bytes.clone()), Some(bytes)));
+        let fallback = || streaming_outboard(&self.s3, key.clone(), outboard_size, is_whole_blob);
+
+        // If another task is already loading this hash's outboard, join it
+        // instead of issuing a duplicate S3 GET.
+        let existing_rx = lock(&self.loading_outboards).get(&hash).cloned();
+        if let Some(rx) = existing_rx {
+            return Ok(match await_in_flight(rx, outboard_size).await {
+                Some(bytes) => (OutboardData::Memory(bytes.clone()), Some(bytes)),
+                None => (fallback(), None),
+            });
         }
-        let reader = S3Reader::bounded_reads(Arc::clone(&self.s3), key, outboard_size);
-        Ok((OutboardData::S3(reader), None))
+
+        let should_cache = outboard_size <= MAX_CACHED_OUTBOARD_BYTES as u64
+            && (is_whole_blob
+                || outboard_size <= SMALL_OUTBOARD_BYTES
+                || self.mark_ranged_seen(hash));
+        if !should_cache {
+            return Ok((fallback(), None));
+        }
+
+        // Bound peak memory across concurrent cold serves: if all load slots
+        // are busy, stream from S3 in constant memory instead of waiting or
+        // allocating another up-to-16 MiB buffer.
+        let Ok(_permit) = Arc::clone(&self.outboard_loads).try_acquire_owned() else {
+            return Ok((fallback(), None));
+        };
+
+        // Re-check cache and in-flight map now that we hold a load permit, and
+        // register ourselves as the single loader for `hash`.
+        enum Claim {
+            Cached(Bytes),
+            Join(OutboardLoadRx),
+            Load(watch::Sender<Option<Result<Bytes, String>>>),
+        }
+        let claim = {
+            if let Some(cached) = lock(&self.outboards).get(&hash)
+                && cached.len() as u64 == outboard_size
+            {
+                Claim::Cached(cached)
+            } else {
+                let mut loading = lock(&self.loading_outboards);
+                if let Some(rx) = loading.get(&hash).cloned() {
+                    Claim::Join(rx)
+                } else {
+                    let (tx, rx) = watch::channel(None);
+                    loading.insert(hash, rx);
+                    Claim::Load(tx)
+                }
+            }
+        };
+        let tx = match claim {
+            Claim::Cached(cached) => return Ok((OutboardData::Memory(cached), None)),
+            Claim::Join(rx) => {
+                drop(_permit);
+                return Ok(match await_in_flight(rx, outboard_size).await {
+                    Some(bytes) => (OutboardData::Memory(bytes.clone()), Some(bytes)),
+                    None => (fallback(), None),
+                });
+            }
+            Claim::Load(tx) => tx,
+        };
+        let _guard = LoadingGuard {
+            loading: &self.loading_outboards,
+            hash,
+        };
+
+        match read_object_exact(&self.s3, &key, outboard_size as usize).await {
+            Ok(bytes) => {
+                let _ = tx.send(Some(Ok(bytes.clone())));
+                Ok((OutboardData::Memory(bytes.clone()), Some(bytes)))
+            }
+            Err(e) => {
+                let _ = tx.send(Some(Err(e.to_string())));
+                Err(e)
+            }
+        }
+    }
+
+    /// Record a cold ranged request for a large-outboard `hash`. Returns
+    /// `true` if `hash` was already seen on a prior ranged request (signalling
+    /// an active stream worth promoting into the outboard cache).
+    fn mark_ranged_seen(&self, hash: Hash) -> bool {
+        let mut seen = lock(&self.ranged_seen);
+        if seen.contains(&hash) {
+            return true;
+        }
+        if seen.len() >= RANGED_SEEN_CAPACITY {
+            seen.clear();
+        }
+        seen.insert(hash);
+        false
     }
 
     /// Refuse `hash` for good: its S3 object does not match it.
@@ -324,12 +453,16 @@ impl S3Server {
         corrupt.insert(hash);
         lock(&self.servable).remove(&hash);
         lock(&self.outboards).remove(&hash);
+        lock(&self.ranged_seen).remove(&hash);
     }
 
-    /// Drop what is remembered of `hash`, so the next fetch asks S3 again.
+    /// Drop what is remembered of `hash`'s S3 presence, so the next fetch
+    /// re-HEADs S3 (detecting a deletion). The cached outboard is kept: it is
+    /// content-addressed by `hash`, so a cancelled seek or transient S3 error
+    /// does not force re-downloading a multi-MiB outboard; only
+    /// [`Self::mark_corrupt`] evicts it.
     pub fn forget(&self, hash: &Hash) {
         lock(&self.servable).remove(hash);
-        lock(&self.outboards).remove(hash);
     }
 
     /// Compute and store the outboard of a blob that lacks one, unless that
@@ -534,6 +667,46 @@ impl OutboardCache {
             self.order.remove(&old_tick);
             self.total_bytes -= evicted.len();
         }
+    }
+}
+
+/// Removes an in-flight entry from `loading_outboards` on completion, error,
+/// or task cancellation so waiters never observe a leaked entry.
+struct LoadingGuard<'a> {
+    loading: &'a Mutex<HashMap<Hash, OutboardLoadRx>>,
+    hash: Hash,
+}
+
+impl Drop for LoadingGuard<'_> {
+    fn drop(&mut self) {
+        lock(self.loading).remove(&self.hash);
+    }
+}
+
+/// Wait for an in-flight full-outboard load for the same hash. Returns `Some`
+/// if it produced an outboard of `expected_size`, or `None` if it failed or
+/// was cancelled (the caller then streams from S3 directly).
+async fn await_in_flight(mut rx: OutboardLoadRx, expected_size: u64) -> Option<Bytes> {
+    let val = rx.wait_for(Option::is_some).await.ok()?;
+    match val.as_ref() {
+        Some(Ok(bytes)) if bytes.len() as u64 == expected_size => Some(bytes.clone()),
+        _ => None,
+    }
+}
+
+/// Constant-memory S3 outboard reader used when not loading the full outboard
+/// into the cache: sequential for whole-blob sends (one S3 GET), bounded
+/// per-node range reads for ranged sends.
+fn streaming_outboard(
+    s3: &Arc<S3Client>,
+    key: String,
+    outboard_size: u64,
+    is_whole_blob: bool,
+) -> OutboardData {
+    if is_whole_blob {
+        OutboardData::S3(S3Reader::new(Arc::clone(s3), key, outboard_size))
+    } else {
+        OutboardData::S3(S3Reader::bounded_reads(Arc::clone(s3), key, outboard_size))
     }
 }
 
@@ -835,5 +1008,50 @@ mod tests {
         cache.remove(&h1);
         assert!(cache.get(&h1).is_none());
         assert_eq!(cache.total_bytes, 40);
+    }
+
+    #[test]
+    fn forget_keeps_cached_outboard_while_mark_corrupt_evicts_it() {
+        let server = S3Server::new(Arc::new(S3Client::new_mock("bucket", "us-east-1", "")));
+        let hash = Hash::new(b"recording");
+        let outboard = Bytes::from(vec![0xABu8; 128]);
+
+        lock(&server.servable).insert(
+            hash,
+            Servable {
+                size: 64 * 1024,
+                object: Object::Blob,
+            },
+        );
+        lock(&server.outboards).insert(hash, outboard.clone());
+
+        // `forget` drops `servable` (next fetch re-HEADs S3) but keeps the
+        // content-addressed outboard warm.
+        server.forget(&hash);
+        assert!(!lock(&server.servable).contains_key(&hash));
+        assert_eq!(lock(&server.outboards).get(&hash), Some(outboard));
+
+        // `mark_corrupt` evicts the outboard and clears `ranged_seen`.
+        assert!(!server.mark_ranged_seen(hash));
+        assert!(server.mark_ranged_seen(hash));
+        server.mark_corrupt(hash, &Object::Blob, "hash mismatch");
+        assert!(lock(&server.outboards).get(&hash).is_none());
+        assert!(!lock(&server.ranged_seen).contains(&hash));
+    }
+
+    #[tokio::test]
+    async fn await_in_flight_shares_result_and_handles_cancellation() {
+        let (tx, rx) = watch::channel(None);
+        let expected = Bytes::from_static(&[7u8; 64]);
+        let waiter = tokio::spawn(await_in_flight(rx, 64));
+        tx.send(Some(Ok(expected.clone()))).unwrap();
+        assert_eq!(waiter.await.unwrap(), Some(expected));
+
+        // If the leader drops without sending (e.g. cancelled), waiters get
+        // `None` and fall back to streaming instead of hanging.
+        let (tx, rx) = watch::channel(None);
+        let waiter = tokio::spawn(await_in_flight(rx, 64));
+        drop(tx);
+        assert_eq!(waiter.await.unwrap(), None);
     }
 }

@@ -1929,3 +1929,90 @@ async fn test_stream_individual_opentdf_payload_segment() {
     pusher.shutdown().await.unwrap();
     node.shutdown().await.unwrap();
 }
+
+/// Concurrent cold ranged fetches for the same blob share one outboard S3 GET,
+/// and a subsequent mid-transfer S3 failure (`forget()`) keeps the validated
+/// outboard cached so the retry does not re-download it.
+#[tokio::test(flavor = "current_thread")]
+async fn test_concurrent_cold_fetches_dedup_outboard_and_survive_forget() {
+    use bao_tree::{ChunkNum, ChunkRanges};
+
+    let (node, s3, _data_dir) = spawn_node(None).await;
+    let node_addr = dial_addr(&node);
+    let tdf = create_large_test_tdf(1024 * 1024);
+    let pusher = IrohTestClient::new().await.unwrap();
+    let hash = pusher.push_to_node(node_addr.clone(), &tdf).await.unwrap();
+    assert!(s3.wait_for_put(&blob_key(hash)).await);
+
+    s3.gets.lock().unwrap().clear();
+
+    // Launch 4 concurrent cold ranged fetches on separate connections.
+    let mut viewers = Vec::new();
+    for _ in 0..4 {
+        viewers.push(IrohTestClient::new().await.unwrap());
+    }
+    let ranges = [(0u64, 4u64), (20, 24), (100, 104), (500, 504)];
+    let futs = viewers.iter().zip(ranges).map(|(v, (first, end))| {
+        let addr = node_addr.clone();
+        let bytes = (first * 1024)..(end * 1024);
+        async move {
+            v.get_ranges_from_node(
+                addr,
+                hash,
+                ChunkRanges::from(ChunkNum(first)..ChunkNum(end)),
+                bytes,
+            )
+            .await
+            .unwrap()
+        }
+    });
+    let results = futures::future::join_all(futs).await;
+    for (fetched, (first, end)) in results.iter().zip(ranges) {
+        assert_eq!(
+            fetched.as_slice(),
+            &tdf[(first * 1024) as usize..(end * 1024) as usize]
+        );
+    }
+
+    let outboard_key = format!("outboards/{}", hash.to_hex());
+    let outboard_gets = || {
+        s3.gets
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _, _)| k == &outboard_key)
+            .count()
+    };
+    assert_eq!(
+        outboard_gets(),
+        1,
+        "4 concurrent cold fetches must de-duplicate into 1 outboard S3 GET"
+    );
+
+    // Force a mid-transfer blob failure so the node calls `forget(hash)`, then
+    // retry: the content-addressed outboard must remain cached (still 1 GET).
+    *s3.fail_get_after.lock().unwrap() = Some(100 * 1024);
+    let retry_viewer = IrohTestClient::new().await.unwrap();
+    assert_refused_as_rate_limited(
+        retry_viewer.fetch_from_node(node_addr.clone(), hash).await,
+        "get",
+    );
+    *s3.fail_get_after.lock().unwrap() = None;
+    let whole = retry_viewer
+        .fetch_from_node(node_addr.clone(), hash)
+        .await
+        .unwrap();
+    assert_eq!(whole.as_ref(), tdf.as_slice());
+    assert_eq!(
+        outboard_gets(),
+        1,
+        "forget() after a failed send must keep the content-addressed outboard cached"
+    );
+
+    retry_viewer.shutdown().await.unwrap();
+    for v in viewers {
+        v.shutdown().await.unwrap();
+    }
+    pusher.shutdown().await.unwrap();
+    node.shutdown().await.unwrap();
+}
