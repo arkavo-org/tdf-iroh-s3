@@ -62,6 +62,19 @@ pub async fn fetch_with_mode(
         .await
         .context("Failed to create Iroh client")?;
 
+    let result = fetch_inner(&client, addr, hash, hash_hex, mode, output_path).await;
+    let _ = client.shutdown().await;
+    result
+}
+
+async fn fetch_inner(
+    client: &IrohTestClient,
+    addr: EndpointAddr,
+    hash: Hash,
+    hash_hex: &str,
+    mode: FetchMode,
+    output_path: Option<&Path>,
+) -> Result<()> {
     println!("Connecting to node {}...", addr.id);
 
     let data = match mode {
@@ -95,7 +108,7 @@ pub async fn fetch_with_mode(
         }
         FetchMode::ListMembers => {
             let conn = client.connect(addr).await?;
-            let archive = TdfRemoteArchive::open(&client, conn, hash, None).await?;
+            let archive = TdfRemoteArchive::open(client, conn, hash, None).await?;
             println!(
                 "TDF {} ({} bytes, {} members):",
                 hash_hex,
@@ -108,14 +121,14 @@ pub async fn fetch_with_mode(
                     8 => "deflate",
                     other => {
                         println!(
-                            "  {}  offset={} compressed={} uncompressed={} method={other}",
+                            "  {:?}  offset={} compressed={} uncompressed={} method={other}",
                             m.name, m.header_offset, m.compressed_size, m.uncompressed_size
                         );
                         continue;
                     }
                 };
                 println!(
-                    "  {}  offset={} compressed={} uncompressed={} method={method}",
+                    "  {:?}  offset={} compressed={} uncompressed={} method={method}",
                     m.name, m.header_offset, m.compressed_size, m.uncompressed_size
                 );
             }
@@ -124,7 +137,7 @@ pub async fn fetch_with_mode(
         FetchMode::Member(name) => {
             println!("Streaming TDF member {:?} from {}...", name, hash_hex);
             let conn = client.connect(addr).await?;
-            let archive = TdfRemoteArchive::open(&client, conn, hash, None).await?;
+            let archive = TdfRemoteArchive::open(client, conn, hash, None).await?;
             let data = archive.fetch_member(&name).await?;
             println!(
                 "Fetched and verified member {:?} ({} bytes of {} byte archive)",
@@ -140,7 +153,7 @@ pub async fn fetch_with_mode(
                 index, hash_hex
             );
             let conn = client.connect(addr).await?;
-            let mut archive = TdfRemoteArchive::open(&client, conn, hash, None).await?;
+            let mut archive = TdfRemoteArchive::open(client, conn, hash, None).await?;
             let data = archive.fetch_payload_segment(index).await?;
             println!(
                 "Fetched and verified payload segment {} ({} bytes of {} byte archive)",
@@ -158,7 +171,6 @@ pub async fn fetch_with_mode(
         println!("Written to {}", path.display());
     }
 
-    client.shutdown().await?;
     Ok(())
 }
 

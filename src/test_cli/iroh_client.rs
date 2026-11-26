@@ -5,7 +5,8 @@ use iroh_base::TransportAddr;
 use iroh_blobs::BlobsProtocol;
 use iroh_blobs::api::blobs::Bitfield;
 use iroh_blobs::protocol::{
-    ChunkRanges, ChunkRangesSeq, GetManyRequest, GetRequest, ObserveRequest, PushRequest,
+    ChunkRanges, ChunkRangesExt, ChunkRangesSeq, GetManyRequest, GetRequest, ObserveRequest,
+    PushRequest,
 };
 use iroh_blobs::store::mem::MemStore;
 use iroh_blobs::{Hash, HashAndFormat};
@@ -298,16 +299,16 @@ impl IrohTestClient {
     }
 
     /// Learn the exact byte length of `hash` on an open connection by
-    /// fetching chunk 0 (`0..1 KiB`) and verifying it against `hash`.
+    /// fetching the last chunk (`ChunkRanges::last_chunk()`), which BAO
+    /// authenticates against `hash` along with the blob's exact length.
     pub async fn probe_size_on(
         &self,
         conn: &iroh::endpoint::Connection,
         hash: Hash,
     ) -> Result<u64> {
-        use bao_tree::ChunkNum;
         let request = GetRequest::new(
             hash,
-            ChunkRangesSeq::from_ranges([ChunkRanges::from(ChunkNum(0)..ChunkNum(1))]),
+            ChunkRangesSeq::from_ranges([ChunkRanges::last_chunk()]),
         );
         self.store
             .remote()
@@ -341,11 +342,22 @@ impl IrohTestClient {
             .execute_get(conn.clone(), request)
             .await
             .context("Failed to get ranges from remote node")?;
-        self.store
-            .export_ranges(hash, bytes)
+        let expected_len = bytes.end - bytes.start;
+        let data = self
+            .store
+            .export_ranges(hash, bytes.clone())
             .concatenate()
             .await
-            .context("Failed to read fetched ranges from local store")
+            .context("Failed to read fetched ranges from local store")?;
+        if data.len() as u64 != expected_len {
+            anyhow::bail!(
+                "requested byte range {}..{} ({expected_len} bytes) exceeds blob bounds (got {} bytes)",
+                bytes.start,
+                bytes.end,
+                data.len()
+            );
+        }
+        Ok(data)
     }
 
     /// Fetch the exact byte range `bytes` of `hash` over an existing
@@ -373,11 +385,22 @@ impl IrohTestClient {
                 .await
                 .context("Failed to get ranges from remote node")?;
         }
-        self.store
-            .export_ranges(hash, bytes)
+        let expected_len = bytes.end - bytes.start;
+        let data = self
+            .store
+            .export_ranges(hash, bytes.clone())
             .concatenate()
             .await
-            .context("Failed to read fetched ranges from local store")
+            .context("Failed to read fetched ranges from local store")?;
+        if data.len() as u64 != expected_len {
+            anyhow::bail!(
+                "requested byte range {}..{} ({expected_len} bytes) exceeds blob bounds (got {} bytes)",
+                bytes.start,
+                bytes.end,
+                data.len()
+            );
+        }
+        Ok(data)
     }
 
     /// Get only the 1 KiB chunks `chunks` of `hash` from a remote node, then

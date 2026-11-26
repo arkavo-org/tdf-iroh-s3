@@ -483,9 +483,11 @@ impl S3Client {
         let mut request = self.client.get_object().bucket(&self.bucket).key(key);
         // A range on a zero-length object is invalid in S3; ask for all of it
         // when reading from 0 with no upper bound.
-        match end {
+        let expected_content_range_prefix = match end {
             Some(end) if end > start => {
-                request = request.range(format!("bytes={start}-{}", end - 1));
+                let last = end - 1;
+                request = request.range(format!("bytes={start}-{last}"));
+                Some(format!("bytes {start}-{last}/"))
             }
             Some(_) => {
                 return Err(anyhow::anyhow!(
@@ -494,11 +496,22 @@ impl S3Client {
             }
             None if start > 0 => {
                 request = request.range(format!("bytes={start}-"));
+                Some(format!("bytes {start}-"))
             }
-            None => {}
-        }
+            None => None,
+        };
         match request.send().await {
-            Ok(resp) => Ok(Some(Box::pin(resp.body.into_async_read()))),
+            Ok(resp) => {
+                if let Some(expected_prefix) = expected_content_range_prefix {
+                    let actual = resp.content_range().unwrap_or_default();
+                    if !actual.starts_with(&expected_prefix) {
+                        return Err(anyhow::anyhow!(
+                            "S3 GET {key} ignored Range header: expected Content-Range starting with {expected_prefix:?}, got {actual:?}"
+                        ));
+                    }
+                }
+                Ok(Some(Box::pin(resp.body.into_async_read())))
+            }
             Err(e) => {
                 if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
                     Ok(None)

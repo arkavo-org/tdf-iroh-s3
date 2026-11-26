@@ -9,6 +9,7 @@
 //! ranged `GetRequest`s, verifying every 16 KiB chunk group against the blob's
 //! BLAKE3 root hash.
 
+use std::collections::HashSet;
 use std::io::{Cursor, Read};
 use std::ops::Range;
 
@@ -19,11 +20,19 @@ use opentdf::TdfManifest;
 use zip::ZipArchive;
 
 use crate::test_cli::iroh_client::IrohTestClient;
+use crate::validation::structure::{
+    MAX_ARCHIVE_ENTRIES, MAX_CENTRAL_DIRECTORY_READ, MAX_MANIFEST_BYTES,
+};
 
-/// Initial tail window fetched from the end of a TDF to locate the ZIP End of
-/// Central Directory (and, for small/medium archives, the Central Directory
-/// itself in the same round trip).
-const TAIL_FETCH_BYTES: u64 = 64 * 1024;
+/// Initial tail window fetched from the end of a TDF: covers the maximum
+/// possible ZIP comment (65,535 bytes) + 22-byte EOCD + 20-byte ZIP64 locator
+/// (65,577 bytes, rounded to 66 KiB).
+const TAIL_FETCH_BYTES: u64 = 66 * 1024;
+
+/// Maximum uncompressed bytes accepted when decoding a single streamed ZIP
+/// member via [`TdfRemoteArchive::fetch_member`], defending against deflate
+/// bombs in untrusted archives.
+pub const MAX_MEMBER_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Slack read past the fixed 30-byte ZIP local file header so the variable
 /// filename and extra fields are almost always covered in the same single
@@ -105,6 +114,12 @@ impl<'a> TdfRemoteArchive<'a> {
             }
         };
 
+        if cd_span.size > MAX_CENTRAL_DIRECTORY_READ {
+            bail!(
+                "ZIP Central Directory of {} bytes exceeds {MAX_CENTRAL_DIRECTORY_READ} bytes",
+                cd_span.size
+            );
+        }
         let cd_end = cd_span
             .offset
             .checked_add(cd_span.size)
@@ -153,10 +168,22 @@ impl<'a> TdfRemoteArchive<'a> {
     /// example `manifest.json`, `master.m3u8`, or `video-segment0.m4s`),
     /// verifying both its BAO hash proof and its ZIP CRC32.
     pub async fn fetch_member(&self, name: &str) -> Result<Vec<u8>> {
+        self.fetch_member_with_limit(name, MAX_MEMBER_BYTES).await
+    }
+
+    /// Like [`Self::fetch_member`], enforcing a caller-chosen cap on the
+    /// decoded byte length.
+    pub async fn fetch_member_with_limit(&self, name: &str, max_bytes: u64) -> Result<Vec<u8>> {
         let info = self
             .member(name)
             .with_context(|| format!("member {name:?} not found in TDF archive"))?
             .clone();
+        if info.uncompressed_size > max_bytes {
+            bail!(
+                "member {name:?} declares {} bytes, exceeding limit of {max_bytes} bytes",
+                info.uncompressed_size
+            );
+        }
 
         // Fetch the local file header plus the compressed payload in one range
         // request (extending only if the local extra field exceeds our slack).
@@ -192,7 +219,7 @@ impl<'a> TdfRemoteArchive<'a> {
 
         let entry_len = usize::try_from(data_end - info.header_offset)
             .context("ZIP member larger than addressable memory")?;
-        decode_single_member(&info, &member_bytes[..entry_len])
+        decode_single_member(&info, &member_bytes[..entry_len], max_bytes)
     }
 
     /// Fetch and parse the TDF manifest (`manifest.json` or legacy
@@ -203,7 +230,9 @@ impl<'a> TdfRemoteArchive<'a> {
                 .into_iter()
                 .find(|n| self.member(n).is_some())
                 .ok_or_else(|| anyhow!("TDF archive has no manifest.json or 0.manifest.json"))?;
-            let bytes = self.fetch_member(name).await?;
+            let bytes = self
+                .fetch_member_with_limit(name, MAX_MANIFEST_BYTES)
+                .await?;
             let json = std::str::from_utf8(&bytes).context("TDF manifest is not UTF-8")?;
             let parsed =
                 TdfManifest::from_json(json).context("Failed to parse TDF manifest JSON")?;
@@ -246,6 +275,9 @@ impl<'a> TdfRemoteArchive<'a> {
             let seg_len = seg
                 .encrypted_segment_size
                 .unwrap_or(integrity.encrypted_segment_size_default);
+            if seg_len == 0 {
+                bail!("segment {segment_index} has zero encryptedSegmentSize");
+            }
             (payload_name, offset, seg_len)
         };
 
@@ -269,14 +301,14 @@ impl<'a> TdfRemoteArchive<'a> {
             .context("Failed to fetch payload local file header")?;
         let data_offset = parse_local_header_data_offset(&local_header, info.header_offset)?;
 
-        let byte_range = (data_offset + seg_offset)..(data_offset + seg_offset + seg_len);
-        if byte_range.end > data_offset + info.compressed_size || byte_range.end > self.size {
-            bail!(
-                "segment {segment_index} ({byte_range:?}) exceeds payload member bounds ({}..{})",
-                data_offset,
-                data_offset + info.compressed_size
-            );
-        }
+        let byte_range = segment_byte_range(
+            data_offset,
+            info.compressed_size,
+            self.size,
+            seg_offset,
+            seg_len,
+            segment_index,
+        )?;
 
         self.client
             .get_byte_range_on(&self.conn, self.hash, byte_range)
@@ -285,10 +317,52 @@ impl<'a> TdfRemoteArchive<'a> {
     }
 }
 
+/// Checked byte-range computation for one OpenTDF payload segment inside a
+/// `Stored` payload member.
+fn segment_byte_range(
+    data_offset: u64,
+    payload_len: u64,
+    archive_size: u64,
+    seg_offset: u64,
+    seg_len: u64,
+    segment_index: usize,
+) -> Result<Range<u64>> {
+    if seg_len == 0 {
+        bail!("segment {segment_index} has zero length");
+    }
+    let payload_end = data_offset
+        .checked_add(payload_len)
+        .filter(|&end| end <= archive_size)
+        .ok_or_else(|| anyhow!("payload member bounds exceed archive size"))?;
+    let seg_start = data_offset
+        .checked_add(seg_offset)
+        .ok_or_else(|| anyhow!("segment {segment_index} start offset overflow"))?;
+    let seg_end = seg_start
+        .checked_add(seg_len)
+        .ok_or_else(|| anyhow!("segment {segment_index} end offset overflow"))?;
+    if seg_end > payload_end {
+        bail!(
+            "segment {segment_index} ({seg_start}..{seg_end}) exceeds payload member bounds ({data_offset}..{payload_end})"
+        );
+    }
+    Ok(seg_start..seg_end)
+}
+
 /// Decode and CRC-verify a single member from its `[local_header || payload]`
 /// bytes by wrapping them with its Central Directory entry (rebased to offset
 /// 0) and a synthetic End of Central Directory, then reading through `zip`.
-fn decode_single_member(info: &ZipMemberInfo, local_and_payload: &[u8]) -> Result<Vec<u8>> {
+fn decode_single_member(
+    info: &ZipMemberInfo,
+    local_and_payload: &[u8],
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
+    if info.uncompressed_size > max_bytes {
+        bail!(
+            "member {:?} declares {} bytes, exceeding limit of {max_bytes} bytes",
+            info.name,
+            info.uncompressed_size
+        );
+    }
     let cd_offset = u32::try_from(local_and_payload.len())
         .context("single ZIP member exceeds 4 GiB standalone view")?;
     let mut cd_entry = info.raw_cd_entry.clone();
@@ -310,13 +384,21 @@ fn decode_single_member(info: &ZipMemberInfo, local_and_payload: &[u8]) -> Resul
 
     let mut archive = ZipArchive::new(Cursor::new(mini_zip))
         .context("Failed to open standalone ZIP view for member extraction")?;
-    let mut entry = archive
+    let entry = archive
         .by_index(0)
         .with_context(|| format!("Failed to read member {:?}", info.name))?;
-    let mut out = Vec::with_capacity(info.uncompressed_size as usize);
+    let prealloc = info.uncompressed_size.min(max_bytes).min(1024 * 1024) as usize;
+    let mut out = Vec::with_capacity(prealloc);
     entry
+        .take(max_bytes.saturating_add(1))
         .read_to_end(&mut out)
         .with_context(|| format!("Failed to decode/verify member {:?}", info.name))?;
+    if out.len() as u64 > max_bytes {
+        bail!(
+            "member {:?} expanded past limit of {max_bytes} bytes",
+            info.name
+        );
+    }
     Ok(out)
 }
 
@@ -401,14 +483,14 @@ fn locate_central_directory(tail: &[u8], tail_offset: u64, total_size: u64) -> R
     let cd_size = u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]);
     let cd_offset = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]);
 
-    if entries == u16::MAX || cd_size == u32::MAX || cd_offset == u32::MAX {
-        if eocd_rel < 20 {
-            bail!("ZIP64 EOCD locator precedes fetched tail");
+    let has_zip64_locator =
+        eocd_rel >= 20 && tail[eocd_rel - 20..eocd_rel - 16] == ZIP64_LOCATOR_SIG;
+    let must_use_zip64 = cd_size == u32::MAX || cd_offset == u32::MAX;
+    if must_use_zip64 || (entries == u16::MAX && has_zip64_locator) {
+        if !has_zip64_locator {
+            bail!("ZIP64 EOCD locator missing");
         }
         let loc = &tail[eocd_rel - 20..eocd_rel];
-        if loc[0..4] != ZIP64_LOCATOR_SIG {
-            bail!("ZIP64 EOCD locator signature missing");
-        }
         let eocd64_offset = u64::from_le_bytes(loc[8..16].try_into().expect("8 bytes"));
         if eocd64_offset >= total_size {
             bail!("ZIP64 EOCD offset {eocd64_offset} exceeds archive size {total_size}");
@@ -431,6 +513,14 @@ fn parse_zip64_eocd(slice: &[u8]) -> Result<CentralDirectorySpan> {
     if slice.len() < 56 || slice[0..4] != EOCD64_SIG {
         bail!("invalid ZIP64 End of Central Directory record");
     }
+    let entries_disk = u64::from_le_bytes(slice[24..32].try_into().expect("8 bytes"));
+    let entries_total = u64::from_le_bytes(slice[32..40].try_into().expect("8 bytes"));
+    if entries_disk.max(entries_total) > MAX_ARCHIVE_ENTRIES {
+        bail!(
+            "TDF archive lists {} members, more than {MAX_ARCHIVE_ENTRIES}",
+            entries_disk.max(entries_total)
+        );
+    }
     let cd_size = u64::from_le_bytes(slice[40..48].try_into().expect("8 bytes"));
     let cd_offset = u64::from_le_bytes(slice[48..56].try_into().expect("8 bytes"));
     Ok(CentralDirectorySpan {
@@ -445,8 +535,12 @@ fn parse_central_directory(cd_bytes: &[u8]) -> Result<Vec<ZipMemberInfo>> {
     const CD_FIXED_LEN: usize = 46;
 
     let mut members = Vec::new();
+    let mut seen_names = HashSet::new();
     let mut pos = 0usize;
     while pos < cd_bytes.len() {
+        if members.len() as u64 >= MAX_ARCHIVE_ENTRIES {
+            bail!("TDF archive lists more than {MAX_ARCHIVE_ENTRIES} members");
+        }
         if pos + CD_FIXED_LEN > cd_bytes.len() || cd_bytes[pos..pos + 4] != CD_HEADER_SIG {
             bail!("corrupt ZIP Central Directory header at offset {pos}");
         }
@@ -466,6 +560,9 @@ fn parse_central_directory(cd_bytes: &[u8]) -> Result<Vec<ZipMemberInfo>> {
             bail!("truncated ZIP Central Directory entry at offset {pos}");
         }
         let name = String::from_utf8_lossy(&cd_bytes[name_start..extra_start]).into_owned();
+        if !seen_names.insert(name.clone()) {
+            bail!("duplicate ZIP member name {name:?}");
+        }
         let extra = &cd_bytes[extra_start..extra_start + extra_len];
 
         if uncompressed_size == u32::MAX as u64
@@ -652,8 +749,112 @@ mod tests {
             .unwrap();
             let end = (data_off + member.compressed_size) as usize;
             let slice = &zip_bytes[member.header_offset as usize..end];
-            let decoded = decode_single_member(member, slice).unwrap();
+            let decoded = decode_single_member(member, slice, MAX_MEMBER_BYTES).unwrap();
             assert_eq!(&decoded, expected);
         }
+    }
+
+    #[test]
+    fn rejects_deflate_bomb_and_oversized_member() {
+        let big = vec![0u8; 64 * 1024];
+        let zip_bytes = build_zip(&[("bomb.bin", &big, CompressionMethod::Deflated)]);
+        let size = zip_bytes.len() as u64;
+        let CdLookup::Found(span) = locate_central_directory(&zip_bytes, 0, size).unwrap() else {
+            panic!("expected EOCD");
+        };
+        let cd = &zip_bytes[span.offset as usize..(span.offset + span.size) as usize];
+        let mut members = parse_central_directory(cd).unwrap();
+        let m = &mut members[0];
+        let data_off =
+            parse_local_header_data_offset(&zip_bytes[m.header_offset as usize..], m.header_offset)
+                .unwrap();
+        let slice = &zip_bytes[m.header_offset as usize..(data_off + m.compressed_size) as usize];
+
+        // Declared uncompressed size above cap is rejected immediately.
+        assert!(decode_single_member(m, slice, 1024).is_err());
+
+        // Even if the Central Directory lies about uncompressed_size, take(cap + 1)
+        // stops expansion past the cap.
+        m.uncompressed_size = 512;
+        assert!(decode_single_member(m, slice, 1024).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_member_names_and_handles_65535_zip32_eocd() {
+        let zip_bytes = build_zip(&[("a.bin", b"1", CompressionMethod::Stored)]);
+        let size = zip_bytes.len() as u64;
+        let CdLookup::Found(span) = locate_central_directory(&zip_bytes, 0, size).unwrap() else {
+            panic!("expected EOCD");
+        };
+        let cd = &zip_bytes[span.offset as usize..(span.offset + span.size) as usize];
+        let mut doubled_cd = cd.to_vec();
+        doubled_cd.extend_from_slice(cd);
+        let err = parse_central_directory(&doubled_cd).unwrap_err();
+        assert!(format!("{err:#}").contains("duplicate"), "{err:#}");
+
+        // A non-ZIP64 archive with exactly 65,535 entries and no ZIP64 locator
+        // must still resolve via ZIP32.
+        let mut eocd = [0u8; 22];
+        eocd[0..4].copy_from_slice(b"PK\x05\x06");
+        eocd[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
+        eocd[12..16].copy_from_slice(&100u32.to_le_bytes());
+        eocd[16..20].copy_from_slice(&50u32.to_le_bytes());
+        let CdLookup::Found(found) = locate_central_directory(&eocd, 150, 172).unwrap() else {
+            panic!("expected ZIP32 fallback");
+        };
+        assert_eq!(
+            found,
+            CentralDirectorySpan {
+                offset: 50,
+                size: 100
+            }
+        );
+    }
+
+    #[test]
+    fn segment_byte_range_checks_overflow_zero_and_bounds() {
+        assert_eq!(
+            segment_byte_range(100, 500, 1000, 50, 100, 0).unwrap(),
+            150..250
+        );
+        assert!(segment_byte_range(100, 500, 1000, 50, 0, 0).is_err());
+        assert!(segment_byte_range(100, 500, 1000, u64::MAX, 10, 0).is_err());
+        assert!(segment_byte_range(100, 500, 1000, 450, 100, 0).is_err());
+    }
+
+    #[test]
+    fn parses_zip64_eocd_and_rebases_zip64_cd_offset() {
+        let mut eocd64 = [0u8; 56];
+        eocd64[0..4].copy_from_slice(b"PK\x06\x06");
+        eocd64[24..32].copy_from_slice(&10u64.to_le_bytes());
+        eocd64[32..40].copy_from_slice(&10u64.to_le_bytes());
+        eocd64[40..48].copy_from_slice(&2048u64.to_le_bytes());
+        eocd64[48..56].copy_from_slice(&5_000_000_000u64.to_le_bytes());
+        let span = parse_zip64_eocd(&eocd64).unwrap();
+        assert_eq!(
+            span,
+            CentralDirectorySpan {
+                offset: 5_000_000_000,
+                size: 2048
+            }
+        );
+
+        // Build a CD entry with a ZIP64 local header offset sentinel and rebase to 0.
+        let mut cd = vec![0u8; 46 + 5 + 12];
+        cd[0..4].copy_from_slice(b"PK\x01\x02");
+        cd[20..24].copy_from_slice(&16u32.to_le_bytes());
+        cd[24..28].copy_from_slice(&16u32.to_le_bytes());
+        cd[28..30].copy_from_slice(&5u16.to_le_bytes()); // name_len = 5
+        cd[30..32].copy_from_slice(&12u16.to_le_bytes()); // extra_len = 12 (4 hdr + 8 offset)
+        cd[42..46].copy_from_slice(&u32::MAX.to_le_bytes()); // ZIP64 offset sentinel
+        cd[46..51].copy_from_slice(b"a.m4s");
+        cd[51..53].copy_from_slice(&0x0001u16.to_le_bytes());
+        cd[53..55].copy_from_slice(&8u16.to_le_bytes());
+        cd[55..63].copy_from_slice(&5_000_000_000u64.to_le_bytes());
+
+        let parsed = parse_central_directory(&cd).unwrap();
+        assert_eq!(parsed[0].header_offset, 5_000_000_000);
+        rebase_cd_entry_to_zero(&mut cd).unwrap();
+        assert_eq!(u64::from_le_bytes(cd[55..63].try_into().unwrap()), 0);
     }
 }
