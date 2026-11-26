@@ -66,6 +66,8 @@ fn set_dummy_aws_credentials() {
 #[derive(Clone, Default)]
 struct FakeS3 {
     puts: Arc<Mutex<Vec<String>>>,
+    /// Each successful GET handled by the fake: `(key, Range header, slice bytes)`.
+    gets: Arc<Mutex<Vec<RecordedGet>>>,
     /// Keys HEAD finds, with their sizes: blobs ingested before the test.
     present: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     /// The bodies PUT (or seeded with [`FakeS3::put_object`]), by key.
@@ -81,6 +83,9 @@ struct FakeS3 {
 
 /// The `x-amz-meta-*` headers of one object, as (name, value).
 type Metadata = Vec<(String, String)>;
+
+/// One GET answered by [`FakeS3`]: `(key, Range header, bytes served)`.
+type RecordedGet = (String, Option<String>, usize);
 
 /// The real object bytes of a PUT body: `aws-chunked` framing
 /// (`<hex-size>[;chunk-signature=...]\r\n<data>\r\n ... 0\r\n<trailers>`)
@@ -204,7 +209,7 @@ impl FakeS3 {
         if method == Method::GET
             && let Some(object) = stored
         {
-            let mut response = self.get(&headers, &object);
+            let mut response = self.get(key, &headers, &object);
             for (name, value) in self.meta(key) {
                 response.headers_mut().insert(
                     axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
@@ -228,9 +233,13 @@ impl FakeS3 {
     }
 
     /// A GET of a stored object: whole, or the slice a `Range` names.
-    fn get(&self, headers: &HeaderMap, object: &Bytes) -> axum::response::Response {
+    fn get(&self, key: &str, headers: &HeaderMap, object: &Bytes) -> axum::response::Response {
         let total = object.len();
-        let (status, start, end) = match headers.get("range").and_then(|v| v.to_str().ok()) {
+        let range_header = headers
+            .get("range")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let (status, start, end) = match range_header.as_deref() {
             None => (StatusCode::OK, 0, total),
             Some(range) => match requested_range(range, total) {
                 Some((start, end)) => (StatusCode::PARTIAL_CONTENT, start, end + 1),
@@ -246,6 +255,10 @@ impl FakeS3 {
             },
         };
         let slice = object.slice(start..end);
+        self.gets
+            .lock()
+            .unwrap()
+            .push((key.to_string(), range_header, slice.len()));
         let mut response_headers = vec![
             ("content-length", slice.len().to_string()),
             ("etag", "\"fake\"".to_string()),
@@ -1607,6 +1620,312 @@ async fn test_a_node_uploaded_blob_is_stored_byte_for_byte() {
     assert_eq!(stored.len(), tdf.len());
     assert!(stored.as_ref() == tdf.as_slice(), "stored bytes differ");
 
+    pusher.shutdown().await.unwrap();
+    node.shutdown().await.unwrap();
+}
+
+/// Build a ZIP archive with explicit per-member compression methods.
+fn build_zip_with_methods(members: &[(&str, &[u8], zip::CompressionMethod)]) -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = Vec::new();
+    {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        for (name, bytes, method) in members {
+            let options = zip::write::SimpleFileOptions::default().compression_method(*method);
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    buf
+}
+
+/// Non-repeating deterministic bytes for test segments.
+fn pattern_bytes(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed ^ 0x9E37_79B9_7F4A_7C15u64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 32) as u8
+        })
+        .collect()
+}
+
+/// Ranged gets issue tight bounded `Range: bytes=START-END` GETs to S3
+/// (splitting distant disjoint ranges cleanly) and reuse the cached BAO
+/// outboard across repeated segment requests.
+#[tokio::test(flavor = "current_thread")]
+async fn test_range_gets_use_bounded_s3_ranges_and_cache_outboard() {
+    use bao_tree::{ChunkNum, ChunkRanges};
+
+    let (node, s3, _data_dir) = spawn_node(None).await;
+    let node_addr = dial_addr(&node);
+    let tdf = create_large_test_tdf(1024 * 1024);
+    let pusher = IrohTestClient::new().await.unwrap();
+    let hash = pusher.push_to_node(node_addr.clone(), &tdf).await.unwrap();
+    assert!(s3.wait_for_put(&blob_key(hash)).await);
+
+    s3.gets.lock().unwrap().clear();
+
+    let viewer = IrohTestClient::new().await.unwrap();
+    let conn = viewer.connect(node_addr.clone()).await.unwrap();
+    let len = tdf.len() as u64;
+    let last = (len - 1) / 1024;
+
+    // Three separate range fetches on one connection.
+    for (first, end) in [(3u64, 5u64), (17, 45), (last, last + 1)] {
+        let bytes = (first * 1024)..(end * 1024).min(len);
+        let fetched = viewer
+            .get_ranges_on(
+                &conn,
+                hash,
+                ChunkRanges::from(ChunkNum(first)..ChunkNum(end)),
+                bytes.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetched, tdf[bytes.start as usize..bytes.end as usize]);
+    }
+
+    // One request with two distant disjoint ranges (> 256 KiB apart): must
+    // issue two tight bounded S3 GETs instead of spanning the whole blob.
+    let mut disjoint = ChunkRanges::from(ChunkNum(0)..ChunkNum(2));
+    disjoint |= ChunkRanges::from(ChunkNum(last)..ChunkNum(last + 1));
+    let tail_start = last * 1024;
+    let fetched_tail = viewer
+        .get_ranges_on(&conn, hash, disjoint, tail_start..len)
+        .await
+        .unwrap();
+    assert_eq!(fetched_tail, tdf[tail_start as usize..]);
+
+    let gets = s3.gets.lock().unwrap().clone();
+    let outboard_key = format!("outboards/{}", hash.to_hex());
+    let blob_k = blob_key(hash);
+
+    let outboard_gets: Vec<_> = gets.iter().filter(|(k, _, _)| k == &outboard_key).collect();
+    assert_eq!(
+        outboard_gets.len(),
+        1,
+        "outboard should be fetched once and served from LRU cache thereafter: {outboard_gets:?}"
+    );
+
+    let blob_gets: Vec<_> = gets.iter().filter(|(k, _, _)| k == &blob_k).collect();
+    assert_eq!(
+        blob_gets.len(),
+        5,
+        "3 single-span requests + 2 disjoint spans = 5 bounded S3 GETs: {blob_gets:?}"
+    );
+    for (_, range, bytes_served) in &blob_gets {
+        let header = range
+            .as_deref()
+            .expect("partial blob GET must send a Range header");
+        assert!(
+            !header.ends_with('-'),
+            "partial blob GET must have a bounded end, got {header:?}"
+        );
+        assert!(
+            *bytes_served <= 64 * 1024,
+            "each bounded range GET should only read its chunk-group span, got {bytes_served} bytes ({header:?})"
+        );
+    }
+
+    viewer.shutdown().await.unwrap();
+    pusher.shutdown().await.unwrap();
+    node.shutdown().await.unwrap();
+}
+
+/// A viewer can stream individual HLS/fMP4 video segments from inside a TDF
+/// over one Iroh QUIC connection without downloading the skipped segments or
+/// re-fetching the outboard from S3.
+#[tokio::test(flavor = "current_thread")]
+async fn test_stream_individual_hls_members_from_tdf() {
+    use tdf_iroh_s3::test_cli::tdf_stream::TdfRemoteArchive;
+    use zip::CompressionMethod;
+
+    let manifest = include_str!("fixtures/fairplay-key-envelope-manifest.json");
+    let master_m3u8 = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000\nvideo.m3u8\n";
+    let video_m3u8 = b"#EXTM3U\n#EXT-X-TARGETDURATION:8\n#EXT-X-MAP:URI=\"video-init.mp4\"\n#EXTINF:8.0,\nvideo-segment0.m4s\n#EXTINF:8.0,\nvideo-segment1.m4s\n#EXTINF:8.0,\nvideo-segment2.m4s\n#EXT-X-ENDLIST\n";
+    let video_init = pattern_bytes(8 * 1024, 1);
+    let seg0 = pattern_bytes(256 * 1024, 2);
+    let seg1 = pattern_bytes(256 * 1024, 3);
+    let seg2 = pattern_bytes(256 * 1024, 4);
+    let key_envelope = pattern_bytes(44, 5);
+
+    let tdf = build_zip_with_methods(&[
+        (
+            "manifest.json",
+            manifest.as_bytes(),
+            CompressionMethod::Stored,
+        ),
+        ("0.payload", &key_envelope, CompressionMethod::Stored),
+        ("master.m3u8", master_m3u8, CompressionMethod::Deflated),
+        ("video.m3u8", video_m3u8, CompressionMethod::Deflated),
+        ("video-init.mp4", &video_init, CompressionMethod::Stored),
+        ("video-segment0.m4s", &seg0, CompressionMethod::Stored),
+        ("video-segment1.m4s", &seg1, CompressionMethod::Stored),
+        ("video-segment2.m4s", &seg2, CompressionMethod::Stored),
+    ]);
+
+    let (node, s3, _data_dir) = spawn_node(None).await;
+    let node_addr = dial_addr(&node);
+    let pusher = IrohTestClient::new().await.unwrap();
+    let hash = pusher.push_to_node(node_addr.clone(), &tdf).await.unwrap();
+    assert!(s3.wait_for_put(&blob_key(hash)).await);
+
+    s3.gets.lock().unwrap().clear();
+
+    let viewer = IrohTestClient::new().await.unwrap();
+    let conn = viewer.connect(node_addr.clone()).await.unwrap();
+    let archive = TdfRemoteArchive::open(&viewer, conn, hash, None)
+        .await
+        .unwrap();
+
+    assert_eq!(archive.size(), tdf.len() as u64);
+    assert_eq!(archive.members().len(), 8);
+
+    // Stream only playback metadata and segment 2 (skipping segments 0 and 1).
+    assert_eq!(
+        archive.fetch_member("manifest.json").await.unwrap(),
+        manifest.as_bytes()
+    );
+    assert_eq!(
+        archive.fetch_member("master.m3u8").await.unwrap(),
+        master_m3u8
+    );
+    assert_eq!(
+        archive.fetch_member("video-init.mp4").await.unwrap(),
+        video_init
+    );
+    assert_eq!(
+        archive.fetch_member("video-segment2.m4s").await.unwrap(),
+        seg2
+    );
+
+    let gets = s3.gets.lock().unwrap().clone();
+    let outboard_key = format!("outboards/{}", hash.to_hex());
+    let blob_k = blob_key(hash);
+
+    let outboard_get_count = gets.iter().filter(|(k, _, _)| k == &outboard_key).count();
+    assert_eq!(
+        outboard_get_count, 1,
+        "outboard fetched once for whole session"
+    );
+
+    let blob_bytes_read: usize = gets
+        .iter()
+        .filter(|(k, _, _)| k == &blob_k)
+        .map(|(_, _, n)| *n)
+        .sum();
+    // Segments 0 and 1 (512 KiB) were skipped, so total S3 bytes read must be
+    // well below the ~776 KiB archive size.
+    assert!(
+        blob_bytes_read < tdf.len() - 400 * 1024,
+        "expected skipped segments not to be read from S3: read {blob_bytes_read} of {} bytes",
+        tdf.len()
+    );
+
+    viewer.shutdown().await.unwrap();
+    pusher.shutdown().await.unwrap();
+    node.shutdown().await.unwrap();
+}
+
+/// A viewer can stream an individual encrypted OpenTDF payload segment from a
+/// ZIP-Stored `0.payload` member, and gets a clear error if `0.payload` is
+/// Deflated instead of Stored.
+#[tokio::test(flavor = "current_thread")]
+async fn test_stream_individual_opentdf_payload_segment() {
+    use tdf_iroh_s3::test_cli::tdf_stream::TdfRemoteArchive;
+    use zip::CompressionMethod;
+
+    let seg_sizes = [64 * 1024usize, 64 * 1024, 64 * 1024, 48 * 1024];
+    let segments: Vec<Vec<u8>> = seg_sizes
+        .iter()
+        .enumerate()
+        .map(|(i, &sz)| pattern_bytes(sz, 100 + i as u64))
+        .collect();
+    let full_payload: Vec<u8> = segments.iter().flatten().copied().collect();
+
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/fairplay-key-envelope-manifest.json")).unwrap();
+    manifest["encryptionInformation"]["integrityInformation"]["segments"] = serde_json::json!(
+        seg_sizes
+            .iter()
+            .map(|&sz| serde_json::json!({
+                "encryptedSegmentSize": sz,
+                "hash": "BwcHBwcHBwcHBwcHBwcHBw==",
+                "segmentSize": sz - 28,
+            }))
+            .collect::<Vec<_>>()
+    );
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+    let stored_tdf = build_zip_with_methods(&[
+        ("manifest.json", &manifest_bytes, CompressionMethod::Stored),
+        ("0.payload", &full_payload, CompressionMethod::Stored),
+    ]);
+    let deflated_tdf = build_zip_with_methods(&[
+        ("manifest.json", &manifest_bytes, CompressionMethod::Stored),
+        ("0.payload", &full_payload, CompressionMethod::Deflated),
+    ]);
+
+    let (node, s3, _data_dir) = spawn_node(None).await;
+    let node_addr = dial_addr(&node);
+    let pusher = IrohTestClient::new().await.unwrap();
+    let stored_hash = pusher
+        .push_to_node(node_addr.clone(), &stored_tdf)
+        .await
+        .unwrap();
+    assert!(s3.wait_for_put(&blob_key(stored_hash)).await);
+    let deflated_hash = pusher
+        .push_to_node(node_addr.clone(), &deflated_tdf)
+        .await
+        .unwrap();
+    assert!(s3.wait_for_put(&blob_key(deflated_hash)).await);
+
+    s3.gets.lock().unwrap().clear();
+
+    let viewer = IrohTestClient::new().await.unwrap();
+    let conn = viewer.connect(node_addr.clone()).await.unwrap();
+    let mut archive = TdfRemoteArchive::open(&viewer, conn.clone(), stored_hash, None)
+        .await
+        .unwrap();
+
+    let fetched_seg2 = archive.fetch_payload_segment(2).await.unwrap();
+    assert_eq!(fetched_seg2, segments[2]);
+
+    let blob_k = blob_key(stored_hash);
+    let blob_bytes_read: usize = s3
+        .gets
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(k, _, _)| k == &blob_k)
+        .map(|(_, _, n)| *n)
+        .sum();
+    // Fetching segment 2 (64 KiB) + manifest/tail must read well under the
+    // 240 KiB total payload.
+    assert!(
+        blob_bytes_read < stored_tdf.len() - 64 * 1024,
+        "expected only segment 2 to be read from S3: read {blob_bytes_read} of {} bytes",
+        stored_tdf.len()
+    );
+
+    // Deflated 0.payload cannot be random-accessed by segment offset.
+    let mut deflated_archive = TdfRemoteArchive::open(&viewer, conn, deflated_hash, None)
+        .await
+        .unwrap();
+    let err = deflated_archive
+        .fetch_payload_segment(0)
+        .await
+        .expect_err("deflated 0.payload must be rejected for segment streaming");
+    assert!(
+        format!("{err:#}").contains("Stored"),
+        "error should explain Stored requirement, got: {err:#}"
+    );
+
+    viewer.shutdown().await.unwrap();
     pusher.shutdown().await.unwrap();
     node.shutdown().await.unwrap();
 }

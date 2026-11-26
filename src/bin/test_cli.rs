@@ -112,7 +112,8 @@ enum Commands {
         data: String,
     },
 
-    /// Fetch a blob from a remote node by BLAKE3 hash
+    /// Fetch a blob (or a single byte range, ZIP member, or OpenTDF segment)
+    /// from a remote node by BLAKE3 hash
     Fetch {
         /// Remote node Endpoint ID
         #[arg(short, long)]
@@ -125,6 +126,22 @@ enum Commands {
         /// BLAKE3 hash (hex) of the blob to fetch
         #[arg(long)]
         hash: String,
+
+        /// Fetch only a verified byte range (START..END, e.g. 0..65536)
+        #[arg(long, conflicts_with_all = ["list_members", "member", "segment"])]
+        range: Option<String>,
+
+        /// Fetch only the ZIP Central Directory and list TDF archive members
+        #[arg(long, conflicts_with_all = ["range", "member", "segment"])]
+        list_members: bool,
+
+        /// Fetch only one ZIP member from the TDF (e.g. video-segment0.m4s)
+        #[arg(long, conflicts_with_all = ["range", "list_members", "segment"])]
+        member: Option<String>,
+
+        /// Fetch only one encrypted OpenTDF payload segment (0-indexed)
+        #[arg(long, conflicts_with_all = ["range", "list_members", "member"])]
+        segment: Option<usize>,
 
         /// Optional output file path
         #[arg(short, long)]
@@ -228,11 +245,26 @@ async fn main() -> Result<()> {
             node,
             addr,
             hash,
+            range,
+            list_members,
+            member,
+            segment,
             output,
         } => {
+            use tdf_iroh_s3::test_cli::fetch::{FetchMode, fetch_with_mode, parse_byte_range};
             let endpoint_addr = parse_addr(&node, &addr)?;
-            tdf_iroh_s3::test_cli::fetch::fetch_blob(endpoint_addr, &hash, output.as_deref())
-                .await?;
+            let mode = if let Some(spec) = range {
+                FetchMode::ByteRange(parse_byte_range(&spec)?)
+            } else if list_members {
+                FetchMode::ListMembers
+            } else if let Some(name) = member {
+                FetchMode::Member(name)
+            } else if let Some(index) = segment {
+                FetchMode::PayloadSegment(index)
+            } else {
+                FetchMode::Whole
+            };
+            fetch_with_mode(endpoint_addr, &hash, mode, output.as_deref()).await?;
         }
     }
 

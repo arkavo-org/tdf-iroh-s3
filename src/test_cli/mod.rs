@@ -4,3 +4,4 @@ pub mod iroh_client;
 pub mod publish;
 pub mod push;
 pub mod push_raw;
+pub mod tdf_stream;
