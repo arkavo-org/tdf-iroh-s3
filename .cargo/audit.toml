@@ -15,8 +15,26 @@ ignore = [
     # declared size. Same function, same reason as above; opentdf 0.16 does
     # not call it either.
     "RUSTSEC-2026-0429",
+    # zip 2.x: AES entries returned without verifying their authentication code
+    # on empty/truncated data. Across the unified dependency graph
+    # (`cargo tree -e features -i zip`), only `deflate` is enabled (no
+    # `aes-crypto`) and ZIP-level AES encryption is never used (OpenTDF
+    # encrypts the payload itself). Fixed in zip 9, waiting on opentdf moving
+    # off zip 2.
+    "RUSTSEC-2026-0545",
+    # zip 2.x: ZipStreamReader uses local-header names rather than central
+    # directory names. Neither the node (`src/validation/structure.rs`), the
+    # streaming test client (`src/test_cli/tdf_stream.rs`), nor opentdf calls
+    # ZipStreamReader; all parse through the Central Directory / ZipArchive.
+    # Fixed in zip 9.0.5, waiting on opentdf moving off zip 2.
+    "RUSTSEC-2026-0548",
     # crypto-bigint 0.5 timing side channel, via p256 0.13. The node only
     # verifies ES256 signatures (public inputs); signing keys appear only in
     # tests and examples. Lifted by p256 0.14.
     "RUSTSEC-2026-0387",
+    # url 2.5.8: stack overflow in Url::origin() on nested `blob:` URLs.
+    # The node never calls Url::origin() and only accepts https/http URLs
+    # (`src/authz.rs` compares scheme/host/port directly). Fixed in url 2.5.9,
+    # which requires a Rust version newer than this crate's MSRV (1.91).
+    "RUSTSEC-2026-0592",
 ]

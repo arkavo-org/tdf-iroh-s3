@@ -32,13 +32,16 @@ change between commits; the creator catalog contract is
    `outboards/<hash>` before the blob. So `GET /blobs/<hash>` answering 200
    means the blob can be served. An upload that fails is retried twice (after
    1 s and 5 s) before the publish fails; the publisher pushes again.
-4. Any peer can retrieve blobs by hash — the TDF encryption layer handles access control.
-   A fetch (get or get_many) is answered straight from S3: the node writes
-   the blob's size, then the BAO encoding of the requested ranges, read from
-   `blobs/<hash>` and `outboards/<hash>` through range GETs. The node keeps
-   no copy of what it serves, and the peer verifies every chunk group
-   against the hash. Only single blobs are pushed or fetched; hash sequences
-   are refused, and so are observe requests and a get_many over 64 hashes.
+4. Any peer can retrieve blobs (or verified byte/chunk ranges for streaming
+   individual video segments out of a TDF) by hash — the TDF encryption layer
+   handles access control. A fetch (get or get_many) is answered straight from
+   S3: the node writes the blob's size, then the BAO encoding of the requested
+   ranges, read from `blobs/<hash>` through bounded range GETs covering only
+   the requested chunk-group spans and `outboards/<hash>` (held in a bounded
+   64 MiB in-memory LRU cache for active streams). The node keeps no copy of
+   blob data, and the peer verifies every 16 KiB chunk group against the hash.
+   Only single blobs are pushed or fetched; hash sequences are refused, and so
+   are observe requests and a get_many over 64 hashes.
 5. The local iroh store only stages pushes. A push is pending until ingest
    is done with it, and the store's garbage collector (every `[iroh]
    gc_interval_secs`, default 60) deletes every stored blob no pending push
@@ -313,6 +316,12 @@ cargo run --bin tdf-iroh-s3-test -- --help
 # Creator's flow against a node: session (if gated), push, wait for ingest
 cargo run --bin tdf-iroh-s3-test -- publish -n <endpointId> --addr <ip:port> \
   --url http://127.0.0.1:8090 --token-file token.txt -d recording.tdf
+
+# Stream a single segment or list members from a remote TDF without downloading it whole
+cargo run --bin tdf-iroh-s3-test -- fetch -n <endpointId> --addr <ip:port> \
+  --hash <blake3> --list-members
+cargo run --bin tdf-iroh-s3-test -- fetch -n <endpointId> --addr <ip:port> \
+  --hash <blake3> --member video-segment0.m4s -o video-segment0.m4s
 ```
 
 `publish-session` and `push-raw` take `--secret-key-file` so both use the

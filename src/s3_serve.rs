@@ -1,13 +1,24 @@
 //! Serving fetches straight from S3.
 //!
-//! The node holds no copy of what it serves. A get is answered from
+//! The node holds no copy of blob data. A get is answered from
 //! `blobs/<hash>` and `outboards/<hash>` (the blob's BAO hash tree, written
 //! by ingest before the blob): the response is the blob's size, then the
 //! BAO encoding of the requested ranges, exactly as iroh-blobs' own
 //! provider sends it, so any iroh-blobs client verifies every chunk group
-//! against the hash. Both objects are read sequentially through one open
-//! range GET each, reopened only when a read jumps backwards or far ahead,
-//! so a whole-blob get costs two S3 GETs and constant memory.
+//! against the hash.
+//!
+//! Data reads from `blobs/<hash>` are bounded to the requested chunk-group
+//! spans (merged across gaps up to [`SKIP_LIMIT`]), so a whole-blob get costs
+//! one full S3 GET and a single-segment range get costs one tight bounded
+//! `Range: bytes=start-end` GET instead of streaming the rest of the archive.
+//! Outboards up to [`MAX_CACHED_OUTBOARD_BYTES`] (16 MiB, covering blobs up to
+//! 4 GiB) are kept in a bounded LRU cache so streaming a recording segment by
+//! segment reads `outboards/<hash>` from S3 once instead of re-reading Merkle
+//! tree paths on every segment. Cold loads are de-duplicated per hash and
+//! capped at [`OUTBOARD_LOADS`] in flight (bounding peak memory across all
+//! concurrent serves); a cold first ranged request on a large (> 1 MiB)
+//! outboard streams only the tree nodes it needs and promotes the outboard
+//! into the cache on the second ranged request.
 //!
 //! A blob ingested before outboards were stored has none: the first fetch
 //! of it computes the outboard by streaming the blob from S3 once, checks
@@ -19,8 +30,9 @@
 //! `catalog-outboards/<hash>`. Those prefixes stay apart from `blobs/` so
 //! a catalog document never passes as an ingested recording.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
+use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -34,7 +46,7 @@ use iroh_blobs::Hash;
 use iroh_blobs::store::IROH_BLOCK_SIZE;
 use iroh_io::AsyncStreamWriter;
 use tokio::io::{AsyncBufRead, AsyncReadExt};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tracing::{error, info, warn};
 
 use crate::store::s3::S3Client;
@@ -45,7 +57,7 @@ pub const S3_STALL: Duration = Duration::from_secs(30);
 
 /// A write to the fetcher that makes no progress for this long fails: a
 /// peer that keeps its connection open but stops reading would otherwise
-/// hold a serve slot, and two open S3 GETs, for as long as it likes.
+/// hold a serve slot, and open S3 GETs, for as long as it likes.
 pub const PEER_STALL: Duration = Duration::from_secs(60);
 
 /// After a failed outboard computation, how long fetches of the blob are
@@ -67,6 +79,44 @@ const BACKFILLS: usize = 2;
 
 /// Most blob sizes remembered.
 const SIZES_CAPACITY: usize = 100_000;
+
+/// Total memory budget for cached BAO outboards (64 MiB: ~4 max-size 4 GiB
+/// recordings, or ~160 100 MiB recordings).
+const OUTBOARD_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Hard global memory cap (in KiB) across all live in-memory outboard buffers
+/// (cached entries plus evicted entries still held by active slow sends):
+/// 128 MiB total (64 MiB cache + 64 MiB headroom). Requests exceeding this cap
+/// fall back to constant-memory streaming from S3.
+const OUTBOARD_MEMORY_BUDGET_KIB: usize = 128 * 1024;
+
+/// Largest single outboard cached in memory (16 MiB, which covers blobs up to
+/// 4 GiB at [`IROH_BLOCK_SIZE`]). Larger outboards are streamed from S3.
+const MAX_CACHED_OUTBOARD_BYTES: usize = 16 * 1024 * 1024;
+
+/// Outboards up to this size (1 MiB, covering blobs up to 256 MiB) are loaded
+/// and cached eagerly on first access. Larger cold outboards serve their first
+/// narrow ranged request via read-ahead S3 range reads and promote into the
+/// cache on a second ranged request (or immediately on a whole/wide send).
+const SMALL_OUTBOARD_BYTES: u64 = 1024 * 1024;
+
+/// Minimum bounded read-ahead window (64 KiB) when streaming a ranged outboard
+/// directly from S3, preventing one-GET-per-64-byte-node amplification.
+const OUTBOARD_READ_AHEAD: u64 = 64 * 1024;
+
+/// Most outboards held in the cache at once, bounding map overhead when
+/// serving many small blobs.
+const OUTBOARD_CACHE_ENTRIES: usize = 1024;
+
+/// Most cold full-outboard loads allowed in flight at once.
+const OUTBOARD_LOADS: usize = 4;
+
+/// Most large-outboard hashes remembered for 2-hit ranged cache promotion.
+const RANGED_SEEN_CAPACITY: usize = 10_000;
+
+/// Broadcast channel carrying the result of one in-flight outboard load so
+/// concurrent cold requests for the same hash share a single S3 GET.
+type OutboardLoadRx = watch::Receiver<Option<Result<Bytes, String>>>;
 
 /// Why a hash is not served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +166,23 @@ pub struct S3Server {
     s3: Arc<S3Client>,
     /// Hashes known to be servable (object and outboard in S3).
     servable: Mutex<HashMap<Hash, Servable>>,
+    /// Bounded LRU cache of pre-order BAO outboards (`outboards/<hash>` and
+    /// `catalog-outboards/<hash>`), so segment-by-segment streaming avoids
+    /// re-fetching Merkle tree paths from S3 on every range request.
+    outboards: Mutex<OutboardCache>,
+    /// Caps concurrent full-outboard loads in flight ([`OUTBOARD_LOADS`]).
+    outboard_loads: Arc<Semaphore>,
+    /// Hard KiB-weighted memory budget ([`OUTBOARD_MEMORY_BUDGET_KIB`]) held
+    /// for the full lifetime of every in-memory outboard buffer (both cached
+    /// and in-flight evicted buffers held by slow peers).
+    outboard_mem: Arc<Semaphore>,
+    /// In-flight full-outboard loads by hash so concurrent cold requests for
+    /// the same blob share a single S3 GET and buffer.
+    loading_outboards: Mutex<HashMap<Hash, OutboardLoadRx>>,
+    /// Hashes with large (> [`SMALL_OUTBOARD_BYTES`]) outboards that have
+    /// already seen one cold ranged request; a second ranged request promotes
+    /// their outboard into `outboards`.
+    ranged_seen: Mutex<HashSet<Hash>>,
     /// Hashes whose outboard is being computed.
     backfilling: Mutex<HashSet<Hash>>,
     backfills: Arc<Semaphore>,
@@ -134,6 +201,15 @@ impl S3Server {
         Arc::new(Self {
             s3,
             servable: Mutex::default(),
+            outboards: Mutex::new(OutboardCache::new(
+                OUTBOARD_CACHE_BYTES,
+                MAX_CACHED_OUTBOARD_BYTES,
+                OUTBOARD_CACHE_ENTRIES,
+            )),
+            outboard_loads: Arc::new(Semaphore::new(OUTBOARD_LOADS)),
+            outboard_mem: Arc::new(Semaphore::new(OUTBOARD_MEMORY_BUDGET_KIB)),
+            loading_outboards: Mutex::default(),
+            ranged_seen: Mutex::default(),
             backfilling: Mutex::default(),
             backfills: Arc::new(Semaphore::new(BACKFILLS)),
             corrupt: Mutex::default(),
@@ -210,15 +286,26 @@ impl S3Server {
         let size = servable.size;
         let tree = BaoTree::new(size, IROH_BLOCK_SIZE);
         let object = &servable.object;
-        let data = S3Reader::new(Arc::clone(&self.s3), object.data_key(&self.s3, &hex), size);
+        let spans = data_spans(ranges, size);
+        let spans_bytes: u64 = spans.iter().map(|r| r.end - r.start).sum();
+        let data = S3Reader::with_spans(
+            Arc::clone(&self.s3),
+            object.data_key(&self.s3, &hex),
+            size,
+            spans,
+        );
+        let outboard_size = tree.outboard_size();
+        // Treat whole-blob fetches and wide resumes (>= 25% of the blob, e.g.
+        // `ChunkNum(1)..`) as sequential outboard scans so they never issue
+        // many small ranged GETs against `outboards/<hash>`.
+        let wide_read = ranges.is_all() || (size > 0 && spans_bytes >= size / 4);
+        let outboard_data = self
+            .load_outboard(hash, object, &hex, outboard_size, wide_read)
+            .await?;
         let outboard = PreOrderOutboard {
             root: blake3::Hash::from(hash),
             tree,
-            data: S3Reader::new(
-                Arc::clone(&self.s3),
-                object.outboard_key(&self.s3, &hex),
-                tree.outboard_size(),
-            ),
+            data: outboard_data,
         };
         let mut writer = QuicWriter(writer);
         writer.write(&size.to_le_bytes()).await?;
@@ -234,6 +321,156 @@ impl S3Server {
                 }
                 io::Error::other(e)
             })
+    }
+
+    /// Try to reserve KiB-weighted memory permits for an outboard of
+    /// `outboard_size` bytes, evicting oldest unused cache entries if needed.
+    fn try_acquire_outboard_mem(&self, outboard_size: u64) -> Option<OwnedSemaphorePermit> {
+        let permits = u32::try_from(outboard_size.div_ceil(1024).max(1)).ok()?;
+        if let Ok(p) = Arc::clone(&self.outboard_mem).try_acquire_many_owned(permits) {
+            return Some(p);
+        }
+        let evicted = lock(&self.outboards).evict_bytes(outboard_size as usize);
+        drop(evicted);
+        Arc::clone(&self.outboard_mem)
+            .try_acquire_many_owned(permits)
+            .ok()
+    }
+
+    /// Return the BAO outboard reader for `hash`:
+    /// - from memory if empty or already cached;
+    /// - waiting on an in-flight load for the same hash if one is running
+    ///   (de-duplicating concurrent cold requests into one S3 GET and buffer);
+    /// - loaded whole into memory and cached immediately (under the global
+    ///   KiB-weighted memory budget and [`OUTBOARD_LOADS`] concurrency cap)
+    ///   for wide/whole-blob sends, small outboards (≤ 1 MiB), or a second
+    ///   ranged request on a large outboard;
+    /// - streamed directly from S3 in constant memory otherwise (sequential
+    ///   for wide/whole-blob sends, 64 KiB read-ahead windows for narrow
+    ///   ranged sends).
+    async fn load_outboard(
+        &self,
+        hash: Hash,
+        object: &Object,
+        hex: &str,
+        outboard_size: u64,
+        wide_read: bool,
+    ) -> io::Result<OutboardData> {
+        if outboard_size == 0 {
+            return Ok(OutboardData::Memory(Bytes::new()));
+        }
+        if let Some(cached) = lock(&self.outboards).get(&hash)
+            && cached.len() as u64 == outboard_size
+        {
+            return Ok(OutboardData::Memory(cached));
+        }
+        let key = object.outboard_key(&self.s3, hex);
+        let fallback = || streaming_outboard(&self.s3, key.clone(), outboard_size, wide_read);
+
+        // If another task is already loading this hash's outboard, join it
+        // instead of issuing a duplicate S3 GET.
+        let existing_rx = lock(&self.loading_outboards).get(&hash).cloned();
+        if let Some(rx) = existing_rx {
+            return match await_in_flight(rx, outboard_size).await {
+                InFlightOutcome::Ready(bytes) => Ok(OutboardData::Memory(bytes)),
+                InFlightOutcome::Failed(msg) => Err(io::Error::other(msg)),
+                InFlightOutcome::Cancelled => Ok(fallback()),
+            };
+        }
+
+        let should_cache = outboard_size <= MAX_CACHED_OUTBOARD_BYTES as u64
+            && (wide_read || outboard_size <= SMALL_OUTBOARD_BYTES || self.mark_ranged_seen(hash));
+        if !should_cache {
+            return Ok(fallback());
+        }
+
+        // Bound concurrent cold loads and total live outboard memory across
+        // all serves (cached + in-flight evicted buffers).
+        let Ok(_load_permit) = Arc::clone(&self.outboard_loads).try_acquire_owned() else {
+            return Ok(fallback());
+        };
+        let Some(mem_permit) = self.try_acquire_outboard_mem(outboard_size) else {
+            return Ok(fallback());
+        };
+
+        // Re-check cache and in-flight map now that we hold permits, and
+        // register ourselves as the single loader for `hash`.
+        enum Claim {
+            Cached(Bytes),
+            Join(OutboardLoadRx),
+            Load(watch::Sender<Option<Result<Bytes, String>>>),
+        }
+        let claim = {
+            if let Some(cached) = lock(&self.outboards).get(&hash)
+                && cached.len() as u64 == outboard_size
+            {
+                Claim::Cached(cached)
+            } else {
+                let mut loading = lock(&self.loading_outboards);
+                if let Some(rx) = loading.get(&hash).cloned() {
+                    Claim::Join(rx)
+                } else {
+                    let (tx, rx) = watch::channel(None);
+                    loading.insert(hash, rx);
+                    Claim::Load(tx)
+                }
+            }
+        };
+        let tx = match claim {
+            Claim::Cached(cached) => return Ok(OutboardData::Memory(cached)),
+            Claim::Join(rx) => {
+                drop(mem_permit);
+                drop(_load_permit);
+                return match await_in_flight(rx, outboard_size).await {
+                    InFlightOutcome::Ready(bytes) => Ok(OutboardData::Memory(bytes)),
+                    InFlightOutcome::Failed(msg) => Err(io::Error::other(msg)),
+                    InFlightOutcome::Cancelled => Ok(fallback()),
+                };
+            }
+            Claim::Load(tx) => tx,
+        };
+        let _guard = LoadingGuard {
+            loading: &self.loading_outboards,
+            hash,
+        };
+
+        match read_object_exact(&self.s3, &key, outboard_size as usize).await {
+            Ok(bytes) => {
+                // Attach the byte-weighted permit to the `Bytes` owner so the
+                // memory budget stays accounted for until both the cache entry
+                // and every active send using this buffer drop it.
+                let budgeted = Bytes::from_owner(BudgetedOutboard {
+                    data: bytes,
+                    _permit: mem_permit,
+                });
+                // Cache immediately on load so concurrent/mid-send requests
+                // share this single buffer and cancelled sends do not discard
+                // it. Every send still validates nodes via BAO, and
+                // `mark_corrupt` evicts any corrupt entry.
+                lock(&self.outboards).insert(hash, budgeted.clone());
+                let _ = tx.send(Some(Ok(budgeted.clone())));
+                Ok(OutboardData::Memory(budgeted))
+            }
+            Err(e) => {
+                let _ = tx.send(Some(Err(e.to_string())));
+                Err(e)
+            }
+        }
+    }
+
+    /// Record a cold ranged request for a large-outboard `hash`. Returns
+    /// `true` if `hash` was already seen on a prior ranged request (signalling
+    /// an active stream worth promoting into the outboard cache).
+    fn mark_ranged_seen(&self, hash: Hash) -> bool {
+        let mut seen = lock(&self.ranged_seen);
+        if seen.contains(&hash) {
+            return true;
+        }
+        if seen.len() >= RANGED_SEEN_CAPACITY {
+            seen.clear();
+        }
+        seen.insert(hash);
+        false
     }
 
     /// Refuse `hash` for good: its S3 object does not match it.
@@ -252,9 +489,15 @@ impl S3Server {
         }
         corrupt.insert(hash);
         lock(&self.servable).remove(&hash);
+        lock(&self.outboards).remove(&hash);
+        lock(&self.ranged_seen).remove(&hash);
     }
 
-    /// Drop what is remembered of `hash`, so the next fetch asks S3 again.
+    /// Drop what is remembered of `hash`'s S3 presence, so the next fetch
+    /// re-HEADs S3 (detecting a deletion). The cached outboard is kept: it is
+    /// content-addressed by `hash`, so a cancelled seek or transient S3 error
+    /// does not force re-downloading a multi-MiB outboard; only
+    /// [`Self::mark_corrupt`] evicts it.
     pub fn forget(&self, hash: &Hash) {
         lock(&self.servable).remove(hash);
     }
@@ -316,8 +559,20 @@ impl S3Server {
         }
         let data = Bytes::from(outboard.data);
         match object {
-            Object::Blob => self.s3.put_outboard(&hex, data).await?,
-            Object::CatalogDocument { .. } => self.s3.put_catalog_outboard(&hex, data).await?,
+            Object::Blob => self.s3.put_outboard(&hex, data.clone()).await?,
+            Object::CatalogDocument { .. } => {
+                self.s3.put_catalog_outboard(&hex, data.clone()).await?;
+            }
+        }
+        if !data.is_empty()
+            && data.len() <= MAX_CACHED_OUTBOARD_BYTES
+            && let Some(mem_permit) = self.try_acquire_outboard_mem(data.len() as u64)
+        {
+            let budgeted = Bytes::from_owner(BudgetedOutboard {
+                data,
+                _permit: mem_permit,
+            });
+            lock(&self.outboards).insert(hash, budgeted);
         }
         Ok(None)
     }
@@ -332,47 +587,353 @@ async fn head<T, F: Future<Output = anyhow::Result<Option<T>>>>(
         .map_err(|_| anyhow::anyhow!("S3 HEAD timed out"))?
 }
 
-/// Reads one S3 object at increasing offsets through one open GET.
+/// Byte ranges of a `size`-byte blob that `encode_ranges_validated` reads
+/// for `ranges`, rounded outward to [`IROH_BLOCK_SIZE`] chunk-group
+/// boundaries and merged across gaps up to [`SKIP_LIMIT`].
+fn data_spans(ranges: &ChunkRanges, size: u64) -> Vec<Range<u64>> {
+    if size == 0 {
+        return Vec::new();
+    }
+    let block_bytes = IROH_BLOCK_SIZE.bytes() as u64;
+    let mut spans: Vec<Range<u64>> = Vec::new();
+    // `ChunkRanges` is a `RangeSet2<ChunkNum>`: its sorted `boundaries()` pair
+    // up as `[b[2k], b[2k+1])`, with an odd trailing boundary meaning
+    // `[b[last], ∞)` (so `ChunkRanges::all()` is `[ChunkNum(0)]`).
+    for pair in ranges.boundaries().chunks(2) {
+        let start_byte = pair[0].0.saturating_mul(1024);
+        if start_byte >= size {
+            break;
+        }
+        let aligned_start = (start_byte / block_bytes) * block_bytes;
+        let aligned_end = match pair.get(1) {
+            Some(end) => {
+                if pair[0] >= *end {
+                    continue;
+                }
+                let end_byte = end.0.saturating_mul(1024);
+                end_byte
+                    .div_ceil(block_bytes)
+                    .saturating_mul(block_bytes)
+                    .min(size)
+            }
+            None => size,
+        };
+        let span = aligned_start..aligned_end;
+        if let Some(prev) = spans.last_mut()
+            && span.start <= prev.end.saturating_add(SKIP_LIMIT)
+        {
+            prev.end = prev.end.max(span.end);
+        } else {
+            spans.push(span);
+        }
+    }
+    spans
+}
+
+/// Read an entire S3 object whose expected length is `expected` bytes,
+/// failing on stall ([`S3_STALL`]), missing key, or unexpected length.
+async fn read_object_exact(s3: &S3Client, key: &str, expected: usize) -> io::Result<Bytes> {
+    let mut body = tokio::time::timeout(S3_STALL, s3.get_object_range(key, 0, None))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "S3 GET got no response"))?
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{key} is not in S3")))?;
+    let mut buf = BytesMut::zeroed(expected);
+    read_exact(&mut body, &mut buf).await?;
+    // Ensure the object has no trailing bytes beyond what `check()` observed.
+    let mut extra = [0u8; 1];
+    let trailing = tokio::time::timeout(S3_STALL, body.read(&mut extra))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "S3 GET stalled"))??;
+    if trailing != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{key} is longer than the {expected} bytes expected"),
+        ));
+    }
+    Ok(buf.freeze())
+}
+
+/// Exact LRU cache of pre-order BAO outboards, bounded by total bytes,
+/// per-entry bytes, and entry count.
+struct OutboardCache {
+    max_bytes: usize,
+    max_entry_bytes: usize,
+    max_entries: usize,
+    total_bytes: usize,
+    tick: u64,
+    entries: HashMap<Hash, (u64, Bytes)>,
+    order: BTreeMap<u64, Hash>,
+}
+
+impl OutboardCache {
+    fn new(max_bytes: usize, max_entry_bytes: usize, max_entries: usize) -> Self {
+        Self {
+            max_bytes,
+            max_entry_bytes,
+            max_entries,
+            total_bytes: 0,
+            tick: 0,
+            entries: HashMap::new(),
+            order: BTreeMap::new(),
+        }
+    }
+
+    fn get(&mut self, hash: &Hash) -> Option<Bytes> {
+        let (old_tick, bytes) = self.entries.get_mut(hash)?;
+        self.order.remove(old_tick);
+        self.tick += 1;
+        *old_tick = self.tick;
+        self.order.insert(self.tick, *hash);
+        Some(bytes.clone())
+    }
+
+    fn insert(&mut self, hash: Hash, bytes: Bytes) {
+        let len = bytes.len();
+        if len == 0 || len > self.max_entry_bytes || len > self.max_bytes || self.max_entries == 0 {
+            return;
+        }
+        self.remove(&hash);
+        while self.total_bytes + len > self.max_bytes || self.entries.len() >= self.max_entries {
+            let Some((_, oldest)) = self.order.pop_first() else {
+                break;
+            };
+            if let Some((_, evicted)) = self.entries.remove(&oldest) {
+                self.total_bytes -= evicted.len();
+            }
+        }
+        self.tick += 1;
+        self.entries.insert(hash, (self.tick, bytes));
+        self.order.insert(self.tick, hash);
+        self.total_bytes += len;
+    }
+
+    fn remove(&mut self, hash: &Hash) {
+        if let Some((old_tick, evicted)) = self.entries.remove(hash) {
+            self.order.remove(&old_tick);
+            self.total_bytes -= evicted.len();
+        }
+    }
+
+    /// Evict oldest entries until at least `target_bytes` have been removed
+    /// (or the cache is empty), returning the evicted buffers so the caller
+    /// can drop them outside the cache lock.
+    fn evict_bytes(&mut self, target_bytes: usize) -> Vec<Bytes> {
+        let mut freed = 0usize;
+        let mut evicted_bufs = Vec::new();
+        while freed < target_bytes {
+            let Some((_, oldest)) = self.order.pop_first() else {
+                break;
+            };
+            if let Some((_, evicted)) = self.entries.remove(&oldest) {
+                self.total_bytes -= evicted.len();
+                freed += evicted.len();
+                evicted_bufs.push(evicted);
+            }
+        }
+        evicted_bufs
+    }
+}
+
+/// Owns an in-memory outboard buffer together with its KiB-weighted memory
+/// permit, wrapped in [`Bytes::from_owner`] so the permit stays held until
+/// both the LRU cache and every active send using the buffer drop it.
+struct BudgetedOutboard {
+    data: Bytes,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AsRef<[u8]> for BudgetedOutboard {
+    fn as_ref(&self) -> &[u8] {
+        self.data.as_ref()
+    }
+}
+
+/// Removes an in-flight entry from `loading_outboards` on completion, error,
+/// or task cancellation so waiters never observe a leaked entry.
+struct LoadingGuard<'a> {
+    loading: &'a Mutex<HashMap<Hash, OutboardLoadRx>>,
+    hash: Hash,
+}
+
+impl Drop for LoadingGuard<'_> {
+    fn drop(&mut self) {
+        lock(self.loading).remove(&self.hash);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InFlightOutcome {
+    Ready(Bytes),
+    Failed(String),
+    Cancelled,
+}
+
+/// Wait for an in-flight full-outboard load for the same hash.
+async fn await_in_flight(mut rx: OutboardLoadRx, expected_size: u64) -> InFlightOutcome {
+    let Ok(val) = rx.wait_for(Option::is_some).await else {
+        return InFlightOutcome::Cancelled;
+    };
+    match val.as_ref() {
+        Some(Ok(bytes)) if bytes.len() as u64 == expected_size => {
+            InFlightOutcome::Ready(bytes.clone())
+        }
+        Some(Ok(bytes)) => InFlightOutcome::Failed(format!(
+            "loaded outboard has {} bytes, expected {expected_size}",
+            bytes.len()
+        )),
+        Some(Err(msg)) => InFlightOutcome::Failed(msg.clone()),
+        None => InFlightOutcome::Cancelled,
+    }
+}
+
+/// Constant-memory S3 outboard reader used when not loading the full outboard
+/// into the cache: sequential for wide/whole-blob sends (one S3 GET), bounded
+/// [`OUTBOARD_READ_AHEAD`] windows for narrow ranged sends.
+fn streaming_outboard(
+    s3: &Arc<S3Client>,
+    key: String,
+    outboard_size: u64,
+    wide_read: bool,
+) -> OutboardData {
+    if wide_read {
+        OutboardData::S3(S3Reader::new(Arc::clone(s3), key, outboard_size))
+    } else {
+        OutboardData::S3(S3Reader::with_read_ahead(
+            Arc::clone(s3),
+            key,
+            outboard_size,
+            OUTBOARD_READ_AHEAD,
+        ))
+    }
+}
+
+/// Backing store for a pre-order BAO outboard: in-memory [`Bytes`] (zero-copy
+/// slices) or bounded range GETs against S3 for outboards above
+/// [`MAX_CACHED_OUTBOARD_BYTES`].
+enum OutboardData {
+    Memory(Bytes),
+    S3(S3Reader),
+}
+
+impl AsyncSliceReader for OutboardData {
+    async fn read_at(&mut self, offset: u64, len: usize) -> io::Result<Bytes> {
+        match self {
+            OutboardData::Memory(bytes) => {
+                let total = bytes.len() as u64;
+                if offset >= total || len == 0 {
+                    return Ok(Bytes::new());
+                }
+                let start = offset as usize;
+                let end = start.saturating_add(len).min(bytes.len());
+                Ok(bytes.slice(start..end))
+            }
+            OutboardData::S3(reader) => reader.read_at(offset, len).await,
+        }
+    }
+
+    async fn size(&mut self) -> io::Result<u64> {
+        match self {
+            OutboardData::Memory(bytes) => Ok(bytes.len() as u64),
+            OutboardData::S3(reader) => reader.size().await,
+        }
+    }
+}
+
+/// Reads one S3 object at increasing offsets through bounded range GETs.
 struct S3Reader {
     s3: Arc<S3Client>,
     key: String,
     size: u64,
+    /// Precomputed byte spans this reader expects to cover; each span opens
+    /// one bounded S3 GET (`bytes=start-(end-1)`). Reads outside these spans
+    /// open a bounded range of at least `min_read_ahead` bytes (clamped to
+    /// `size`).
+    spans: Vec<Range<u64>>,
+    min_read_ahead: u64,
     open: Option<OpenGet>,
 }
 
 struct OpenGet {
     pos: u64,
+    end: u64,
     body: Pin<Box<dyn AsyncBufRead + Send>>,
 }
 
 impl S3Reader {
+    /// Read the whole object sequentially (`[0, size)`).
     fn new(s3: Arc<S3Client>, key: String, size: u64) -> Self {
+        let spans = (size > 0).then_some(0..size).into_iter().collect();
+        Self::with_spans(s3, key, size, spans)
+    }
+
+    /// Read only the precomputed byte `spans`, opening one bounded S3 GET per
+    /// span.
+    fn with_spans(s3: Arc<S3Client>, key: String, size: u64, spans: Vec<Range<u64>>) -> Self {
         Self {
             s3,
             key,
             size,
+            spans,
+            min_read_ahead: 0,
             open: None,
         }
     }
 
-    async fn open_at(&mut self, offset: u64) -> io::Result<&mut OpenGet> {
-        let reusable = self
-            .open
-            .as_ref()
-            .is_some_and(|o| o.pos <= offset && offset - o.pos <= SKIP_LIMIT);
+    /// Open bounded S3 range GETs of at least `min_read_ahead` bytes on each
+    /// cache miss so consecutive small reads (such as BAO parent nodes) reuse
+    /// one GET instead of opening a GET per 64-byte node.
+    fn with_read_ahead(s3: Arc<S3Client>, key: String, size: u64, min_read_ahead: u64) -> Self {
+        Self {
+            s3,
+            key,
+            size,
+            spans: Vec::new(),
+            min_read_ahead,
+            open: None,
+        }
+    }
+
+    /// Exclusive upper byte bound for a new S3 GET starting at `offset` that
+    /// must cover at least `needed_end`.
+    fn fetch_end(&self, offset: u64, needed_end: u64) -> u64 {
+        let min_end = needed_end.max(offset.saturating_add(self.min_read_ahead));
+        self.spans
+            .iter()
+            .find(|s| s.start <= offset && offset < s.end)
+            .map_or(min_end, |s| s.end.max(min_end))
+            .min(self.size)
+    }
+
+    async fn open_at(&mut self, offset: u64, len: usize) -> io::Result<&mut OpenGet> {
+        let needed_end = offset.saturating_add(len as u64).min(self.size);
+        let reusable = self.open.as_ref().is_some_and(|o| {
+            o.pos <= offset && offset - o.pos <= SKIP_LIMIT && needed_end <= o.end
+        });
         if !reusable {
             self.open = None;
-            let body = tokio::time::timeout(S3_STALL, self.s3.get_object_from(&self.key, offset))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "S3 GET got no response"))?
-                .map_err(io::Error::other)?
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("{} is not in S3", self.key),
-                    )
-                })?;
-            self.open = Some(OpenGet { pos: offset, body });
+            let fetch_end = self.fetch_end(offset, needed_end);
+            // A full-object GET from 0 omits `Range` (handles 0-byte objects
+            // and avoids an unnecessary 206 header).
+            let range_end = (offset > 0 || fetch_end < self.size).then_some(fetch_end);
+            let body = tokio::time::timeout(
+                S3_STALL,
+                self.s3.get_object_range(&self.key, offset, range_end),
+            )
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "S3 GET got no response"))?
+            .map_err(io::Error::other)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{} is not in S3", self.key),
+                )
+            })?;
+            self.open = Some(OpenGet {
+                pos: offset,
+                end: fetch_end,
+                body,
+            });
         }
         let open = self.open.as_mut().expect("opened above");
         while open.pos < offset {
@@ -392,7 +953,7 @@ impl AsyncSliceReader for S3Reader {
         }
         let len = len.min(usize::try_from(self.size - offset).unwrap_or(usize::MAX));
         let result = async {
-            let open = self.open_at(offset).await?;
+            let open = self.open_at(offset, len).await?;
             let mut buf = BytesMut::zeroed(len);
             read_exact(&mut open.body, &mut buf).await?;
             open.pos += len as u64;
@@ -459,4 +1020,189 @@ impl AsyncStreamWriter for QuicWriter<'_> {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bao_tree::ChunkNum;
+
+    fn span_bounds(ranges: &ChunkRanges, size: u64) -> Vec<(u64, u64)> {
+        data_spans(ranges, size)
+            .into_iter()
+            .map(|r| (r.start, r.end))
+            .collect()
+    }
+
+    #[test]
+    fn data_spans_all_covers_whole_blob() {
+        assert_eq!(
+            span_bounds(&ChunkRanges::all(), 1_000_000),
+            [(0, 1_000_000)]
+        );
+        assert!(data_spans(&ChunkRanges::all(), 0).is_empty());
+    }
+
+    #[test]
+    fn data_spans_rounds_to_chunk_groups_and_clamps_to_size() {
+        // Chunks 3..5 lie inside chunk group 0 (0..16 KiB).
+        let ranges = ChunkRanges::from(ChunkNum(3)..ChunkNum(5));
+        assert_eq!(span_bounds(&ranges, 1_000_000), [(0, 16_384)]);
+
+        // Chunks 17..45 span chunk groups 1..3 (16 KiB..48 KiB).
+        let ranges = ChunkRanges::from(ChunkNum(17)..ChunkNum(45));
+        assert_eq!(span_bounds(&ranges, 1_000_000), [(16_384, 49_152)]);
+
+        // Tail range clamps to the exact blob size.
+        let size = 100_000u64;
+        let last = ChunkNum((size - 1) / 1024);
+        let ranges = ChunkRanges::from(last..ChunkNum(last.0 + 1));
+        assert_eq!(span_bounds(&ranges, size), [(98_304, 100_000)]);
+    }
+
+    #[test]
+    fn data_spans_merges_nearby_ranges_and_splits_distant_ones() {
+        // Two ranges separated by <= SKIP_LIMIT (256 KiB) merge into one span.
+        let mut nearby = ChunkRanges::from(ChunkNum(0)..ChunkNum(1));
+        nearby |= ChunkRanges::from(ChunkNum(100)..ChunkNum(101));
+        assert_eq!(span_bounds(&nearby, 2_000_000), [(0, 114_688)]);
+
+        // Two ranges separated by > SKIP_LIMIT stay two distinct bounded spans.
+        let mut far = ChunkRanges::from(ChunkNum(0)..ChunkNum(1));
+        far |= ChunkRanges::from(ChunkNum(1000)..ChunkNum(1001));
+        assert_eq!(
+            span_bounds(&far, 2_000_000),
+            [(0, 16_384), (1_015_808, 1_032_192)]
+        );
+    }
+
+    #[test]
+    fn data_spans_handles_open_ended_and_out_of_bounds() {
+        let from = ChunkRanges::from(ChunkNum(20)..);
+        assert_eq!(span_bounds(&from, 100_000), [(16_384, 100_000)]);
+
+        let past_eof = ChunkRanges::from(ChunkNum(500)..ChunkNum(600));
+        assert!(data_spans(&past_eof, 100_000).is_empty());
+    }
+
+    #[test]
+    fn outboard_cache_evicts_lru_by_bytes_and_entries() {
+        let mut cache = OutboardCache::new(100, 60, 2);
+        let h1 = Hash::new(b"one");
+        let h2 = Hash::new(b"two");
+        let h3 = Hash::new(b"three");
+
+        cache.insert(h1, Bytes::from(vec![1u8; 40]));
+        cache.insert(h2, Bytes::from(vec![2u8; 40]));
+        assert_eq!(cache.total_bytes, 80);
+
+        // Touch h1 so h2 becomes least recently used.
+        assert_eq!(cache.get(&h1).unwrap().len(), 40);
+
+        // Inserting h3 (40 bytes) exceeds both max_bytes (120 > 100) and
+        // max_entries (3 > 2), evicting h2 while keeping h1.
+        cache.insert(h3, Bytes::from(vec![3u8; 40]));
+        assert!(cache.get(&h2).is_none());
+        assert_eq!(cache.get(&h1).unwrap().len(), 40);
+        assert_eq!(cache.get(&h3).unwrap().len(), 40);
+        assert_eq!(cache.total_bytes, 80);
+
+        // Entries larger than max_entry_bytes or empty are ignored.
+        let huge = Hash::new(b"huge");
+        cache.insert(huge, Bytes::from(vec![9u8; 61]));
+        assert!(cache.get(&huge).is_none());
+        let empty = Hash::new(b"empty");
+        cache.insert(empty, Bytes::new());
+        assert!(cache.get(&empty).is_none());
+
+        // Explicit removal frees bytes.
+        cache.remove(&h1);
+        assert!(cache.get(&h1).is_none());
+        assert_eq!(cache.total_bytes, 40);
+    }
+
+    #[test]
+    fn forget_keeps_cached_outboard_while_mark_corrupt_evicts_it() {
+        let server = S3Server::new(Arc::new(S3Client::new_mock("bucket", "us-east-1", "")));
+        let hash = Hash::new(b"recording");
+        let outboard = Bytes::from(vec![0xABu8; 128]);
+
+        lock(&server.servable).insert(
+            hash,
+            Servable {
+                size: 64 * 1024,
+                object: Object::Blob,
+            },
+        );
+        lock(&server.outboards).insert(hash, outboard.clone());
+
+        // `forget` drops `servable` (next fetch re-HEADs S3) but keeps the
+        // content-addressed outboard warm.
+        server.forget(&hash);
+        assert!(!lock(&server.servable).contains_key(&hash));
+        assert_eq!(lock(&server.outboards).get(&hash), Some(outboard));
+
+        // `mark_corrupt` evicts the outboard and clears `ranged_seen`.
+        assert!(!server.mark_ranged_seen(hash));
+        assert!(server.mark_ranged_seen(hash));
+        server.mark_corrupt(hash, &Object::Blob, "hash mismatch");
+        assert!(lock(&server.outboards).get(&hash).is_none());
+        assert!(!lock(&server.ranged_seen).contains(&hash));
+    }
+
+    #[tokio::test]
+    async fn await_in_flight_shares_result_and_handles_failure_and_cancellation() {
+        let (tx, rx) = watch::channel(None);
+        let expected = Bytes::from_static(&[7u8; 64]);
+        let waiter = tokio::spawn(await_in_flight(rx, 64));
+        tx.send(Some(Ok(expected.clone()))).unwrap();
+        assert_eq!(waiter.await.unwrap(), InFlightOutcome::Ready(expected));
+
+        // Leader S3 failure propagates to joiners so they don't stall twice.
+        let (tx, rx) = watch::channel(None);
+        let waiter = tokio::spawn(await_in_flight(rx, 64));
+        tx.send(Some(Err("S3 GET stalled".to_string()))).unwrap();
+        assert_eq!(
+            waiter.await.unwrap(),
+            InFlightOutcome::Failed("S3 GET stalled".to_string())
+        );
+
+        // If the leader drops without sending (e.g. cancelled), waiters get
+        // `Cancelled` and fall back to streaming instead of hanging.
+        let (tx, rx) = watch::channel(None);
+        let waiter = tokio::spawn(await_in_flight(rx, 64));
+        drop(tx);
+        assert_eq!(waiter.await.unwrap(), InFlightOutcome::Cancelled);
+    }
+
+    #[test]
+    fn budgeted_outboard_holds_memory_permits_until_all_clones_drop() {
+        let server = S3Server::new(Arc::new(S3Client::new_mock("bucket", "us-east-1", "")));
+        let start_avail = server.outboard_mem.available_permits();
+        let size = 32 * 1024u64; // 32 KiB -> 32 permits
+        let permit = server.try_acquire_outboard_mem(size).unwrap();
+        let budgeted = Bytes::from_owner(BudgetedOutboard {
+            data: Bytes::from(vec![1u8; size as usize]),
+            _permit: permit,
+        });
+        assert_eq!(server.outboard_mem.available_permits(), start_avail - 32);
+
+        // Cloning the Bytes (e.g., cache + active send) keeps permits held even
+        // after the cache entry is removed, releasing only once the last send drops.
+        let hash = Hash::new(b"budgeted");
+        lock(&server.outboards).insert(hash, budgeted.clone());
+        lock(&server.outboards).remove(&hash);
+        assert_eq!(server.outboard_mem.available_permits(), start_avail - 32);
+
+        drop(budgeted);
+        assert_eq!(server.outboard_mem.available_permits(), start_avail);
+    }
+
+    #[test]
+    fn s3_reader_read_ahead_bounds_small_node_reads() {
+        let s3 = Arc::new(S3Client::new_mock("bucket", "us-east-1", ""));
+        let reader = S3Reader::with_read_ahead(s3, "outboards/x".into(), 100_000, 64 * 1024);
+        assert_eq!(reader.fetch_end(0, 64), 64 * 1024);
+        assert_eq!(reader.fetch_end(80_000, 80_064), 100_000);
+    }
 }

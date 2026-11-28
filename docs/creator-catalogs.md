@@ -232,10 +232,16 @@ The first account to push a recording owns it. When the node ingests a push, it 
    - The BLAKE3 hash of the bytes must equal `catalogHash`.
    - Rewrap the envelope, decrypt it, and check the payload is a valid `/2` document whose `owner` is `<sub>`.
    - Unwrap every entry's inline metadata TDF in one bulk rewrap: at most 1000 policies per rewrap, split by size as well (arks refuses an HTTP/3 body over 2 MiB). Treat a missing per-entry result as refused. Refuse metadata whose `contentID`, `version` or `payloadHash` differs from its entry's, and show only the entries that decrypt.
-3. **Download a recording.** Fetch `payloadHash` over iroh, from the endpoint ID compiled into the viewer.
+3. **Download or stream a recording.** Fetch `payloadHash` over iroh, from the endpoint ID compiled into the viewer.
    - Reject the download if it is larger than `payloadSize`.
-   - Verify the BLAKE3 hash before using the file.
+   - Verify the BLAKE3 hash (or, for ranged reads, BAO chunk-group proofs against `payloadHash`) before using the bytes.
    - Expect the transfer to fail now and then: iroh connections stall, drop and change paths. A failed transfer is worth another attempt; the node keeps nothing from it.
+   - **Streaming segments on demand:** `iroh-blobs` `Request::Get` accepts arbitrary single-blob `ChunkRanges` (1 KiB chunks verified per 16 KiB chunk group against `payloadHash`), and one QUIC connection carries any number of sequential or concurrent range streams. A viewer does not need to download the whole TDF before starting playback:
+     1. Fetch the ZIP tail (`payloadSize - 65536 .. payloadSize`, and the Central Directory range if larger) to learn every member's offset and size.
+     2. Fetch `manifest.json`, `0.payload` (key envelope), playlists, and init segments (in one multi-range `ChunkRanges` request), unwrap keys with KAS, and start playback.
+     3. Fetch individual `.m4s` ZIP members — or individual encrypted segments from `0.payload` using `encryptionInformation.integrityInformation.segments` — as playback or seeking requests them.
+     - **Creator packaging for streaming:** store media segments and `0.payload` uncompressed (ZIP `Stored`, method 0; required to seek directly into OpenTDF `0.payload` segments, and avoids wasted CPU on incompressible ciphertext), and place `manifest.json`, `0.payload`, playlists, and init segments contiguously so startup metadata fits in one contiguous range.
+     - **Node serving behavior:** the node translates requested `ChunkRanges` into tight bounded S3 `Range: bytes=start-end` GETs (merging gaps up to 256 KiB) and caches active BAO outboards in a bounded in-memory LRU cache (64 MiB total, up to 16 MiB per recording), so streaming a recording reads `outboards/<hash>` from S3 once and reads only the requested segment bytes from `blobs/<hash>`.
 4. **Read the node's refusal.** The node approves or refuses each request before it sends a byte. A refused request is reset with an iroh-blobs error code:
    - `ERR_PERMISSION` (1) is final. The hash is blocked, S3 has no such blob, or its S3 object turned out not to match the hash. Do not retry. Hash-sequence requests, observe requests and a `get_many` naming more than 64 hashes get this answer before any lookup, so fetch one blob at a time.
    - `ERR_LIMIT` (2) means try again. S3 did not answer in time (a HEAD over 10 s, or a GET that sends nothing for 30 s), the blob's outboard is being computed, or the node is serving 256 fetches at once. Retry with a backoff.

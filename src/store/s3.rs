@@ -468,14 +468,50 @@ impl S3Client {
         key: &str,
         start: u64,
     ) -> Result<Option<std::pin::Pin<Box<dyn tokio::io::AsyncBufRead + Send>>>> {
+        self.get_object_range(key, start, None).await
+    }
+
+    /// Open a GET of the object at `key` for bytes `[start, end)` (`end = None`
+    /// reads to EOF), streamed. `None` when there is no such object. The body
+    /// is read as it arrives; the caller bounds how long it waits.
+    pub async fn get_object_range(
+        &self,
+        key: &str,
+        start: u64,
+        end: Option<u64>,
+    ) -> Result<Option<std::pin::Pin<Box<dyn tokio::io::AsyncBufRead + Send>>>> {
         let mut request = self.client.get_object().bucket(&self.bucket).key(key);
-        // A range on a zero-length object is invalid in S3; from 0, ask for
-        // all of it.
-        if start > 0 {
-            request = request.range(format!("bytes={start}-"));
-        }
+        // A range on a zero-length object is invalid in S3; ask for all of it
+        // when reading from 0 with no upper bound.
+        let expected_content_range_prefix = match end {
+            Some(end) if end > start => {
+                let last = end - 1;
+                request = request.range(format!("bytes={start}-{last}"));
+                Some(format!("bytes {start}-{last}/"))
+            }
+            Some(_) => {
+                return Err(anyhow::anyhow!(
+                    "Invalid empty byte range {start}.. for {key}"
+                ));
+            }
+            None if start > 0 => {
+                request = request.range(format!("bytes={start}-"));
+                Some(format!("bytes {start}-"))
+            }
+            None => None,
+        };
         match request.send().await {
-            Ok(resp) => Ok(Some(Box::pin(resp.body.into_async_read()))),
+            Ok(resp) => {
+                if let Some(expected_prefix) = expected_content_range_prefix {
+                    let actual = resp.content_range().unwrap_or_default();
+                    if !actual.starts_with(&expected_prefix) {
+                        return Err(anyhow::anyhow!(
+                            "S3 GET {key} ignored Range header: expected Content-Range starting with {expected_prefix:?}, got {actual:?}"
+                        ));
+                    }
+                }
+                Ok(Some(Box::pin(resp.body.into_async_read())))
+            }
             Err(e) => {
                 if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
                     Ok(None)

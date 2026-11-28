@@ -5,7 +5,8 @@ use iroh_base::TransportAddr;
 use iroh_blobs::BlobsProtocol;
 use iroh_blobs::api::blobs::Bitfield;
 use iroh_blobs::protocol::{
-    ChunkRanges, ChunkRangesSeq, GetManyRequest, GetRequest, ObserveRequest, PushRequest,
+    ChunkRanges, ChunkRangesExt, ChunkRangesSeq, GetManyRequest, GetRequest, ObserveRequest,
+    PushRequest,
 };
 use iroh_blobs::store::mem::MemStore;
 use iroh_blobs::{Hash, HashAndFormat};
@@ -283,6 +284,125 @@ impl IrohTestClient {
         Ok(data)
     }
 
+    /// Open a reusable QUIC connection to `addr` on the `iroh-blobs` ALPN.
+    /// Callers streaming multiple ranges or segments from the same node should
+    /// reuse one connection across [`Self::get_ranges_on`] /
+    /// [`Self::get_byte_range_on`] calls.
+    pub async fn connect(
+        &self,
+        addr: impl Into<EndpointAddr>,
+    ) -> Result<iroh::endpoint::Connection> {
+        self.endpoint
+            .connect(addr, iroh_blobs::ALPN)
+            .await
+            .context("Failed to connect to remote node")
+    }
+
+    /// Learn the exact byte length of `hash` on an open connection by
+    /// fetching the last chunk (`ChunkRanges::last_chunk()`), which BAO
+    /// authenticates against `hash` along with the blob's exact length.
+    pub async fn probe_size_on(
+        &self,
+        conn: &iroh::endpoint::Connection,
+        hash: Hash,
+    ) -> Result<u64> {
+        let request = GetRequest::new(
+            hash,
+            ChunkRangesSeq::from_ranges([ChunkRanges::last_chunk()]),
+        );
+        self.store
+            .remote()
+            .execute_get(conn.clone(), request)
+            .await
+            .context("Failed to probe blob size from remote node")?;
+        let bitfield = self
+            .store
+            .observe(hash)
+            .await
+            .context("Failed to read probed blob size from local store")?;
+        Ok(bitfield.size())
+    }
+
+    /// Get only the 1 KiB chunks `chunks` of `hash` over an existing
+    /// connection, then read `bytes` of it from this client's store. The
+    /// client verifies every chunk group it receives against `hash`.
+    pub async fn get_ranges_on(
+        &self,
+        conn: &iroh::endpoint::Connection,
+        hash: Hash,
+        chunks: ChunkRanges,
+        bytes: std::ops::Range<u64>,
+    ) -> Result<Vec<u8>> {
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let request = GetRequest::new(hash, ChunkRangesSeq::from_ranges([chunks]));
+        self.store
+            .remote()
+            .execute_get(conn.clone(), request)
+            .await
+            .context("Failed to get ranges from remote node")?;
+        let expected_len = bytes.end - bytes.start;
+        let data = self
+            .store
+            .export_ranges(hash, bytes.clone())
+            .concatenate()
+            .await
+            .context("Failed to read fetched ranges from local store")?;
+        if data.len() as u64 != expected_len {
+            anyhow::bail!(
+                "requested byte range {}..{} ({expected_len} bytes) exceeds blob bounds (got {} bytes)",
+                bytes.start,
+                bytes.end,
+                data.len()
+            );
+        }
+        Ok(data)
+    }
+
+    /// Fetch the exact byte range `bytes` of `hash` over an existing
+    /// connection, requesting only the minimal 1 KiB chunks not already
+    /// verified in this client's local store.
+    pub async fn get_byte_range_on(
+        &self,
+        conn: &iroh::endpoint::Connection,
+        hash: Hash,
+        bytes: std::ops::Range<u64>,
+    ) -> Result<Vec<u8>> {
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted = crate::test_cli::tdf_stream::byte_range_to_chunk_ranges(&bytes);
+        let missing = match self.store.observe(hash).await {
+            Ok(bitfield) => &wanted - &bitfield.ranges,
+            Err(_) => wanted,
+        };
+        if !missing.is_empty() {
+            let request = GetRequest::new(hash, ChunkRangesSeq::from_ranges([missing]));
+            self.store
+                .remote()
+                .execute_get(conn.clone(), request)
+                .await
+                .context("Failed to get ranges from remote node")?;
+        }
+        let expected_len = bytes.end - bytes.start;
+        let data = self
+            .store
+            .export_ranges(hash, bytes.clone())
+            .concatenate()
+            .await
+            .context("Failed to read fetched ranges from local store")?;
+        if data.len() as u64 != expected_len {
+            anyhow::bail!(
+                "requested byte range {}..{} ({expected_len} bytes) exceeds blob bounds (got {} bytes)",
+                bytes.start,
+                bytes.end,
+                data.len()
+            );
+        }
+        Ok(data)
+    }
+
     /// Get only the 1 KiB chunks `chunks` of `hash` from a remote node, then
     /// read `bytes` of it from this client's store. The client verifies every
     /// chunk group it receives against the hash.
@@ -293,22 +413,8 @@ impl IrohTestClient {
         chunks: ChunkRanges,
         bytes: std::ops::Range<u64>,
     ) -> Result<Vec<u8>> {
-        let conn = self
-            .endpoint
-            .connect(addr, iroh_blobs::ALPN)
-            .await
-            .context("Failed to connect to remote node")?;
-        let request = GetRequest::new(hash, ChunkRangesSeq::from_ranges([chunks]));
-        self.store
-            .remote()
-            .execute_get(conn, request)
-            .await
-            .context("Failed to get ranges from remote node")?;
-        self.store
-            .export_ranges(hash, bytes)
-            .concatenate()
-            .await
-            .context("Failed to read fetched ranges from local store")
+        let conn = self.connect(addr).await?;
+        self.get_ranges_on(&conn, hash, chunks, bytes).await
     }
 
     /// Fetch blobs from a remote node with one get-many request, returning
